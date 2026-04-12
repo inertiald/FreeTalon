@@ -62,18 +62,19 @@ CODING_TASKS: list[str] = [
     "Write a CSV parser that handles quoted fields and newlines within fields.",
 ]
 
-# Shell command executed inside each claw container.
-# The STATUS: lines are parsed by the poller to drive phase transitions.
-_CLAW_CMD_TEMPLATE = (
-    "python3 -u -c \""
-    "import time, sys; "
-    "print('TASK: {task}', flush=True); "
+# Python command executed inside each claw container.
+# The task description is injected via the CLAW_TASK environment variable
+# (never embedded in the command string) to eliminate shell-injection risk.
+# The STATUS: lines drive phase transitions in the polling loop.
+_CLAW_CMD = (
+    "import os, time; "
+    "task = os.environ.get('CLAW_TASK', '(unknown task)'); "
+    "print(f'TASK: {task}', flush=True); "
     "print('STATUS: thinking', flush=True); "
-    "time.sleep({think}); "
+    "time.sleep(float(os.environ['CLAW_THINK_SECS'])); "
     "print('STATUS: executing', flush=True); "
-    "time.sleep({execute}); "
+    "time.sleep(float(os.environ['CLAW_EXEC_SECS'])); "
     "print('STATUS: complete', flush=True)"
-    "\""
 )
 
 
@@ -260,7 +261,8 @@ def launch_claw(
       to prevent memory run-away.
     * ``network=LLM_HOST_NETWORK`` — the internal bridge that gives access to
       the LLM-Host container but **no** host or internet access.
-    * ``cpu_quota=100_000`` — limits each claw to one logical CPU core.
+    * ``cpu_quota=100_000`` — limits each claw to one logical CPU core
+      (100,000 µs quota out of the default 100,000 µs ``cpu_period``).
     """
     name = f"{CONTAINER_PREFIX}-{state.index}"
 
@@ -268,24 +270,23 @@ def launch_claw(
     state.update(ClawPhase.LAUNCHING)
     _remove_stale_container(client, name)
 
-    cmd = _CLAW_CMD_TEMPLATE.format(
-        task=state.task.replace('"', '\\"').replace("'", "\\'"),
-        think=think_secs,
-        execute=exec_secs,
-    )
-
     try:
         container = client.containers.run(
             image=CLAW_IMAGE,
-            command=["sh", "-c", cmd],
+            command=["python3", "-u", "-c", _CLAW_CMD],
             name=name,
             detach=True,
             mem_limit=MEM_LIMIT,
             memswap_limit=MEM_LIMIT,  # swap == mem_limit → effectively no swap
             network=LLM_HOST_NETWORK,
-            cpu_quota=100_000,  # 100 000 µs per 100 ms period == 1 vCPU
+            cpu_quota=100_000,  # 100 000 µs quota / 100 000 µs period == 1 vCPU
             remove=False,
             labels={"freetalon.claw": str(state.index)},
+            environment={
+                "CLAW_TASK": state.task,
+                "CLAW_THINK_SECS": str(think_secs),
+                "CLAW_EXEC_SECS": str(exec_secs),
+            },
         )
     except (ImageNotFound, APIError) as exc:
         logger.log(f"[red]Claw {state.index} failed to launch:[/red] {exc}")
