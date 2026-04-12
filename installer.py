@@ -61,7 +61,6 @@ def detect_gpu() -> str:
 # ---------------------------------------------------------------------------
 
 _NVIDIA_COMPOSE: dict = {
-    "version": "3.8",
     "services": {
         "ollama": {
             "image": "ollama/ollama:latest",
@@ -85,7 +84,6 @@ _NVIDIA_COMPOSE: dict = {
 }
 
 _AMD_COMPOSE: dict = {
-    "version": "3.8",
     "services": {
         "ollama": {
             "image": "ollama/ollama:rocm",
@@ -98,7 +96,6 @@ _AMD_COMPOSE: dict = {
 }
 
 _CPU_COMPOSE: dict = {
-    "version": "3.8",
     "services": {
         "ollama": {
             "image": "ollama/ollama:latest",
