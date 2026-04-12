@@ -14,7 +14,17 @@ import os
 import random
 from pathlib import Path
 
-from nicegui import app, events, ui
+from nicegui import app, events, ui  # noqa: F401 – app imported for storage
+
+# ---------------------------------------------------------------------------
+# Upload safety constants
+# ---------------------------------------------------------------------------
+
+_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB per file
+_BLOCKED_EXTENSIONS = {
+    ".exe", ".bat", ".cmd", ".sh", ".ps1", ".msi",
+    ".dll", ".so", ".dylib", ".bin",
+}
 
 # ---------------------------------------------------------------------------
 # Workspace resolution (mirrors installer.py logic)
@@ -82,6 +92,18 @@ _GLOBAL_CSS = """
 .ft-textarea .q-field__control:before { border-color: #334155 !important; }
 .ft-textarea .q-field__control:hover:before { border-color: #10b981 !important; }
 """
+
+# ---------------------------------------------------------------------------
+# Upload panel style constants
+# ---------------------------------------------------------------------------
+
+_PANEL_STYLE_HIDDEN = (
+    "position:fixed;bottom:5.5rem;right:2rem;z-index:99;width:22rem;"
+    "background:#0f172a;border:1px solid #334155;border-radius:1rem;"
+    "padding:1.25rem;display:none;"
+    "box-shadow:0 8px 32px rgba(0,0,0,0.6);"
+)
+_PANEL_STYLE_VISIBLE = _PANEL_STYLE_HIDDEN.replace("display:none;", "display:block;")
 
 # ---------------------------------------------------------------------------
 # Main page
@@ -164,13 +186,11 @@ def index() -> None:
                             ).style("color:#cbd5e1;")
 
                     await ui.run_javascript(
-                        "var el=document.querySelector('.ft-msg-area');"
+                        "const el=document.querySelector('.ft-msg-area');"
                         "if(el){el.scrollTop=el.scrollHeight;}"
                     )
 
-                msg_area._props["class"] = (
-                    msg_area._props.get("class", "") + " ft-msg-area"
-                )
+                msg_area.classes("ft-msg-area")
 
                 ui.button(icon="send", on_click=_send).props(
                     "round unelevated"
@@ -260,12 +280,7 @@ def index() -> None:
     upload_panel = (
         ui.card()
         .classes("ft-dropzone")
-        .style(
-            "position:fixed;bottom:5.5rem;right:2rem;z-index:99;width:22rem;"
-            "background:#0f172a;border:1px solid #334155;border-radius:1rem;"
-            "padding:1.25rem;display:none;"
-            "box-shadow:0 8px 32px rgba(0,0,0,0.6);"
-        )
+        .style(_PANEL_STYLE_HIDDEN)
     )
 
     with upload_panel:
@@ -280,10 +295,35 @@ def index() -> None:
             )
 
         def _handle_upload(e: events.UploadEventArguments) -> None:
-            dest = Path(WORKSPACE) / e.name
-            dest.write_bytes(e.content.read())
+            # Strip directory components to prevent path traversal
+            safe_name = Path(e.name).name
+            if not safe_name:
+                ui.notify("Invalid filename.", type="negative", position="top-right")
+                return
+
+            # Block potentially dangerous file extensions
+            if Path(safe_name).suffix.lower() in _BLOCKED_EXTENSIONS:
+                ui.notify(
+                    f"File type not allowed: '{Path(safe_name).suffix}'",
+                    type="negative",
+                    position="top-right",
+                )
+                return
+
+            # Enforce file size limit
+            data = e.content.read()
+            if len(data) > _MAX_UPLOAD_BYTES:
+                ui.notify(
+                    f"File exceeds 100 MB limit: '{safe_name}'",
+                    type="negative",
+                    position="top-right",
+                )
+                return
+
+            dest = Path(WORKSPACE) / safe_name
+            dest.write_bytes(data)
             ui.notify(
-                f"✔ Saved '{e.name}'",
+                f"✔ Saved '{safe_name}'",
                 type="positive",
                 position="top-right",
             )
@@ -299,12 +339,8 @@ def index() -> None:
 
     def _toggle_upload() -> None:
         upload_visible[0] = not upload_visible[0]
-        visible = upload_visible[0]
         upload_panel.style(
-            upload_panel._style.replace(
-                "display:none;" if not visible else "display:block;",
-                "display:block;" if visible else "display:none;",
-            )
+            _PANEL_STYLE_VISIBLE if upload_visible[0] else _PANEL_STYLE_HIDDEN
         )
 
     toggle_btn.on_click(_toggle_upload)
