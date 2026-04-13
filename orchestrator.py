@@ -387,8 +387,13 @@ class ClawOrchestrator:
                                 "Browser claw %s is ready at %s", task_id, base_url
                             )
                             return
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Browser claw %s not yet ready at %s: %s",
+                        task_id,
+                        base_url,
+                        exc,
+                    )
             time.sleep(_BROWSER_READY_INTERVAL)
 
         raise RuntimeError(

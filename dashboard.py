@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import json as _json
 import logging
 import os
 import random
@@ -543,7 +544,6 @@ def index() -> None:
                             result_lbl.set_text("Task ID and command JSON are required")
                             return
                         try:
-                            import json as _json
                             cmd_obj = _json.loads(raw)
                         except Exception as exc:  # noqa: BLE001
                             result_lbl.set_text(f"Invalid JSON: {exc}")

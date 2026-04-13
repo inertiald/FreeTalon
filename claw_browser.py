@@ -307,6 +307,11 @@ def run() -> None:
         page: Page = context.new_page()
 
         # Start the HTTP server on a background thread.
+        # Bind to all interfaces so that the host (running the orchestrator)
+        # can reach the HTTP server via the container's Docker bridge IP.
+        # Docker's network isolation means the container is only reachable
+        # from the host and other containers on the same bridge — not from
+        # the public internet.
         server = _ThreadingHTTPServer(("0.0.0.0", CLAW_PORT), _Handler)  # noqa: S104
         server_thread = threading.Thread(
             target=server.serve_forever,
