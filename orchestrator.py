@@ -50,6 +50,11 @@ _CPU_QUOTA = 50_000  # 50 % of one CPU core
 _BROWSER_READY_TIMEOUT = 30  # seconds
 _BROWSER_READY_INTERVAL = 0.5  # seconds between probes
 
+# Timeout for a single HTTP command forwarded to a browser claw (seconds).
+# Must be longer than _BROWSER_READY_TIMEOUT and Playwright's navigation
+# timeout (30 s) so that slow page loads do not cause spurious failures.
+_BROWSER_COMMAND_TIMEOUT = 65
+
 
 # ---------------------------------------------------------------------------
 # ClawOrchestrator
@@ -357,7 +362,7 @@ class ClawOrchestrator:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=65) as resp:
+            with urllib.request.urlopen(req, timeout=_BROWSER_COMMAND_TIMEOUT) as resp:
                 return json.loads(resp.read())
         except urllib.error.URLError as exc:
             raise RuntimeError(

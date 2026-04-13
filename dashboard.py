@@ -11,6 +11,7 @@ local-only security constraints.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import logging
 import os
 import random
@@ -590,24 +591,23 @@ def index() -> None:
                 screenshot_gallery = ui.column().classes("w-full gap-2")
 
             def _refresh_screenshots() -> None:
-                png_files = sorted(
-                    _SCREENSHOTS_DIR.glob("*.png"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )[:6]  # show the 6 most recent screenshots
-
-                screenshot_count_lbl.set_text(
-                    f"{len(list(_SCREENSHOTS_DIR.glob('*.png')))} files"
+                all_pngs = list(_SCREENSHOTS_DIR.glob("*.png"))
+                # Use heapq.nlargest to avoid sorting the full list when only
+                # the 6 most-recent files are needed.
+                recent_pngs = heapq.nlargest(
+                    6, all_pngs, key=lambda p: p.stat().st_mtime
                 )
+
+                screenshot_count_lbl.set_text(f"{len(all_pngs)} files")
 
                 screenshot_gallery.clear()
                 with screenshot_gallery:
-                    if not png_files:
+                    if not recent_pngs:
                         ui.label("No screenshots yet").classes(
                             "text-xs italic"
                         ).style("color:#475569;")
                     else:
-                        for png in png_files:
+                        for png in recent_pngs:
                             with ui.column().classes("w-full gap-0"):
                                 ui.image(f"/screenshots/{png.name}").classes(
                                     "w-full rounded"

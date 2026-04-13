@@ -52,6 +52,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
+from typing import Callable
 
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
@@ -62,6 +63,11 @@ from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 SCREENSHOTS_DIR = Path(os.environ.get("SCREENSHOTS_DIR", "/screenshots"))
 CLAW_PORT = int(os.environ.get("CLAW_PORT", "8080"))
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# Timeout for a single command waiting in the HTTP handler queue (seconds).
+# Set slightly above the Playwright default navigation timeout (30 s) to give
+# the browser enough room to complete slow page loads.
+_COMMAND_TIMEOUT = 65
 
 logging.basicConfig(
     level=getattr(logging, _LOG_LEVEL, logging.INFO),
@@ -123,7 +129,8 @@ def _handle_type(page: Page, cmd: dict) -> dict:
 def _handle_scroll(page: Page, cmd: dict) -> dict:
     x = int(cmd.get("x", 0))
     y = int(cmd.get("y", 0))
-    page.evaluate(f"window.scrollBy({x}, {y})")
+    # Pass x/y as Playwright arguments to avoid JS injection via f-string.
+    page.evaluate("([dx, dy]) => window.scrollBy(dx, dy)", [x, y])
     return {"ok": True}
 
 
@@ -163,7 +170,7 @@ def _handle_list_screenshots(_page: Page, _cmd: dict) -> dict:
     return {"ok": True, "screenshots": [f.name for f in files]}
 
 
-_HANDLERS: dict[str, object] = {
+_HANDLERS: dict[str, Callable[[Page, dict], dict]] = {
     "navigate": _handle_navigate,
     "screenshot": _handle_screenshot,
     "click": _handle_click,
@@ -216,9 +223,9 @@ class _Handler(BaseHTTPRequestHandler):
         result_q: queue.Queue = queue.Queue(maxsize=1)
         _cmd_bus.put((cmd, result_q))
         try:
-            result = result_q.get(timeout=60)
+            result = result_q.get(timeout=_COMMAND_TIMEOUT)
         except queue.Empty:
-            result = {"ok": False, "error": "Command timed out after 60 s"}
+            result = {"ok": False, "error": f"Command timed out after {_COMMAND_TIMEOUT} s"}
 
         self._send(200, result)
 
