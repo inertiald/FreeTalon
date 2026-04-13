@@ -10,8 +10,11 @@ local-only security constraints.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import random
+import uuid
 from pathlib import Path
 
 from nicegui import app, events, ui  # noqa: F401 – app imported for storage
@@ -25,6 +28,20 @@ _BLOCKED_EXTENSIONS = {
     ".exe", ".bat", ".cmd", ".sh", ".ps1", ".msi",
     ".dll", ".so", ".dylib", ".bin",
 }
+
+# ---------------------------------------------------------------------------
+# Claw Orchestrator (optional — requires a running Docker daemon)
+# ---------------------------------------------------------------------------
+
+_orchestrator: object | None = None
+try:
+    from orchestrator import ClawOrchestrator
+
+    _orchestrator = ClawOrchestrator()
+except Exception:  # noqa: BLE001 – Docker may not be installed/running
+    logging.getLogger(__name__).warning(
+        "Docker is not available — Agent Tasks panel will be disabled."
+    )
 
 # ---------------------------------------------------------------------------
 # Workspace resolution (mirrors installer.py logic)
@@ -201,7 +218,7 @@ def index() -> None:
         # ================================================================== #
         with ui.column().classes("h-full").style(
             "width:18rem;background:#0f172a;border-left:1px solid #1e293b;"
-            "display:flex;flex-direction:column;overflow:hidden;"
+            "display:flex;flex-direction:column;overflow-y:auto;"
         ):
 
             # -- Sidebar header -------------------------------------------
@@ -214,9 +231,7 @@ def index() -> None:
                 )
 
             # -- 10 progress bars -----------------------------------------
-            with ui.column().classes("w-full px-4 py-3 gap-3").style(
-                "flex:1;overflow-y:auto;"
-            ):
+            with ui.column().classes("w-full px-4 py-3 gap-3"):
                 for i in range(10):
                     val = _claw_values[i]
                     pct = int(val * 100)
@@ -259,6 +274,193 @@ def index() -> None:
                 ui.button("Refresh", icon="refresh", on_click=_refresh).props(
                     "flat dense"
                 ).style("color:#10b981;")
+
+            # ── Divider ───────────────────────────────────────────────────
+            ui.element("div").classes("w-full").style(
+                "border-top:1px solid #1e293b;margin:0.25rem 0;"
+            )
+
+            # ============================================================= #
+            # AGENT TASKS — orchestrator integration                         #
+            # ============================================================= #
+
+            with ui.row().classes("w-full px-4 py-2 items-center gap-2"):
+                ui.icon("hub").style("color:#10b981;font-size:1.3rem;")
+                ui.label("Agent Tasks").classes("text-lg font-semibold").style(
+                    "color:#10b981;"
+                )
+
+            # -- Active claws list ----------------------------------------
+            claw_list = ui.column().classes("w-full px-4 gap-1")
+            with claw_list:
+                if _orchestrator is None:
+                    ui.label("Docker not connected").classes(
+                        "text-xs italic"
+                    ).style("color:#ef4444;")
+                else:
+                    ui.label("No active claws").classes(
+                        "text-xs italic"
+                    ).style("color:#475569;")
+
+            # -- Live log viewer ------------------------------------------
+            with ui.column().classes("w-full px-4 py-2 gap-1"):
+                ui.label("Live Logs").classes("text-xs font-mono").style(
+                    "color:#94a3b8;"
+                )
+                log_el = (
+                    ui.log(max_lines=200)
+                    .classes("w-full")
+                    .style(
+                        "height:10rem;background:#0f172a;color:#94a3b8;"
+                        "font-size:0.7rem;font-family:monospace;"
+                        "border:1px solid #1e293b;border-radius:0.5rem;"
+                    )
+                )
+
+            # -- Spawn Claw dialog ----------------------------------------
+            def _open_spawn_dialog() -> None:
+                with ui.dialog() as dlg, ui.card().style(
+                    "background:#1e293b;color:#f1f5f9;min-width:22rem;"
+                ):
+                    ui.label("Spawn New Claw").classes(
+                        "text-lg font-bold"
+                    ).style("color:#10b981;")
+
+                    tid_input = ui.input(
+                        "Task ID",
+                        value=uuid.uuid4().hex[:8],
+                    ).classes("w-full").style("color:#f1f5f9;")
+
+                    desc_input = ui.textarea(
+                        "Python code to execute",
+                        placeholder="print('Hello from the claw!')",
+                    ).classes("w-full").style("color:#f1f5f9;")
+
+                    async def _do_spawn() -> None:
+                        if _orchestrator is None:
+                            ui.notify(
+                                "Docker is not available",
+                                type="negative",
+                                position="top-right",
+                            )
+                            dlg.close()
+                            return
+
+                        tid = (tid_input.value or "").strip()
+                        desc = (desc_input.value or "").strip()
+                        if not tid or not desc:
+                            ui.notify(
+                                "Task ID and code are required",
+                                type="warning",
+                                position="top-right",
+                            )
+                            return
+
+                        try:
+                            short_id = await asyncio.to_thread(
+                                _orchestrator.spawn_claw, tid, desc
+                            )
+                            ui.notify(
+                                f"Spawned claw {short_id}",
+                                type="positive",
+                                position="top-right",
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            ui.notify(
+                                f"Spawn failed: {exc}",
+                                type="negative",
+                                position="top-right",
+                            )
+                        dlg.close()
+
+                    with ui.row().classes("w-full justify-end gap-2 mt-3"):
+                        ui.button("Cancel", on_click=dlg.close).props(
+                            "flat"
+                        ).style("color:#94a3b8;")
+                        ui.button(
+                            "Spawn", icon="rocket_launch", on_click=_do_spawn,
+                        ).style("background:#059669;color:#fff;")
+
+                dlg.open()
+
+            with ui.row().classes("w-full px-4 py-2"):
+                ui.button(
+                    "Spawn Claw",
+                    icon="add_circle",
+                    on_click=_open_spawn_dialog,
+                ).props("flat dense").style("color:#10b981;")
+
+            # -- Kill Switch ──────────────────────────────────────────────
+            async def _kill_all() -> None:
+                if _orchestrator is None:
+                    ui.notify(
+                        "Docker is not available",
+                        type="negative",
+                        position="top-right",
+                    )
+                    return
+                count = await asyncio.to_thread(_orchestrator.kill_all)
+                log_el.clear()
+                ui.notify(
+                    f"🛑 Kill Switch: stopped {count} container(s)",
+                    type="warning",
+                    position="top-right",
+                )
+
+            with ui.row().classes("w-full px-4 pb-4"):
+                ui.button(
+                    "⛔ KILL ALL CLAWS",
+                    icon="dangerous",
+                    on_click=_kill_all,
+                ).classes("w-full").style(
+                    "background:#7f1d1d;color:#fecaca;font-weight:bold;"
+                    "border:1px solid #ef4444;border-radius:0.5rem;"
+                )
+
+            # -- Periodic claw status + log drain -------------------------
+            def _tick_claws() -> None:
+                if _orchestrator is None:
+                    return
+
+                claws = _orchestrator.list_claws()
+
+                # Rebuild the container list widget
+                claw_list.clear()
+                with claw_list:
+                    if not claws:
+                        ui.label("No active claws").classes(
+                            "text-xs italic"
+                        ).style("color:#475569;")
+                    else:
+                        for claw in claws:
+                            status = claw["status"]
+                            colour = {
+                                "running": "#10b981",
+                                "exited": "#f59e0b",
+                                "created": "#3b82f6",
+                                "removed": "#ef4444",
+                            }.get(status, "#94a3b8")
+                            with ui.row().classes(
+                                "w-full items-center gap-2"
+                            ):
+                                ui.icon("circle").style(
+                                    f"color:{colour};font-size:0.5rem;"
+                                )
+                                ui.label(claw["task_id"]).classes(
+                                    "text-xs font-mono"
+                                ).style("color:#e2e8f0;")
+                                ui.label(status).classes(
+                                    "text-xs font-mono"
+                                ).style(
+                                    f"color:{colour};margin-left:auto;"
+                                )
+
+                # Drain pending log lines into the viewer
+                for claw in claws:
+                    for line in _orchestrator.drain_logs(claw["task_id"]):
+                        log_el.push(f"[{claw['task_id']}] {line}")
+
+            ui.timer(1.0, _tick_claws)
 
     # ====================================================================== #
     # FLOATING UPLOAD PANEL                                                  #
