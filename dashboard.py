@@ -61,6 +61,12 @@ if _env_path.exists():
 
 Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
 
+# Screenshot directory — created here and served as static files so ui.image()
+# can reference them by URL path (/screenshots/<filename>).
+_SCREENSHOTS_DIR = Path(WORKSPACE) / "screenshots"
+_SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+app.add_static_files("/screenshots", str(_SCREENSHOTS_DIR))
+
 # ---------------------------------------------------------------------------
 # Shared mutable state (per-process, single user — local-only deployment)
 # ---------------------------------------------------------------------------
@@ -416,6 +422,204 @@ def index() -> None:
                     "background:#7f1d1d;color:#fecaca;font-weight:bold;"
                     "border:1px solid #ef4444;border-radius:0.5rem;"
                 )
+
+            # ── Divider ───────────────────────────────────────────────────
+            ui.element("div").classes("w-full").style(
+                "border-top:1px solid #1e293b;margin:0.25rem 0;"
+            )
+
+            # ============================================================= #
+            # BROWSER CLAW — spawn headless Chromium + screenshot gallery   #
+            # ============================================================= #
+
+            with ui.row().classes("w-full px-4 py-2 items-center gap-2"):
+                ui.icon("travel_explore").style("color:#10b981;font-size:1.3rem;")
+                ui.label("Browser Claw").classes("text-lg font-semibold").style(
+                    "color:#10b981;"
+                )
+
+            # -- Spawn Browser Claw dialog --------------------------------
+            def _open_browser_spawn_dialog() -> None:
+                with ui.dialog() as dlg, ui.card().style(
+                    "background:#1e293b;color:#f1f5f9;min-width:22rem;"
+                ):
+                    ui.label("Spawn Browser Claw").classes(
+                        "text-lg font-bold"
+                    ).style("color:#10b981;")
+
+                    ui.label(
+                        "Starts a headless Chromium container. "
+                        "Screenshots are saved to your workspace."
+                    ).classes("text-xs").style("color:#94a3b8;")
+
+                    btid_input = ui.input(
+                        "Task ID",
+                        value=f"browser-{uuid.uuid4().hex[:6]}",
+                    ).classes("w-full").style("color:#f1f5f9;")
+
+                    async def _do_spawn_browser() -> None:
+                        if _orchestrator is None:
+                            ui.notify(
+                                "Docker is not available",
+                                type="negative",
+                                position="top-right",
+                            )
+                            dlg.close()
+                            return
+
+                        tid = (btid_input.value or "").strip()
+                        if not tid:
+                            ui.notify(
+                                "Task ID is required",
+                                type="warning",
+                                position="top-right",
+                            )
+                            return
+
+                        shots_path = str(_SCREENSHOTS_DIR)
+                        try:
+                            short_id = await asyncio.to_thread(
+                                _orchestrator.spawn_browser_claw, tid, shots_path
+                            )
+                            ui.notify(
+                                f"Browser claw ready — {short_id}",
+                                type="positive",
+                                position="top-right",
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            ui.notify(
+                                f"Browser claw spawn failed: {exc}",
+                                type="negative",
+                                position="top-right",
+                            )
+                        dlg.close()
+
+                    with ui.row().classes("w-full justify-end gap-2 mt-3"):
+                        ui.button("Cancel", on_click=dlg.close).props(
+                            "flat"
+                        ).style("color:#94a3b8;")
+                        ui.button(
+                            "Launch",
+                            icon="rocket_launch",
+                            on_click=_do_spawn_browser,
+                        ).style("background:#059669;color:#fff;")
+
+                dlg.open()
+
+            # -- Send command to browser claw dialog ----------------------
+            def _open_browser_cmd_dialog() -> None:
+                with ui.dialog() as dlg, ui.card().style(
+                    "background:#1e293b;color:#f1f5f9;min-width:24rem;"
+                ):
+                    ui.label("Send Browser Command").classes(
+                        "text-lg font-bold"
+                    ).style("color:#10b981;")
+
+                    ui.label(
+                        'JSON command — e.g. {"cmd":"navigate","url":"https://youtube.com"}'
+                    ).classes("text-xs").style("color:#94a3b8;")
+
+                    bcmd_tid = ui.input(
+                        "Task ID of running browser claw",
+                    ).classes("w-full").style("color:#f1f5f9;")
+
+                    bcmd_json = ui.textarea(
+                        "Command JSON",
+                        placeholder='{"cmd": "screenshot"}',
+                    ).classes("w-full").style("color:#f1f5f9;")
+
+                    result_lbl = ui.label("").classes("text-xs font-mono w-full").style(
+                        "color:#34d399;word-break:break-all;"
+                    )
+
+                    async def _do_send_cmd() -> None:
+                        if _orchestrator is None:
+                            result_lbl.set_text("Docker is not available")
+                            return
+                        tid = (bcmd_tid.value or "").strip()
+                        raw = (bcmd_json.value or "").strip()
+                        if not tid or not raw:
+                            result_lbl.set_text("Task ID and command JSON are required")
+                            return
+                        try:
+                            import json as _json
+                            cmd_obj = _json.loads(raw)
+                        except Exception as exc:  # noqa: BLE001
+                            result_lbl.set_text(f"Invalid JSON: {exc}")
+                            return
+                        try:
+                            response = await asyncio.to_thread(
+                                _orchestrator.send_browser_command, tid, cmd_obj
+                            )
+                            result_lbl.set_text(str(response))
+                        except Exception as exc:  # noqa: BLE001
+                            result_lbl.set_text(f"Error: {exc}")
+
+                    with ui.row().classes("w-full justify-end gap-2 mt-3"):
+                        ui.button("Close", on_click=dlg.close).props(
+                            "flat"
+                        ).style("color:#94a3b8;")
+                        ui.button(
+                            "Send", icon="send", on_click=_do_send_cmd,
+                        ).style("background:#059669;color:#fff;")
+
+                dlg.open()
+
+            with ui.row().classes("w-full px-4 gap-2"):
+                ui.button(
+                    "Launch Browser",
+                    icon="add_circle",
+                    on_click=_open_browser_spawn_dialog,
+                ).props("flat dense").style("color:#10b981;")
+                ui.button(
+                    "Send Command",
+                    icon="terminal",
+                    on_click=_open_browser_cmd_dialog,
+                ).props("flat dense").style("color:#10b981;")
+
+            # -- Screenshots gallery --------------------------------------
+            with ui.column().classes("w-full px-4 py-2 gap-1"):
+                with ui.row().classes("w-full items-center justify-between"):
+                    ui.label("Screenshots").classes("text-xs font-mono").style(
+                        "color:#94a3b8;"
+                    )
+                    screenshot_count_lbl = ui.label("0 files").classes(
+                        "text-xs font-mono"
+                    ).style("color:#475569;")
+
+                screenshot_gallery = ui.column().classes("w-full gap-2")
+
+            def _refresh_screenshots() -> None:
+                png_files = sorted(
+                    _SCREENSHOTS_DIR.glob("*.png"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )[:6]  # show the 6 most recent screenshots
+
+                screenshot_count_lbl.set_text(
+                    f"{len(list(_SCREENSHOTS_DIR.glob('*.png')))} files"
+                )
+
+                screenshot_gallery.clear()
+                with screenshot_gallery:
+                    if not png_files:
+                        ui.label("No screenshots yet").classes(
+                            "text-xs italic"
+                        ).style("color:#475569;")
+                    else:
+                        for png in png_files:
+                            with ui.column().classes("w-full gap-0"):
+                                ui.image(f"/screenshots/{png.name}").classes(
+                                    "w-full rounded"
+                                ).style(
+                                    "border:1px solid #334155;"
+                                    "border-radius:0.375rem;"
+                                )
+                                ui.label(png.name).classes(
+                                    "text-xs font-mono truncate w-full"
+                                ).style("color:#64748b;")
+
+            ui.timer(2.0, _refresh_screenshots)
 
             # -- Periodic claw status + log drain -------------------------
             def _tick_claws() -> None:
