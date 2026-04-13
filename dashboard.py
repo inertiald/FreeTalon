@@ -358,7 +358,7 @@ def index() -> None:
 
                         try:
                             short_id = await asyncio.to_thread(
-                                _orchestrator.spawn_claw, tid, desc,
+                                _orchestrator.spawn_claw, tid, desc
                             )
                             ui.notify(
                                 f"Spawned claw {short_id}",
