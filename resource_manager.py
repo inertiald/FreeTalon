@@ -214,9 +214,10 @@ class ResourceManager:
     def _bytes_to_docker_mem(nbytes: int) -> str:
         """Convert a byte count to a Docker ``mem_limit`` string.
 
-        Uses ``g`` (GiB) for values ≥ 1 GiB, ``m`` (MiB) otherwise.
+        Uses ``g`` (GiB) for values that divide evenly into whole GiB,
+        ``m`` (MiB) otherwise for precision.
         """
-        if nbytes >= _GiB:
+        if nbytes >= _GiB and nbytes % _GiB == 0:
             gib = nbytes // _GiB
             return f"{gib}g"
         mib = max(nbytes // _MiB, 64)  # floor at 64 MiB

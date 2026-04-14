@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import urllib.error
@@ -451,7 +452,7 @@ class ClawOrchestrator:
         limits = self._resource_mgr.limits_for("video")
         container_name = f"media-claw-{task_id}"
 
-        host_path = Path(output_host_path).resolve()
+        host_path = _validate_host_path(output_host_path)
         host_path.mkdir(parents=True, exist_ok=True)
 
         container: Container = self._client.containers.run(
@@ -524,7 +525,7 @@ class ClawOrchestrator:
         container_name = f"upload-claw-{task_id}"
         upload_net = self._ensure_upload_network()
 
-        host_path = Path(output_host_path).resolve()
+        host_path = _validate_host_path(output_host_path)
         host_path.mkdir(parents=True, exist_ok=True)
 
         container: Container = self._client.containers.run(
@@ -651,6 +652,25 @@ class ClawOrchestrator:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _validate_host_path(raw_path: str) -> Path:
+    """Resolve *raw_path* and verify it is absolute and safe.
+
+    Raises :class:`ValueError` if the resolved path is not absolute or
+    if the raw input contains suspicious traversal sequences.
+    """
+    resolved = Path(raw_path).resolve()
+    if not resolved.is_absolute():
+        raise ValueError(f"Path must be absolute, got: {raw_path!r}")
+    # After resolve(), ".." components are eliminated.  Reject paths whose
+    # *raw* form tries to escape upward (e.g. "../../../etc").
+    normalised = os.path.normpath(raw_path)
+    if normalised.startswith("..") or "/../" in raw_path:
+        raise ValueError(
+            f"Path contains directory traversal sequences: {raw_path!r}"
+        )
+    return resolved
 
 
 def _force_remove(container: Container) -> bool:
