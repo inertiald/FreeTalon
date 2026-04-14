@@ -655,20 +655,22 @@ class ClawOrchestrator:
 
 
 def _validate_host_path(raw_path: str) -> Path:
-    """Resolve *raw_path* and verify it is absolute and safe.
+    """Resolve *raw_path* and verify it stays within the workspace.
 
-    Raises :class:`ValueError` if the resolved path is not absolute or
-    if the raw input contains suspicious traversal sequences.
+    Raises :class:`ValueError` if the resolved path escapes outside the
+    user's home directory, preventing directory-traversal attacks.
     """
+    if not raw_path or not raw_path.strip():
+        raise ValueError("Path must not be empty.")
     resolved = Path(raw_path).resolve()
-    if not resolved.is_absolute():
-        raise ValueError(f"Path must be absolute, got: {raw_path!r}")
-    # After resolve(), ".." components are eliminated.  Reject paths whose
-    # *raw* form tries to escape upward (e.g. "../../../etc").
-    normalised = os.path.normpath(raw_path)
-    if normalised.startswith("..") or "/../" in raw_path:
+    # Ensure the resolved path lives under the user's home directory.
+    # This is the broadest safe boundary — callers typically pass a
+    # workspace sub-path (e.g. ~/freetalon-workspace/output).
+    home = Path.home().resolve()
+    if not str(resolved).startswith(str(home) + os.sep) and resolved != home:
         raise ValueError(
-            f"Path contains directory traversal sequences: {raw_path!r}"
+            f"Path {raw_path!r} resolves to {resolved} which is outside "
+            f"the user's home directory ({home})."
         )
     return resolved
 
