@@ -24,6 +24,8 @@ from docker.errors import APIError, NotFound
 from docker.models.containers import Container
 from docker.models.networks import Network
 
+from resource_manager import ResourceManager
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -38,13 +40,11 @@ BROWSER_CLAW_IMAGE = "freetalon-claw-browser"
 BROWSER_CLAW_PORT = 8080
 _BROWSER_NETWORK_NAME = "freetalon-browser-net"
 
+# Upload network — non-internal bridge used by YouTube-upload claws.
+_UPLOAD_NETWORK_NAME = "freetalon-upload-net"
+
 _CONTAINER_LABEL_KEY = "freetalon.managed"
 _TASK_LABEL_KEY = "freetalon.task_id"
-
-# Resource caps — keep claws from starving the host.
-_MEM_LIMIT = "512m"
-_CPU_PERIOD = 100_000
-_CPU_QUOTA = 50_000  # 50 % of one CPU core
 
 # How long to wait for a browser claw HTTP server to become reachable.
 _BROWSER_READY_TIMEOUT = 30  # seconds
@@ -85,6 +85,7 @@ class ClawOrchestrator:
         self._log_queues: dict[str, Queue[str]] = defaultdict(Queue)
         self._log_threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
+        self._resource_mgr = ResourceManager()
         self._network: Network = self._ensure_network()
 
     # ── Network management ────────────────────────────────────────────────
@@ -122,6 +123,22 @@ class ClawOrchestrator:
                 # internal=False (default) — browser claws need internet access.
             )
 
+    def _ensure_upload_network(self) -> Network:
+        """Return the upload-accessible bridge network, creating it when absent.
+
+        Used exclusively by YouTube-upload claws that need outbound internet
+        access to reach the YouTube API.  The network is non-internal so
+        containers attached to it can route to the public internet.
+        """
+        try:
+            return self._client.networks.get(_UPLOAD_NETWORK_NAME)
+        except NotFound:
+            return self._client.networks.create(
+                _UPLOAD_NETWORK_NAME,
+                driver="bridge",
+                # internal=False (default) — upload claws need internet access.
+            )
+
     # ── Container lifecycle ───────────────────────────────────────────────
 
     def spawn_claw(self, task_id: str, task_description: str) -> str:
@@ -147,6 +164,7 @@ class ClawOrchestrator:
         docker.errors.APIError
             On any other Docker daemon error.
         """
+        limits = self._resource_mgr.limits_for("default")
         container_name = f"claw-{task_id}"
 
         container: Container = self._client.containers.run(
@@ -162,10 +180,10 @@ class ClawOrchestrator:
                 _CONTAINER_LABEL_KEY: "true",
                 _TASK_LABEL_KEY: task_id,
             },
-            mem_limit=_MEM_LIMIT,
-            cpu_period=_CPU_PERIOD,
-            cpu_quota=_CPU_QUOTA,
-            read_only=True,
+            mem_limit=limits.mem_limit,
+            cpu_period=limits.cpu_period,
+            cpu_quota=limits.cpu_quota,
+            read_only=limits.read_only,
         )
 
         with self._lock:
@@ -265,6 +283,7 @@ class ClawOrchestrator:
 
         container_name = f"browser-claw-{task_id}"
         browser_net = self._ensure_browser_network()
+        limits = self._resource_mgr.limits_for("default")
 
         container: Container = self._client.containers.run(
             BROWSER_CLAW_IMAGE,
@@ -275,9 +294,9 @@ class ClawOrchestrator:
                 _CONTAINER_LABEL_KEY: "true",
                 _TASK_LABEL_KEY: task_id,
             },
-            mem_limit=_MEM_LIMIT,
-            cpu_period=_CPU_PERIOD,
-            cpu_quota=_CPU_QUOTA,
+            mem_limit=limits.mem_limit,
+            cpu_period=limits.cpu_period,
+            cpu_quota=limits.cpu_quota,
             # read_only=False — browser claw must write screenshots to the volume.
             volumes={str(host_path): {"bind": "/screenshots", "mode": "rw"}},
             environment={
@@ -401,6 +420,162 @@ class ClawOrchestrator:
             f"{_BROWSER_READY_TIMEOUT} s.  Check 'docker logs {container.name}'."
         )
 
+    # ── Media Claw (video tasks) ──────────────────────────────────────────
+
+    def spawn_media_claw(
+        self, task_id: str, task_description: str, output_host_path: str
+    ) -> str:
+        """Start a resource-heavy container for video / media tasks.
+
+        The container receives up to 8 GiB RAM and 400 % CPU (4 cores),
+        clamped to the host's actual capacity by the :class:`ResourceManager`.
+        The root filesystem is **not** read-only, and ``/workspace/output``
+        is bind-mounted in read-write mode so that the claw can persist
+        rendered media files back to the host.
+
+        Parameters
+        ----------
+        task_id:
+            Unique task identifier.
+        task_description:
+            Python source code to execute inside the container.
+        output_host_path:
+            Absolute path on the host that is bind-mounted as
+            ``/workspace/output`` inside the container.
+
+        Returns
+        -------
+        str
+            The short container ID assigned by Docker.
+        """
+        limits = self._resource_mgr.limits_for("video")
+        container_name = f"media-claw-{task_id}"
+
+        host_path = Path(output_host_path).resolve()
+        host_path.mkdir(parents=True, exist_ok=True)
+
+        container: Container = self._client.containers.run(
+            TRUSTED_IMAGE,
+            command=["python3", "-c", task_description],
+            name=container_name,
+            network=NETWORK_NAME,
+            detach=True,
+            labels={
+                _CONTAINER_LABEL_KEY: "true",
+                _TASK_LABEL_KEY: task_id,
+            },
+            mem_limit=limits.mem_limit,
+            cpu_period=limits.cpu_period,
+            cpu_quota=limits.cpu_quota,
+            read_only=limits.read_only,  # False for video profile
+            volumes={str(host_path): {"bind": "/workspace/output", "mode": "rw"}},
+        )
+
+        with self._lock:
+            self._containers[task_id] = container
+
+        thread = threading.Thread(
+            target=self._stream_logs,
+            args=(task_id, container),
+            daemon=True,
+            name=f"media-claw-log-{task_id}",
+        )
+        thread.start()
+        with self._lock:
+            self._log_threads[task_id] = thread
+
+        logger.info(
+            "Spawned media claw %s (container %s) — mem=%s cpu_quota=%d",
+            task_id,
+            container.short_id,
+            limits.mem_limit,
+            limits.cpu_quota,
+        )
+        return container.short_id
+
+    # ── Upload Claw (YouTube upload tasks) ────────────────────────────────
+
+    def spawn_upload_claw(
+        self, task_id: str, task_description: str, output_host_path: str
+    ) -> str:
+        """Start an internet-enabled container for YouTube upload tasks.
+
+        The container uses the ``youtube_upload`` resource profile which
+        mirrors the *video* profile's compute budget but is attached to a
+        **non-internal** bridge network (``freetalon-upload-net``) so that
+        it can reach the YouTube API over the public internet.
+
+        Parameters
+        ----------
+        task_id:
+            Unique task identifier.
+        task_description:
+            Python source code to execute inside the container.
+        output_host_path:
+            Absolute path on the host that is bind-mounted as
+            ``/workspace/output`` inside the container.
+
+        Returns
+        -------
+        str
+            The short container ID assigned by Docker.
+        """
+        limits = self._resource_mgr.limits_for("youtube_upload")
+        container_name = f"upload-claw-{task_id}"
+        upload_net = self._ensure_upload_network()
+
+        host_path = Path(output_host_path).resolve()
+        host_path.mkdir(parents=True, exist_ok=True)
+
+        container: Container = self._client.containers.run(
+            TRUSTED_IMAGE,
+            command=["python3", "-c", task_description],
+            name=container_name,
+            # Non-internal bridge — allows outbound internet access for
+            # YouTube API uploads while still being isolated from the host
+            # network namespace.
+            network=upload_net.name,
+            detach=True,
+            labels={
+                _CONTAINER_LABEL_KEY: "true",
+                _TASK_LABEL_KEY: task_id,
+            },
+            mem_limit=limits.mem_limit,
+            cpu_period=limits.cpu_period,
+            cpu_quota=limits.cpu_quota,
+            read_only=limits.read_only,  # False for upload profile
+            volumes={str(host_path): {"bind": "/workspace/output", "mode": "rw"}},
+        )
+
+        with self._lock:
+            self._containers[task_id] = container
+
+        thread = threading.Thread(
+            target=self._stream_logs,
+            args=(task_id, container),
+            daemon=True,
+            name=f"upload-claw-log-{task_id}",
+        )
+        thread.start()
+        with self._lock:
+            self._log_threads[task_id] = thread
+
+        logger.info(
+            "Spawned upload claw %s (container %s) — network=%s mem=%s cpu_quota=%d",
+            task_id,
+            container.short_id,
+            upload_net.name,
+            limits.mem_limit,
+            limits.cpu_quota,
+        )
+        return container.short_id
+
+    # ── Resource introspection ────────────────────────────────────────────
+
+    def resource_summary(self) -> dict[str, object]:
+        """Return host resources and per-profile limits (JSON-friendly)."""
+        return self._resource_mgr.summary()
+
     # ── Log streaming ─────────────────────────────────────────────────────
 
     def _stream_logs(self, task_id: str, container: Container) -> None:
@@ -464,8 +639,8 @@ class ClawOrchestrator:
         return result
 
     def cleanup_network(self) -> None:
-        """Remove the internal bridge network and the browser network (best-effort)."""
-        for net_name in (NETWORK_NAME, _BROWSER_NETWORK_NAME):
+        """Remove the internal bridge, browser, and upload networks (best-effort)."""
+        for net_name in (NETWORK_NAME, _BROWSER_NETWORK_NAME, _UPLOAD_NETWORK_NAME):
             try:
                 net = self._client.networks.get(net_name)
                 net.remove()

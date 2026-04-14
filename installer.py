@@ -7,6 +7,7 @@ a tailored ``docker-compose.yml`` and ``.env`` file for the local workspace.
 
 from __future__ import annotations
 
+import copy
 import os
 import platform
 import shutil
@@ -60,12 +61,86 @@ def detect_gpu() -> str:
 # File generation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Shared network and claw service definitions
+# ---------------------------------------------------------------------------
+
+_NETWORKS: dict = {
+    "freetalon-claw-net": {
+        "driver": "bridge",
+        "internal": True,
+    },
+    "freetalon-browser-net": {
+        "driver": "bridge",
+    },
+    "freetalon-upload-net": {
+        "driver": "bridge",
+    },
+}
+
+_CLAW_SERVICES: dict = {
+    "media-claw": {
+        "image": "trusted-python-base",
+        "networks": ["freetalon-claw-net"],
+        "read_only": False,
+        "volumes": ["${LOCAL_WORKSPACE}/output:/workspace/output:rw"],
+        "deploy": {
+            "resources": {
+                "limits": {
+                    "memory": "8g",
+                    "cpus": "4.0",
+                },
+            },
+        },
+        "profiles": ["media"],
+    },
+    "upload-claw": {
+        "image": "trusted-python-base",
+        "networks": ["freetalon-upload-net"],
+        "read_only": False,
+        "volumes": ["${LOCAL_WORKSPACE}/output:/workspace/output:rw"],
+        "deploy": {
+            "resources": {
+                "limits": {
+                    "memory": "8g",
+                    "cpus": "4.0",
+                },
+            },
+        },
+        "profiles": ["upload"],
+    },
+    "browser-claw": {
+        "image": "freetalon-claw-browser",
+        "networks": ["freetalon-browser-net"],
+        "volumes": ["${LOCAL_WORKSPACE}/screenshots:/screenshots:rw"],
+        "environment": {
+            "SCREENSHOTS_DIR": "/screenshots",
+            "CLAW_PORT": "8080",
+        },
+        "deploy": {
+            "resources": {
+                "limits": {
+                    "memory": "512m",
+                    "cpus": "0.5",
+                },
+            },
+        },
+        "profiles": ["browser"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# GPU-specific compose templates
+# ---------------------------------------------------------------------------
+
 _NVIDIA_COMPOSE: dict = {
     "services": {
         "ollama": {
             "image": "ollama/ollama:latest",
             "ports": ["11434:11434"],
             "volumes": ["${LOCAL_WORKSPACE}:/workspace"],
+            "networks": ["freetalon-claw-net"],
             "deploy": {
                 "resources": {
                     "reservations": {
@@ -79,7 +154,7 @@ _NVIDIA_COMPOSE: dict = {
                     }
                 }
             },
-        }
+        },
     },
 }
 
@@ -89,6 +164,7 @@ _AMD_COMPOSE: dict = {
             "image": "ollama/ollama:rocm",
             "ports": ["11434:11434"],
             "volumes": ["${LOCAL_WORKSPACE}:/workspace"],
+            "networks": ["freetalon-claw-net"],
             "devices": ["/dev/kfd", "/dev/dri"],
             "group_add": ["video"],
         }
@@ -101,6 +177,7 @@ _CPU_COMPOSE: dict = {
             "image": "ollama/ollama:latest",
             "ports": ["11434:11434"],
             "volumes": ["${LOCAL_WORKSPACE}:/workspace"],
+            "networks": ["freetalon-claw-net"],
         }
     },
 }
@@ -109,10 +186,16 @@ _CPU_COMPOSE: dict = {
 def _compose_template(gpu: str) -> dict:
     """Return the docker-compose dict for the detected *gpu* type."""
     if gpu == GPU_NVIDIA:
-        return _NVIDIA_COMPOSE
-    if gpu == GPU_AMD:
-        return _AMD_COMPOSE
-    return _CPU_COMPOSE
+        base = _NVIDIA_COMPOSE
+    elif gpu == GPU_AMD:
+        base = _AMD_COMPOSE
+    else:
+        base = _CPU_COMPOSE
+
+    compose = copy.deepcopy(base)
+    compose["services"].update(copy.deepcopy(_CLAW_SERVICES))
+    compose["networks"] = copy.deepcopy(_NETWORKS)
+    return compose
 
 
 def generate_compose(gpu: str, path: str = "docker-compose.yml") -> None:
