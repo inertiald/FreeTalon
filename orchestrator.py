@@ -9,9 +9,14 @@ reachable from a claw is the LLM service container on the same bridge.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+import time
+import urllib.error
+import urllib.request
 from collections import defaultdict
+from pathlib import Path
 from queue import Empty, Queue
 
 import docker
@@ -28,6 +33,11 @@ logger = logging.getLogger(__name__)
 NETWORK_NAME = "freetalon-claw-net"
 TRUSTED_IMAGE = "trusted-python-base"
 
+# Browser Claw image and its dedicated (internet-accessible) network.
+BROWSER_CLAW_IMAGE = "freetalon-claw-browser"
+BROWSER_CLAW_PORT = 8080
+_BROWSER_NETWORK_NAME = "freetalon-browser-net"
+
 _CONTAINER_LABEL_KEY = "freetalon.managed"
 _TASK_LABEL_KEY = "freetalon.task_id"
 
@@ -35,6 +45,15 @@ _TASK_LABEL_KEY = "freetalon.task_id"
 _MEM_LIMIT = "512m"
 _CPU_PERIOD = 100_000
 _CPU_QUOTA = 50_000  # 50 % of one CPU core
+
+# How long to wait for a browser claw HTTP server to become reachable.
+_BROWSER_READY_TIMEOUT = 30  # seconds
+_BROWSER_READY_INTERVAL = 0.5  # seconds between probes
+
+# Timeout for a single HTTP command forwarded to a browser claw (seconds).
+# Must be longer than _BROWSER_READY_TIMEOUT and Playwright's navigation
+# timeout (30 s) so that slow page loads do not cause spurious failures.
+_BROWSER_COMMAND_TIMEOUT = 65
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +104,22 @@ class ClawOrchestrator:
                 NETWORK_NAME,
                 driver="bridge",
                 internal=True,
+            )
+
+    def _ensure_browser_network(self) -> Network:
+        """Return the browser-accessible bridge network, creating it when absent.
+
+        Unlike the internal claw network, this network allows outbound internet
+        access so browser claws can navigate to external URLs.  It is kept
+        separate from the default Docker bridge to make the intent explicit.
+        """
+        try:
+            return self._client.networks.get(_BROWSER_NETWORK_NAME)
+        except NotFound:
+            return self._client.networks.create(
+                _BROWSER_NETWORK_NAME,
+                driver="bridge",
+                # internal=False (default) — browser claws need internet access.
             )
 
     # ── Container lifecycle ───────────────────────────────────────────────
@@ -183,6 +218,189 @@ class ClawOrchestrator:
         logger.info("Kill switch activated — stopped %d container(s)", stopped)
         return stopped
 
+    # ── Browser Claw ──────────────────────────────────────────────────────
+
+    def spawn_browser_claw(
+        self, task_id: str, screenshots_host_path: str
+    ) -> str:
+        """Start a headless-Chromium browser claw for *task_id*.
+
+        The container runs the ``freetalon-claw-browser`` image and exposes
+        an HTTP command server on ``BROWSER_CLAW_PORT``.  Screenshots are
+        saved inside the container at ``/screenshots`` which is bind-mounted
+        to *screenshots_host_path* on the host.
+
+        Unlike standard claws, browser claws run on a non-internal bridge
+        so they can reach external URLs.  They are still memory- and
+        CPU-capped, and they do **not** get a read-only filesystem because
+        they must write screenshots.
+
+        Parameters
+        ----------
+        task_id:
+            Unique identifier (used in the container name ``browser-claw-<id>``
+            and in orchestrator bookkeeping).
+        screenshots_host_path:
+            Absolute path on the *host* that will be bind-mounted as
+            ``/screenshots`` inside the container.  Created automatically if
+            it does not exist.
+
+        Returns
+        -------
+        str
+            The short container ID assigned by Docker.
+
+        Raises
+        ------
+        docker.errors.ImageNotFound
+            If the *freetalon-claw-browser* image has not been built.
+        docker.errors.APIError
+            On any other Docker daemon error.
+        RuntimeError
+            If the browser claw HTTP server does not become reachable within
+            ``_BROWSER_READY_TIMEOUT`` seconds.
+        """
+        host_path = Path(screenshots_host_path).resolve()
+        host_path.mkdir(parents=True, exist_ok=True)
+
+        container_name = f"browser-claw-{task_id}"
+        browser_net = self._ensure_browser_network()
+
+        container: Container = self._client.containers.run(
+            BROWSER_CLAW_IMAGE,
+            name=container_name,
+            network=browser_net.name,
+            detach=True,
+            labels={
+                _CONTAINER_LABEL_KEY: "true",
+                _TASK_LABEL_KEY: task_id,
+            },
+            mem_limit=_MEM_LIMIT,
+            cpu_period=_CPU_PERIOD,
+            cpu_quota=_CPU_QUOTA,
+            # read_only=False — browser claw must write screenshots to the volume.
+            volumes={str(host_path): {"bind": "/screenshots", "mode": "rw"}},
+            environment={
+                "SCREENSHOTS_DIR": "/screenshots",
+                "CLAW_PORT": str(BROWSER_CLAW_PORT),
+            },
+        )
+
+        with self._lock:
+            self._containers[task_id] = container
+
+        thread = threading.Thread(
+            target=self._stream_logs,
+            args=(task_id, container),
+            daemon=True,
+            name=f"browser-claw-log-{task_id}",
+        )
+        thread.start()
+        with self._lock:
+            self._log_threads[task_id] = thread
+
+        logger.info(
+            "Spawned browser claw %s (container %s)", task_id, container.short_id
+        )
+
+        # Wait until the HTTP server inside the container is reachable.
+        self._wait_for_browser_ready(task_id, container)
+
+        return container.short_id
+
+    def get_browser_claw_url(self, task_id: str) -> str | None:
+        """Return the base HTTP URL for the browser claw command server.
+
+        Returns *None* if *task_id* is not a known container or if the
+        container's IP cannot be determined.
+        """
+        with self._lock:
+            container = self._containers.get(task_id)
+        if container is None:
+            return None
+        try:
+            container.reload()
+            nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            ip = nets.get(_BROWSER_NETWORK_NAME, {}).get("IPAddress", "")
+            if not ip:
+                return None
+            return f"http://{ip}:{BROWSER_CLAW_PORT}"
+        except (NotFound, APIError):
+            return None
+
+    def send_browser_command(self, task_id: str, cmd: dict) -> dict:
+        """Send a JSON command to the browser claw and return the response.
+
+        Parameters
+        ----------
+        task_id:
+            The task ID of a running browser claw.
+        cmd:
+            A command dict, e.g. ``{"cmd": "navigate", "url": "https://…"}``.
+
+        Returns
+        -------
+        dict
+            The JSON response from the claw.  Always contains an ``"ok"`` key.
+
+        Raises
+        ------
+        RuntimeError
+            If the container URL cannot be determined or the HTTP request
+            fails.
+        """
+        base_url = self.get_browser_claw_url(task_id)
+        if base_url is None:
+            raise RuntimeError(
+                f"Browser claw {task_id!r} is not running or its IP is unknown."
+            )
+        body = json.dumps(cmd).encode()
+        req = urllib.request.Request(
+            f"{base_url}/command",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=_BROWSER_COMMAND_TIMEOUT) as resp:
+                return json.loads(resp.read())
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"Command to browser claw {task_id!r} failed: {exc}"
+            ) from exc
+
+    def _wait_for_browser_ready(self, task_id: str, container: Container) -> None:
+        """Block until the browser claw HTTP server responds to /health."""
+        deadline = time.monotonic() + _BROWSER_READY_TIMEOUT
+        base_url: str | None = None
+
+        while time.monotonic() < deadline:
+            if base_url is None:
+                base_url = self.get_browser_claw_url(task_id)
+            if base_url:
+                try:
+                    with urllib.request.urlopen(
+                        f"{base_url}/health", timeout=2
+                    ) as resp:
+                        if resp.status == 200:
+                            logger.info(
+                                "Browser claw %s is ready at %s", task_id, base_url
+                            )
+                            return
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Browser claw %s not yet ready at %s: %s",
+                        task_id,
+                        base_url,
+                        exc,
+                    )
+            time.sleep(_BROWSER_READY_INTERVAL)
+
+        raise RuntimeError(
+            f"Browser claw {task_id!r} did not become ready within "
+            f"{_BROWSER_READY_TIMEOUT} s.  Check 'docker logs {container.name}'."
+        )
+
     # ── Log streaming ─────────────────────────────────────────────────────
 
     def _stream_logs(self, task_id: str, container: Container) -> None:
@@ -246,12 +464,13 @@ class ClawOrchestrator:
         return result
 
     def cleanup_network(self) -> None:
-        """Remove the internal bridge network (best-effort)."""
-        try:
-            net = self._client.networks.get(NETWORK_NAME)
-            net.remove()
-        except (NotFound, APIError):
-            pass
+        """Remove the internal bridge network and the browser network (best-effort)."""
+        for net_name in (NETWORK_NAME, _BROWSER_NETWORK_NAME):
+            try:
+                net = self._client.networks.get(net_name)
+                net.remove()
+            except (NotFound, APIError):
+                pass
 
 
 # ---------------------------------------------------------------------------

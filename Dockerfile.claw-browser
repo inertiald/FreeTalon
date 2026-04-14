@@ -1,0 +1,52 @@
+# Dockerfile for the FreeTalon Browser Claw image.
+#
+# Build:
+#     docker build -t freetalon-claw-browser -f Dockerfile.claw-browser .
+#
+# The image provides a persistent headless Chromium session driven by
+# claw_browser.py.  The command server listens on $CLAW_PORT (default 8080)
+# and accepts JSON-over-HTTP commands so that an LLM can navigate, click,
+# type, and capture screenshots without rebuilding the container.
+#
+# Screenshots are written to $SCREENSHOTS_DIR (default /screenshots).
+# Mount a host path there so the NiceGUI Hub can display them:
+#
+#     docker run --rm \
+#         -p 8080:8080 \
+#         -v "$(pwd)/screenshots:/screenshots" \
+#         freetalon-claw-browser
+#
+# For the managed path, see ClawOrchestrator.spawn_browser_claw() in
+# orchestrator.py.
+
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+
+# Security: run as a non-root user to limit blast radius, consistent with
+# the convention established in Dockerfile.trusted-base.
+RUN useradd --create-home --shell /bin/sh claw
+
+# The base image pre-installs Chromium under /ms-playwright (owned by root,
+# world-readable).  Point Playwright at that directory so the non-root 'claw'
+# user can locate the browsers without a redundant installation step.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Screenshot output directory — bind-mount a host path here at runtime.
+RUN mkdir -p /screenshots && chown claw:claw /screenshots
+VOLUME ["/screenshots"]
+
+WORKDIR /home/claw
+
+COPY claw_browser.py /home/claw/claw_browser.py
+RUN chown claw:claw /home/claw/claw_browser.py
+
+USER claw
+
+# Runtime configuration — override with -e flags on docker run.
+ENV SCREENSHOTS_DIR=/screenshots \
+    CLAW_PORT=8080 \
+    LOG_LEVEL=INFO
+
+EXPOSE 8080
+
+# -u: unbuffered stdout/stderr so logs reach the orchestrator immediately.
+CMD ["python3", "-u", "claw_browser.py"]
