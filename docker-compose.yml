@@ -1,0 +1,97 @@
+# FreeTalon — local-first, multi-agent AI agentic system.
+#
+# Zero-trust, base-image-only architecture.  Two segregated network
+# tiers separate trusted AI logic from untrusted sandboxed workloads:
+#
+#   * back-tier     — trusted services (Hub ⇄ LLM).  Standard bridge.
+#   * sandbox-tier  — untrusted ‘claw’ containers spawned by the Hub.
+#                     ``internal: true`` removes the default gateway,
+#                     so workloads have **no** route to the public
+#                     internet unless an explicit proxy override is
+#                     attached at spawn time.
+#
+# Hardware-agnostic: the GPU reservation block is a *request*.  On
+# hosts without an NVIDIA runtime (MacBook, Raspberry Pi, …) Compose
+# will fall back gracefully when the reservation cannot be satisfied
+# and the ``count``/``capabilities`` fields are interpreted as a soft
+# preference by the orchestrator profile in use.
+
+name: freetalon
+
+networks:
+  back-tier:
+    name: freetalon-back-tier
+    driver: bridge
+    attachable: true
+    labels:
+      freetalon.tier: back
+
+  sandbox-tier:
+    name: freetalon-sandbox-tier
+    driver: bridge
+    internal: true        # no external gateway — explicit proxy only
+    attachable: true
+    labels:
+      freetalon.tier: sandbox
+
+volumes:
+  ollama-models:
+    name: freetalon-ollama-models
+    labels:
+      freetalon.role: llm-weights
+
+services:
+  # ────────────────────────────────────────────────────────────────
+  # LLM service — local Ollama runtime.
+  # Reserves exactly one NVIDIA GPU; degrades gracefully on hosts
+  # without an NVIDIA runtime (the reservation is a request, not a
+  # hard requirement, when ``count: 1`` is used).
+  # ────────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: freetalon-ollama
+    restart: unless-stopped
+    networks:
+      - back-tier
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_KEEP_ALIVE: "5m"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ────────────────────────────────────────────────────────────────
+  # Talon Hub — orchestrator / dashboard.
+  # Mounts the host Docker socket so the Hub can spawn sibling
+  # ‘claw’ containers on the sandbox-tier.  Sits on back-tier to
+  # reach the Ollama service over the internal bridge.
+  # ────────────────────────────────────────────────────────────────
+  talon-hub:
+    image: freetalon-hub:latest
+    container_name: freetalon-hub
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - back-tier
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      OLLAMA_URL: "http://ollama:11434"
+      FREETALON_BACK_NETWORK: "freetalon-back-tier"
+      FREETALON_SANDBOX_NETWORK: "freetalon-sandbox-tier"
+    ports:
+      - "127.0.0.1:7860:7860"   # NiceGUI dashboard, loopback only
