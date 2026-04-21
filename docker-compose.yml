@@ -1,0 +1,91 @@
+# docker-compose.yml — FreeTalon reference stack.
+#
+# Generated from the installer's CPU-only template with all claw profiles.
+# Adjust GPU settings via `python installer.py` or manually edit the
+# 'ollama' service below.
+#
+# Profiles:
+#   docker compose up                  → ollama only
+#   docker compose --profile media up  → + media-claw
+#   docker compose --profile upload up → + upload-claw
+#   docker compose --profile browser up→ + browser-claw
+
+services:
+  # -- LLM backend --------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - "${LOCAL_WORKSPACE}:/workspace"
+    networks:
+      - freetalon-claw-net
+
+  # -- Media Claw (video tasks) -------------------------------------------
+  # Up to 8 GiB RAM / 4 CPU cores.  /workspace/output is RW so the claw
+  # can persist rendered media files back to the host.
+  media-claw:
+    image: trusted-python-base
+    networks:
+      - freetalon-claw-net
+    read_only: false
+    volumes:
+      - "${LOCAL_WORKSPACE}/output:/workspace/output:rw"
+    deploy:
+      resources:
+        limits:
+          memory: "8g"
+          cpus: "4.0"
+    profiles:
+      - media
+
+  # -- Upload Claw (YouTube upload) ----------------------------------------
+  # Same compute budget as media-claw but on a non-internal bridge so the
+  # container can reach the YouTube API over the public internet.
+  upload-claw:
+    image: trusted-python-base
+    networks:
+      - freetalon-upload-net
+    read_only: false
+    volumes:
+      - "${LOCAL_WORKSPACE}/output:/workspace/output:rw"
+    deploy:
+      resources:
+        limits:
+          memory: "8g"
+          cpus: "4.0"
+    profiles:
+      - upload
+
+  # -- Browser Claw --------------------------------------------------------
+  browser-claw:
+    image: freetalon-claw-browser
+    networks:
+      - freetalon-browser-net
+    volumes:
+      - "${LOCAL_WORKSPACE}/screenshots:/screenshots:rw"
+    environment:
+      SCREENSHOTS_DIR: /screenshots
+      CLAW_PORT: "8080"
+    deploy:
+      resources:
+        limits:
+          memory: "512m"
+          cpus: "0.5"
+    profiles:
+      - browser
+
+# -- Networks --------------------------------------------------------------
+networks:
+  # Internal-only bridge — claws can reach the LLM but NOT the internet.
+  freetalon-claw-net:
+    driver: bridge
+    internal: true
+
+  # Browser claws need outbound internet access for web navigation.
+  freetalon-browser-net:
+    driver: bridge
+
+  # Upload claws need outbound internet access for YouTube API.
+  freetalon-upload-net:
+    driver: bridge
