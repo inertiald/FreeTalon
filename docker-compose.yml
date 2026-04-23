@@ -19,7 +19,29 @@ services:
     volumes:
       - "${LOCAL_WORKSPACE}:/workspace"
     networks:
+      - back-tier
       - freetalon-claw-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # -- Hub (orchestrator) —- spawns sibling claw containers ---------------
+  # Mounts the Docker socket so the Hub can call the Docker API directly
+  # and launch/manage sibling containers at runtime.  Stays on back-tier
+  # to communicate with Ollama but has no sandbox-tier exposure.
+  decapod-hub:
+    image: trusted-python-base
+    networks:
+      - back-tier
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    restart: unless-stopped
 
   # -- Media Claw (video tasks) -------------------------------------------
   # Up to 8 GiB RAM / 4 CPU cores.  /workspace/output is RW so the claw
@@ -77,6 +99,21 @@ services:
 
 # -- Networks --------------------------------------------------------------
 networks:
+  # Back-tier: internal bridge for AI logic (Hub ↔ Ollama, Hub ↔ claws).
+  # Not marked internal=true so the Hub can pull models on first startup,
+  # but all claw workloads stay on freetalon-claw-net or sandbox-tier.
+  back-tier:
+    driver: bridge
+
+  # Sandbox-tier: fully air-gapped — no external gateway.
+  # Default claw containers (spawn_claw) attach here for zero-internet
+  # isolation.  To enable proxy egress for a specific service set the
+  # HTTP_PROXY / HTTPS_PROXY environment variables on that service; the
+  # network itself never gains a default gateway.
+  sandbox-tier:
+    driver: bridge
+    internal: true
+
   # Internal-only bridge — claws can reach the LLM but NOT the internet.
   freetalon-claw-net:
     driver: bridge
