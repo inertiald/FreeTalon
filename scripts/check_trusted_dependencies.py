@@ -46,7 +46,8 @@ def _check_requirements(errors: list[str]) -> None:
         return
 
     pat = re.compile(
-        r"^[a-zA-Z0-9_.-]+==[a-zA-Z0-9_.+!-]+(?:\s+--hash=sha256:[a-f0-9]{64})+$"
+        r"^[a-zA-Z0-9_.-]+(?:\[[a-zA-Z0-9_.\-,]+\])?==[a-zA-Z0-9_.+!-]+"
+        r"(?:\s+--hash=sha256:[a-f0-9]{64})+$"
     )
     for entry in logical:
         if any(op in entry for op in (">=", "<=", "~=", ">", "<")):
