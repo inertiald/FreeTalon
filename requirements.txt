@@ -1,5 +1,10 @@
-rich>=13.0.0
-pyyaml>=6.0
-nicegui>=1.4.0
-docker>=7.0.0
-pydantic>=2.8.0
+rich==13.9.4 \
+    --hash=sha256:6049d5e6ec054bf2779ab3358186963bac2ea89175919d699e378b99738c2a90
+pyyaml==6.0.2 \
+    --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476
+nicegui==1.4.26 \
+    --hash=sha256:acc5c0cfe13bf8743b5180a7df845a79eade5cc5f239466a00f1e6d2e8b071d2
+docker==7.1.0 \
+    --hash=sha256:c96b93b7f0a746f9e77d325bcfb87422a3d8bd4f03136ae8a85b37f1898d5fc0
+pydantic==2.8.2 \
+    --hash=sha256:73ee9fddd406dc318b885c7a2eab8a6472b68b8fb5ba8150949fc3db939f23c8

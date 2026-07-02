@@ -34,10 +34,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 NETWORK_NAME = "freetalon-claw-net"
-TRUSTED_IMAGE = "trusted-python-base"
+TRUSTED_IMAGE = "trusted-python-base:1.0.0"
 
 # Browser Claw image and its dedicated (internet-accessible) network.
-BROWSER_CLAW_IMAGE = "freetalon-claw-browser"
+BROWSER_CLAW_IMAGE = "freetalon-claw-browser:1.0.0"
 BROWSER_CLAW_PORT = 8080
 _BROWSER_NETWORK_NAME = "freetalon-browser-net"
 

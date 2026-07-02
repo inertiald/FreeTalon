@@ -1,0 +1,25 @@
+name: Trusted Dependency Policy
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  dependency-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install checker dependency
+        run: python -m pip install pyyaml
+
+      - name: Verify trusted dependency policy
+        run: python scripts/check_trusted_dependencies.py

@@ -13,7 +13,7 @@
 services:
   # -- LLM backend --------------------------------------------------------
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc
     ports:
       - "11434:11434"
     volumes:
@@ -25,7 +25,7 @@ services:
   # Up to 8 GiB RAM / 4 CPU cores.  /workspace/output is RW so the claw
   # can persist rendered media files back to the host.
   media-claw:
-    image: trusted-python-base
+    image: trusted-python-base:1.0.0
     networks:
       - freetalon-claw-net
     read_only: false
@@ -43,7 +43,7 @@ services:
   # Same compute budget as media-claw but on a non-internal bridge so the
   # container can reach the YouTube API over the public internet.
   upload-claw:
-    image: trusted-python-base
+    image: trusted-python-base:1.0.0
     networks:
       - freetalon-upload-net
     read_only: false
@@ -59,7 +59,7 @@ services:
 
   # -- Browser Claw --------------------------------------------------------
   browser-claw:
-    image: freetalon-claw-browser
+    image: freetalon-claw-browser:1.0.0
     networks:
       - freetalon-browser-net
     volumes:

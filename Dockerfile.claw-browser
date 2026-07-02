@@ -1,7 +1,7 @@
 # Dockerfile for the FreeTalon Browser Claw image.
 #
 # Build:
-#     docker build -t freetalon-claw-browser -f Dockerfile.claw-browser .
+#     docker build -t freetalon-claw-browser:1.0.0 -f Dockerfile.claw-browser .
 #
 # The image provides a persistent headless Chromium session driven by
 # claw_browser.py.  The command server listens on $CLAW_PORT (default 8080)
@@ -14,12 +14,12 @@
 #     docker run --rm \
 #         -p 8080:8080 \
 #         -v "$(pwd)/screenshots:/screenshots" \
-#         freetalon-claw-browser
+#         freetalon-claw-browser:1.0.0
 #
 # For the managed path, see ClawOrchestrator.spawn_browser_claw() in
 # orchestrator.py.
 
-FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy@sha256:5656288def8576b31903becabac255b19bc01ee961ddb499de3418d52f55ed2a
 
 # Security: run as a non-root user to limit blast radius, consistent with
 # the convention established in Dockerfile.trusted-base.

@@ -80,7 +80,7 @@ _NETWORKS: dict = {
 
 _CLAW_SERVICES: dict = {
     "media-claw": {
-        "image": "trusted-python-base",
+        "image": "trusted-python-base:1.0.0",
         "networks": ["freetalon-claw-net"],
         "read_only": False,
         "volumes": ["${LOCAL_WORKSPACE}/output:/workspace/output:rw"],
@@ -95,7 +95,7 @@ _CLAW_SERVICES: dict = {
         "profiles": ["media"],
     },
     "upload-claw": {
-        "image": "trusted-python-base",
+        "image": "trusted-python-base:1.0.0",
         "networks": ["freetalon-upload-net"],
         "read_only": False,
         "volumes": ["${LOCAL_WORKSPACE}/output:/workspace/output:rw"],
@@ -110,7 +110,7 @@ _CLAW_SERVICES: dict = {
         "profiles": ["upload"],
     },
     "browser-claw": {
-        "image": "freetalon-claw-browser",
+        "image": "freetalon-claw-browser:1.0.0",
         "networks": ["freetalon-browser-net"],
         "volumes": ["${LOCAL_WORKSPACE}/screenshots:/screenshots:rw"],
         "environment": {
@@ -137,7 +137,7 @@ _CLAW_SERVICES: dict = {
 _NVIDIA_COMPOSE: dict = {
     "services": {
         "ollama": {
-            "image": "ollama/ollama:latest",
+            "image": "ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc",
             "ports": ["11434:11434"],
             "volumes": ["${LOCAL_WORKSPACE}:/workspace"],
             "networks": ["freetalon-claw-net"],
@@ -161,7 +161,7 @@ _NVIDIA_COMPOSE: dict = {
 _AMD_COMPOSE: dict = {
     "services": {
         "ollama": {
-            "image": "ollama/ollama:rocm",
+            "image": "ollama/ollama:rocm@sha256:c2d5755f1cc3777d2616014516dfe08fa9da214add9fe76f399ffd6a45661f1a",
             "ports": ["11434:11434"],
             "volumes": ["${LOCAL_WORKSPACE}:/workspace"],
             "networks": ["freetalon-claw-net"],
@@ -174,7 +174,7 @@ _AMD_COMPOSE: dict = {
 _CPU_COMPOSE: dict = {
     "services": {
         "ollama": {
-            "image": "ollama/ollama:latest",
+            "image": "ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc",
             "ports": ["11434:11434"],
             "volumes": ["${LOCAL_WORKSPACE}:/workspace"],
             "networks": ["freetalon-claw-net"],
