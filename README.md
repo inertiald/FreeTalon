@@ -71,10 +71,10 @@ CLI (freetalon.cli)
 
 ## Trusted dependency baseline
 
-- Python runtime dependencies are pinned to exact versions with SHA256 hashes in `/home/runner/work/FreeTalon/FreeTalon/requirements.txt`.
-- External container images are pinned by immutable digest in `/home/runner/work/FreeTalon/FreeTalon/docker-compose.yml` and Dockerfiles.
+- Python runtime dependencies are pinned to exact versions with SHA256 hashes in `requirements.txt`.
+- External container images are pinned by immutable digest in `docker-compose.yml` and Dockerfiles.
 - Local images use explicit version tags: `trusted-python-base:1.0.0` and `freetalon-claw-browser:1.0.0`.
-- Policy and allowlisted sources are documented in `/home/runner/work/FreeTalon/FreeTalon/docs/approved-dependency-baseline.md`.
+- Policy and allowlisted sources are documented in `docs/approved-dependency-baseline.md`.
 - Automated policy check:
   ```bash
   python scripts/check_trusted_dependencies.py

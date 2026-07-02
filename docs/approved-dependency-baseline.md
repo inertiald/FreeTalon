@@ -4,7 +4,7 @@ FreeTalon uses an allowlist model for runtime dependencies and container bases.
 
 ## Python package baseline
 
-Only the packages listed in `/home/runner/work/FreeTalon/FreeTalon/requirements.txt` are approved runtime dependencies.
+Only the packages listed in `requirements.txt` are approved runtime dependencies.
 
 Policy:
 
