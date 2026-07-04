@@ -1,13 +1,13 @@
 # Dockerfile for the trusted-python-base image used by ClawOrchestrator.
 #
 # Build:
-#     docker build -t trusted-python-base -f Dockerfile.trusted-base .
+#     docker build -t trusted-python-base:1.0.0 -f Dockerfile.trusted-base .
 #
 # The image is intentionally minimal: a slim Python runtime with no
 # extra packages installed.  Claws run with --read-only, capped memory,
 # capped CPU, and on an internal-only Docker bridge network.
 
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 
 # Security: run as a non-root user to limit blast radius.
 RUN useradd --create-home --shell /bin/sh claw
