@@ -125,8 +125,9 @@ class DockerClawSecurityTests(unittest.TestCase):
         self.assertEqual(result["profile"], "default")
 
     def test_empty_code_rejected(self) -> None:
-        with self.assertRaises(ValueError, msg="empty code"):
+        with self.assertRaises(ValueError) as cm:
             self.sanitize({"action": "docker_claw", "code": ""})
+        self.assertIn("non-empty", str(cm.exception))
 
     def test_code_too_long_rejected(self) -> None:
         with self.assertRaises(ValueError):

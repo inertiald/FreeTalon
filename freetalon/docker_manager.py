@@ -36,6 +36,7 @@ except ImportError:
     _RM_AVAILABLE = False
 
 _NETWORK_NAME = "freetalon-claw-net"
+# Built from Dockerfile.trusted-base in the repository root.
 _TRUSTED_IMAGE = "trusted-python-base:1.0.0"
 _CONTAINER_LABEL = "freetalon.managed"
 _TASK_LABEL = "freetalon.task_id"

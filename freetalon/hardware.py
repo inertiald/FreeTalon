@@ -49,9 +49,11 @@ def _detect_rdma() -> bool:
         result = subprocess.run(
             ["lsmod"], capture_output=True, text=True, timeout=2
         )
-        return "rdma_rxe" in result.stdout or "ib_core" in result.stdout
+        if "rdma_rxe" in result.stdout or "ib_core" in result.stdout:
+            return True
     except Exception:  # noqa: BLE001
-        return False
+        pass
+    return False
 
 
 def _detect_nccl() -> bool:
