@@ -130,3 +130,24 @@ CLI (freetalon.cli)
 - Token auth is single-shared-secret (can evolve to mTLS or multi-role local ACL)
 - Retry policy is exponential-like linear backoff (`backoff * attempt`), can be extended with jitter
 - Existing Docker-focused modules remain available but are not yet integrated with the new local API runtime
+
+## Roadmap — distributed and parallel compute
+
+Detailed design in [ADR 0002](docs/adr/0002-distributed-parallel-compute.md).
+
+| Capability | Status |
+|---|---|
+| Ring topology (ring-allreduce, peer-to-peer task flow) | 📋 Planned |
+| Star topology (coordinator + worker fan-out) | 📋 Planned |
+| RDMA transport (InfiniBand / RoCE v2 / iWARP, opt-in) | 📋 Planned |
+| Pipeline parallelism (`pipeline_parallel_size` parameter) | 📋 Planned |
+| Tensor parallelism (`tensor_parallel_size` parameter) | 📋 Planned |
+| vLLM inference engine (vendored, SHA256-pinned, quarterly CVE audit) | 📋 Planned |
+| DeepSpeed training engine (vendored, SHA256-pinned, quarterly CVE audit) | 📋 Planned |
+| NCCL collective backend (system or vendored, version-documented) | 📋 Planned |
+| Pydantic config schema for all parallelism/topology knobs | 📋 Planned |
+| Extended `health` endpoint covering GPU/NCCL worker status | 📋 Planned |
+
+Supply-chain policy for all new frameworks: same as existing OpenClaw-parity model — copy a
+point-in-time release, pin every dependency with a SHA256 hash, add to
+`docs/approved-dependency-baseline.md`, and gate updates behind a PR with an advisory-database clear.
