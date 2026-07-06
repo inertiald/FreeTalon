@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ctypes.util
 import importlib.util
 import os
-from functools import lru_cache
+import shutil
+import subprocess
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,6 +15,8 @@ class HostCapabilities:
     memory_mib: int
     gpu_available: bool
     acceleration_libs: tuple[str, ...]
+    rdma_available: bool = False
+    nccl_available: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +41,25 @@ def _has_module(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
+def _detect_rdma() -> bool:
+    for tool in ("ibstat", "ibv_devices", "rdma"):
+        if shutil.which(tool):
+            return True
+    try:
+        result = subprocess.run(
+            ["lsmod"], capture_output=True, text=True, timeout=2
+        )
+        return "rdma_rxe" in result.stdout or "ib_core" in result.stdout
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _detect_nccl() -> bool:
+    if _has_module("nccl"):
+        return True
+    return bool(ctypes.util.find_library("nccl"))
+
+
 def detect_host_capabilities() -> HostCapabilities:
     cpu_count = max(os.cpu_count() or 1, 1)
     memory_mib = _detect_memory_mib()
@@ -49,6 +73,8 @@ def detect_host_capabilities() -> HostCapabilities:
         memory_mib=memory_mib,
         gpu_available=gpu_available,
         acceleration_libs=tuple(libs),
+        rdma_available=_detect_rdma(),
+        nccl_available=_detect_nccl(),
     )
 
 

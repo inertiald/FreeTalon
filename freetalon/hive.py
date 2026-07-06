@@ -11,6 +11,7 @@ from typing import Any
 
 from .audit import AuditLogger
 from .config import HiveConfig
+from .docker_manager import DockerManager
 from .hardware import HostCapabilities, detect_host_capabilities
 from .security import sanitize_payload
 
@@ -114,6 +115,13 @@ class HiveController:
         with self._lock:
             task = self._tasks.get(task_id)
             return asdict(task) if task else None
+
+    def list_tasks(self, status: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            tasks = [asdict(t) for t in self._tasks.values()]
+        if status:
+            tasks = [t for t in tasks if t["status"] == status]
+        return tasks
 
     def status(self) -> dict[str, Any]:
         now = time.time()
@@ -245,7 +253,36 @@ class HiveController:
                 time.sleep(min(0.05, remaining))
             return {"slept_seconds": duration}
 
+        if action == "docker_claw":
+            payload["_worker_id"] = worker_id
+            return self._run_docker_claw(task_id, payload)
+
         raise RuntimeError(f"Unsupported action: {action}")
+
+    def _run_docker_claw(self, task_id: str, payload: dict[str, Any]) -> Any:
+        dm = DockerManager()
+        code = payload["code"]
+        profile = payload.get("profile", "default")
+        timeout = float(payload.get("timeout", 30.0))
+        dm.spawn_claw(task_id, code, profile)
+        deadline = time.time() + timeout
+        try:
+            while time.time() < deadline:
+                with self._lock:
+                    if self._tasks[task_id].cancel_requested:
+                        dm.kill_claw(task_id)
+                        raise RuntimeError("Task cancelled")
+                self._worker_heartbeats[payload.get("_worker_id", task_id)] = time.time()
+                status = dm.claw_status(task_id)
+                if status in {"exited", "dead"}:
+                    break
+                time.sleep(0.5)
+            else:
+                dm.kill_claw(task_id)
+                raise RuntimeError("docker_claw timed out")
+            return dm.collect_result(task_id)
+        finally:
+            dm.remove_claw(task_id)
 
     def _persist_state(self) -> None:
         state = {

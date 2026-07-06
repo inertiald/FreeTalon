@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 SAFE_TEXT_PATTERN = re.compile(r"^[a-zA-Z0-9 _.,:@/+-]{0,256}$")
+_DOCKER_PROFILES = frozenset({"default", "video", "youtube_upload"})
 
 
 def load_secret(path: str | None, env_var: str) -> str:
@@ -31,8 +32,8 @@ def authorize(bearer_token: str | None, configured_token: str) -> bool:
 
 def sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action", "")).strip().lower()
-    if action not in {"echo", "sum", "sleep"}:
-        raise ValueError("Unsupported action; allowed: echo, sum, sleep")
+    if action not in {"echo", "sum", "sleep", "docker_claw"}:
+        raise ValueError("Unsupported action; allowed: echo, sum, sleep, docker_claw")
 
     retries = int(payload.get("retries", 0))
     if retries < 0 or retries > 5:
@@ -69,6 +70,24 @@ def sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if duration < 0 or duration > 30:
             raise ValueError("sleep duration must be between 0 and 30 seconds")
         clean["duration"] = duration
+
+    elif action == "docker_claw":
+        code = str(payload.get("code", "")).strip()
+        if not code:
+            raise ValueError("docker_claw requires non-empty code")
+        if len(code) > 4096:
+            raise ValueError("code exceeds 4096 character limit")
+        if not all(c.isprintable() or c in {"\n", "\t", "\r"} for c in code):
+            raise ValueError("code contains invalid characters")
+        profile = str(payload.get("profile", "default")).strip().lower()
+        if profile not in _DOCKER_PROFILES:
+            raise ValueError(f"profile must be one of: {sorted(_DOCKER_PROFILES)}")
+        timeout = float(payload.get("timeout", 30.0))
+        if timeout < 1 or timeout > 300:
+            raise ValueError("timeout must be between 1 and 300 seconds")
+        clean["code"] = code
+        clean["profile"] = profile
+        clean["timeout"] = timeout
 
     return clean
 
