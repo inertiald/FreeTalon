@@ -114,6 +114,12 @@ CLI (freetalon.cli)
 | Adaptive host-aware tuning | Partial | ✅ |
 | Benchmark for tuning effect | ❌ | ✅ |
 | Deterministic tests | ❌ | ✅ |
+| Exponential backoff with full jitter | ❌ | ✅ |
+| Request ID correlation (X-Request-ID + audit log) | ❌ | ✅ |
+| Request body size cap (DoS protection) | ❌ | ✅ |
+| `/health/ready` readiness endpoint | ❌ | ✅ |
+| Structured error codes in API responses | ❌ | ✅ |
+| Task ID format validation in URL paths | ❌ | ✅ |
 
 ## Hardening checklist
 
@@ -123,12 +129,17 @@ CLI (freetalon.cli)
 - [x] Bound queue and worker concurrency
 - [x] Redact token in logs
 - [x] Persist and recover task state
+- [x] Exponential backoff with full jitter (`max_backoff_seconds`, `retry_jitter` config knobs)
+- [x] Request ID correlation across every API response header and audit log entry
+- [x] Request body size cap (default 64 KB, configurable via `max_request_body_bytes`)
+- [x] Liveness (`/health`) vs readiness (`/health/ready`) endpoint separation
+- [x] Structured error codes in all API error responses (`error_code` field)
+- [x] Task ID format validation in all URL path handlers
 
 ## Known limitations / next steps
 
 - Single-node local deployment only (no distributed cluster federation yet)
 - Token auth is single-shared-secret (can evolve to mTLS or multi-role local ACL)
-- Retry policy is exponential-like linear backoff (`backoff * attempt`), can be extended with jitter
 - Existing Docker-focused modules remain available but are not yet integrated with the new local API runtime
 
 ## Roadmap — distributed and parallel compute

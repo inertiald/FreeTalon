@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 import uuid
@@ -204,7 +205,11 @@ class HiveController:
                     task.status = "cancelled"
                 elif task.attempt <= task.max_retries:
                     task.status = "retrying"
-                    task.next_run_at = time.time() + (task.backoff_seconds * task.attempt)
+                    cap = self.config.max_backoff_seconds
+                    exp_delay = task.backoff_seconds * (2 ** (task.attempt - 1))
+                    capped = min(exp_delay, cap)
+                    delay = random.uniform(0, capped) if self.config.retry_jitter else capped
+                    task.next_run_at = time.time() + delay
                 else:
                     task.status = "failed"
                 task.updated_at = time.time()

@@ -2,18 +2,27 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .audit import clear_request_id, current_request_id, set_request_id
 from .docker_manager import resource_summary_safe
 from .hive import HiveController
 from .security import authorize
 
+_TASK_ID_RE = __import__("re").compile(r"^[0-9a-f]{12}$")
+_MAX_BODY_DEFAULT = 65536
+
 
 class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+
+
+def _error(code: str, message: str) -> dict[str, Any]:
+    return {"ok": False, "error_code": code, "message": message}
 
 
 class HiveAPIServer:
@@ -25,15 +34,31 @@ class HiveAPIServer:
 
     def start(self, host: str, port: int) -> None:
         api = self
+        max_body = getattr(api.controller.config, "max_request_body_bytes", _MAX_BODY_DEFAULT)
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
+                rid = uuid.uuid4().hex[:12]
+                set_request_id(rid)
+                try:
+                    self._handle_get()
+                finally:
+                    clear_request_id()
+
+            def _handle_get(self) -> None:
                 parsed = urlparse(self.path)
                 path = parsed.path
                 qs = parse_qs(parsed.query)
 
                 if path == "/health":
-                    return self._send(200, {"ok": True, "status": "ready"})
+                    return self._send(200, {"ok": True, "status": "alive"})
+
+                if path == "/health/ready":
+                    status = api.controller.status()
+                    workers_healthy = status["workers"]["healthy"]
+                    if workers_healthy > 0 or status["workers"]["configured"] > 0:
+                        return self._send(200, {"ok": True, "status": "ready"})
+                    return self._send(503, _error("NOT_READY", "No healthy workers available"))
 
                 if path == "/status":
                     if not self._authorized():
@@ -60,13 +85,16 @@ class HiveAPIServer:
                     tasks = api.controller.list_tasks(status=status_filter)
                     return self._send(200, {"ok": True, "tasks": tasks, "count": len(tasks)})
 
-                if path.startswith("/tasks/") and len(path.split("/")) == 3:
+                parts = path.split("/")
+                if len(parts) == 3 and parts[1] == "tasks":
+                    task_id = parts[2]
+                    if not _TASK_ID_RE.fullmatch(task_id):
+                        return self._send(404, _error("NOT_FOUND", "Task not found"))
                     if not self._authorized():
                         return
-                    task_id = path.split("/")[2]
                     task = api.controller.get_task(task_id)
                     if task is None:
-                        return self._send(404, {"ok": False, "error": "Task not found"})
+                        return self._send(404, _error("NOT_FOUND", "Task not found"))
                     return self._send(200, {"ok": True, "task": task})
 
                 if path == "/resources":
@@ -74,9 +102,17 @@ class HiveAPIServer:
                         return
                     return self._send(200, {"ok": True, "resources": resource_summary_safe()})
 
-                return self._send(404, {"ok": False, "error": "Not Found"})
+                return self._send(404, _error("NOT_FOUND", "Not Found"))
 
             def do_POST(self) -> None:  # noqa: N802
+                rid = uuid.uuid4().hex[:12]
+                set_request_id(rid)
+                try:
+                    self._handle_post()
+                finally:
+                    clear_request_id()
+
+            def _handle_post(self) -> None:
                 path = urlparse(self.path).path
                 if path == "/shutdown":
                     if not self._authorized():
@@ -94,17 +130,24 @@ class HiveAPIServer:
                     try:
                         task = api.controller.submit_task(body)
                     except ValueError as exc:
-                        return self._send(400, {"ok": False, "error": str(exc)})
+                        msg = str(exc)
+                        code = "QUEUE_FULL" if "Queue is full" in msg else "INVALID_PAYLOAD"
+                        return self._send(400, _error(code, msg))
                     return self._send(201, {"ok": True, "task_id": task.task_id})
 
-                if path.startswith("/tasks/") and path.endswith("/cancel"):
+                parts = path.split("/")
+                if len(parts) == 4 and parts[1] == "tasks" and parts[3] == "cancel":
+                    task_id = parts[2]
+                    if not _TASK_ID_RE.fullmatch(task_id):
+                        return self._send(404, _error("NOT_FOUND", "Task not found"))
                     if not self._authorized():
                         return
-                    task_id = path.split("/")[2]
                     ok = api.controller.cancel_task(task_id)
-                    return self._send(200 if ok else 404, {"ok": ok, "task_id": task_id})
+                    if ok:
+                        return self._send(200, {"ok": True, "task_id": task_id})
+                    return self._send(404, _error("NOT_FOUND", "Task not found"))
 
-                return self._send(404, {"ok": False, "error": "Not Found"})
+                return self._send(404, _error("NOT_FOUND", "Not Found"))
 
             def _authorized(self) -> bool:
                 header = self.headers.get("Authorization", "")
@@ -114,11 +157,19 @@ class HiveAPIServer:
                 if authorize(token, api.token):
                     return True
                 api.controller.audit.log("auth.denied", path=self.path, source=self.client_address[0])
-                self._send(401, {"ok": False, "error": "Unauthorized"})
+                self._send(401, _error("UNAUTHORIZED", "Unauthorized"))
                 return False
 
             def _json_body(self) -> dict[str, Any] | None:
-                length = int(self.headers.get("Content-Length", "0"))
+                length_str = self.headers.get("Content-Length", "0")
+                try:
+                    length = int(length_str)
+                except ValueError:
+                    self._send(400, _error("INVALID_REQUEST", "Invalid Content-Length"))
+                    return None
+                if length > max_body:
+                    self._send(413, _error("PAYLOAD_TOO_LARGE", f"Request body exceeds {max_body} bytes"))
+                    return None
                 body = self.rfile.read(length)
                 try:
                     data = json.loads(body or b"{}")
@@ -126,7 +177,7 @@ class HiveAPIServer:
                         raise ValueError("JSON body must be an object")
                     return data
                 except (json.JSONDecodeError, ValueError) as exc:
-                    self._send(400, {"ok": False, "error": str(exc)})
+                    self._send(400, _error("INVALID_JSON", str(exc)))
                     return None
 
             def _send(self, code: int, data: dict[str, Any]) -> None:
@@ -134,6 +185,9 @@ class HiveAPIServer:
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))
+                rid = current_request_id()
+                if rid:
+                    self.send_header("X-Request-ID", rid)
                 self.end_headers()
                 self.wfile.write(encoded)
 

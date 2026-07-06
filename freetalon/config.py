@@ -22,6 +22,9 @@ class HiveConfig(BaseModel):
     queue_multiplier: int = Field(default=6, ge=1, le=50)
     heartbeat_timeout_seconds: float = Field(default=20.0, ge=1.0, le=300.0)
     poll_interval_seconds: float = Field(default=0.1, ge=0.01, le=5.0)
+    max_backoff_seconds: float = Field(default=60.0, ge=1.0, le=3600.0)
+    retry_jitter: bool = Field(default=True)
+    max_request_body_bytes: int = Field(default=65536, ge=256, le=10_485_760)
 
     # ADR 0002 — distributed topology and parallelism
     topology: Literal["star", "ring"] = Field(default="star")
