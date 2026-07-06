@@ -5,8 +5,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
+from .docker_manager import resource_summary_safe
 from .hive import HiveController
 from .security import authorize
 
@@ -27,13 +28,18 @@ class HiveAPIServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
-                path = urlparse(self.path).path
+                parsed = urlparse(self.path)
+                path = parsed.path
+                qs = parse_qs(parsed.query)
+
                 if path == "/health":
                     return self._send(200, {"ok": True, "status": "ready"})
+
                 if path == "/status":
                     if not self._authorized():
                         return
                     return self._send(200, {"ok": True, "status": api.controller.status()})
+
                 if path == "/metrics":
                     if not self._authorized():
                         return
@@ -46,6 +52,28 @@ class HiveAPIServer:
                         "queue_max": status["queue"]["max"],
                     }
                     return self._send(200, {"ok": True, "metrics": metrics})
+
+                if path == "/tasks":
+                    if not self._authorized():
+                        return
+                    status_filter = qs.get("status", [None])[0]
+                    tasks = api.controller.list_tasks(status=status_filter)
+                    return self._send(200, {"ok": True, "tasks": tasks, "count": len(tasks)})
+
+                if path.startswith("/tasks/") and len(path.split("/")) == 3:
+                    if not self._authorized():
+                        return
+                    task_id = path.split("/")[2]
+                    task = api.controller.get_task(task_id)
+                    if task is None:
+                        return self._send(404, {"ok": False, "error": "Task not found"})
+                    return self._send(200, {"ok": True, "task": task})
+
+                if path == "/resources":
+                    if not self._authorized():
+                        return
+                    return self._send(200, {"ok": True, "resources": resource_summary_safe()})
+
                 return self._send(404, {"ok": False, "error": "Not Found"})
 
             def do_POST(self) -> None:  # noqa: N802

@@ -185,6 +185,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
         payload["values"] = [float(x) for x in args.values.split(",") if x.strip()]
     elif args.action == "sleep":
         payload["duration"] = float(args.duration)
+    elif args.action == "docker_claw":
+        payload["code"] = args.code
+        payload["profile"] = args.profile
+        payload["timeout"] = args.timeout
     payload["retries"] = args.retries
     payload["backoff_seconds"] = args.backoff
     payload["requires_gpu"] = args.requires_gpu
@@ -197,6 +201,33 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     config = _load_config(args)
     token = _token_from_args(config, args)
     data = _request("POST", f"{_base_url(config)}/tasks/{args.task_id}/cancel", token, payload={})
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_tasks(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    token = _token_from_args(config, args)
+    url = f"{_base_url(config)}/tasks"
+    if getattr(args, "status_filter", None):
+        url += f"?status={args.status_filter}"
+    data = _request("GET", url, token)
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    token = _token_from_args(config, args)
+    data = _request("GET", f"{_base_url(config)}/tasks/{args.task_id}", token)
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_resources(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    token = _token_from_args(config, args)
+    data = _request("GET", f"{_base_url(config)}/resources", token)
     print(json.dumps(data, indent=2, sort_keys=True))
     return 0
 
@@ -220,10 +251,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     submit = sub.add_parser("submit")
     submit.add_argument("--token", default=None)
-    submit.add_argument("--action", choices=["echo", "sum", "sleep"], required=True)
+    submit.add_argument("--action", choices=["echo", "sum", "sleep", "docker_claw"], required=True)
     submit.add_argument("--text", default="")
     submit.add_argument("--values", default="")
     submit.add_argument("--duration", default="0")
+    submit.add_argument("--code", default="")
+    submit.add_argument("--profile", default="default")
+    submit.add_argument("--timeout", type=float, default=30.0)
     submit.add_argument("--retries", type=int, default=0)
     submit.add_argument("--backoff", type=float, default=0.2)
     submit.add_argument("--requires-gpu", action="store_true")
@@ -231,6 +265,19 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = sub.add_parser("cancel")
     cancel.add_argument("--token", default=None)
     cancel.add_argument("task_id")
+
+    tasks_p = sub.add_parser("tasks")
+    tasks_p.add_argument("--token", default=None)
+    tasks_p.add_argument("--status", dest="status_filter", default=None,
+                         choices=["queued", "running", "retrying", "succeeded", "failed", "cancelled"])
+
+    task_p = sub.add_parser("task")
+    task_p.add_argument("--token", default=None)
+    task_p.add_argument("task_id")
+
+    resources_p = sub.add_parser("resources")
+    resources_p.add_argument("--token", default=None)
+
     return p
 
 
@@ -245,6 +292,9 @@ def main(argv: list[str] | None = None) -> int:
         "health": cmd_health,
         "submit": cmd_submit,
         "cancel": cmd_cancel,
+        "tasks": cmd_tasks,
+        "task": cmd_task,
+        "resources": cmd_resources,
     }
     return handlers[args.cmd](args)
 
