@@ -159,6 +159,33 @@ def _truncate_for_notify(msg: str) -> str:
         return msg
     return msg[:_MAX_NOTIFY_LEN] + "…"
 
+
+def _notify_error(msg: str) -> None:
+    """Show a negative top-right notification with a truncated error message."""
+    ui.notify(_truncate_for_notify(msg), type="negative", position="top-right")
+
+
+# Fallback colour for DAG node status labels not in the explicit mapping.
+_NODE_STATUS_FALLBACK_COLOR = "#475569"
+
+# Node status → display colour mapping (reuses the existing dark-theme palette).
+_NODE_STATUS_COLORS: dict[str, str] = {
+    "completed": "#10b981",
+    "running": "#3b82f6",
+    "failed": "#ef4444",
+    "cancelled": "#ef4444",
+    "draft": _NODE_STATUS_FALLBACK_COLOR,
+    "ready": _NODE_STATUS_FALLBACK_COLOR,
+}
+
+# DAG progress tree section styles (shared base + visibility toggle).
+_TREE_STYLE_BASE = (
+    "flex-shrink:0;max-height:14rem;overflow-y:auto;"
+    "border-top:1px solid #1e293b;"
+)
+_TREE_STYLE_HIDDEN = _TREE_STYLE_BASE + "display:none;"
+_TREE_STYLE_VISIBLE = _TREE_STYLE_BASE + "display:block;"
+
 # ---------------------------------------------------------------------------
 # Inline CSS injected once into every page
 # ---------------------------------------------------------------------------
@@ -270,11 +297,6 @@ def index() -> None:
                 ).style("color:#475569;")
 
             # -- DAG Progress Tree (hidden until a plan is submitted) ------
-            _TREE_STYLE_HIDDEN = (
-                "flex-shrink:0;max-height:14rem;overflow-y:auto;"
-                "border-top:1px solid #1e293b;display:none;"
-            )
-            _TREE_STYLE_VISIBLE = _TREE_STYLE_HIDDEN.replace("display:none;", "display:block;")
             plan_tree_section = (
                 ui.column()
                 .classes("w-full px-6 py-2 gap-1")
@@ -288,22 +310,12 @@ def index() -> None:
                     )
                 plan_tree_rows = ui.column().classes("w-full gap-1 pb-1")
 
-            # Status colours matching the existing dark palette.
-            _NODE_STATUS_COLORS: dict[str, str] = {
-                "completed": "#10b981",
-                "running": "#3b82f6",
-                "failed": "#ef4444",
-                "cancelled": "#ef4444",
-                "draft": "#475569",
-                "ready": "#475569",
-            }
-
             def _rebuild_plan_tree(plan: "ExecutionPlan") -> None:  # type: ignore[name-defined]
                 """Rebuild the node rows from the current plan state."""
                 plan_tree_rows.clear()
                 with plan_tree_rows:
                     for node in plan.nodes:
-                        color = _NODE_STATUS_COLORS.get(node.status.value, "#475569")
+                        color = _NODE_STATUS_COLORS.get(node.status.value, _NODE_STATUS_FALLBACK_COLOR)
                         deps = ", ".join(node.depends_on) if node.depends_on else ""
                         with ui.row().classes("w-full items-start gap-2 py-1"):
                             ui.icon("circle").style(
@@ -397,11 +409,7 @@ def index() -> None:
                         status_lbl.set_text(
                             "⚠ Orchestrator pipeline is not available (check server logs)."
                         )
-                        ui.notify(
-                            "Orchestrator pipeline unavailable",
-                            type="negative",
-                            position="top-right",
-                        )
+                        _notify_error("Orchestrator pipeline unavailable")
                         _re_enable()
                         return
 
@@ -411,7 +419,7 @@ def index() -> None:
                     except (ValueError, LLMBackendError, LLMResponseError) as exc:
                         msg = str(exc)
                         status_lbl.set_text(f"⚠ Intake failed: {msg}")
-                        ui.notify(_truncate_for_notify(msg), type="negative", position="top-right")
+                        _notify_error(msg)
                         _re_enable()
                         return
                     except Exception as exc:  # noqa: BLE001
@@ -426,7 +434,7 @@ def index() -> None:
                     except (ValueError, LLMBackendError, LLMResponseError) as exc:
                         msg = str(exc)
                         status_lbl.set_text(f"⚠ Planning failed: {msg}")
-                        ui.notify(_truncate_for_notify(msg), type="negative", position="top-right")
+                        _notify_error(msg)
                         _re_enable()
                         return
                     except Exception as exc:  # noqa: BLE001
