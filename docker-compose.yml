@@ -1,14 +1,23 @@
-# docker-compose.yml — FreeTalon reference stack.
+# docker-compose.yml — FreeTalon hybrid reference stack.
 #
-# Generated from the installer's CPU-only template with all claw profiles.
-# Adjust GPU settings via `python installer.py` or manually edit the
-# 'ollama' service below.
+# Reconciles the two unmerged compose design branches by combining:
+# - zero-trust network tiering (`back-tier`, `sandbox-tier`) and
+#   conservative local-first defaults
+# - broader profile-based claw service coverage (media/upload/browser)
+#
+# This file remains conservative with ADR 0001:
+# existing Docker-oriented modules are kept available, while the local
+# API runtime remains the primary execution path. A dedicated hub service
+# is intentionally not enabled here because it is not yet integrated with
+# the current local runtime.
 #
 # Profiles:
 #   docker compose up                  → ollama only
 #   docker compose --profile media up  → + media-claw
 #   docker compose --profile upload up → + upload-claw
 #   docker compose --profile browser up→ + browser-claw
+
+name: freetalon
 
 services:
   # -- LLM backend --------------------------------------------------------
@@ -17,9 +26,18 @@ services:
     ports:
       - "11434:11434"
     volumes:
+      - ollama-models:/root/.ollama
       - "${LOCAL_WORKSPACE}:/workspace"
     networks:
+      - back-tier
       - freetalon-claw-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   # -- Media Claw (video tasks) -------------------------------------------
   # Up to 8 GiB RAM / 4 CPU cores.  /workspace/output is RW so the claw
@@ -77,7 +95,24 @@ services:
 
 # -- Networks --------------------------------------------------------------
 networks:
+  # Trusted AI back-tier (future hub/orchestrator <-> ollama path).
+  back-tier:
+    driver: bridge
+    attachable: true
+    labels:
+      freetalon.tier: back
+
+  # Reserved sandbox tier for explicit zero-egress claw isolation.
+  # Kept for reference compatibility with earlier compose proposals.
+  sandbox-tier:
+    driver: bridge
+    internal: true
+    attachable: true
+    labels:
+      freetalon.tier: sandbox
+
   # Internal-only bridge — claws can reach the LLM but NOT the internet.
+  # Current Docker manager code paths still target this network name.
   freetalon-claw-net:
     driver: bridge
     internal: true
@@ -89,3 +124,11 @@ networks:
   # Upload claws need outbound internet access for YouTube API.
   freetalon-upload-net:
     driver: bridge
+
+# -- Volumes ---------------------------------------------------------------
+volumes:
+  # Durable model cache to avoid re-pulling Ollama weights.
+  ollama-models:
+    name: freetalon-ollama-models
+    labels:
+      freetalon.role: llm-weights
