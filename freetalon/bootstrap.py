@@ -50,6 +50,13 @@ def missing_module_message(module_name: str, install_command: str) -> str:
 
 
 def ensure_module(module_name: str, project_root: Path, install_command: str) -> None:
+    """Ensure *module_name* is importable for the current entry-point.
+
+    If the current interpreter cannot import the module but the repository
+    virtualenv can, this function replaces the current process with the
+    virtualenv interpreter so user-facing commands like ``python3 dashboard.py``
+    continue to work without manual activation.
+    """
     if module_available(module_name):
         return
 

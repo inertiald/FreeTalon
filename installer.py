@@ -178,6 +178,12 @@ def _yaml_scalar(value: Any) -> str:
 
 
 def _yaml_dump(data: Any, indent: int = 0) -> str:
+    """Serialize a small subset of YAML when PyYAML is unavailable.
+
+    The installer prefers PyYAML when it is importable. This fallback keeps
+    ``python3 installer.py`` usable on a fresh machine before the project
+    dependencies have been installed into ``.venv``.
+    """
     pad = " " * indent
     if isinstance(data, dict):
         lines: list[str] = []
@@ -524,13 +530,16 @@ def print_summary(
         print(f"  Browser automation: optional, rerun with 'python3 {REPO_ROOT / 'installer.py'} --yes --enable-browser'")
 
 
-def launch_ui(venv_path: Path) -> None:
+def launch_ui(venv_path: Path, workspace: Path) -> None:
     python_executable = venv_python_path(venv_path)
     _status("[..]", "Starting dashboard in the project virtual environment")
     # Inherit stdout/stderr so dashboard startup errors stay visible instead of
     # being swallowed by the installer.
-    subprocess.Popen([str(python_executable), str(REPO_ROOT / "dashboard.py")], cwd=str(REPO_ROOT))
+    process = subprocess.Popen([str(python_executable), str(REPO_ROOT / "dashboard.py")], cwd=str(REPO_ROOT))
+    pid_path = workspace / "freetalon-dashboard.pid"
+    pid_path.write_text(f"{process.pid}\n", encoding="utf-8")
     _ok(f"Dashboard launch requested; open http://{UI_HOST}:{UI_PORT}")
+    _ok(f"Dashboard PID {process.pid} recorded in {pid_path}")
 
 
 def main() -> int:
@@ -615,7 +624,7 @@ def main() -> int:
         if not python_ready:
             _fail("--start-ui requires --mode ui, --mode api, or --mode full")
             return 1
-        launch_ui(venv_path)
+        launch_ui(venv_path, workspace)
 
     return 0
 

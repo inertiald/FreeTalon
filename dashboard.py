@@ -85,7 +85,12 @@ WORKSPACE = os.environ.get(
     _env_defaults.get("LOCAL_WORKSPACE", os.path.expanduser("~/freetalon-workspace")),
 )
 UI_HOST = os.environ.get("FREETALON_UI_HOST", _env_defaults.get("FREETALON_UI_HOST", "127.0.0.1"))
-UI_PORT = int(os.environ.get("FREETALON_UI_PORT", _env_defaults.get("FREETALON_UI_PORT", "7860")))
+try:
+    UI_PORT = int(os.environ.get("FREETALON_UI_PORT", _env_defaults.get("FREETALON_UI_PORT", "7860")))
+except ValueError as exc:
+    raise SystemExit(
+        "Invalid FREETALON_UI_PORT value. Re-run 'python3 installer.py --yes' or fix the .env file."
+    ) from exc
 
 Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
 
