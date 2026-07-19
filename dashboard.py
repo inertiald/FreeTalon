@@ -87,11 +87,13 @@ WORKSPACE = os.environ.get(
 _default_ui_host = _env_defaults.get("FREETALON_UI_HOST", "127.0.0.1")
 _default_ui_port = _env_defaults.get("FREETALON_UI_PORT", "7860")
 UI_HOST = os.environ.get("FREETALON_UI_HOST", _default_ui_host)
+_ui_port_raw = os.environ.get("FREETALON_UI_PORT", _default_ui_port)
 try:
-    UI_PORT = int(os.environ.get("FREETALON_UI_PORT", _default_ui_port))
+    UI_PORT = int(_ui_port_raw)
 except ValueError as exc:
     raise SystemExit(
-        "Invalid FREETALON_UI_PORT value. Re-run 'python3 installer.py --yes' or fix the .env file."
+        f"Invalid FREETALON_UI_PORT value: {_ui_port_raw!r}. "
+        "Re-run 'python3 installer.py --yes' or fix the .env file."
     ) from exc
 
 Path(WORKSPACE).mkdir(parents=True, exist_ok=True)

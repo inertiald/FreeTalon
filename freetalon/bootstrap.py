@@ -7,6 +7,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+_BOOTSTRAP_ENV_VAR = "FREETALON_BOOTSTRAPPED"
+
 
 def venv_python_path(project_root: Path, venv_dirname: str = ".venv") -> Path:
     bindir = "Scripts" if os.name == "nt" else "bin"
@@ -65,11 +67,11 @@ def ensure_module(module_name: str, project_root: Path, install_command: str) ->
 
     project_python = venv_python_path(project_root)
     if (
-        os.environ.get("FREETALON_BOOTSTRAPPED") != "1"
+        os.environ.get(_BOOTSTRAP_ENV_VAR) != "1"
         and python_can_import(project_python, module_name)
     ):
         env = os.environ.copy()
-        env["FREETALON_BOOTSTRAPPED"] = "1"
+        env[_BOOTSTRAP_ENV_VAR] = "1"
         # Replace the current process so "python3 dashboard.py" transparently
         # runs inside the prepared project virtualenv without requiring shell
         # activation or a wrapper script.

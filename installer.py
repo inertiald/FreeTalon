@@ -31,6 +31,12 @@ API_PORT = 8765
 REPO_ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_PATH = REPO_ROOT / "requirements.txt"
 DEFAULT_VENV_PATH = REPO_ROOT / ".venv"
+OLLAMA_IMAGE_DEFAULT = (
+    "ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc"
+)
+OLLAMA_IMAGE_AMD = (
+    "ollama/ollama:rocm@sha256:c2d5755f1cc3777d2616014516dfe08fa9da214add9fe76f399ffd6a45661f1a"
+)
 
 
 @dataclass(slots=True)
@@ -255,11 +261,7 @@ def _ollama_service(image: str) -> dict[str, Any]:
 
 
 def _compose_template(gpu: str) -> dict[str, Any]:
-    ollama = _ollama_service(
-        "ollama/ollama:rocm@sha256:c2d5755f1cc3777d2616014516dfe08fa9da214add9fe76f399ffd6a45661f1a"
-        if gpu == GPU_AMD
-        else "ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc"
-    )
+    ollama = _ollama_service(OLLAMA_IMAGE_AMD if gpu == GPU_AMD else OLLAMA_IMAGE_DEFAULT)
     if gpu == GPU_NVIDIA:
         # Prefer the legacy NVIDIA runtime here because it avoids the CDI/runtime
         # mismatch seen on some hosts and gives a deterministic compose file for
@@ -473,7 +475,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _prompt(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
 def resolve_options(args: argparse.Namespace) -> tuple[Path, Path, bool]:
+    """Return ``(workspace_path, venv_path, browser_enabled)`` for this run."""
     workspace = Path(args.workspace).expanduser()
     venv_path = Path(args.venv).expanduser()
     browser_enabled = args.enable_browser
@@ -481,12 +491,12 @@ def resolve_options(args: argparse.Namespace) -> tuple[Path, Path, bool]:
     if args.yes:
         return workspace, venv_path, browser_enabled
 
-    answer = input(f"Workspace path [{workspace}]: ").strip()
+    answer = _prompt(f"Workspace path [{workspace}]: ").strip()
     if answer:
         workspace = Path(answer).expanduser()
 
     if not browser_enabled:
-        browser_answer = input("Prepare optional Playwright browser automation? [y/N]: ").strip().lower()
+        browser_answer = _prompt("Prepare optional Playwright browser automation? [y/N]: ").strip().lower()
         browser_enabled = browser_answer in {"y", "yes"}
 
     return workspace, venv_path, browser_enabled
@@ -543,7 +553,11 @@ def launch_ui(venv_path: Path, workspace: Path) -> None:
     _status("[..]", "Starting dashboard in the project virtual environment")
     # Inherit stdout/stderr so dashboard startup errors stay visible instead of
     # being swallowed by the installer.
-    process = subprocess.Popen([str(python_executable), str(REPO_ROOT / "dashboard.py")], cwd=str(REPO_ROOT))
+    process = subprocess.Popen(
+        [str(python_executable), str(REPO_ROOT / "dashboard.py")],
+        cwd=str(REPO_ROOT),
+        stdin=subprocess.DEVNULL,
+    )
     pid_path = workspace / "freetalon-dashboard.pid"
     pid_path.write_text(f"{process.pid}\n", encoding="utf-8")
     _ok(f"Dashboard launch requested; open http://{UI_HOST}:{UI_PORT}")
