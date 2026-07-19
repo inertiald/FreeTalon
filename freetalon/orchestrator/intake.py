@@ -67,6 +67,8 @@ class LLMSettings:
             )
         if backend == "openai_compatible":
             api_key = os.environ.get("FREETALON_OPENAI_API_KEY")
+            if api_key is not None:
+                api_key = api_key.strip()
             return cls(
                 backend="openai_compatible",
                 base_url=os.environ.get(
@@ -74,7 +76,7 @@ class LLMSettings:
                     _OPENAI_BASE_URL,
                 ).strip(),
                 model=os.environ.get("FREETALON_OPENAI_MODEL", _OPENAI_MODEL).strip(),
-                api_key=api_key.strip() if api_key is not None else None,
+                api_key=api_key,
                 timeout_seconds=timeout_seconds,
             )
         raise ValueError(
