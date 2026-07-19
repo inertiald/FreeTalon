@@ -82,6 +82,18 @@ class TestIntake(unittest.TestCase):
         self.assertEqual(openai_settings.model, "gpt-test")
         self.assertEqual(openai_settings.api_key, "secret")
 
+    def test_llm_settings_preserves_explicit_empty_openai_api_key(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "FREETALON_LLM_BACKEND": "openai_compatible",
+                "FREETALON_OPENAI_API_KEY": "",
+            },
+            clear=False,
+        ):
+            settings = LLMSettings.from_env()
+        self.assertEqual(settings.api_key, "")
+
     def test_intake_request_uses_structured_llm_output(self) -> None:
         response = """
         {"goal":"Automate CI triage","project_type":"devops","capabilities":["logs"],"constraints":{},"missing_inputs":["repo name"]}

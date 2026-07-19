@@ -74,7 +74,7 @@ class LLMSettings:
                     _OPENAI_BASE_URL,
                 ).strip(),
                 model=os.environ.get("FREETALON_OPENAI_MODEL", _OPENAI_MODEL).strip(),
-                api_key=api_key.strip() if api_key else None,
+                api_key=api_key.strip() if api_key is not None else None,
                 timeout_seconds=timeout_seconds,
             )
         raise ValueError(
@@ -126,8 +126,6 @@ def _extract_json_candidate(raw_text: str) -> str:
         lines = stripped.splitlines()
         if len(lines) >= 3 and lines[-1].strip() == "```":
             stripped = "\n".join(lines[1:-1]).strip()
-            if stripped.lower().startswith("json\n"):
-                stripped = stripped[5:].lstrip()
     return stripped
 
 
