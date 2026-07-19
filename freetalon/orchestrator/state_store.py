@@ -29,7 +29,7 @@ class ExecutionPlanStateStore:
 
     Each public method opens and closes its own database connection, which
     is the safest pattern for multi-threaded access to a single SQLite file.
-    A :class:`threading.Lock` serialises writes to prevent concurrent
+    A :class:`threading.Lock` serializes writes to prevent concurrent
     modification.
 
     Parameters

@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from freetalon.orchestrator.models import (
     ExecutionPlan,
     PlanNode,
@@ -51,7 +53,6 @@ class TestModels(unittest.TestCase):
         self.assertEqual(nmap["node-1"].objective, "Scaffold project")
 
     def test_extra_fields_forbidden(self) -> None:
-        from pydantic import ValidationError
         with self.assertRaises(ValidationError):
             TaskIntent(goal="x", unknown_field="y")  # type: ignore[call-arg]
 
