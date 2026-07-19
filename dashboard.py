@@ -394,7 +394,7 @@ def index() -> None:
                     # ── Intake (blocking LLM call — off the event loop) ───
                     try:
                         intent = await asyncio.to_thread(intake_request, raw)
-                    except (ValueError, LLMBackendError, LLMResponseError) as exc:  # noqa: BLE001
+                    except (ValueError, LLMBackendError, LLMResponseError) as exc:
                         msg = str(exc)
                         status_lbl.set_text(f"⚠ Intake failed: {msg}")
                         ui.notify(msg[:400], type="negative", position="top-right")
@@ -409,7 +409,7 @@ def index() -> None:
                     status_lbl.set_text("Planning…")
                     try:
                         plan = await asyncio.to_thread(plan_task_intent, intent)
-                    except (ValueError, LLMBackendError, LLMResponseError) as exc:  # noqa: BLE001
+                    except (ValueError, LLMBackendError, LLMResponseError) as exc:
                         msg = str(exc)
                         status_lbl.set_text(f"⚠ Planning failed: {msg}")
                         ui.notify(msg[:400], type="negative", position="top-right")
