@@ -152,6 +152,13 @@ _MAX_DAG_NODE_LABEL_LEN = 80
 # Maximum characters forwarded to ui.notify() for LLM/pipeline error messages.
 _MAX_NOTIFY_LEN = 400
 
+
+def _truncate_for_notify(msg: str) -> str:
+    """Return *msg* truncated to *_MAX_NOTIFY_LEN* characters with a trailing ellipsis."""
+    if len(msg) <= _MAX_NOTIFY_LEN:
+        return msg
+    return msg[:_MAX_NOTIFY_LEN] + "…"
+
 # ---------------------------------------------------------------------------
 # Inline CSS injected once into every page
 # ---------------------------------------------------------------------------
@@ -404,7 +411,7 @@ def index() -> None:
                     except (ValueError, LLMBackendError, LLMResponseError) as exc:
                         msg = str(exc)
                         status_lbl.set_text(f"⚠ Intake failed: {msg}")
-                        ui.notify(msg[:_MAX_NOTIFY_LEN], type="negative", position="top-right")
+                        ui.notify(_truncate_for_notify(msg), type="negative", position="top-right")
                         _re_enable()
                         return
                     except Exception as exc:  # noqa: BLE001
@@ -419,7 +426,7 @@ def index() -> None:
                     except (ValueError, LLMBackendError, LLMResponseError) as exc:
                         msg = str(exc)
                         status_lbl.set_text(f"⚠ Planning failed: {msg}")
-                        ui.notify(msg[:_MAX_NOTIFY_LEN], type="negative", position="top-right")
+                        ui.notify(_truncate_for_notify(msg), type="negative", position="top-right")
                         _re_enable()
                         return
                     except Exception as exc:  # noqa: BLE001
