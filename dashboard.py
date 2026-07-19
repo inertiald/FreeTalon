@@ -168,7 +168,8 @@ def _notify_error(msg: str) -> None:
 # Fallback colour for DAG node status labels not in the explicit mapping.
 _NODE_STATUS_FALLBACK_COLOR = "#475569"
 
-# Node status → display colour mapping (reuses the existing dark-theme palette).
+# Node status → display colour mapping (keys are PlanStatus.*.value strings).
+# Reuses the existing dark-theme palette; look up with node.status.value.
 _NODE_STATUS_COLORS: dict[str, str] = {
     "completed": "#10b981",
     "running": "#3b82f6",
@@ -310,8 +311,8 @@ def index() -> None:
                     )
                 plan_tree_rows = ui.column().classes("w-full gap-1 pb-1")
 
-            def _rebuild_plan_tree(plan: "ExecutionPlan") -> None:  # type: ignore[name-defined]
-                """Rebuild the node rows from the current plan state."""
+            def _render_plan_tree(plan: "ExecutionPlan") -> None:  # type: ignore[name-defined]
+                """Render DAG node rows in *plan_tree_rows* from the current plan state."""
                 plan_tree_rows.clear()
                 with plan_tree_rows:
                     for node in plan.nodes:
@@ -446,14 +447,14 @@ def index() -> None:
                     _plan_store.save(plan)
                     active_plan_id[0] = plan.plan_id
                     plan_tree_section.style(_TREE_STYLE_VISIBLE)
-                    _rebuild_plan_tree(plan)
+                    _render_plan_tree(plan)
 
                     # ── Executor (async, driven by the event loop) ────────
                     status_lbl.set_text(f"Executing… ({len(plan.nodes)} node(s))")
                     try:
                         executor = Executor(_plan_store, _tool_registry)
                         final_plan = await executor.run(plan.plan_id)
-                        _rebuild_plan_tree(final_plan)
+                        _render_plan_tree(final_plan)
                         if final_plan.status == PlanStatus.COMPLETED:
                             status_lbl.set_text(
                                 f"✓ Done — {len(final_plan.nodes)} node(s) completed."
@@ -934,7 +935,7 @@ def index() -> None:
                 plan = _plan_store.load(pid)
                 if plan is None:
                     return
-                _rebuild_plan_tree(plan)
+                _render_plan_tree(plan)
 
             ui.timer(0.75, _tick_plan)
 
