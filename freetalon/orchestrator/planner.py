@@ -17,6 +17,10 @@ def _plan_id_for_intent(intent: TaskIntent) -> str:
     return f"plan-{digest[:12]}"
 
 
+def _normalized_node_sort_key(node_id: str) -> int:
+    return int(node_id.split("-")[1])
+
+
 def _validate_raw_nodes(raw_nodes: list[Any]) -> list[PlanNode]:
     try:
         return [PlanNode.model_validate(node) for node in raw_nodes]
@@ -83,7 +87,7 @@ def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[P
         node = node_map[original_id]
         normalized_dependencies = sorted(
             {original_to_normalized_id[dependency] for dependency in node.depends_on},
-            key=lambda dependency_id: int(dependency_id.split("-")[1]),
+            key=_normalized_node_sort_key,
         )
         normalized_nodes.append(
             node.model_copy(

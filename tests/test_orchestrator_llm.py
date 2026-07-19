@@ -56,14 +56,14 @@ class TestIntake(unittest.TestCase):
             os.environ,
             {
                 "FREETALON_LLM_BACKEND": "ollama",
-                "FREETALON_OLLAMA_BASE_URL": "http://ollama.local:11434/",
+                "FREETALON_OLLAMA_BASE_URL": "http://ollama.local:11434",
                 "FREETALON_OLLAMA_MODEL": "mistral",
             },
             clear=False,
         ):
             ollama_settings = LLMSettings.from_env()
         self.assertEqual(ollama_settings.backend, "ollama")
-        self.assertEqual(ollama_settings.base_url, "http://ollama.local:11434/")
+        self.assertEqual(ollama_settings.base_url, "http://ollama.local:11434")
         self.assertEqual(ollama_settings.model, "mistral")
 
         with patch.dict(

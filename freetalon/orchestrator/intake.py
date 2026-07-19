@@ -104,7 +104,7 @@ def _post_json(
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             response_text = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace")
+        body_text = exc.read().decode("utf-8", errors="backslashreplace")
         raise LLMBackendError(f"LLM request failed with HTTP {exc.code}: {body_text}") from exc
     except urllib.error.URLError as exc:
         raise LLMBackendError(f"LLM request failed: {exc.reason}") from exc
