@@ -16,6 +16,7 @@ from .prompts import INTAKE_SYSTEM_PROMPT
 
 _OLLAMA_BASE_URL = "http://localhost:11434"
 _OLLAMA_MODEL = "llama3.1"
+# Local development default for self-hosted OpenAI-compatible endpoints.
 _OPENAI_BASE_URL = "http://localhost:8000/v1"
 _OPENAI_MODEL = "gpt-4o-mini"
 _DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -106,9 +107,9 @@ def _post_json(
 
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            response_text = response.read().decode("utf-8")
+            response_text = _decode_response_text(response.read())
     except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="backslashreplace")
+        body_text = _decode_response_text(exc.read())
         raise LLMBackendError(f"LLM request failed with HTTP {exc.code}: {body_text}") from exc
     except urllib.error.URLError as exc:
         raise LLMBackendError(f"LLM request failed: {exc.reason}") from exc
@@ -120,6 +121,13 @@ def _post_json(
     if not isinstance(data, dict):
         raise LLMBackendError("LLM backend returned an unexpected JSON payload.")
     return data
+
+
+def _decode_response_text(payload: bytes) -> str:
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return payload.decode("utf-8", errors="replace")
 
 
 def _extract_json_candidate(raw_text: str) -> str:

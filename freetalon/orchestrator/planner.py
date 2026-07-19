@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 from typing import Any
 
 from pydantic import ValidationError
@@ -65,16 +66,16 @@ def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[P
         for dependency in unique_dependencies:
             adjacency[dependency].append(node.id)
 
-    ready = [node.id for node in nodes if indegree[node.id] == 0]
+    ready = [(original_order[node.id], node.id) for node in nodes if indegree[node.id] == 0]
+    heapq.heapify(ready)
     ordered_ids: list[str] = []
     while ready:
-        ready.sort(key=original_order.__getitem__)
-        current = ready.pop(0)
+        _, current = heapq.heappop(ready)
         ordered_ids.append(current)
         for downstream in sorted(adjacency[current], key=original_order.__getitem__):
             indegree[downstream] -= 1
             if indegree[downstream] == 0:
-                ready.append(downstream)
+                heapq.heappush(ready, (original_order[downstream], downstream))
 
     if len(ordered_ids) != len(nodes):
         raise LLMResponseError("Planner response contained a dependency cycle.")

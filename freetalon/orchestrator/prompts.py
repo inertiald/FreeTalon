@@ -34,7 +34,7 @@ Do not wrap the JSON in markdown, code fences, prose, or explanations.
 Every field must match the required schema exactly.
 Do not invent missing facts; place unclear requirements into "missing_inputs".
 Keep "goal" concise and outcome-focused.
-Use lowercase snake_case or simple lowercase labels for "project_type" and capabilities where practical.
+Use lowercase snake_case labels for "project_type" and capabilities.
 "constraints" must always be a JSON object.
 "capabilities" and "missing_inputs" must always be JSON arrays.
 
@@ -59,4 +59,3 @@ Use "draft" for every node status.
 Required JSON shape:
 {PLANNER_OUTPUT_FORMAT}
 """
-
