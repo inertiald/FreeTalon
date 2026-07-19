@@ -46,6 +46,7 @@ def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[P
 
     for node in nodes:
         unique_dependencies: list[str] = []
+        seen_dependencies: set[str] = set()
         for dependency in node.depends_on:
             if dependency == node.id:
                 raise LLMResponseError(f"Planner node '{node.id}' cannot depend on itself.")
@@ -53,7 +54,8 @@ def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[P
                 raise LLMResponseError(
                     f"Planner node '{node.id}' depends on unknown node '{dependency}'."
                 )
-            if dependency not in unique_dependencies:
+            if dependency not in seen_dependencies:
+                seen_dependencies.add(dependency)
                 unique_dependencies.append(dependency)
         indegree[node.id] = len(unique_dependencies)
         for dependency in unique_dependencies:

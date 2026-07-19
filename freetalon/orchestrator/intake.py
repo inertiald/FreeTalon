@@ -67,8 +67,6 @@ class LLMSettings:
             )
         if backend == "openai_compatible":
             api_key = os.environ.get("FREETALON_OPENAI_API_KEY")
-            if api_key is not None:
-                api_key = api_key.strip()
             return cls(
                 backend="openai_compatible",
                 base_url=os.environ.get(
