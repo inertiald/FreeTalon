@@ -15,6 +15,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 GPU_NVIDIA = "nvidia"
 GPU_AMD = "amd"
 GPU_NONE = "none"
@@ -270,7 +275,12 @@ def _compose_template(gpu: str) -> dict[str, Any]:
 
 
 def generate_compose(gpu: str, path: Path) -> None:
-    _write_if_changed(path, _yaml_dump(_compose_template(gpu)).rstrip() + "\n")
+    template = _compose_template(gpu)
+    if yaml is not None:
+        content = yaml.safe_dump(template, sort_keys=False)
+    else:
+        content = _yaml_dump(template).rstrip() + "\n"
+    _write_if_changed(path, content)
 
 
 def generate_env(
@@ -517,6 +527,8 @@ def print_summary(
 def launch_ui(venv_path: Path) -> None:
     python_executable = venv_python_path(venv_path)
     _status("[..]", "Starting dashboard in the project virtual environment")
+    # Inherit stdout/stderr so dashboard startup errors stay visible instead of
+    # being swallowed by the installer.
     subprocess.Popen([str(python_executable), str(REPO_ROOT / "dashboard.py")], cwd=str(REPO_ROOT))
     _ok(f"Dashboard launch requested; open http://{UI_HOST}:{UI_PORT}")
 

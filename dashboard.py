@@ -28,6 +28,11 @@ ensure_module(
     f"python3 {_PROJECT_ROOT / 'installer.py'} --yes",
 )
 
+try:
+    from dotenv import dotenv_values
+except ImportError:
+    dotenv_values = None
+
 from nicegui import app, events, ui  # noqa: F401 – app imported for storage
 
 # ---------------------------------------------------------------------------
@@ -61,12 +66,19 @@ except Exception:  # noqa: BLE001 – Docker may not be installed/running
 _env_defaults: dict[str, str] = {}
 _env_path = Path(".env")
 if _env_path.exists():
-    for _line in _env_path.read_text(encoding="utf-8").splitlines():
-        _line = _line.strip()
-        if not _line or _line.startswith("#") or "=" not in _line:
-            continue
-        _key, _value = _line.split("=", 1)
-        _env_defaults[_key.strip()] = _value.strip()
+    if dotenv_values is not None:
+        _env_defaults = {
+            _key: _value
+            for _key, _value in dotenv_values(_env_path).items()
+            if _key is not None and _value is not None
+        }
+    else:
+        for _line in _env_path.read_text(encoding="utf-8").splitlines():
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _key, _value = _line.split("=", 1)
+            _env_defaults[_key.strip()] = _value.strip()
 
 WORKSPACE = os.environ.get(
     "LOCAL_WORKSPACE",

@@ -60,6 +60,9 @@ def ensure_module(module_name: str, project_root: Path, install_command: str) ->
     ):
         env = os.environ.copy()
         env["FREETALON_BOOTSTRAPPED"] = "1"
+        # Replace the current process so "python3 dashboard.py" transparently
+        # runs inside the prepared project virtualenv without requiring shell
+        # activation or a wrapper script.
         os.execvpe(str(project_python), [str(project_python), *sys.argv], env)
 
     raise SystemExit(missing_module_message(module_name, install_command))
