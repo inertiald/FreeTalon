@@ -31,7 +31,11 @@ class LLMResponseError(ValueError):
 
 @dataclass(frozen=True)
 class LLMSettings:
-    """Runtime configuration for the intake/planner LLM backend."""
+    """Runtime configuration for the intake/planner LLM backend.
+
+    ``api_key`` is optional so local or self-hosted OpenAI-compatible
+    deployments can run without authentication.
+    """
 
     backend: Literal["ollama", "openai_compatible"] = "ollama"
     base_url: str = _OLLAMA_BASE_URL
