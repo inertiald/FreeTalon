@@ -256,6 +256,9 @@ def _compose_template(gpu: str) -> dict[str, Any]:
         else "ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc"
     )
     if gpu == GPU_NVIDIA:
+        # Prefer the legacy NVIDIA runtime here because it avoids the CDI/runtime
+        # mismatch seen on some hosts and gives a deterministic compose file for
+        # end-user installs.
         ollama["runtime"] = "nvidia"
         ollama["environment"] = {
             "NVIDIA_VISIBLE_DEVICES": "all",
@@ -540,6 +543,10 @@ def launch_ui(venv_path: Path, workspace: Path) -> None:
     pid_path.write_text(f"{process.pid}\n", encoding="utf-8")
     _ok(f"Dashboard launch requested; open http://{UI_HOST}:{UI_PORT}")
     _ok(f"Dashboard PID {process.pid} recorded in {pid_path}")
+    if os.name == "nt":
+        _ok(f"Stop it with: taskkill /PID {process.pid} /F")
+    else:
+        _ok(f"Stop it with: kill $(cat {pid_path})")
 
 
 def main() -> int:
