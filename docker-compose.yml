@@ -1,56 +1,19 @@
-# docker-compose.yml — FreeTalon hybrid reference stack.
-#
-# Reconciles the two unmerged compose design branches by combining:
-# - zero-trust network tiering (`back-tier` plus internal claw network) and
-#   conservative local-first defaults
-# - broader profile-based claw service coverage (media/upload/browser)
-#
-# This file remains conservative with ADR 0001:
-# existing Docker-oriented modules are kept available, while the local
-# API runtime remains the primary execution path. A dedicated hub service
-# is intentionally not enabled here because it is not yet integrated with
-# the current local runtime.
-#
-# Profiles:
-#   docker compose up                  → ollama only
-#   docker compose --profile media up  → + media-claw
-#   docker compose --profile upload up → + upload-claw
-#   docker compose --profile browser up → + browser-claw
-
-name: freetalon
-
+name: "freetalon"
 services:
-  # -- LLM backend --------------------------------------------------------
   ollama:
-    image: ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc
+    image: "ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc"
     ports:
       - "11434:11434"
     volumes:
-      # The Ollama image currently stores model data under /root/.ollama.
-      - ollama-models:/root/.ollama
+      - "ollama-models:/root/.ollama"
       - "${LOCAL_WORKSPACE}:/workspace"
     networks:
-      - back-tier
-      # Intentional bridge: runtime claw workloads on freetalon-claw-net
-      # must be able to reach Ollama without exposing it to public networks.
-      - freetalon-claw-net
-    # Optional GPU reservation request (enable on NVIDIA-capable hosts where
-    # the Docker NVIDIA runtime is installed; no separate Ollama image tag).
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-
-  # -- Media Claw (video tasks) -------------------------------------------
-  # Up to 8 GiB RAM / 4 CPU cores.  /workspace/output is RW so the claw
-  # can persist rendered media files back to the host.
+      - "back-tier"
+      - "freetalon-claw-net"
   media-claw:
-    image: trusted-python-base:1.0.0
+    image: "trusted-python-base:1.0.0"
     networks:
-      - freetalon-claw-net
+      - "freetalon-claw-net"
     read_only: false
     volumes:
       - "${LOCAL_WORKSPACE}/output:/workspace/output:rw"
@@ -60,15 +23,11 @@ services:
           memory: "8g"
           cpus: "4.0"
     profiles:
-      - media
-
-  # -- Upload Claw (YouTube upload) ----------------------------------------
-  # Same compute budget as media-claw but on a non-internal bridge so the
-  # container can reach the YouTube API over the public internet.
+      - "media"
   upload-claw:
-    image: trusted-python-base:1.0.0
+    image: "trusted-python-base:1.0.0"
     networks:
-      - freetalon-upload-net
+      - "freetalon-upload-net"
     read_only: false
     volumes:
       - "${LOCAL_WORKSPACE}/output:/workspace/output:rw"
@@ -78,17 +37,15 @@ services:
           memory: "8g"
           cpus: "4.0"
     profiles:
-      - upload
-
-  # -- Browser Claw --------------------------------------------------------
+      - "upload"
   browser-claw:
-    image: freetalon-claw-browser:1.0.0
+    image: "freetalon-claw-browser:1.0.0"
     networks:
-      - freetalon-browser-net
+      - "freetalon-browser-net"
     volumes:
       - "${LOCAL_WORKSPACE}/screenshots:/screenshots:rw"
     environment:
-      SCREENSHOTS_DIR: /screenshots
+      SCREENSHOTS_DIR: "/screenshots"
       CLAW_PORT: "8080"
     deploy:
       resources:
@@ -96,34 +53,19 @@ services:
           memory: "512m"
           cpus: "0.5"
     profiles:
-      - browser
-
-# -- Networks --------------------------------------------------------------
+      - "browser"
 networks:
-  # Trusted AI back-tier for compose-managed trusted services (currently Ollama).
   back-tier:
-    driver: bridge
+    driver: "bridge"
     labels:
-      freetalon.tier: back
-
-  # Internal-only bridge — claws can reach the LLM but NOT the internet.
-  # Current Docker manager code paths still target this network name.
+      freetalon.tier: "back"
   freetalon-claw-net:
-    driver: bridge
+    driver: "bridge"
     internal: true
-
-  # Browser claws need outbound internet access for web navigation.
   freetalon-browser-net:
-    driver: bridge
-
-  # Upload claws need outbound internet access for YouTube API.
+    driver: "bridge"
   freetalon-upload-net:
-    driver: bridge
-
-# -- Volumes ---------------------------------------------------------------
+    driver: "bridge"
 volumes:
-  # Durable model cache to avoid re-pulling Ollama weights.
   ollama-models:
-    name: freetalon-ollama-models
-    labels:
-      freetalon.role: llm-weights
+    name: "freetalon-ollama-models"

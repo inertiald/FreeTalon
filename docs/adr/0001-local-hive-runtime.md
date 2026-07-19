@@ -20,6 +20,7 @@ Implement a Python-native local hive runtime with:
 - Kept existing Docker-oriented modules intact to avoid breaking existing workflows while adding a coherent local MVP.
 
 ## Consequences
+- Installer-first bootstrap is the supported end-user path: `python3 installer.py --yes` prepares the local virtualenv, dashboard dependencies, `.env`, and Docker defaults before `python3 dashboard.py`.
 - New contributors can run the hive locally with one token and CLI commands.
 - Security and optimization claims are now evidenced by code + docs + tests.
 - Future work can add distributed/federated worker backends while preserving the same API semantics.

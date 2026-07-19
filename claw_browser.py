@@ -54,6 +54,15 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Callable
 
+from freetalon.bootstrap import ensure_module
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+ensure_module(
+    "playwright",
+    _PROJECT_ROOT,
+    f"python3 {_PROJECT_ROOT / 'installer.py'} --yes --enable-browser",
+)
+
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
 # ---------------------------------------------------------------------------

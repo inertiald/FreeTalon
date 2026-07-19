@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+_BOOTSTRAP_ENV_VAR = "FREETALON_BOOTSTRAPPED"
+
+
+def venv_python_path(project_root: Path, venv_dirname: str = ".venv") -> Path:
+    bindir = "Scripts" if os.name == "nt" else "bin"
+    executable = "python.exe" if os.name == "nt" else "python"
+    return project_root / venv_dirname / bindir / executable
+
+
+def module_available(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+def python_can_import(python_executable: Path, module_name: str) -> bool:
+    if not python_executable.exists():
+        return False
+    result = subprocess.run(
+        [
+            str(python_executable),
+            "-c",
+            "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)",
+            module_name,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def missing_module_message(module_name: str, install_command: str) -> str:
+    return textwrap.dedent(
+        f"""\
+        Missing required Python module: {module_name}
+
+        Supported setup:
+          {install_command}
+
+        Then start the local UI with:
+          python3 dashboard.py
+        """
+    ).strip()
+
+
+def ensure_module(module_name: str, project_root: Path, install_command: str) -> None:
+    """Ensure *module_name* is importable for the current entry-point.
+
+    If the current interpreter cannot import the module but the repository
+    virtualenv can, this function replaces the current process with the
+    virtualenv interpreter so user-facing commands like ``python3 dashboard.py``
+    continue to work without manual activation. This replacement happens
+    before the rest of the module imports run, so the original process does
+    not continue executing and any in-memory state from the original process
+    is intentionally discarded.
+    """
+    if module_available(module_name):
+        return
+
+    project_python = venv_python_path(project_root)
+    if (
+        os.environ.get(_BOOTSTRAP_ENV_VAR) != "1"
+        and python_can_import(project_python, module_name)
+    ):
+        env = os.environ.copy()
+        env[_BOOTSTRAP_ENV_VAR] = "1"
+        # Replace the current process so "python3 dashboard.py" transparently
+        # runs inside the prepared project virtualenv without requiring shell
+        # activation or a wrapper script.
+        os.execvpe(str(project_python), [str(project_python), *sys.argv], env)
+
+    raise SystemExit(missing_module_message(module_name, install_command))

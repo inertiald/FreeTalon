@@ -2,6 +2,68 @@
 
 A local openclaw hive, security hardened and hardware optimized.
 
+## 5-minute local UI
+
+Golden path on a fresh Ubuntu-like machine with Python 3 and Docker available:
+
+```bash
+python3 installer.py --yes
+python3 dashboard.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:7860
+```
+
+One-command variant:
+
+```bash
+python3 installer.py --yes --start-ui
+```
+
+What the installer does:
+- creates or reuses `./.venv`
+- installs pinned Python dependencies into that venv
+- generates `.env` and `docker-compose.yml`
+- detects Docker/GPU support and falls back to CPU-safe compose defaults when needed
+- optionally prepares local Playwright + Chromium with `--enable-browser`
+
+`python3 dashboard.py` is the supported UI start command after install. It will reuse the project venv automatically, so you do not need to remember `source .venv/bin/activate`.
+
+## Setup modes
+
+| Mode | Command | Use for |
+|---|---|---|
+| Local UI | `python3 installer.py --yes --mode ui` | NiceGUI dashboard on localhost |
+| Local API/CLI | `python3 installer.py --yes --mode api` | `python -m freetalon.cli ...` workflows |
+| Docker only | `python3 installer.py --yes --mode docker` | Compose and GPU/runtime validation only |
+| Full | `python3 installer.py --yes --mode full` | UI + API + Docker defaults |
+
+## Docker / GPU notes
+
+- NVIDIA hosts use `runtime: nvidia` in generated compose instead of CDI-only reservations.
+- If an NVIDIA GPU is present but Docker lacks the `nvidia` runtime, the installer warns early and generates CPU-safe compose output instead of leaving `docker compose up -d` to fail later.
+- AMD hosts keep the ROCm path when `/dev/kfd` and `/dev/dri` are available; otherwise the installer falls back to CPU mode.
+- If Docker or the Docker Compose plugin is missing, the local UI/API path still works.
+
+## Optional local browser automation
+
+To prepare host-side Playwright for `claw_browser.py`:
+
+```bash
+python3 installer.py --yes --enable-browser
+```
+
+That installs the pinned Playwright Python package and Chromium browser binaries automatically.
+
+To also build the local Docker images used by claw profiles:
+
+```bash
+python3 installer.py --yes --enable-browser --build-images
+```
+
 ## Current state vs vision (gap analysis)
 
 ### What previously existed
@@ -41,11 +103,11 @@ CLI (freetalon.cli)
        └─ Audit logging (structured JSON events)
 ```
 
-## Quickstart (local)
+## Quickstart (local API/CLI)
 
-1. Install dependencies:
+1. Run the installer:
    ```bash
-   python -m pip install -r requirements.txt
+   python3 installer.py --yes --mode api
    ```
 2. Set API token (required):
    ```bash
@@ -53,21 +115,39 @@ CLI (freetalon.cli)
    ```
 3. Start hive daemon:
    ```bash
-   python -m freetalon.cli start
+   ./.venv/bin/python -m freetalon.cli start
    ```
 4. Health + status:
    ```bash
-   python -m freetalon.cli health
-   python -m freetalon.cli status --token "$FREETALON_API_TOKEN"
+   ./.venv/bin/python -m freetalon.cli health
+   ./.venv/bin/python -m freetalon.cli status --token "$FREETALON_API_TOKEN"
    ```
 5. Submit task:
    ```bash
-   python -m freetalon.cli submit --token "$FREETALON_API_TOKEN" --action echo --text "hello hive"
+   ./.venv/bin/python -m freetalon.cli submit --token "$FREETALON_API_TOKEN" --action echo --text "hello hive"
+   ./.venv/bin/python -m freetalon.cli submit --token "$FREETALON_API_TOKEN" --action docker_claw --code "print('hello from docker claw')"
    ```
 6. Stop daemon:
    ```bash
-   python -m freetalon.cli stop
+   ./.venv/bin/python -m freetalon.cli stop
    ```
+
+## Docker quickstart
+
+After `python3 installer.py --yes --mode docker` or `--mode full`:
+
+```bash
+docker compose up -d
+docker compose --profile browser up -d
+```
+
+Use the browser profile only after preparing the local browser image path (`python3 installer.py --yes --enable-browser --build-images`) or when your workflow specifically needs browser automation.
+
+## Why the installer-first flow is the supported default
+
+- `dashboard.py` depends on NiceGUI, so the installer provisions the venv and dependencies first.
+- Docker/browser features have host-specific prerequisites, so the installer validates them up front and prints deterministic next steps.
+- The CLI/API workflow remains available and unchanged once the environment is prepared.
 
 ## Trusted dependency baseline
 

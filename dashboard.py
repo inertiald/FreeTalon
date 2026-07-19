@@ -19,6 +19,20 @@ import random
 import uuid
 from pathlib import Path
 
+from freetalon.bootstrap import ensure_module
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+ensure_module(
+    "nicegui",
+    _PROJECT_ROOT,
+    f"python3 {_PROJECT_ROOT / 'installer.py'} --yes",
+)
+
+try:
+    from dotenv import dotenv_values
+except ImportError:
+    dotenv_values = None
+
 from nicegui import app, events, ui  # noqa: F401 – app imported for storage
 
 # ---------------------------------------------------------------------------
@@ -49,17 +63,38 @@ except Exception:  # noqa: BLE001 – Docker may not be installed/running
 # Workspace resolution (mirrors installer.py logic)
 # ---------------------------------------------------------------------------
 
-WORKSPACE = os.environ.get(
-    "LOCAL_WORKSPACE",
-    os.path.expanduser("~/freetalon-workspace"),
-)
-
+_env_defaults: dict[str, str] = {}
 _env_path = Path(".env")
 if _env_path.exists():
-    for _line in _env_path.read_text(encoding="utf-8").splitlines():
-        if _line.startswith("LOCAL_WORKSPACE="):
-            WORKSPACE = _line.split("=", 1)[1].strip()
-            break
+    if dotenv_values is not None:
+        _env_defaults = {
+            _key: _value
+            for _key, _value in dotenv_values(_env_path).items()
+            if _key is not None and _value is not None
+        }
+    else:
+        for _line in _env_path.read_text(encoding="utf-8").splitlines():
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _key, _value = _line.split("=", 1)
+            _env_defaults[_key.strip()] = _value.strip()
+
+WORKSPACE = os.environ.get(
+    "LOCAL_WORKSPACE",
+    _env_defaults.get("LOCAL_WORKSPACE", os.path.expanduser("~/freetalon-workspace")),
+)
+_default_ui_host = _env_defaults.get("FREETALON_UI_HOST", "127.0.0.1")
+_default_ui_port = _env_defaults.get("FREETALON_UI_PORT", "7860")
+UI_HOST = os.environ.get("FREETALON_UI_HOST", _default_ui_host)
+_ui_port_raw = os.environ.get("FREETALON_UI_PORT", _default_ui_port)
+try:
+    UI_PORT = int(_ui_port_raw)
+except ValueError as exc:
+    raise SystemExit(
+        f"Invalid FREETALON_UI_PORT value: {_ui_port_raw!r}. "
+        "Re-run 'python3 installer.py --yes' or fix the .env file."
+    ) from exc
 
 Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
 
@@ -759,8 +794,8 @@ def index() -> None:
 if __name__ in {"__main__", "__mp_main__"}:
     ui.run(
         title="FreeTalon Dashboard",
-        host="127.0.0.1",
-        port=7860,
+        host=UI_HOST,
+        port=UI_PORT,
         dark=True,
         favicon="🦅",
         reload=False,
