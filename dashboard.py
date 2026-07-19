@@ -60,6 +60,39 @@ except Exception:  # noqa: BLE001 – Docker may not be installed/running
     )
 
 # ---------------------------------------------------------------------------
+# Orchestrator pipeline (intake → plan → execute)
+# ---------------------------------------------------------------------------
+
+_PIPELINE_AVAILABLE = False
+_plan_store: "ExecutionPlanStateStore | None" = None  # type: ignore[name-defined]
+_tool_registry: "ToolRegistry | None" = None  # type: ignore[name-defined]
+
+try:
+    from freetalon.orchestrator import (
+        Executor,
+        ExecutionPlanStateStore,
+        PlanStatus,
+        ToolRegistry,
+    )
+    from freetalon.orchestrator.intake import (
+        LLMBackendError,
+        LLMResponseError,
+        intake_request,
+    )
+    from freetalon.orchestrator.planner import plan_task_intent
+
+    # Persistent plan store — SQLite, restart-safe.
+    _plan_store = ExecutionPlanStateStore()
+    # Non-strict: nodes with unrecognised capabilities receive a no-op handler
+    # instead of raising UnknownCapabilityError, so demo DAGs can reach COMPLETED.
+    _tool_registry = ToolRegistry(strict=False)
+    _PIPELINE_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    logging.getLogger(__name__).warning(
+        "Orchestrator pipeline unavailable — submit will show an error message."
+    )
+
+# ---------------------------------------------------------------------------
 # Workspace resolution (mirrors installer.py logic)
 # ---------------------------------------------------------------------------
 
@@ -180,6 +213,10 @@ def index() -> None:
     bar_elements: list[ui.element] = []
     pct_labels: list[ui.label] = []
     upload_visible: list[bool] = [False]
+    # Swarm plan state — mutable single-element lists so inner closures can write.
+    active_plan_id: list[str | None] = [None]
+    plan_running: list[bool] = [False]
+    send_btn_holder: list[ui.button] = []
 
     # ====================================================================== #
     # OUTER ROW — fills the viewport                                         #
@@ -216,6 +253,71 @@ def index() -> None:
                     "text-sm italic self-center mt-6"
                 ).style("color:#475569;")
 
+            # -- DAG Progress Tree (hidden until a plan is submitted) ------
+            _TREE_STYLE_HIDDEN = (
+                "flex-shrink:0;max-height:14rem;overflow-y:auto;"
+                "border-top:1px solid #1e293b;display:none;"
+            )
+            _TREE_STYLE_VISIBLE = _TREE_STYLE_HIDDEN.replace("display:none;", "display:block;")
+            plan_tree_section = (
+                ui.column()
+                .classes("w-full px-6 py-2 gap-1")
+                .style(_TREE_STYLE_HIDDEN)
+            )
+            with plan_tree_section:
+                with ui.row().classes("w-full items-center gap-2"):
+                    ui.icon("account_tree").style("color:#94a3b8;font-size:1rem;")
+                    ui.label("DAG Progress").classes("text-xs font-mono").style(
+                        "color:#94a3b8;"
+                    )
+                plan_tree_rows = ui.column().classes("w-full gap-1 pb-1")
+
+            # Status colours matching the existing dark palette.
+            _NODE_STATUS_COLORS: dict[str, str] = {
+                "completed": "#10b981",
+                "running": "#3b82f6",
+                "failed": "#ef4444",
+                "cancelled": "#ef4444",
+                "draft": "#475569",
+                "ready": "#475569",
+            }
+
+            def _rebuild_plan_tree(plan: "ExecutionPlan") -> None:  # type: ignore[name-defined]
+                """Rebuild the node rows from the current plan state."""
+                plan_tree_rows.clear()
+                with plan_tree_rows:
+                    for node in plan.nodes:
+                        color = _NODE_STATUS_COLORS.get(node.status.value, "#475569")
+                        deps = ", ".join(node.depends_on) if node.depends_on else ""
+                        with ui.row().classes("w-full items-start gap-2 py-1"):
+                            ui.icon("circle").style(
+                                f"color:{color};font-size:0.55rem;"
+                                "margin-top:5px;flex-shrink:0;"
+                            )
+                            with ui.column().classes("flex-1 gap-0"):
+                                with ui.row().classes("items-center gap-2 flex-wrap"):
+                                    ui.label(node.id).classes(
+                                        "text-xs font-mono font-semibold"
+                                    ).style("color:#e2e8f0;")
+                                    ui.label(node.status.value).classes(
+                                        "text-xs font-mono"
+                                    ).style(f"color:{color};")
+                                obj = node.objective
+                                if len(obj) > 80:
+                                    obj = obj[:80] + "…"
+                                ui.label(obj).classes("text-xs").style("color:#94a3b8;")
+                                if deps:
+                                    ui.label(f"↳ {deps}").classes(
+                                        "text-xs font-mono"
+                                    ).style("color:#475569;")
+                                if node.error:
+                                    err = node.error
+                                    if len(err) > 80:
+                                        err = err[:80] + "…"
+                                    ui.label(err).classes("text-xs").style(
+                                        "color:#ef4444;"
+                                    )
+
             # -- Input row ------------------------------------------------
             with ui.row().classes("w-full px-6 py-4 gap-3 items-end").style(
                 "border-top:1px solid #1e293b;flex-shrink:0;background:#0f172a;"
@@ -226,35 +328,133 @@ def index() -> None:
                     .classes("flex-1 ft-textarea")
                 )
 
+                def _re_enable() -> None:
+                    """Re-enable input + send button after plan finishes."""
+                    plan_running[0] = False
+                    text_input.enable()
+                    if send_btn_holder:
+                        send_btn_holder[0].enable()
+
                 async def _send() -> None:
                     raw = (text_input.value or "").strip()
                     if not raw:
                         return
-                    text_input.set_value("")
+                    if plan_running[0]:
+                        ui.notify(
+                            "A plan is already running — please wait.",
+                            type="warning",
+                            position="top-right",
+                        )
+                        return
 
+                    text_input.set_value("")
+                    text_input.disable()
+                    if send_btn_holder:
+                        send_btn_holder[0].disable()
+                    plan_running[0] = True
+
+                    # ── User message bubble ───────────────────────────────
                     with msg_area:
                         with ui.row().classes("w-full justify-end"):
                             ui.label(raw).classes(
                                 "ft-bubble-user px-4 py-2"
                             ).style("color:#ecfdf5;")
 
+                    # ── Bot status bubble (updated as pipeline progresses) ─
                     with msg_area:
-                        with ui.row().classes("w-full justify-start gap-2 items-start"):
+                        with ui.row().classes(
+                            "w-full justify-start gap-2 items-start"
+                        ):
                             ui.icon("smart_toy").style("color:#10b981;margin-top:2px;")
-                            ui.label(f"(echo) {raw}").classes(
-                                "ft-bubble-bot px-4 py-2"
-                            ).style("color:#cbd5e1;")
+                            status_lbl = (
+                                ui.label("Analyzing request…")
+                                .classes("ft-bubble-bot px-4 py-2")
+                                .style("color:#cbd5e1;")
+                            )
 
                     await ui.run_javascript(
                         "const el=document.querySelector('.ft-msg-area');"
                         "if(el){el.scrollTop=el.scrollHeight;}"
                     )
 
+                    if not _PIPELINE_AVAILABLE:
+                        status_lbl.set_text(
+                            "⚠ Orchestrator pipeline is not available (check server logs)."
+                        )
+                        ui.notify(
+                            "Orchestrator pipeline unavailable",
+                            type="negative",
+                            position="top-right",
+                        )
+                        _re_enable()
+                        return
+
+                    # ── Intake (blocking LLM call — off the event loop) ───
+                    try:
+                        intent = await asyncio.to_thread(intake_request, raw)
+                    except (ValueError, LLMBackendError, LLMResponseError) as exc:  # noqa: BLE001
+                        msg = str(exc)[:200]
+                        status_lbl.set_text(f"⚠ Intake failed: {msg}")
+                        ui.notify(msg, type="negative", position="top-right")
+                        _re_enable()
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        status_lbl.set_text(f"⚠ Unexpected error during intake: {exc}")
+                        _re_enable()
+                        return
+
+                    # ── Planner (blocking LLM call — off the event loop) ──
+                    status_lbl.set_text("Planning…")
+                    try:
+                        plan = await asyncio.to_thread(plan_task_intent, intent)
+                    except (ValueError, LLMBackendError, LLMResponseError) as exc:  # noqa: BLE001
+                        msg = str(exc)[:200]
+                        status_lbl.set_text(f"⚠ Planning failed: {msg}")
+                        ui.notify(msg, type="negative", position="top-right")
+                        _re_enable()
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        status_lbl.set_text(f"⚠ Unexpected error during planning: {exc}")
+                        _re_enable()
+                        return
+
+                    # ── Persist plan + reveal progress tree ───────────────
+                    _plan_store.save(plan)
+                    active_plan_id[0] = plan.plan_id
+                    plan_tree_section.style(_TREE_STYLE_VISIBLE)
+                    _rebuild_plan_tree(plan)
+
+                    # ── Executor (async, driven by the event loop) ────────
+                    status_lbl.set_text(f"Executing… ({len(plan.nodes)} node(s))")
+                    try:
+                        executor = Executor(_plan_store, _tool_registry)
+                        final_plan = await executor.run(plan.plan_id)
+                        _rebuild_plan_tree(final_plan)
+                        if final_plan.status.value == "completed":
+                            status_lbl.set_text(
+                                f"✓ Done — {len(final_plan.nodes)} node(s) completed."
+                            )
+                        else:
+                            status_lbl.set_text(
+                                f"Finished with status: {final_plan.status.value}"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        status_lbl.set_text(f"⚠ Execution error: {exc}")
+                    finally:
+                        _re_enable()
+                        await ui.run_javascript(
+                            "const el=document.querySelector('.ft-msg-area');"
+                            "if(el){el.scrollTop=el.scrollHeight;}"
+                        )
+
                 msg_area.classes("ft-msg-area")
 
-                ui.button(icon="send", on_click=_send).props(
-                    "round unelevated"
-                ).style("background:#059669;color:#fff;")
+                _btn = (
+                    ui.button(icon="send", on_click=_send)
+                    .props("round unelevated")
+                    .style("background:#059669;color:#fff;")
+                )
+                send_btn_holder.append(_btn)
 
         # ================================================================== #
         # RIGHT PANEL — Claw Monitor sidebar                                 #
@@ -700,6 +900,19 @@ def index() -> None:
                         log_el.push(f"[{claw['task_id']}] {line}")
 
             ui.timer(1.0, _tick_claws)
+
+            # -- Plan progress tree polling --------------------------------
+            def _tick_plan() -> None:
+                """Poll the plan store and refresh the DAG progress tree."""
+                pid = active_plan_id[0]
+                if pid is None or _plan_store is None:
+                    return
+                plan = _plan_store.load(pid)
+                if plan is None:
+                    return
+                _rebuild_plan_tree(plan)
+
+            ui.timer(0.75, _tick_plan)
 
     # ====================================================================== #
     # FLOATING UPLOAD PANEL                                                  #
