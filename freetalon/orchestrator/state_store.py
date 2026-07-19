@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Generator, Optional
 
 from .models import ExecutionPlan
 
@@ -26,6 +27,11 @@ CREATE TABLE IF NOT EXISTS execution_plans (
 class ExecutionPlanStateStore:
     """Local SQLite store for :class:`ExecutionPlan` objects.
 
+    Each public method opens and closes its own database connection, which
+    is the safest pattern for multi-threaded access to a single SQLite file.
+    A :class:`threading.Lock` serialises writes to prevent concurrent
+    modification.
+
     Parameters
     ----------
     db_path:
@@ -35,11 +41,22 @@ class ExecutionPlanStateStore:
 
     def __init__(self, db_path: Path | str = _DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
-        self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute(_CREATE_TABLE_SQL)
-        self._conn.commit()
+        self._write_lock = threading.Lock()
+        # Initialise the schema on first use.
+        with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(_CREATE_TABLE_SQL)
+
+    # ── Internal helpers ──────────────────────────────────────────────────
+
+    @contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
+        """Open a short-lived connection, yield it, then close it."""
+        conn = sqlite3.connect(str(self._db_path))
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -51,12 +68,12 @@ class ExecutionPlanStateStore:
         plan:
             The :class:`ExecutionPlan` to persist.
         """
-        with self._lock:
-            self._conn.execute(
+        with self._write_lock, self._connect() as conn:
+            conn.execute(
                 "INSERT OR REPLACE INTO execution_plans (plan_id, plan_json) VALUES (?, ?)",
                 (plan.plan_id, plan.model_dump_json()),
             )
-            self._conn.commit()
+            conn.commit()
 
     def load(self, plan_id: str) -> Optional[ExecutionPlan]:
         """Return the :class:`ExecutionPlan` for *plan_id*, or ``None`` if absent.
@@ -66,8 +83,8 @@ class ExecutionPlanStateStore:
         plan_id:
             Identifier of the plan to retrieve.
         """
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._connect() as conn:
+            cursor = conn.execute(
                 "SELECT plan_json FROM execution_plans WHERE plan_id = ?",
                 (plan_id,),
             )
@@ -84,23 +101,19 @@ class ExecutionPlanStateStore:
         bool
             ``True`` if a record was deleted, ``False`` if it did not exist.
         """
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._write_lock, self._connect() as conn:
+            cursor = conn.execute(
                 "DELETE FROM execution_plans WHERE plan_id = ?",
                 (plan_id,),
             )
-            self._conn.commit()
-        return cursor.rowcount > 0
+            conn.commit()
+            return cursor.rowcount > 0
 
     def list_ids(self) -> list[str]:
         """Return a list of all stored plan IDs ordered by insertion time."""
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._connect() as conn:
+            cursor = conn.execute(
                 "SELECT plan_id FROM execution_plans ORDER BY rowid"
             )
             return [row[0] for row in cursor.fetchall()]
 
-    def close(self) -> None:
-        """Close the underlying database connection."""
-        with self._lock:
-            self._conn.close()

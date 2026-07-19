@@ -65,7 +65,6 @@ class TestStateStore(unittest.TestCase):
         self.store = ExecutionPlanStateStore(db_path=db_path)
 
     def tearDown(self) -> None:
-        self.store.close()
         self.tmpdir.cleanup()
 
     def test_save_and_load_round_trip(self) -> None:
@@ -117,11 +116,9 @@ class TestStateStore(unittest.TestCase):
         db_path = Path(self.tmpdir.name) / "persist_test.db"
         store1 = ExecutionPlanStateStore(db_path=db_path)
         store1.save(_make_plan("persist-plan"))
-        store1.close()
 
         store2 = ExecutionPlanStateStore(db_path=db_path)
         loaded = store2.load("persist-plan")
-        store2.close()
         self.assertIsNotNone(loaded)
 
     def test_full_round_trip_no_data_loss(self) -> None:
