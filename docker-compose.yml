@@ -1,7 +1,7 @@
 # docker-compose.yml — FreeTalon hybrid reference stack.
 #
 # Reconciles the two unmerged compose design branches by combining:
-# - zero-trust network tiering (`back-tier`, `sandbox-tier`) and
+# - zero-trust network tiering (`back-tier` plus internal claw network) and
 #   conservative local-first defaults
 # - broader profile-based claw service coverage (media/upload/browser)
 #
@@ -15,7 +15,7 @@
 #   docker compose up                  → ollama only
 #   docker compose --profile media up  → + media-claw
 #   docker compose --profile upload up → + upload-claw
-#   docker compose --profile browser up→ + browser-claw
+#   docker compose --profile browser up → + browser-claw
 
 name: freetalon
 
@@ -26,18 +26,23 @@ services:
     ports:
       - "11434:11434"
     volumes:
+      # The Ollama image currently stores model data under /root/.ollama.
       - ollama-models:/root/.ollama
       - "${LOCAL_WORKSPACE}:/workspace"
     networks:
       - back-tier
+      # Intentional bridge: runtime claw workloads on freetalon-claw-net
+      # must be able to reach Ollama without exposing it to public networks.
       - freetalon-claw-net
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # Optional GPU reservation request (enable on NVIDIA-capable hosts where
+    # the Docker NVIDIA runtime is installed; no separate Ollama image tag).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
 
   # -- Media Claw (video tasks) -------------------------------------------
   # Up to 8 GiB RAM / 4 CPU cores.  /workspace/output is RW so the claw
@@ -95,21 +100,11 @@ services:
 
 # -- Networks --------------------------------------------------------------
 networks:
-  # Trusted AI back-tier (future hub/orchestrator <-> ollama path).
+  # Trusted AI back-tier for compose-managed trusted services (currently Ollama).
   back-tier:
     driver: bridge
-    attachable: true
     labels:
       freetalon.tier: back
-
-  # Reserved sandbox tier for explicit zero-egress claw isolation.
-  # Kept for reference compatibility with earlier compose proposals.
-  sandbox-tier:
-    driver: bridge
-    internal: true
-    attachable: true
-    labels:
-      freetalon.tier: sandbox
 
   # Internal-only bridge — claws can reach the LLM but NOT the internet.
   # Current Docker manager code paths still target this network name.
