@@ -18,6 +18,7 @@ import os
 import random
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from freetalon.bootstrap import ensure_module
 
@@ -66,6 +67,8 @@ except Exception:  # noqa: BLE001 – Docker may not be installed/running
 _PIPELINE_AVAILABLE = False
 _plan_store: "ExecutionPlanStateStore | None" = None  # type: ignore[name-defined]
 _tool_registry: "ToolRegistry | None" = None  # type: ignore[name-defined]
+# Fallback colour for DAG node status labels not in the explicit mapping.
+_NODE_STATUS_FALLBACK_COLOR = "#475569"
 
 try:
     from freetalon.orchestrator import (
@@ -86,11 +89,25 @@ try:
     # Non-strict: nodes with unrecognised capabilities receive a no-op handler
     # instead of raising UnknownCapabilityError, so demo DAGs can reach COMPLETED.
     _tool_registry = ToolRegistry(strict=False)
+    # Node status → display colour mapping (keyed on PlanStatus enum members for
+    # type safety; look up with node.status directly since PlanStatus is str Enum).
+    _NODE_STATUS_COLORS: dict[PlanStatus, str] = {
+        PlanStatus.COMPLETED: "#10b981",
+        PlanStatus.RUNNING: "#3b82f6",
+        PlanStatus.FAILED: "#ef4444",
+        PlanStatus.CANCELLED: "#ef4444",
+        PlanStatus.DRAFT: _NODE_STATUS_FALLBACK_COLOR,
+        PlanStatus.READY: _NODE_STATUS_FALLBACK_COLOR,
+    }
     _PIPELINE_AVAILABLE = True
 except Exception:  # noqa: BLE001
+    _NODE_STATUS_COLORS = {}  # type: ignore[assignment]
     logging.getLogger(__name__).warning(
         "Orchestrator pipeline unavailable — submit will show an error message."
     )
+
+if TYPE_CHECKING:
+    from freetalon.orchestrator import ExecutionPlan as _ExecutionPlan
 
 # ---------------------------------------------------------------------------
 # Workspace resolution (mirrors installer.py logic)
@@ -164,20 +181,6 @@ def _notify_error(msg: str) -> None:
     """Show a negative top-right notification with a truncated error message."""
     ui.notify(_truncate_for_notify(msg), type="negative", position="top-right")
 
-
-# Fallback colour for DAG node status labels not in the explicit mapping.
-_NODE_STATUS_FALLBACK_COLOR = "#475569"
-
-# Node status → display colour mapping (keys are PlanStatus.*.value strings).
-# Reuses the existing dark-theme palette; look up with node.status.value.
-_NODE_STATUS_COLORS: dict[str, str] = {
-    "completed": "#10b981",
-    "running": "#3b82f6",
-    "failed": "#ef4444",
-    "cancelled": "#ef4444",
-    "draft": _NODE_STATUS_FALLBACK_COLOR,
-    "ready": _NODE_STATUS_FALLBACK_COLOR,
-}
 
 # DAG progress tree section styles (shared base + visibility toggle).
 _TREE_STYLE_BASE = (
@@ -311,12 +314,13 @@ def index() -> None:
                     )
                 plan_tree_rows = ui.column().classes("w-full gap-1 pb-1")
 
-            def _render_plan_tree(plan: "ExecutionPlan") -> None:  # type: ignore[name-defined]
+            def _render_plan_tree(plan: _ExecutionPlan) -> None:
                 """Render DAG node rows in *plan_tree_rows* from the current plan state."""
                 plan_tree_rows.clear()
                 with plan_tree_rows:
                     for node in plan.nodes:
-                        color = _NODE_STATUS_COLORS.get(node.status.value, _NODE_STATUS_FALLBACK_COLOR)
+                        # node.status is a PlanStatus (str Enum) — use directly as key.
+                        color = _NODE_STATUS_COLORS.get(node.status, _NODE_STATUS_FALLBACK_COLOR)
                         deps = ", ".join(node.depends_on) if node.depends_on else ""
                         with ui.row().classes("w-full items-start gap-2 py-1"):
                             ui.icon("circle").style(
