@@ -202,9 +202,14 @@ def _yaml_dump(data: Any, indent: int = 0) -> str:
     if isinstance(data, list):
         lines = []
         for item in data:
-            if isinstance(item, (dict, list)) and item:
-                lines.append(f"{pad}-")
-                lines.append(_yaml_dump(item, indent + 2))
+            if isinstance(item, dict) and item:
+                nested = _yaml_dump(item, indent + 2).splitlines()
+                lines.append(f"{pad}- {nested[0].lstrip()}")
+                lines.extend(nested[1:])
+            elif isinstance(item, list) and item:
+                nested = _yaml_dump(item, indent + 2).splitlines()
+                lines.append(f"{pad}- {nested[0].lstrip()}")
+                lines.extend(nested[1:])
             else:
                 lines.append(f"{pad}- {_yaml_scalar(item)}")
         return "\n".join(lines)
@@ -584,7 +589,11 @@ def main() -> int:
     compose_gpu = GPU_NONE
     if args.mode in {"docker", "full"}:
         if args.skip_docker_validation:
-            docker_status = DockerStatus(cli_available=shutil.which("docker") is not None, daemon_reachable=False, compose_available=False)
+            docker_status = DockerStatus(
+                cli_available=shutil.which("docker") is not None,
+                daemon_reachable=False,
+                compose_available=False,
+            )
         else:
             docker_status = detect_docker_status()
 
@@ -615,7 +624,13 @@ def main() -> int:
     else:
         _ok("Docker compose generation skipped for selected mode")
 
-    generate_env(workspace=str(workspace), install_mode=args.mode, docker_profile=compose_gpu, browser_enabled=browser_enabled, path=REPO_ROOT / ".env")
+    generate_env(
+        workspace=str(workspace),
+        install_mode=args.mode,
+        docker_profile=compose_gpu,
+        browser_enabled=browser_enabled,
+        path=REPO_ROOT / ".env",
+    )
 
     print_summary(
         mode=args.mode,

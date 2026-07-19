@@ -55,7 +55,10 @@ def ensure_module(module_name: str, project_root: Path, install_command: str) ->
     If the current interpreter cannot import the module but the repository
     virtualenv can, this function replaces the current process with the
     virtualenv interpreter so user-facing commands like ``python3 dashboard.py``
-    continue to work without manual activation.
+    continue to work without manual activation. This replacement happens
+    before the rest of the module imports run, so the original process does
+    not continue executing and any in-memory state from the original process
+    is intentionally discarded.
     """
     if module_available(module_name):
         return
