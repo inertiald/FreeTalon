@@ -75,18 +75,20 @@ def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[P
     if len(ordered_ids) != len(nodes):
         raise LLMResponseError("Planner response contained a dependency cycle.")
 
-    id_map = {original_id: f"node-{index}" for index, original_id in enumerate(ordered_ids, start=1)}
+    original_to_normalized_id = {
+        original_id: f"node-{index}" for index, original_id in enumerate(ordered_ids, start=1)
+    }
     normalized_nodes: list[PlanNode] = []
     for original_id in ordered_ids:
         node = node_map[original_id]
         normalized_dependencies = sorted(
-            {id_map[dependency] for dependency in node.depends_on},
+            {original_to_normalized_id[dependency] for dependency in node.depends_on},
             key=lambda dependency_id: int(dependency_id.split("-")[1]),
         )
         normalized_nodes.append(
             node.model_copy(
                 update={
-                    "id": id_map[original_id],
+                    "id": original_to_normalized_id[original_id],
                     "depends_on": normalized_dependencies,
                     "status": PlanStatus.DRAFT,
                     "error": None,

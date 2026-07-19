@@ -54,9 +54,7 @@ class LLMSettings:
                 "FREETALON_LLM_TIMEOUT_SECONDS must be a positive number."
             ) from exc
         if timeout_seconds <= 0:
-            raise ValueError(
-                "FREETALON_LLM_TIMEOUT_SECONDS must be a positive number."
-            )
+            raise ValueError("FREETALON_LLM_TIMEOUT_SECONDS must be greater than zero.")
 
         if backend == "ollama":
             return cls(
