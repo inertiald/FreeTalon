@@ -281,6 +281,8 @@ def index() -> None:
                 "draft": "#475569",
                 "ready": "#475569",
             }
+            # Maximum characters shown for node objective/error labels in the tree.
+            _MAX_LABEL_LEN = 80
 
             def _rebuild_plan_tree(plan: "ExecutionPlan") -> None:  # type: ignore[name-defined]
                 """Rebuild the node rows from the current plan state."""
@@ -303,8 +305,8 @@ def index() -> None:
                                         "text-xs font-mono"
                                     ).style(f"color:{color};")
                                 obj = node.objective
-                                if len(obj) > 80:
-                                    obj = obj[:80] + "…"
+                                if len(obj) > _MAX_LABEL_LEN:
+                                    obj = obj[:_MAX_LABEL_LEN] + "…"
                                 ui.label(obj).classes("text-xs").style("color:#94a3b8;")
                                 if deps:
                                     ui.label(f"↳ {deps}").classes(
@@ -312,8 +314,8 @@ def index() -> None:
                                     ).style("color:#475569;")
                                 if node.error:
                                     err = node.error
-                                    if len(err) > 80:
-                                        err = err[:80] + "…"
+                                    if len(err) > _MAX_LABEL_LEN:
+                                        err = err[:_MAX_LABEL_LEN] + "…"
                                     ui.label(err).classes("text-xs").style(
                                         "color:#ef4444;"
                                     )
@@ -393,9 +395,9 @@ def index() -> None:
                     try:
                         intent = await asyncio.to_thread(intake_request, raw)
                     except (ValueError, LLMBackendError, LLMResponseError) as exc:  # noqa: BLE001
-                        msg = str(exc)[:200]
+                        msg = str(exc)
                         status_lbl.set_text(f"⚠ Intake failed: {msg}")
-                        ui.notify(msg, type="negative", position="top-right")
+                        ui.notify(msg[:400], type="negative", position="top-right")
                         _re_enable()
                         return
                     except Exception as exc:  # noqa: BLE001
@@ -408,9 +410,9 @@ def index() -> None:
                     try:
                         plan = await asyncio.to_thread(plan_task_intent, intent)
                     except (ValueError, LLMBackendError, LLMResponseError) as exc:  # noqa: BLE001
-                        msg = str(exc)[:200]
+                        msg = str(exc)
                         status_lbl.set_text(f"⚠ Planning failed: {msg}")
-                        ui.notify(msg, type="negative", position="top-right")
+                        ui.notify(msg[:400], type="negative", position="top-right")
                         _re_enable()
                         return
                     except Exception as exc:  # noqa: BLE001
@@ -430,7 +432,7 @@ def index() -> None:
                         executor = Executor(_plan_store, _tool_registry)
                         final_plan = await executor.run(plan.plan_id)
                         _rebuild_plan_tree(final_plan)
-                        if final_plan.status.value == "completed":
+                        if final_plan.status == PlanStatus.COMPLETED:
                             status_lbl.set_text(
                                 f"✓ Done — {len(final_plan.nodes)} node(s) completed."
                             )
