@@ -102,7 +102,7 @@ class Executor:
         while True:
             plan = self._load_or_raise(plan_id)
 
-            if _is_terminal(plan.status) and plan.status != PlanStatus.RUNNING:
+            if _is_terminal(plan.status):
                 # Plan was externally cancelled or otherwise terminated.
                 break
 
@@ -172,6 +172,8 @@ class Executor:
                 if target is not None:
                     target.status = PlanStatus.COMPLETED
                     if isinstance(result, dict):
+                        # Merge handler output back into inputs so downstream
+                        # nodes can read the produced values.
                         target.inputs.update(result)
                     target.error = None
                     plan.touch()

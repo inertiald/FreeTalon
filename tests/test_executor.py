@@ -339,7 +339,11 @@ class TestExecutor(unittest.TestCase):
 
         plan = _make_plan("concurrent-plan", nodes)
         self.store.save(plan)
-        result = _run(Executor(store=self.store, registry=registry, max_concurrency=3).run("concurrent-plan"))
+        result = _run(
+            Executor(store=self.store, registry=registry, max_concurrency=3).run(
+                "concurrent-plan"
+            )
+        )
         self.assertEqual(result.status, PlanStatus.COMPLETED)
         self.assertEqual(sorted(started), ["cap_0", "cap_1", "cap_2"])
 
