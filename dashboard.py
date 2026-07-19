@@ -144,6 +144,15 @@ app.add_static_files("/screenshots", str(_SCREENSHOTS_DIR))
 _claw_values: list[float] = [round(random.uniform(0.15, 0.95), 2) for _ in range(10)]
 
 # ---------------------------------------------------------------------------
+# DAG progress tree display constants
+# ---------------------------------------------------------------------------
+
+# Maximum characters shown for node objective/error labels in the tree view.
+_MAX_DAG_NODE_LABEL_LEN = 80
+# Maximum characters forwarded to ui.notify() for LLM/pipeline error messages.
+_MAX_NOTIFY_LEN = 400
+
+# ---------------------------------------------------------------------------
 # Inline CSS injected once into every page
 # ---------------------------------------------------------------------------
 
@@ -281,8 +290,6 @@ def index() -> None:
                 "draft": "#475569",
                 "ready": "#475569",
             }
-            # Maximum characters shown for node objective/error labels in the tree.
-            _MAX_LABEL_LEN = 80
 
             def _rebuild_plan_tree(plan: "ExecutionPlan") -> None:  # type: ignore[name-defined]
                 """Rebuild the node rows from the current plan state."""
@@ -305,8 +312,8 @@ def index() -> None:
                                         "text-xs font-mono"
                                     ).style(f"color:{color};")
                                 obj = node.objective
-                                if len(obj) > _MAX_LABEL_LEN:
-                                    obj = obj[:_MAX_LABEL_LEN] + "…"
+                                if len(obj) > _MAX_DAG_NODE_LABEL_LEN:
+                                    obj = obj[:_MAX_DAG_NODE_LABEL_LEN] + "…"
                                 ui.label(obj).classes("text-xs").style("color:#94a3b8;")
                                 if deps:
                                     ui.label(f"↳ {deps}").classes(
@@ -314,8 +321,8 @@ def index() -> None:
                                     ).style("color:#475569;")
                                 if node.error:
                                     err = node.error
-                                    if len(err) > _MAX_LABEL_LEN:
-                                        err = err[:_MAX_LABEL_LEN] + "…"
+                                    if len(err) > _MAX_DAG_NODE_LABEL_LEN:
+                                        err = err[:_MAX_DAG_NODE_LABEL_LEN] + "…"
                                     ui.label(err).classes("text-xs").style(
                                         "color:#ef4444;"
                                     )
@@ -397,7 +404,7 @@ def index() -> None:
                     except (ValueError, LLMBackendError, LLMResponseError) as exc:
                         msg = str(exc)
                         status_lbl.set_text(f"⚠ Intake failed: {msg}")
-                        ui.notify(msg[:400], type="negative", position="top-right")
+                        ui.notify(msg[:_MAX_NOTIFY_LEN], type="negative", position="top-right")
                         _re_enable()
                         return
                     except Exception as exc:  # noqa: BLE001
@@ -412,7 +419,7 @@ def index() -> None:
                     except (ValueError, LLMBackendError, LLMResponseError) as exc:
                         msg = str(exc)
                         status_lbl.set_text(f"⚠ Planning failed: {msg}")
-                        ui.notify(msg[:400], type="negative", position="top-right")
+                        ui.notify(msg[:_MAX_NOTIFY_LEN], type="negative", position="top-right")
                         _re_enable()
                         return
                     except Exception as exc:  # noqa: BLE001
