@@ -7,6 +7,7 @@ recover in-flight plans after a process restart without any external services.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,7 @@ class ExecutionPlanStateStore:
 
     def __init__(self, db_path: Path | str = _DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(_CREATE_TABLE_SQL)
@@ -49,11 +51,12 @@ class ExecutionPlanStateStore:
         plan:
             The :class:`ExecutionPlan` to persist.
         """
-        self._conn.execute(
-            "INSERT OR REPLACE INTO execution_plans (plan_id, plan_json) VALUES (?, ?)",
-            (plan.plan_id, plan.model_dump_json()),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO execution_plans (plan_id, plan_json) VALUES (?, ?)",
+                (plan.plan_id, plan.model_dump_json()),
+            )
+            self._conn.commit()
 
     def load(self, plan_id: str) -> Optional[ExecutionPlan]:
         """Return the :class:`ExecutionPlan` for *plan_id*, or ``None`` if absent.
@@ -63,11 +66,12 @@ class ExecutionPlanStateStore:
         plan_id:
             Identifier of the plan to retrieve.
         """
-        cursor = self._conn.execute(
-            "SELECT plan_json FROM execution_plans WHERE plan_id = ?",
-            (plan_id,),
-        )
-        row = cursor.fetchone()
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT plan_json FROM execution_plans WHERE plan_id = ?",
+                (plan_id,),
+            )
+            row = cursor.fetchone()
         if row is None:
             return None
         return ExecutionPlan.model_validate_json(row[0])
@@ -80,18 +84,23 @@ class ExecutionPlanStateStore:
         bool
             ``True`` if a record was deleted, ``False`` if it did not exist.
         """
-        cursor = self._conn.execute(
-            "DELETE FROM execution_plans WHERE plan_id = ?",
-            (plan_id,),
-        )
-        self._conn.commit()
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM execution_plans WHERE plan_id = ?",
+                (plan_id,),
+            )
+            self._conn.commit()
         return cursor.rowcount > 0
 
     def list_ids(self) -> list[str]:
-        """Return a list of all stored plan IDs in insertion order."""
-        cursor = self._conn.execute("SELECT plan_id FROM execution_plans")
-        return [row[0] for row in cursor.fetchall()]
+        """Return a list of all stored plan IDs ordered by insertion time."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT plan_id FROM execution_plans ORDER BY rowid"
+            )
+            return [row[0] for row in cursor.fetchall()]
 
     def close(self) -> None:
         """Close the underlying database connection."""
-        self._conn.close()
+        with self._lock:
+            self._conn.close()

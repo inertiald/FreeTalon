@@ -99,7 +99,7 @@ class TestStateStore(unittest.TestCase):
         for i in range(3):
             self.store.save(_make_plan(f"plan-{i}"))
         ids = self.store.list_ids()
-        self.assertEqual(sorted(ids), ["plan-0", "plan-1", "plan-2"])
+        self.assertEqual(ids, ["plan-0", "plan-1", "plan-2"])
 
     def test_save_upserts_on_same_id(self) -> None:
         plan = _make_plan("upsert-plan")
