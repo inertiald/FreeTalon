@@ -26,6 +26,10 @@ GPU_NONE = "none"
 NODE_ROLE_ORCHESTRATOR = "orchestrator"
 NODE_ROLE_WORKER = "worker"
 DEFAULT_NODE_ROLE = NODE_ROLE_ORCHESTRATOR
+NODE_ROLE_LABELS = {
+    NODE_ROLE_ORCHESTRATOR: "Primary Orchestrator",
+    NODE_ROLE_WORKER: "Worker Node",
+}
 PLAYWRIGHT_VERSION = "1.40.0"
 UI_HOST = "127.0.0.1"
 UI_PORT = 7860
@@ -518,7 +522,8 @@ def resolve_options(args: argparse.Namespace) -> tuple[Path, Path, bool, str]:
 
     if node_role is None:
         role_answer = _prompt(
-            "Node role: [1] Primary Orchestrator, [2] Worker Node [1]: "
+            f"Node role: [1] {NODE_ROLE_LABELS[NODE_ROLE_ORCHESTRATOR]}, "
+            f"[2] {NODE_ROLE_LABELS[NODE_ROLE_WORKER]} [1]: "
         ).strip().lower()
         if role_answer in {"2", "worker", "worker node", NODE_ROLE_WORKER}:
             node_role = NODE_ROLE_WORKER
@@ -543,7 +548,7 @@ def print_summary(
     print("FreeTalon setup complete.")
     print()
     print(f"Mode: {mode}")
-    role_label = "Primary Orchestrator" if node_role == NODE_ROLE_ORCHESTRATOR else "Worker Node"
+    role_label = NODE_ROLE_LABELS.get(node_role, node_role)
     print(f"Node role: {role_label}")
     print(f"Workspace: {workspace}")
     print(f"Virtualenv: {venv_path}")
