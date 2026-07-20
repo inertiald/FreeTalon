@@ -42,10 +42,20 @@ def _has_module(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
-def _detect_rdma() -> bool:
-    for tool in ("ibstat", "ibv_devices", "rdma"):
-        if shutil.which(tool):
-            return True
+def _rxe_module_loaded() -> bool:
+    """Return True if the soft-RoCE (rxe) or core IB kernel module is loaded.
+
+    Reads /proc/modules directly first (no subprocess), falling back to
+    ``lsmod``. Never raises — returns False on any error.
+    """
+    try:
+        with open("/proc/modules", "r", encoding="utf-8") as fh:
+            for line in fh:
+                name = line.split(" ", 1)[0]
+                if name in {"rdma_rxe", "ib_core", "rxe"}:
+                    return True
+    except OSError:
+        pass
     try:
         result = subprocess.run(
             ["lsmod"], capture_output=True, text=True, timeout=2
@@ -57,10 +67,43 @@ def _detect_rdma() -> bool:
     return False
 
 
-def _detect_nccl() -> bool:
-    if _has_module("nccl"):
-        return True
-    return bool(ctypes.util.find_library("nccl"))
+def detect_rdma_capability() -> bool:
+    """Safely detect RDMA capability per ADR 0002.
+
+    Checks for the presence of the ``ibstat`` tool, the ``rxe`` (soft-RoCE) /
+    core IB kernel module, or the ``rdma`` CLI tool. All probes are guarded so
+    this function never raises an unhandled exception; it returns False when no
+    RDMA capability can be established.
+    """
+    for tool in ("ibstat", "rdma", "ibv_devices"):
+        try:
+            if shutil.which(tool):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return _rxe_module_loaded()
+
+
+def detect_nccl() -> bool:
+    """Safely detect NCCL availability per ADR 0002.
+
+    Checks for the shared library ``libnccl.so`` (via the dynamic loader) or an
+    importable ``nccl`` Python module. Never raises — returns False on failure.
+    """
+    try:
+        if _has_module("nccl"):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return bool(ctypes.util.find_library("nccl"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Backward-compatible private aliases.
+_detect_rdma = detect_rdma_capability
+_detect_nccl = detect_nccl
 
 
 def _detect_gpu_count() -> int:
@@ -105,8 +148,8 @@ def detect_host_capabilities() -> HostCapabilities:
         memory_mib=memory_mib,
         gpu_available=gpu_available,
         acceleration_libs=tuple(libs),
-        rdma_available=_detect_rdma(),
-        nccl_available=_detect_nccl(),
+        rdma_available=detect_rdma_capability(),
+        nccl_available=detect_nccl(),
         gpu_count=gpu_count,
     )
 
