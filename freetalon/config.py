@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .hardware import HostCapabilities, RuntimeTuning, adaptive_tuning, detect_host_capabilities
 
@@ -32,10 +32,38 @@ class HiveConfig(BaseModel):
     nccl_socket_ifname: str = Field(default="lo", max_length=32)
     nccl_debug: bool = Field(default=False)
 
+    # ADR 0002 — DeepSpeed and vLLM engine knobs
+    deepspeed_zero_stage: int = Field(default=0, ge=0, le=3)
+    vllm_max_model_len: int = Field(default=4096, ge=1, le=1_048_576)
+    vllm_dtype: Literal["auto", "float16", "bfloat16"] = Field(default="auto")
+
     @field_validator("workspace", "state_path", "audit_log_path", mode="before")
     @classmethod
     def _expand_path(cls, value: object) -> Path:
         return Path(value).expanduser().resolve()
+
+    @field_validator("nccl_socket_ifname")
+    @classmethod
+    def _non_empty_ifname(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("nccl_socket_ifname must not be empty")
+        return stripped
+
+    @model_validator(mode="after")
+    def _validate_distributed_combination(self) -> "HiveConfig":
+        # Per ADR 0002: invalid combinations are caught and reported before
+        # any worker is spawned rather than failing deep inside a framework.
+        world_size = (
+            self.tensor_parallel_size
+            * self.pipeline_parallel_size
+            * self.data_parallel_size
+        )
+        if world_size < 1:
+            raise ValueError(
+                "combined world size (tensor x pipeline x data) must be >= 1"
+            )
+        return self
 
     def runtime_tuning(self, host: HostCapabilities | None = None) -> RuntimeTuning:
         capabilities = host or detect_host_capabilities()
