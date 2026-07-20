@@ -8,6 +8,7 @@ from typing import Any
 
 SAFE_TEXT_PATTERN = re.compile(r"^[a-zA-Z0-9 _.,:@/+-]{0,256}$")
 _DOCKER_PROFILES = frozenset({"default", "video", "youtube_upload"})
+_VLLM_DTYPES = frozenset({"auto", "float16", "bfloat16"})
 
 
 def load_secret(path: str | None, env_var: str) -> str:
@@ -88,6 +89,95 @@ def sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         clean["code"] = code
         clean["profile"] = profile
         clean["timeout"] = timeout
+
+    return clean
+
+
+def _validate_model_name(payload: dict[str, Any]) -> str:
+    model = str(payload.get("model", "")).strip()
+    if not model or not SAFE_TEXT_PATTERN.fullmatch(model):
+        raise ValueError("model name is empty or contains unsupported characters")
+    return model
+
+
+def _validate_parallel_override(payload: dict[str, Any], key: str, upper: int) -> int:
+    value = int(payload.get(key, 1))
+    if value < 1 or value > upper:
+        raise ValueError(f"{key} must be between 1 and {upper}")
+    return value
+
+
+def sanitize_inference_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate an ADR 0002 ``task_type: "inference"`` payload.
+
+    Enforces the ADR 0001 security-boundary pattern: the raw payload is
+    validated and normalised before any framework-specific parameters are
+    derived. Unknown keys are dropped by returning an explicit whitelist.
+    """
+    task_type = str(payload.get("task_type", "inference")).strip().lower()
+    if task_type != "inference":
+        raise ValueError("sanitize_inference_payload requires task_type='inference'")
+
+    clean: dict[str, Any] = {
+        "task_type": "inference",
+        "model": _validate_model_name(payload),
+        "tensor_parallel_size": _validate_parallel_override(
+            payload, "tensor_parallel_size", 512
+        ),
+        "pipeline_parallel_size": _validate_parallel_override(
+            payload, "pipeline_parallel_size", 128
+        ),
+    }
+
+    if "prompt" in payload:
+        prompt = str(payload.get("prompt", ""))
+        if len(prompt) > 8192:
+            raise ValueError("prompt exceeds 8192 character limit")
+        clean["prompt"] = prompt
+
+    if "dtype" in payload:
+        dtype = str(payload.get("dtype", "auto")).strip().lower()
+        if dtype not in _VLLM_DTYPES:
+            raise ValueError(f"dtype must be one of: {sorted(_VLLM_DTYPES)}")
+        clean["dtype"] = dtype
+
+    return clean
+
+
+def sanitize_training_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate an ADR 0002 ``task_type: "training"`` payload.
+
+    Enforces the ADR 0001 security-boundary pattern before any DeepSpeed
+    parameters are derived. ZeRO stage and parallelism knobs are bounded here.
+    """
+    task_type = str(payload.get("task_type", "training")).strip().lower()
+    if task_type != "training":
+        raise ValueError("sanitize_training_payload requires task_type='training'")
+
+    zero_stage = int(payload.get("deepspeed_zero_stage", 0))
+    if zero_stage < 0 or zero_stage > 3:
+        raise ValueError("deepspeed_zero_stage must be between 0 and 3")
+
+    clean: dict[str, Any] = {
+        "task_type": "training",
+        "model": _validate_model_name(payload),
+        "deepspeed_zero_stage": zero_stage,
+        "tensor_parallel_size": _validate_parallel_override(
+            payload, "tensor_parallel_size", 512
+        ),
+        "pipeline_parallel_size": _validate_parallel_override(
+            payload, "pipeline_parallel_size", 128
+        ),
+        "data_parallel_size": _validate_parallel_override(
+            payload, "data_parallel_size", 1024
+        ),
+    }
+
+    if "dataset" in payload:
+        dataset = str(payload.get("dataset", "")).strip()
+        if not dataset or not SAFE_TEXT_PATTERN.fullmatch(dataset):
+            raise ValueError("dataset is empty or contains unsupported characters")
+        clean["dataset"] = dataset
 
     return clean
 
