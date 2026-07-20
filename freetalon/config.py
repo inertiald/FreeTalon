@@ -65,6 +65,54 @@ class HiveConfig(BaseModel):
             )
         return self
 
+    @property
+    def world_size(self) -> int:
+        """Combined GPU world size (tensor x pipeline x data parallelism)."""
+        return (
+            self.tensor_parallel_size
+            * self.pipeline_parallel_size
+            * self.data_parallel_size
+        )
+
+    def validate_against_host(self, host: HostCapabilities | None = None) -> None:
+        """Cross-check distributed config against the live host profile.
+
+        Per ADR 0002, invalid combinations (e.g. ``tensor_parallel_size`` >
+        available GPUs) must be caught and reported before any worker is
+        spawned.  This complements the static ``model_validator`` above, which
+        cannot see the runtime hardware profile.  Raises ``ValueError`` on the
+        first violation.
+        """
+        capabilities = host or detect_host_capabilities()
+
+        # 1. GPU world size must fit the available GPUs (only enforced when the
+        #    host reports a positive GPU count; a zero count means detection is
+        #    unavailable, e.g. cupy-only hosts, so we do not block CPU dev flows).
+        if capabilities.gpu_count > 0 and self.world_size > capabilities.gpu_count:
+            raise ValueError(
+                f"requested GPU world size {self.world_size} "
+                f"(tensor={self.tensor_parallel_size} x "
+                f"pipeline={self.pipeline_parallel_size} x "
+                f"data={self.data_parallel_size}) exceeds available GPUs "
+                f"({capabilities.gpu_count})"
+            )
+
+        # 2. RDMA transport requires RDMA-capable hardware.
+        if self.transport == "rdma" and not capabilities.rdma_available:
+            raise ValueError(
+                "transport='rdma' requested but no RDMA capability was detected "
+                "on this host (InfiniBand/RoCE/iWARP)"
+            )
+
+        # 3. Multi-GPU parallelism or DeepSpeed ZeRO needs NCCL for collectives.
+        needs_nccl = self.world_size > 1 or self.deepspeed_zero_stage > 0
+        if needs_nccl and not capabilities.nccl_available:
+            raise ValueError(
+                "distributed GPU execution (world_size > 1 or "
+                "deepspeed_zero_stage > 0) requires NCCL, which was not detected "
+                "on this host"
+            )
+
     def runtime_tuning(self, host: HostCapabilities | None = None) -> RuntimeTuning:
         capabilities = host or detect_host_capabilities()
         return adaptive_tuning(capabilities, self.worker_cap, self.queue_multiplier)
