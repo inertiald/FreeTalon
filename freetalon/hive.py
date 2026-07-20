@@ -13,7 +13,15 @@ from .audit import AuditLogger
 from .config import HiveConfig
 from .docker_manager import DockerManager
 from .hardware import HostCapabilities, detect_host_capabilities
-from .security import sanitize_payload
+from .inference import VLLMInferenceEngine
+from .security import (
+    sanitize_inference_payload,
+    sanitize_payload,
+    sanitize_training_payload,
+)
+from .training import DeepSpeedTrainingEngine
+
+_ML_TASK_TYPES = frozenset({"inference", "training"})
 
 
 @dataclass(slots=True)
@@ -81,8 +89,58 @@ class HiveController:
         self._persist_state()
         self.audit.log("hive.stopped", task_count=len(self._tasks))
 
+    def _sanitize_submission(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Route the payload through the correct security-boundary sanitizer.
+
+        ADR 0002 task types (``inference``/``training``) use their dedicated
+        sanitizers; all other submissions fall back to the classic action
+        sanitizer. The raw payload is never stored unsanitized.
+        """
+        task_type = str(payload.get("task_type", "")).strip().lower()
+        if task_type == "inference":
+            return sanitize_inference_payload(payload)
+        if task_type == "training":
+            return sanitize_training_payload(payload)
+        return sanitize_payload(payload)
+
+    def _gate_ml_capabilities(self, clean: dict[str, Any]) -> None:
+        """Fail-fast capability gate for ADR 0002 ML task types.
+
+        Rejects at submit time (rather than deep inside a framework) when the
+        host cannot satisfy the request: GPU workers are required, and the
+        requested parallelism must fit the host profile.
+        """
+        if not self.host.gpu_available:
+            raise ValueError(
+                f"task_type='{clean['task_type']}' requires GPU-capable workers, "
+                "but no GPU acceleration is available on this host"
+            )
+
+        world_size = (
+            int(clean.get("tensor_parallel_size", 1))
+            * int(clean.get("pipeline_parallel_size", 1))
+            * int(clean.get("data_parallel_size", 1))
+        )
+        if self.host.gpu_count > 0 and world_size > self.host.gpu_count:
+            raise ValueError(
+                f"requested GPU world size {world_size} exceeds available GPUs "
+                f"({self.host.gpu_count})"
+            )
+
+        needs_nccl = world_size > 1 or int(clean.get("deepspeed_zero_stage", 0)) > 0
+        if needs_nccl and not self.host.nccl_available:
+            raise ValueError(
+                "distributed GPU execution (world_size > 1 or "
+                "deepspeed_zero_stage > 0) requires NCCL, which was not detected "
+                "on this host"
+            )
+
     def submit_task(self, payload: dict[str, Any]) -> TaskRecord:
-        clean = sanitize_payload(payload)
+        clean = self._sanitize_submission(payload)
+        task_type = clean.get("task_type")
+        if task_type in _ML_TASK_TYPES:
+            # Fail fast: reject before queuing if the host cannot satisfy it.
+            self._gate_ml_capabilities(clean)
         with self._lock:
             active = [t for t in self._tasks.values() if t.status in {"queued", "retrying", "running"}]
             if len(active) >= self.tuning.max_queue_size:
@@ -96,7 +154,11 @@ class HiveController:
             )
             self._tasks[task_id] = task
             self._persist_state()
-        self.audit.log("task.submitted", task_id=task.task_id, action=clean["action"])
+        self.audit.log(
+            "task.submitted",
+            task_id=task.task_id,
+            action=clean.get("action", task_type),
+        )
         return task
 
     def cancel_task(self, task_id: str) -> bool:
@@ -233,6 +295,12 @@ class HiveController:
         self.audit.log("task.completed", task_id=task_id, status=task.status)
 
     def _run_action(self, task_id: str, payload: dict[str, Any], worker_id: str) -> Any:
+        task_type = payload.get("task_type")
+        if task_type == "inference":
+            return self._run_inference(payload)
+        if task_type == "training":
+            return self._run_training(payload)
+
         action = payload["action"]
 
         if payload.get("requires_gpu") and not self.host.gpu_available:
@@ -265,6 +333,16 @@ class HiveController:
             return self._run_docker_claw(task_id, payload)
 
         raise RuntimeError(f"Unsupported action: {action}")
+
+    def _run_inference(self, payload: dict[str, Any]) -> Any:
+        # Routes ADR 0002 task_type='inference' to the vLLM engine wrapper.
+        engine = VLLMInferenceEngine(self.config, payload)
+        return engine.generate(payload.get("prompt", ""))
+
+    def _run_training(self, payload: dict[str, Any]) -> Any:
+        # Routes ADR 0002 task_type='training' to the DeepSpeed engine wrapper.
+        engine = DeepSpeedTrainingEngine(self.config, payload)
+        return engine.initialize()
 
     def _run_docker_claw(self, task_id: str, payload: dict[str, Any]) -> Any:
         dm = DockerManager()
