@@ -3,11 +3,23 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
-from dataclasses import replace
 from pathlib import Path
 
 from freetalon.config import HiveConfig
+from freetalon.hardware import HostCapabilities
 from freetalon.hive import HiveController
+
+
+def _cpu_only_host() -> HostCapabilities:
+    return HostCapabilities(
+        cpu_count=4,
+        memory_mib=4096,
+        gpu_available=False,
+        acceleration_libs=(),
+        rdma_available=False,
+        nccl_available=False,
+        gpu_count=0,
+    )
 
 
 class SchedulerTests(unittest.TestCase):
@@ -22,8 +34,7 @@ class SchedulerTests(unittest.TestCase):
             queue_multiplier=3,
             poll_interval_seconds=0.02,
         )
-        self.controller = HiveController(self.config)
-        self.controller.host = replace(self.controller.host, gpu_available=False)
+        self.controller = HiveController(self.config, host=_cpu_only_host())
         self.controller.start()
 
     def tearDown(self) -> None:
