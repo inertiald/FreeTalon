@@ -49,6 +49,42 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("FREETALON_INSTALL_MODE=full", content)
         self.assertIn("FREETALON_UI_PORT=7860", content)
         self.assertIn("FREETALON_BROWSER_ENABLED=1", content)
+        self.assertIn("FREETALON_NODE_ROLE=orchestrator", content)
+
+    def test_generate_env_records_worker_node_role(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / ".env"
+            installer.generate_env(
+                workspace="/tmp/free-talon-workspace",
+                install_mode="full",
+                docker_profile=installer.GPU_NONE,
+                browser_enabled=False,
+                path=path,
+                node_role=installer.NODE_ROLE_WORKER,
+            )
+            content = path.read_text(encoding="utf-8")
+        self.assertIn("FREETALON_NODE_ROLE=worker", content)
+
+    def test_resolve_options_yes_defaults_to_orchestrator_role(self) -> None:
+        args = installer.parse_args(["--yes"])
+        _, _, _, node_role = installer.resolve_options(args)
+        self.assertEqual(node_role, installer.NODE_ROLE_ORCHESTRATOR)
+
+    def test_resolve_options_honors_node_role_flag(self) -> None:
+        args = installer.parse_args(["--yes", "--node-role", "worker"])
+        _, _, _, node_role = installer.resolve_options(args)
+        self.assertEqual(node_role, installer.NODE_ROLE_WORKER)
+
+    def test_resolve_options_prompts_for_node_role(self) -> None:
+        args = installer.parse_args([])
+        answers = iter(["", "n", "2"])
+        original_prompt = installer._prompt
+        installer._prompt = lambda prompt: next(answers)
+        try:
+            _, _, _, node_role = installer.resolve_options(args)
+        finally:
+            installer._prompt = original_prompt
+        self.assertEqual(node_role, installer.NODE_ROLE_WORKER)
 
     def test_bootstrap_venv_python_path_matches_platform(self) -> None:
         root = Path("/tmp/freetalon-example")
