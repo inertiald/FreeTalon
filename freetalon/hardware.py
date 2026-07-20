@@ -17,6 +17,7 @@ class HostCapabilities:
     acceleration_libs: tuple[str, ...]
     rdma_available: bool = False
     nccl_available: bool = False
+    gpu_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +63,34 @@ def _detect_nccl() -> bool:
     return bool(ctypes.util.find_library("nccl"))
 
 
+def _detect_gpu_count() -> int:
+    # Prefer an authoritative query via nvidia-smi when present; fall back to
+    # counting /dev/nvidia* device nodes. Never raises — returns 0 on failure.
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        try:
+            result = subprocess.run(
+                [smi, "--query-gpu=index", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode == 0:
+                count = sum(1 for line in result.stdout.splitlines() if line.strip())
+                if count:
+                    return count
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return sum(
+            1
+            for name in os.listdir("/dev")
+            if name.startswith("nvidia") and name[6:].isdigit()
+        )
+    except OSError:
+        return 0
+
+
 def detect_host_capabilities() -> HostCapabilities:
     cpu_count = max(os.cpu_count() or 1, 1)
     memory_mib = _detect_memory_mib()
@@ -69,7 +98,8 @@ def detect_host_capabilities() -> HostCapabilities:
     for lib in ("cupy", "torch", "numba"):
         if _has_module(lib):
             libs.append(lib)
-    gpu_available = _has_module("cupy")
+    gpu_count = _detect_gpu_count()
+    gpu_available = _has_module("cupy") or gpu_count > 0
     return HostCapabilities(
         cpu_count=cpu_count,
         memory_mib=memory_mib,
@@ -77,6 +107,7 @@ def detect_host_capabilities() -> HostCapabilities:
         acceleration_libs=tuple(libs),
         rdma_available=_detect_rdma(),
         nccl_available=_detect_nccl(),
+        gpu_count=gpu_count,
     )
 
 
