@@ -18,6 +18,7 @@ import os
 import random
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from freetalon.bootstrap import ensure_module
 
@@ -58,6 +59,55 @@ except Exception:  # noqa: BLE001 – Docker may not be installed/running
     logging.getLogger(__name__).warning(
         "Docker is not available — Agent Tasks panel will be disabled."
     )
+
+# ---------------------------------------------------------------------------
+# Orchestrator pipeline (intake → plan → execute)
+# ---------------------------------------------------------------------------
+
+_PIPELINE_AVAILABLE = False
+_plan_store: "ExecutionPlanStateStore | None" = None  # type: ignore[name-defined]
+_tool_registry: "ToolRegistry | None" = None  # type: ignore[name-defined]
+# Fallback colour for DAG node status labels not in the explicit mapping.
+_NODE_STATUS_FALLBACK_COLOR = "#475569"
+
+try:
+    from freetalon.orchestrator import (
+        Executor,
+        ExecutionPlanStateStore,
+        PlanStatus,
+        ToolRegistry,
+    )
+    from freetalon.orchestrator.intake import (
+        LLMBackendError,
+        LLMResponseError,
+        intake_request,
+    )
+    from freetalon.orchestrator.planner import plan_task_intent
+
+    # Persistent plan store — SQLite, restart-safe.
+    _plan_store = ExecutionPlanStateStore()
+    # Non-strict: nodes with unrecognised capabilities receive a no-op handler
+    # instead of raising UnknownCapabilityError, so demo DAGs can reach COMPLETED.
+    _tool_registry = ToolRegistry(strict=False)
+    # Node status → display colour mapping (keyed on PlanStatus enum members for
+    # type safety; look up with node.status directly since PlanStatus is str Enum).
+    _NODE_STATUS_COLORS: dict[PlanStatus, str] = {
+        PlanStatus.COMPLETED: "#10b981",
+        PlanStatus.RUNNING: "#3b82f6",
+        PlanStatus.FAILED: "#ef4444",
+        PlanStatus.CANCELLED: "#ef4444",
+        PlanStatus.DRAFT: _NODE_STATUS_FALLBACK_COLOR,
+        PlanStatus.READY: _NODE_STATUS_FALLBACK_COLOR,
+    }
+    _PIPELINE_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    _NODE_STATUS_COLORS = {}  # type: ignore[assignment]
+    logging.getLogger(__name__).warning(
+        "Orchestrator pipeline unavailable — submit will show an error message."
+    )
+
+if TYPE_CHECKING:
+    from freetalon.orchestrator import ExecutionPlan as _ExecutionPlan
 
 # ---------------------------------------------------------------------------
 # Workspace resolution (mirrors installer.py logic)
@@ -109,6 +159,36 @@ app.add_static_files("/screenshots", str(_SCREENSHOTS_DIR))
 # ---------------------------------------------------------------------------
 
 _claw_values: list[float] = [round(random.uniform(0.15, 0.95), 2) for _ in range(10)]
+
+# ---------------------------------------------------------------------------
+# DAG progress tree display constants
+# ---------------------------------------------------------------------------
+
+# Maximum characters shown for node objective/error labels in the tree view.
+_MAX_DAG_NODE_LABEL_LEN = 80
+# Maximum characters forwarded to ui.notify() for LLM/pipeline error messages.
+_MAX_NOTIFY_LEN = 400
+
+
+def _truncate_for_notify(msg: str) -> str:
+    """Return *msg* truncated to *_MAX_NOTIFY_LEN* characters with a trailing ellipsis."""
+    if len(msg) <= _MAX_NOTIFY_LEN:
+        return msg
+    return msg[:_MAX_NOTIFY_LEN] + "…"
+
+
+def _notify_error(msg: str) -> None:
+    """Show a negative top-right notification with a truncated error message."""
+    ui.notify(_truncate_for_notify(msg), type="negative", position="top-right")
+
+
+# DAG progress tree section styles (shared base + visibility toggle).
+_TREE_STYLE_BASE = (
+    "flex-shrink:0;max-height:14rem;overflow-y:auto;"
+    "border-top:1px solid #1e293b;"
+)
+_TREE_STYLE_HIDDEN = _TREE_STYLE_BASE + "display:none;"
+_TREE_STYLE_VISIBLE = _TREE_STYLE_BASE + "display:block;"
 
 # ---------------------------------------------------------------------------
 # Inline CSS injected once into every page
@@ -180,6 +260,10 @@ def index() -> None:
     bar_elements: list[ui.element] = []
     pct_labels: list[ui.label] = []
     upload_visible: list[bool] = [False]
+    # Swarm plan state — mutable single-element lists so inner closures can write.
+    active_plan_id: list[str | None] = [None]
+    plan_running: list[bool] = [False]
+    send_btn_holder: list[ui.button] = []
 
     # ====================================================================== #
     # OUTER ROW — fills the viewport                                         #
@@ -216,6 +300,57 @@ def index() -> None:
                     "text-sm italic self-center mt-6"
                 ).style("color:#475569;")
 
+            # -- DAG Progress Tree (hidden until a plan is submitted) ------
+            plan_tree_section = (
+                ui.column()
+                .classes("w-full px-6 py-2 gap-1")
+                .style(_TREE_STYLE_HIDDEN)
+            )
+            with plan_tree_section:
+                with ui.row().classes("w-full items-center gap-2"):
+                    ui.icon("account_tree").style("color:#94a3b8;font-size:1rem;")
+                    ui.label("DAG Progress").classes("text-xs font-mono").style(
+                        "color:#94a3b8;"
+                    )
+                plan_tree_rows = ui.column().classes("w-full gap-1 pb-1")
+
+            def _render_plan_tree(plan: _ExecutionPlan) -> None:
+                """Render DAG node rows in *plan_tree_rows* from the current plan state."""
+                plan_tree_rows.clear()
+                with plan_tree_rows:
+                    for node in plan.nodes:
+                        # node.status is a PlanStatus (str Enum) — use directly as key.
+                        color = _NODE_STATUS_COLORS.get(node.status, _NODE_STATUS_FALLBACK_COLOR)
+                        deps = ", ".join(node.depends_on) if node.depends_on else ""
+                        with ui.row().classes("w-full items-start gap-2 py-1"):
+                            ui.icon("circle").style(
+                                f"color:{color};font-size:0.55rem;"
+                                "margin-top:5px;flex-shrink:0;"
+                            )
+                            with ui.column().classes("flex-1 gap-0"):
+                                with ui.row().classes("items-center gap-2 flex-wrap"):
+                                    ui.label(node.id).classes(
+                                        "text-xs font-mono font-semibold"
+                                    ).style("color:#e2e8f0;")
+                                    ui.label(node.status.value).classes(
+                                        "text-xs font-mono"
+                                    ).style(f"color:{color};")
+                                obj = node.objective
+                                if len(obj) > _MAX_DAG_NODE_LABEL_LEN:
+                                    obj = obj[:_MAX_DAG_NODE_LABEL_LEN] + "…"
+                                ui.label(obj).classes("text-xs").style("color:#94a3b8;")
+                                if deps:
+                                    ui.label(f"↳ {deps}").classes(
+                                        "text-xs font-mono"
+                                    ).style("color:#475569;")
+                                if node.error:
+                                    err = node.error
+                                    if len(err) > _MAX_DAG_NODE_LABEL_LEN:
+                                        err = err[:_MAX_DAG_NODE_LABEL_LEN] + "…"
+                                    ui.label(err).classes("text-xs").style(
+                                        "color:#ef4444;"
+                                    )
+
             # -- Input row ------------------------------------------------
             with ui.row().classes("w-full px-6 py-4 gap-3 items-end").style(
                 "border-top:1px solid #1e293b;flex-shrink:0;background:#0f172a;"
@@ -226,35 +361,129 @@ def index() -> None:
                     .classes("flex-1 ft-textarea")
                 )
 
+                def _re_enable() -> None:
+                    """Re-enable input + send button after plan finishes."""
+                    plan_running[0] = False
+                    text_input.enable()
+                    if send_btn_holder:
+                        send_btn_holder[0].enable()
+
                 async def _send() -> None:
                     raw = (text_input.value or "").strip()
                     if not raw:
                         return
-                    text_input.set_value("")
+                    if plan_running[0]:
+                        ui.notify(
+                            "A plan is already running — please wait.",
+                            type="warning",
+                            position="top-right",
+                        )
+                        return
 
+                    text_input.set_value("")
+                    text_input.disable()
+                    if send_btn_holder:
+                        send_btn_holder[0].disable()
+                    plan_running[0] = True
+
+                    # ── User message bubble ───────────────────────────────
                     with msg_area:
                         with ui.row().classes("w-full justify-end"):
                             ui.label(raw).classes(
                                 "ft-bubble-user px-4 py-2"
                             ).style("color:#ecfdf5;")
 
+                    # ── Bot status bubble (updated as pipeline progresses) ─
                     with msg_area:
-                        with ui.row().classes("w-full justify-start gap-2 items-start"):
+                        with ui.row().classes(
+                            "w-full justify-start gap-2 items-start"
+                        ):
                             ui.icon("smart_toy").style("color:#10b981;margin-top:2px;")
-                            ui.label(f"(echo) {raw}").classes(
-                                "ft-bubble-bot px-4 py-2"
-                            ).style("color:#cbd5e1;")
+                            status_lbl = (
+                                ui.label("Analyzing request…")
+                                .classes("ft-bubble-bot px-4 py-2")
+                                .style("color:#cbd5e1;")
+                            )
 
                     await ui.run_javascript(
                         "const el=document.querySelector('.ft-msg-area');"
                         "if(el){el.scrollTop=el.scrollHeight;}"
                     )
 
+                    if not _PIPELINE_AVAILABLE:
+                        status_lbl.set_text(
+                            "⚠ Orchestrator pipeline is not available (check server logs)."
+                        )
+                        _notify_error("Orchestrator pipeline unavailable")
+                        _re_enable()
+                        return
+
+                    # ── Intake (blocking LLM call — off the event loop) ───
+                    try:
+                        intent = await asyncio.to_thread(intake_request, raw)
+                    except (ValueError, LLMBackendError, LLMResponseError) as exc:
+                        msg = str(exc)
+                        status_lbl.set_text(f"⚠ Intake failed: {msg}")
+                        _notify_error(msg)
+                        _re_enable()
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        status_lbl.set_text(f"⚠ Unexpected error during intake: {exc}")
+                        _re_enable()
+                        return
+
+                    # ── Planner (blocking LLM call — off the event loop) ──
+                    status_lbl.set_text("Planning…")
+                    try:
+                        plan = await asyncio.to_thread(plan_task_intent, intent)
+                    except (ValueError, LLMBackendError, LLMResponseError) as exc:
+                        msg = str(exc)
+                        status_lbl.set_text(f"⚠ Planning failed: {msg}")
+                        _notify_error(msg)
+                        _re_enable()
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        status_lbl.set_text(f"⚠ Unexpected error during planning: {exc}")
+                        _re_enable()
+                        return
+
+                    # ── Persist plan + reveal progress tree ───────────────
+                    _plan_store.save(plan)
+                    active_plan_id[0] = plan.plan_id
+                    plan_tree_section.style(_TREE_STYLE_VISIBLE)
+                    _render_plan_tree(plan)
+
+                    # ── Executor (async, driven by the event loop) ────────
+                    status_lbl.set_text(f"Executing… ({len(plan.nodes)} node(s))")
+                    try:
+                        executor = Executor(_plan_store, _tool_registry)
+                        final_plan = await executor.run(plan.plan_id)
+                        _render_plan_tree(final_plan)
+                        if final_plan.status == PlanStatus.COMPLETED:
+                            status_lbl.set_text(
+                                f"✓ Done — {len(final_plan.nodes)} node(s) completed."
+                            )
+                        else:
+                            status_lbl.set_text(
+                                f"Finished with status: {final_plan.status.value}"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        status_lbl.set_text(f"⚠ Execution error: {exc}")
+                    finally:
+                        _re_enable()
+                        await ui.run_javascript(
+                            "const el=document.querySelector('.ft-msg-area');"
+                            "if(el){el.scrollTop=el.scrollHeight;}"
+                        )
+
                 msg_area.classes("ft-msg-area")
 
-                ui.button(icon="send", on_click=_send).props(
-                    "round unelevated"
-                ).style("background:#059669;color:#fff;")
+                _btn = (
+                    ui.button(icon="send", on_click=_send)
+                    .props("round unelevated")
+                    .style("background:#059669;color:#fff;")
+                )
+                send_btn_holder.append(_btn)
 
         # ================================================================== #
         # RIGHT PANEL — Claw Monitor sidebar                                 #
@@ -700,6 +929,19 @@ def index() -> None:
                         log_el.push(f"[{claw['task_id']}] {line}")
 
             ui.timer(1.0, _tick_claws)
+
+            # -- Plan progress tree polling --------------------------------
+            def _tick_plan() -> None:
+                """Poll the plan store and refresh the DAG progress tree."""
+                pid = active_plan_id[0]
+                if pid is None or _plan_store is None:
+                    return
+                plan = _plan_store.load(pid)
+                if plan is None:
+                    return
+                _render_plan_tree(plan)
+
+            ui.timer(0.75, _tick_plan)
 
     # ====================================================================== #
     # FLOATING UPLOAD PANEL                                                  #
