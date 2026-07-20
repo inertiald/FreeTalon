@@ -34,10 +34,17 @@ class TaskRecord:
 
 
 class HiveController:
-    def __init__(self, config: HiveConfig) -> None:
+    def __init__(
+        self, config: HiveConfig, host: HostCapabilities | None = None
+    ) -> None:
         self.config = config
         self.config.ensure_directories()
-        self.host: HostCapabilities = detect_host_capabilities()
+        self.host: HostCapabilities = host or detect_host_capabilities()
+        # Per ADR 0002: invalid distributed combinations (e.g. requested GPU
+        # world size exceeding available GPUs, rdma transport without RDMA
+        # hardware, or NCCL-requiring parallelism without NCCL) are caught and
+        # reported here, before any worker is spawned.
+        self.config.validate_against_host(self.host)
         self.tuning = self.config.runtime_tuning(self.host)
         self.audit = AuditLogger(self.config.audit_log_path)
 
