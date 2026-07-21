@@ -264,7 +264,7 @@ class DiscoverTopologyTests(unittest.TestCase):
 
         call_count = [0]
 
-        def _side_effect(cmd, **kwargs):  # noqa: ANN001
+        def _side_effect(_cmd, **kwargs):  # noqa: ANN001
             call_count[0] += 1
             if call_count[0] == 1:
                 return json_result
