@@ -146,8 +146,25 @@ def parse_lldp_json(raw: str) -> NetworkTopology:
                     neighbors.append(neighbor)
 
         return NetworkTopology(neighbors=tuple(neighbors))
+    except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
+        return _EMPTY_TOPOLOGY
     except Exception:  # noqa: BLE001
         return _EMPTY_TOPOLOGY
+
+
+def _extract_lldp_value(val: Any) -> str:
+    """Return the string value from a lldpctl JSON field.
+
+    lldpctl may represent a field as a plain string, as a list of
+    ``{"value": "…"}`` dicts, or as a list of plain strings.  This helper
+    normalises all three representations to a single string.
+    """
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list) and val:
+        first = val[0]
+        return first.get("value", "") if isinstance(first, dict) else str(first)
+    return ""
 
 
 def _parse_json_neighbor(local_iface: str, details: dict[str, Any]) -> Neighbor | None:
@@ -162,16 +179,8 @@ def _parse_json_neighbor(local_iface: str, details: dict[str, Any]) -> Neighbor 
             for cid, cinfo in chassis_block.items():
                 chassis_id = cid
                 if isinstance(cinfo, dict):
-                    name_val = cinfo.get("name", [])
-                    if isinstance(name_val, list) and name_val:
-                        system_name = name_val[0].get("value", "") if isinstance(name_val[0], dict) else str(name_val[0])
-                    elif isinstance(name_val, str):
-                        system_name = name_val
-                    desc_val = cinfo.get("descr", "")
-                    if isinstance(desc_val, list) and desc_val:
-                        chassis_desc = desc_val[0].get("value", "") if isinstance(desc_val[0], dict) else str(desc_val[0])
-                    elif isinstance(desc_val, str):
-                        chassis_desc = desc_val
+                    system_name = _extract_lldp_value(cinfo.get("name", ""))
+                    chassis_desc = _extract_lldp_value(cinfo.get("descr", ""))
                 break
 
         port_block = details.get("port", {})
@@ -183,11 +192,7 @@ def _parse_json_neighbor(local_iface: str, details: dict[str, Any]) -> Neighbor 
                 port_id = str(id_val.get("value", ""))
             elif isinstance(id_val, str):
                 port_id = id_val
-            desc_val = port_block.get("descr", "")
-            if isinstance(desc_val, list) and desc_val:
-                port_desc = desc_val[0].get("value", "") if isinstance(desc_val[0], dict) else str(desc_val[0])
-            elif isinstance(desc_val, str):
-                port_desc = desc_val
+            port_desc = _extract_lldp_value(port_block.get("descr", ""))
 
         link_hint = " ".join([port_desc, chassis_desc])
         return Neighbor(
@@ -197,6 +202,8 @@ def _parse_json_neighbor(local_iface: str, details: dict[str, Any]) -> Neighbor 
             remote_system_name=system_name,
             link_type=_classify_link(link_hint),
         )
+    except (KeyError, AttributeError, TypeError):
+        return None
     except Exception:  # noqa: BLE001
         return None
 
@@ -250,6 +257,8 @@ def parse_lldp_keyvalue(raw: str) -> NetworkTopology:
             )
 
         return NetworkTopology(neighbors=tuple(neighbors))
+    except (KeyError, AttributeError, ValueError, TypeError):
+        return _EMPTY_TOPOLOGY
     except Exception:  # noqa: BLE001
         return _EMPTY_TOPOLOGY
 
@@ -287,6 +296,8 @@ def discover_topology() -> NetworkTopology:
             # on a parse error when lldpctl is present but has no neighbours).
             if topology.neighbors or _looks_like_valid_json(result.stdout):
                 return topology
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
     except Exception:  # noqa: BLE001
         pass
 
@@ -300,6 +311,8 @@ def discover_topology() -> NetworkTopology:
         )
         if result.returncode == 0:
             return parse_lldp_keyvalue(result.stdout)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
     except Exception:  # noqa: BLE001
         pass
 
