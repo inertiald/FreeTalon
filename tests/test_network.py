@@ -194,8 +194,7 @@ class RenderPlanTests(unittest.TestCase):
 
     def test_render_plan_produces_non_empty_plan_id(self) -> None:
         plan = render_plan(self.clean, audit=self.audit)
-        self.assertIsInstance(plan.plan_id, str)
-        self.assertTrue(len(plan.plan_id) == 64)  # SHA-256 hex digest
+        self.assertEqual(len(plan.plan_id), 64)  # SHA-256 hex digest
 
     def test_render_plan_is_deterministic(self) -> None:
         plan1 = render_plan(self.clean, audit=self.audit)

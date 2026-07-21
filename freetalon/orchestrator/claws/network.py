@@ -90,8 +90,12 @@ _HOST_PATTERN: re.Pattern[str] = re.compile(
 )
 
 #: Allowed characters in a single config line.
+#: Semicolons are intentionally excluded: they are valid command separators on
+#: some platforms (e.g. Cisco IOS) and could be used to smuggle additional
+#: commands into a push.  Extend this pattern via a pull-request review if a
+#: specific device type legitimately requires them.
 _CONFIG_LINE_PATTERN: re.Pattern[str] = re.compile(
-    r"^[a-zA-Z0-9 _.,:@/+\-=!#$%^&*()\[\]{}|\\<>?`~;'\"]{0,512}$"
+    r"^[a-zA-Z0-9 _.,:@/+\-=!#$%^&*()\[\]{}|\\<>?`~'\"]{0,512}$"
 )
 
 
