@@ -61,7 +61,7 @@ All new dependencies (Netmiko, libvirt-python, lldpctl bindings) follow the supp
 - [ ] **Task 1.3: Netmiko Configuration Module.** Scaffold `freetalon/orchestrator/claws/network.py`. Build a utility that accepts JSON configurations and applies them to local switches using the Netmiko library.
 
 ### Phase 2: Dynamic Task Routing
-- [ ] **Task 2.1: Sub-DAG Injection.** Update `freetalon/orchestrator/executor.py`. If a task returns a `DependencyMissing` payload, the executor must call the planner to generate a sub-DAG, insert it into the `ExecutionPlan`, and resolve it before continuing.
+- [x] **Task 2.1: Sub-DAG Injection.** Update `freetalon/orchestrator/executor.py`. If a task returns a `DependencyMissing` payload, the executor must call the planner to generate a sub-DAG, insert it into the `ExecutionPlan`, and resolve it before continuing. *(Done: added `DEPENDENCY_MISSING_KEY` / `DependencyRequest` / `_is_dependency_missing` signal protocol, injectable `subdag_planner` constructor parameter, `_inject_subdag` helper that remaps ids and rewires the originating node to DRAFT, a per-node injection-count loop guard capped at `MAX_INJECTION_ATTEMPTS`, and a no-planner fallback that fails the node gracefully; all covered by new tests in `tests/test_executor.py`.)*
 - [ ] **Task 2.2: Dynamic Tool Loading.** Update the routing logic so that if a required tool script is missing, the orchestrator triggers a code-generation task to scaffold the missing Python script, loads it dynamically, and retries.
 
 ### Phase 3: Infrastructure Provisioning
