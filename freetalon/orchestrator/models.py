@@ -22,6 +22,7 @@ class PlanStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    NEEDS_TOOL = "needs_tool"  # Terminal: missing capability; draft scaffold proposed for human review
 
 
 class TaskIntent(BaseModel):

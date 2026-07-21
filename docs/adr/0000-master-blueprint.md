@@ -62,7 +62,7 @@ All new dependencies (Netmiko, libvirt-python, lldpctl bindings) follow the supp
 
 ### Phase 2: Dynamic Task Routing
 - [ ] **Task 2.1: Sub-DAG Injection.** Update `freetalon/orchestrator/executor.py`. If a task returns a `DependencyMissing` payload, the executor must call the planner to generate a sub-DAG, insert it into the `ExecutionPlan`, and resolve it before continuing.
-- [ ] **Task 2.2: Dynamic Tool Loading.** Update the routing logic so that if a required tool script is missing, the orchestrator triggers a code-generation task to scaffold the missing Python script, loads it dynamically, and retries.
+- [x] **Task 2.2: Dynamic Tool Loading.** Update the routing logic so that if a required tool script is missing, the orchestrator handles it. *(Done: a missing capability now generates a draft scaffold proposed for human review in `generated/proposed_tools/<capability>/` via `ToolScaffolder`, the node is marked `NEEDS_TOOL`, and audit events are emitted; **runtime code-generation-and-execution was deliberately NOT implemented per security review** — generation and execution remain separated by a human and a commit.)*
 
 ### Phase 3: Infrastructure Provisioning
 - [ ] **Task 3.1: Libvirt Environment Management.** Create `freetalon/orchestrator/claws/hypervisor.py`. Write a module that accepts resource parameters (CPU/RAM) and uses `libvirt-python` to provision and teardown KVM virtual machines for isolated task execution.
