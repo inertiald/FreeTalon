@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from freetalon.audit import AuditLogger
 from freetalon.orchestrator.executor import (
@@ -45,7 +46,7 @@ from freetalon.orchestrator.tool_scaffolder import (
 # ── Test helpers ──────────────────────────────────────────────────────────────
 
 
-def _run(coro):  # type: ignore[no-untyped-def]
+def _run(coro: Any) -> Any:  # noqa: ANN401
     return asyncio.run(coro)
 
 

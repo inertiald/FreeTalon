@@ -259,7 +259,7 @@ class ToolScaffolder:
         for entry in sys.path:
             try:
                 entry_resolved = Path(entry).resolve()
-            except Exception:  # noqa: BLE001
+            except (OSError, ValueError):
                 continue
             if entry_resolved == resolved or resolved.is_relative_to(entry_resolved):
                 raise AssertionError(

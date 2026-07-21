@@ -231,8 +231,9 @@ class Executor:
         """
         from .tool_scaffolder import CapabilityNameError
 
+        assert self._scaffolder is not None  # Guarded by caller (_handle_missing_capability is only called when scaffolder is set)
         try:
-            proposal = self._scaffolder.propose(capability)  # type: ignore[union-attr]
+            proposal = self._scaffolder.propose(capability)
             error_msg = (
                 f"Missing capability {capability!r}: draft scaffold proposed at "
                 f"{proposal.path!s} (hash={proposal.content_hash}).  "
