@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any, Callable,TYPE_CHECKING, TypedDict
 
 from .models import ExecutionPlan, PlanNode, PlanStatus
 from .state_store import ExecutionPlanStateStore
@@ -40,6 +40,54 @@ logger = logging.getLogger(__name__)
 
 # Sentinel used to indicate a node completed without returning a dict result.
 _NO_RESULT: dict[str, Any] = {}
+
+# ── DependencyMissing result protocol ────────────────────────────────────────
+
+#: Key whose presence in a handler result dict signals that the node cannot
+#: proceed until one or more prerequisite tasks are fulfilled.  The value must
+#: be a :class:`DependencyRequest` mapping.
+DEPENDENCY_MISSING_KEY = "dependency_missing"
+
+#: Maximum number of times a single node may trigger sub-DAG injection before
+#: the executor gives up and marks it ``FAILED``.
+MAX_INJECTION_ATTEMPTS = 3
+
+
+class _DependencyRequestRequired(TypedDict):
+    """Required fields of a :class:`DependencyRequest` payload."""
+
+    objectives: list[str]
+
+
+class DependencyRequest(_DependencyRequestRequired, total=False):
+    """Typed payload returned by a handler to signal missing prerequisites.
+
+    A handler that cannot proceed because upstream data or services are absent
+    returns::
+
+        return {
+            DEPENDENCY_MISSING_KEY: DependencyRequest(
+                objectives=["fetch dataset", "validate schema"],
+                inputs={"dataset_url": "s3://…"},
+            )
+        }
+
+    Fields
+    ------
+    objectives:
+        Human-readable descriptions of what each missing prerequisite must
+        deliver.  One :class:`~freetalon.orchestrator.models.PlanNode` will be
+        generated per objective (required).
+    inputs:
+        Optional seed inputs forwarded to every generated prerequisite node.
+    """
+
+    inputs: dict[str, Any]
+
+
+def _is_dependency_missing(result: Any) -> bool:
+    """Return ``True`` when *result* is a :data:`DEPENDENCY_MISSING_KEY` payload."""
+    return isinstance(result, dict) and DEPENDENCY_MISSING_KEY in result
 
 
 class ExecutorError(RuntimeError):
@@ -58,6 +106,13 @@ class Executor:
     max_concurrency:
         Maximum number of nodes that may be in-flight simultaneously.
         Defaults to ``8``.
+    subdag_planner:
+        Optional callable used to resolve :data:`DEPENDENCY_MISSING_KEY`
+        payloads.  It receives a :class:`DependencyRequest` and must return a
+        list of :class:`~freetalon.orchestrator.models.PlanNode` objects
+        representing the sub-DAG required to satisfy the missing prerequisites.
+        When ``None`` (default), a ``DependencyMissing`` result marks the node
+        ``FAILED`` with a descriptive error rather than injecting any sub-DAG.
     scaffolder:
         Optional :class:`~freetalon.orchestrator.tool_scaffolder.ToolScaffolder`.
         When provided, a missing capability triggers a draft scaffold proposal
@@ -75,12 +130,16 @@ class Executor:
         store: ExecutionPlanStateStore,
         registry: ToolRegistry,
         max_concurrency: int = 8,
+        subdag_planner: Callable[[DependencyRequest], list[PlanNode]] | None = None,
         scaffolder: ToolScaffolder | None = None,
         audit_logger: AuditLogger | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._subdag_planner = subdag_planner
+        # Tracks how many times each node has triggered sub-DAG injection.
+        self._injection_counts: dict[str, int] = {}
         self._scaffolder = scaffolder
         self._audit_logger = audit_logger
 
@@ -190,7 +249,60 @@ class Executor:
             try:
                 handler = self._registry.resolve(capability)
                 result = await handler(dict(target.inputs))
-                # Persist success.
+
+                # ── DependencyMissing branch ──────────────────────────────
+                if _is_dependency_missing(result):
+                    dep_request: DependencyRequest = result[DEPENDENCY_MISSING_KEY]
+
+                    if self._subdag_planner is None:
+                        self._record_failure(
+                            plan_id,
+                            node.id,
+                            "DependencyMissing returned but no subdag_planner is configured.",
+                        )
+                        logger.error(
+                            "Node %s failed: DependencyMissing with no planner.", node.id
+                        )
+                        return
+
+                    count = self._injection_counts.get(node.id, 0)
+                    if count >= MAX_INJECTION_ATTEMPTS:
+                        self._record_failure(
+                            plan_id,
+                            node.id,
+                            f"Injection loop guard: node {node.id!r} exceeded "
+                            f"the maximum of {MAX_INJECTION_ATTEMPTS} sub-DAG injections.",
+                        )
+                        logger.error(
+                            "Node %s failed: injection loop guard triggered.", node.id
+                        )
+                        return
+
+                    self._injection_counts[node.id] = count + 1
+                    try:
+                        sub_nodes = self._subdag_planner(dep_request)
+                        plan = self._load_or_raise(plan_id)
+                        plan = _inject_subdag(plan, node.id, sub_nodes)
+                        plan.touch()
+                        self._store.save(plan)
+                    except Exception as planner_exc:  # noqa: BLE001
+                        self._record_failure(
+                            plan_id,
+                            node.id,
+                            f"sub-DAG planner raised an error: {planner_exc}",
+                        )
+                        logger.exception(
+                            "Node %s failed: sub-DAG planner error.", node.id
+                        )
+                        return
+                    logger.info(
+                        "Node %s: injected %d sub-DAG node(s); node reset to DRAFT.",
+                        node.id,
+                        len(sub_nodes),
+                    )
+                    return
+
+                # ── Normal success branch ─────────────────────────────────
                 plan = self._load_or_raise(plan_id)
                 target = _find_node(plan, node.id)
                 if target is not None:
@@ -391,3 +503,90 @@ def _derive_plan_status(plan: ExecutionPlan) -> PlanStatus:
     if all(_is_terminal(s) for s in statuses):
         return PlanStatus.COMPLETED
     return PlanStatus.RUNNING
+
+
+def _inject_subdag(
+    plan: ExecutionPlan,
+    orig_node_id: str,
+    sub_nodes: list[PlanNode],
+) -> ExecutionPlan:
+    """Insert *sub_nodes* into *plan* and rewire *orig_node_id* to run after them.
+
+    Each injected node receives a fresh, non-colliding id of the form
+    ``injected-{orig_node_id}-{k}`` (with a numeric suffix if that id already
+    exists).  Internal dependency wiring among the sub-nodes is preserved.
+    The originating node is reset to ``DRAFT`` so the main run-loop reschedules
+    it once all injected prerequisites complete.
+
+    Parameters
+    ----------
+    plan:
+        The live :class:`ExecutionPlan` to mutate.
+    orig_node_id:
+        Id of the node that raised the :data:`DEPENDENCY_MISSING_KEY` signal.
+    sub_nodes:
+        Nodes returned by the sub-DAG planner (may have arbitrary internal
+        ids; those ids are remapped to avoid collisions with *plan*).
+
+    Returns
+    -------
+    ExecutionPlan
+        The same *plan* object, mutated in place (returned for convenience).
+    """
+    if not sub_nodes:
+        # Nothing to inject; reset originating node so it can be retried.
+        orig = _find_node(plan, orig_node_id)
+        if orig is not None:
+            orig.status = PlanStatus.DRAFT
+            orig.error = None
+        return plan
+
+    # 1. Build unique ids for each injected node.
+    existing_ids = {n.id for n in plan.nodes}
+    id_map: dict[str, str] = {}
+    for k, sub_node in enumerate(sub_nodes):
+        base = f"injected-{orig_node_id}-{k}"
+        candidate = base
+        suffix = 0
+        while candidate in existing_ids:
+            suffix += 1
+            candidate = f"{base}-{suffix}"
+        id_map[sub_node.id] = candidate
+        existing_ids.add(candidate)
+
+    # 2. Remap ids and internal depends_on references.
+    remapped: list[PlanNode] = []
+    for sub_node in sub_nodes:
+        new_deps = [id_map.get(d, d) for d in sub_node.depends_on]
+        remapped.append(
+            PlanNode(
+                id=id_map[sub_node.id],
+                objective=sub_node.objective,
+                depends_on=new_deps,
+                assigned_claw=sub_node.assigned_claw,
+                status=PlanStatus.DRAFT,
+                inputs=dict(sub_node.inputs),
+                outputs=list(sub_node.outputs),
+                acceptance=list(sub_node.acceptance),
+            )
+        )
+
+    # 3. Determine terminal nodes of the sub-DAG (nothing else in the sub-DAG
+    #    depends on them); the originating node must wait for all of them.
+    all_sub_deps = {d for n in remapped for d in n.depends_on}
+    terminal_ids = [n.id for n in remapped if n.id not in all_sub_deps]
+
+    # 4. Append injected nodes to the plan.
+    plan.nodes.extend(remapped)
+
+    # 5. Rewire the originating node: add terminals as new prerequisites and
+    #    reset it to DRAFT so the scheduler picks it up after they complete.
+    orig = _find_node(plan, orig_node_id)
+    if orig is not None:
+        for tid in terminal_ids:
+            if tid not in orig.depends_on:
+                orig.depends_on.append(tid)
+        orig.status = PlanStatus.DRAFT
+        orig.error = None
+
+    return plan
