@@ -6,6 +6,12 @@ schedules nodes whose dependencies are satisfied, dispatches them to
 :class:`~freetalon.orchestrator.tool_registry.ToolRegistry` handlers, and
 persists status updates back to the store.
 
+When a required capability is missing and a :class:`~freetalon.orchestrator.tool_scaffolder.ToolScaffolder`
+is injected, the executor emits a draft scaffold for human review (ADR 0000 Task 2.2)
+and marks the node ``NEEDS_TOOL``.  The generated file is **never** imported,
+registered, or executed — generation and execution are separated by a human and a
+commit.
+
 Typical usage::
 
     registry = ToolRegistry()
@@ -20,11 +26,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable, TypedDict
+from typing import Any, Callable,TYPE_CHECKING, TypedDict
 
 from .models import ExecutionPlan, PlanNode, PlanStatus
 from .state_store import ExecutionPlanStateStore
 from .tool_registry import ToolRegistry, UnknownCapabilityError
+
+if TYPE_CHECKING:
+    from freetalon.audit import AuditLogger
+    from .tool_scaffolder import ToolScaffolder
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +113,16 @@ class Executor:
         representing the sub-DAG required to satisfy the missing prerequisites.
         When ``None`` (default), a ``DependencyMissing`` result marks the node
         ``FAILED`` with a descriptive error rather than injecting any sub-DAG.
+    scaffolder:
+        Optional :class:`~freetalon.orchestrator.tool_scaffolder.ToolScaffolder`.
+        When provided, a missing capability triggers a draft scaffold proposal
+        (written to disk for human review) and the node is set to ``NEEDS_TOOL``
+        instead of ``FAILED``.  When ``None`` (default), the existing ``FAILED``
+        behaviour is preserved unchanged.
+    audit_logger:
+        Optional :class:`~freetalon.audit.AuditLogger`.  When provided,
+        scaffold events (``tool.scaffold.proposed``, ``tool.scaffold.rejected``,
+        node ``needs_tool`` transitions) are written to the audit log.
     """
 
     def __init__(
@@ -111,6 +131,8 @@ class Executor:
         registry: ToolRegistry,
         max_concurrency: int = 8,
         subdag_planner: Callable[[DependencyRequest], list[PlanNode]] | None = None,
+        scaffolder: ToolScaffolder | None = None,
+        audit_logger: AuditLogger | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -118,6 +140,8 @@ class Executor:
         self._subdag_planner = subdag_planner
         # Tracks how many times each node has triggered sub-DAG injection.
         self._injection_counts: dict[str, int] = {}
+        self._scaffolder = scaffolder
+        self._audit_logger = audit_logger
 
     # ── Public interface ──────────────────────────────────────────────────
 
@@ -292,11 +316,93 @@ class Executor:
                     self._store.save(plan)
                 logger.info("Node %s completed.", node.id)
             except UnknownCapabilityError as exc:
-                self._record_failure(plan_id, node.id, str(exc))
-                logger.error("Node %s failed: unknown capability %r.", node.id, capability)
+                if self._scaffolder is not None:
+                    self._handle_missing_capability(plan_id, node.id, capability, exc)
+                else:
+                    self._record_failure(plan_id, node.id, str(exc))
+                    logger.error(
+                        "Node %s failed: unknown capability %r.", node.id, capability
+                    )
             except Exception as exc:  # noqa: BLE001
                 self._record_failure(plan_id, node.id, str(exc))
                 logger.exception("Node %s failed with exception.", node.id)
+
+    def _handle_missing_capability(
+        self,
+        plan_id: str,
+        node_id: str,
+        capability: str,
+        exc: UnknownCapabilityError,
+    ) -> None:
+        """Invoke the scaffolder for a missing capability and set node to NEEDS_TOOL.
+
+        The scaffolder writes a draft stub to the quarantine directory for
+        human review.  The executor NEVER imports, registers, or executes the
+        generated file.  Resolving the capability always goes through the
+        ``ToolRegistry`` allowlist.
+        """
+        from .tool_scaffolder import CapabilityNameError
+
+        assert self._scaffolder is not None  # Guarded by caller (_handle_missing_capability is only called when scaffolder is set)
+        try:
+            proposal = self._scaffolder.propose(capability)
+            error_msg = (
+                f"Missing capability {capability!r}: draft scaffold proposed at "
+                f"{proposal.path!s} (hash={proposal.content_hash}).  "
+                "Review, implement, and register it before re-running this plan."
+            )
+            if self._audit_logger is not None:
+                self._audit_logger.log(
+                    "tool.scaffold.proposed",
+                    capability=capability,
+                    path=str(proposal.path),
+                    content_hash=proposal.content_hash,
+                    node_id=node_id,
+                    plan_id=plan_id,
+                )
+            logger.warning(
+                "Node %s: capability %r missing — draft scaffold written to %s.",
+                node_id,
+                capability,
+                proposal.path,
+            )
+        except CapabilityNameError as val_exc:
+            error_msg = (
+                f"Missing capability {capability!r} and scaffold rejected: {val_exc}"
+            )
+            if self._audit_logger is not None:
+                self._audit_logger.log(
+                    "tool.scaffold.rejected",
+                    capability=capability,
+                    reason=str(val_exc),
+                    node_id=node_id,
+                    plan_id=plan_id,
+                )
+            logger.error(
+                "Node %s: capability %r scaffold rejected: %s", node_id, capability, val_exc
+            )
+
+        # Record NEEDS_TOOL — a non-runnable terminal state for this run.
+        try:
+            plan = self._load_or_raise(plan_id)
+            node = _find_node(plan, node_id)
+            if node is not None:
+                node.status = PlanStatus.NEEDS_TOOL
+                node.error = error_msg
+                plan.touch()
+                self._store.save(plan)
+            if self._audit_logger is not None:
+                self._audit_logger.log(
+                    "node.needs_tool",
+                    node_id=node_id,
+                    plan_id=plan_id,
+                    capability=capability,
+                    error=error_msg,
+                )
+        except ExecutorError:
+            logger.error(
+                "Could not record NEEDS_TOOL for node %s — plan gone.", node_id
+            )
 
     def _record_failure(self, plan_id: str, node_id: str, error: str) -> None:
         """Persist a FAILED status and error message for *node_id*."""
@@ -328,6 +434,7 @@ def _is_terminal(status: PlanStatus) -> bool:
         PlanStatus.COMPLETED,
         PlanStatus.FAILED,
         PlanStatus.CANCELLED,
+        PlanStatus.NEEDS_TOOL,
     }
 
 
@@ -348,7 +455,8 @@ def _collect_runnable(plan: ExecutionPlan) -> list[PlanNode]:
     """Return nodes that are ready to be dispatched.
 
     A node is runnable when its status is ``DRAFT`` or ``READY`` **and** all
-    of its declared ``depends_on`` nodes are ``COMPLETED``.
+    of its declared ``depends_on`` nodes are ``COMPLETED``.  Nodes in
+    ``NEEDS_TOOL`` are never re-dispatched (they are terminal for this run).
     """
     node_map = plan.node_map()
     return [
@@ -375,6 +483,10 @@ def _derive_plan_status(plan: ExecutionPlan) -> PlanStatus:
     Rules:
     - Any node ``FAILED`` → plan ``FAILED``
     - Any node ``CANCELLED`` → plan ``CANCELLED``
+    - Any node ``NEEDS_TOOL`` (and no ``FAILED``) → plan ``FAILED``
+      (surface as ``FAILED`` so callers know the plan did not complete; the
+      individual node's ``NEEDS_TOOL`` status plus its ``error`` field carry
+      the scaffold-proposal details).
     - All nodes ``COMPLETED`` → plan ``COMPLETED``
     - Otherwise → ``RUNNING`` (still in progress)
     """
@@ -383,6 +495,11 @@ def _derive_plan_status(plan: ExecutionPlan) -> PlanStatus:
         return PlanStatus.FAILED
     if PlanStatus.CANCELLED in statuses:
         return PlanStatus.CANCELLED
+    if PlanStatus.NEEDS_TOOL in statuses:
+        # At least one node needs a missing tool; surface plan as FAILED so
+        # callers know the plan did not complete successfully.  Individual
+        # NEEDS_TOOL nodes retain their status for inspection.
+        return PlanStatus.FAILED
     if all(_is_terminal(s) for s in statuses):
         return PlanStatus.COMPLETED
     return PlanStatus.RUNNING
