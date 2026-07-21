@@ -462,7 +462,7 @@ class TestSubDagInjectionExecutor(unittest.TestCase):
         registry.register("main-cap", flaky_handler)
         registry.register("prereq-cap", prereq_handler)
 
-        def fake_planner(dep_req):
+        def fake_planner(dependency_request):
             return [
                 PlanNode(
                     id="generated-prereq",
@@ -522,7 +522,7 @@ class TestSubDagInjectionExecutor(unittest.TestCase):
         registry.register("cap-a", step_a)
         registry.register("cap-b", step_b)
 
-        def fake_planner(dep_req):
+        def fake_planner(dependency_request):
             node_a = PlanNode(id="sub-a", objective="step A", assigned_claw="cap-a")
             node_b = PlanNode(
                 id="sub-b",
@@ -594,7 +594,7 @@ class TestSubDagInjectionExecutor(unittest.TestCase):
         registry.register("always-cap", always_missing)
         registry.register("dummy-cap", dummy_prereq)
 
-        def fake_planner(dep_req):
+        def fake_planner(dependency_request):
             return [
                 PlanNode(
                     id="prereq",

@@ -43,7 +43,13 @@ DEPENDENCY_MISSING_KEY = "dependency_missing"
 MAX_INJECTION_ATTEMPTS = 3
 
 
-class DependencyRequest(TypedDict, total=False):
+class _DependencyRequestRequired(TypedDict):
+    """Required fields of a :class:`DependencyRequest` payload."""
+
+    objectives: list[str]
+
+
+class DependencyRequest(_DependencyRequestRequired, total=False):
     """Typed payload returned by a handler to signal missing prerequisites.
 
     A handler that cannot proceed because upstream data or services are absent
@@ -66,7 +72,6 @@ class DependencyRequest(TypedDict, total=False):
         Optional seed inputs forwarded to every generated prerequisite node.
     """
 
-    objectives: list[str]
     inputs: dict[str, Any]
 
 
