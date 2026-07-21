@@ -9,6 +9,7 @@ from pathlib import Path
 
 from freetalon.orchestrator.executor import (
     DEPENDENCY_MISSING_KEY,
+    MAX_INJECTION_ATTEMPTS,
     Executor,
     ExecutorError,
     _all_dependencies_met,
@@ -605,8 +606,6 @@ class TestSubDagInjectionExecutor(unittest.TestCase):
         node = PlanNode(id="looper", objective="loops forever", assigned_claw="always-cap")
         plan = _make_plan("loop-plan", [node])
         self.store.save(plan)
-
-        from freetalon.orchestrator.executor import MAX_INJECTION_ATTEMPTS
 
         executor = Executor(
             store=self.store,

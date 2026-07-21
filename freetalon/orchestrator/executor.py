@@ -250,11 +250,22 @@ class Executor:
                         return
 
                     self._injection_counts[node.id] = count + 1
-                    sub_nodes = self._subdag_planner(dep_request)
-                    plan = self._load_or_raise(plan_id)
-                    plan = _inject_subdag(plan, node.id, sub_nodes)
-                    plan.touch()
-                    self._store.save(plan)
+                    try:
+                        sub_nodes = self._subdag_planner(dep_request)
+                        plan = self._load_or_raise(plan_id)
+                        plan = _inject_subdag(plan, node.id, sub_nodes)
+                        plan.touch()
+                        self._store.save(plan)
+                    except Exception as planner_exc:  # noqa: BLE001
+                        self._record_failure(
+                            plan_id,
+                            node.id,
+                            f"sub-DAG planner raised an error: {planner_exc}",
+                        )
+                        logger.exception(
+                            "Node %s failed: sub-DAG planner error.", node.id
+                        )
+                        return
                     logger.info(
                         "Node %s: injected %d sub-DAG node(s); node reset to DRAFT.",
                         node.id,
