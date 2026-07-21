@@ -110,7 +110,7 @@ class TestToolScaffolder(unittest.TestCase):
         self.assertIn("NotImplementedError", content)
 
     def test_custom_codegen_backend_used_for_content(self) -> None:
-        def stubbed_backend(capability: str, inputs: dict) -> str:
+        def stubbed_backend(capability: str, _inputs: dict[str, Any]) -> str:
             return f"# stub for {capability}\n"
 
         scaffolder = self._scaffolder(backend=stubbed_backend)
