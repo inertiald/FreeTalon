@@ -57,7 +57,7 @@ All new dependencies (Netmiko, libvirt-python, lldpctl bindings) follow the supp
 
 ### Phase 1: Installation & Network Discovery
 - [x] **Task 1.1: Multi-Node Installer.** Update `installer.py`. Add a CLI prompt to select "Primary Orchestrator" or "Worker Node". *(Done: added `--node-role {orchestrator,worker}` flag with interactive prompt fallback; the selected role is persisted to `.env` as `FREETALON_NODE_ROLE`.)*
-- [ ] **Task 1.2: Network Topology Mapping.** Create `freetalon/mesh/recon.py`. Write a subprocess wrapper for `lldpctl` to parse local network topology (DAC/Ethernet connections) into a JSON model.
+- [x] **Task 1.2: Network Topology Mapping.** Create `freetalon/mesh/recon.py`. Write a subprocess wrapper for `lldpctl` to parse local network topology (DAC/Ethernet connections) into a JSON model. *(Done: added `freetalon/mesh/` package with `Neighbor` and `NetworkTopology` frozen dataclasses, `parse_lldp_json` / `parse_lldp_keyvalue` parsers, and a `discover_topology()` entry-point that uses `shutil.which`, a 3-second timeout, and never raises — falling back to an empty topology on any failure.)*
 - [ ] **Task 1.3: Netmiko Configuration Module.** Scaffold `freetalon/orchestrator/claws/network.py`. Build a utility that accepts JSON configurations and applies them to local switches using the Netmiko library.
 
 ### Phase 2: Dynamic Task Routing
