@@ -63,7 +63,13 @@ _DOMAIN_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{
 
 @dataclass(slots=True, frozen=True)
 class DomainPlan:
-    """Immutable dry-run description of the libvirt domain to be defined."""
+    """Immutable dry-run description of the libvirt domain to be defined.
+
+    ``disk_gib`` remains optional because callers may request a VM that boots
+    directly from an approved base image without asking FreeTalon to size a
+    separate overlay volume; when supplied, it has already passed the bounded
+    GiB validation in :func:`sanitize_domain_request`.
+    """
 
     name: str
     vcpus: int
@@ -142,6 +148,7 @@ def _coerce_bounded_int(
 
     raw_value = payload[key]
     if isinstance(raw_value, bool):
+        # Resource knobs are explicit numeric capacities, not truthy flags.
         raise ValueError(f"{key} must be an integer")
     try:
         value = int(raw_value)
@@ -265,7 +272,8 @@ def _build_domain_xml(clean_request: dict[str, Any]) -> str:
 
     ET.SubElement(domain, "name").text = clean_request["name"]
     # libvirt separates maximum memory from current allocation; for these
-    # fixed-size task VMs both values start equal at definition time.
+    # fixed-size task VMs both values start equal at definition time and this
+    # module does not attempt memory ballooning or dynamic resize behavior.
     ET.SubElement(domain, "memory", {"unit": "MiB"}).text = maximum_memory_mib
     ET.SubElement(domain, "currentMemory", {"unit": "MiB"}).text = maximum_memory_mib
     ET.SubElement(domain, "vcpu", {"placement": "static"}).text = domain_vcpus

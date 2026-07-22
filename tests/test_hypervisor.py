@@ -87,7 +87,7 @@ class SanitizeDomainRequestTests(unittest.TestCase):
         self.assertNotIn("ignored", clean)
 
     def test_rejects_unsafe_name(self) -> None:
-        for bad_name in ("../../evil", "vm;shutdown", "bad/name", "bad name"):
+        for bad_name in ("../../evil", "vm;shutdown", "bad/name", "bad name", "a" * 64):
             with self.subTest(bad_name=bad_name):
                 with self.assertRaises(ValueError):
                     sanitize_domain_request(_make_valid_payload(name=bad_name))
@@ -162,12 +162,16 @@ class RenderDomainPlanTests(unittest.TestCase):
         self.audit_path.unlink(missing_ok=True)
 
     def test_render_plan_is_well_formed_without_libvirt(self) -> None:
-        sys.modules.pop("libvirt", None)
-        plan = render_domain_plan(self.clean, audit=self.audit)
-        self.assertIsInstance(plan, DomainPlan)
-        self.assertNotIn("libvirt", sys.modules)
+        libvirt_mod = sys.modules.pop("libvirt", None)
+        try:
+            plan = render_domain_plan(self.clean, audit=self.audit)
+            self.assertIsInstance(plan, DomainPlan)
+            self.assertNotIn("libvirt", sys.modules)
 
-        root = ET.fromstring(plan.domain_xml)
+            root = ET.fromstring(plan.domain_xml)
+        finally:
+            if libvirt_mod is not None:
+                sys.modules["libvirt"] = libvirt_mod
         self.assertEqual(root.tag, "domain")
         self.assertEqual(root.attrib["type"], "kvm")
         self.assertEqual(root.findtext("name"), "worker-vm-01")
