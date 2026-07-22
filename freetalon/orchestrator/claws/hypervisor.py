@@ -261,14 +261,13 @@ def validate_against_host(
 def _build_domain_xml(clean_request: dict[str, Any]) -> str:
     domain = ET.Element("domain", {"type": "kvm"})
     maximum_memory_mib = str(clean_request["memory_mib"])
-    current_memory_mib = maximum_memory_mib
     domain_vcpus = str(clean_request["vcpus"])
 
     ET.SubElement(domain, "name").text = clean_request["name"]
-    # libvirt distinguishes the domain's maximum memory from its current
-    # allocation, even when both start at the same value for a fixed-size VM.
+    # libvirt separates maximum memory from current allocation; for these
+    # fixed-size task VMs both values start equal at definition time.
     ET.SubElement(domain, "memory", {"unit": "MiB"}).text = maximum_memory_mib
-    ET.SubElement(domain, "currentMemory", {"unit": "MiB"}).text = current_memory_mib
+    ET.SubElement(domain, "currentMemory", {"unit": "MiB"}).text = maximum_memory_mib
     ET.SubElement(domain, "vcpu", {"placement": "static"}).text = domain_vcpus
 
     os_element = ET.SubElement(domain, "os")

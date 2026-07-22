@@ -171,7 +171,10 @@ class RenderDomainPlanTests(unittest.TestCase):
         self.assertEqual(root.tag, "domain")
         self.assertEqual(root.attrib["type"], "kvm")
         self.assertEqual(root.findtext("name"), "worker-vm-01")
-        self.assertEqual(root.findtext("memory"), str(self.clean["memory_mib"]))
+        memory = root.find("memory")
+        self.assertIsNotNone(memory)
+        self.assertEqual(memory.attrib["unit"], "MiB")
+        self.assertEqual(memory.text, str(self.clean["memory_mib"]))
         self.assertEqual(root.findtext("vcpu"), str(self.clean["vcpus"]))
         self.assertEqual(
             root.find("./devices/disk/source").attrib["file"],
