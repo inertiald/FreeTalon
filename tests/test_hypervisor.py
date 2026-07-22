@@ -168,8 +168,8 @@ class RenderDomainPlanTests(unittest.TestCase):
         self.assertEqual(root.tag, "domain")
         self.assertEqual(root.attrib["type"], "kvm")
         self.assertEqual(root.findtext("name"), "worker-vm-01")
-        self.assertEqual(root.findtext("memory"), "8192")
-        self.assertEqual(root.findtext("vcpu"), "4")
+        self.assertEqual(root.findtext("memory"), str(self.clean["memory_mib"]))
+        self.assertEqual(root.findtext("vcpu"), str(self.clean["vcpus"]))
         self.assertEqual(
             root.find("./devices/disk/source").attrib["file"],
             ALLOWED_BASE_IMAGES["debian-12"],

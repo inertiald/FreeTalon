@@ -260,16 +260,13 @@ def validate_against_host(
 
 def _build_domain_xml(clean_request: dict[str, Any]) -> str:
     domain = ET.Element("domain", {"type": "kvm"})
+    memory_mib = str(clean_request["memory_mib"])
+    domain_vcpus = str(clean_request["vcpus"])
+
     ET.SubElement(domain, "name").text = clean_request["name"]
-    ET.SubElement(domain, "memory", {"unit": "MiB"}).text = str(
-        clean_request["memory_mib"]
-    )
-    ET.SubElement(domain, "currentMemory", {"unit": "MiB"}).text = str(
-        clean_request["memory_mib"]
-    )
-    ET.SubElement(domain, "vcpu", {"placement": "static"}).text = str(
-        clean_request["vcpus"]
-    )
+    ET.SubElement(domain, "memory", {"unit": "MiB"}).text = memory_mib
+    ET.SubElement(domain, "currentMemory", {"unit": "MiB"}).text = memory_mib
+    ET.SubElement(domain, "vcpu", {"placement": "static"}).text = domain_vcpus
 
     os_element = ET.SubElement(domain, "os")
     ET.SubElement(os_element, "type", {"arch": "x86_64"}).text = "hvm"
