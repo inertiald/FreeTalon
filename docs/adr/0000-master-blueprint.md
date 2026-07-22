@@ -67,7 +67,7 @@ All new dependencies (Netmiko, libvirt-python, lldpctl bindings) follow the supp
 - [x] **Task 2.2: Dynamic Tool Loading.** Update the routing logic so that if a required tool script is missing, the orchestrator handles it. *(Done: a missing capability now generates a draft scaffold proposed for human review in `generated/proposed_tools/<capability>/` via `ToolScaffolder`, the node is marked `NEEDS_TOOL`, and audit events are emitted; **runtime code-generation-and-execution was deliberately NOT implemented per security review** — generation and execution remain separated by a human and a commit.)*
 
 ### Phase 3: Infrastructure Provisioning
-- [ ] **Task 3.1: Libvirt Environment Management.** Create `freetalon/orchestrator/claws/hypervisor.py`. Write a module that accepts resource parameters (CPU/RAM) and uses `libvirt-python` to provision and teardown KVM virtual machines for isolated task execution.
+- [x] **Task 3.1: Libvirt Environment Management.** Create `freetalon/orchestrator/claws/hypervisor.py`. Write a module that accepts resource parameters (CPU/RAM) and uses `libvirt-python` to provision and teardown KVM virtual machines for isolated task execution. *(Done: added whitelist sanitization for domain requests, host-capacity CPU/RAM cross-checks, dry-run domain-XML rendering, and deferred `libvirt-python` execution paths that stay blocked until the dependency is vendored and SHA256-pinned per the approved baseline.)*
 
 ### Phase 4: UI & Pipeline Validation
 - [ ] **Task 4.1: DAG Visualization.** Update `dashboard.py`. Enhance the NiceGUI interface to render deeply nested DAG structures to monitor complex pipeline executions.
