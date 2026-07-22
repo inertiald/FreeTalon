@@ -325,10 +325,11 @@ def index() -> None:
                 """Render DAG node rows in *plan_tree_rows* from the current plan state."""
                 plan_tree_rows.clear()
                 dag_levels = compute_dag_levels(plan)
+                node_order = {node.id: index for index, node in enumerate(plan.nodes)}
                 with plan_tree_rows:
-                    for _, node in sorted(
-                        enumerate(plan.nodes),
-                        key=lambda item: (dag_levels.get(item[1].id, 0), item[0]),
+                    for node in sorted(
+                        plan.nodes,
+                        key=lambda item: (dag_levels.get(item.id, 0), node_order.get(item.id, 0)),
                     ):
                         # node.status is a PlanStatus (str Enum) — use directly as key.
                         color = _NODE_STATUS_COLORS.get(node.status, _NODE_STATUS_FALLBACK_COLOR)
@@ -361,7 +362,7 @@ def index() -> None:
                                     ui.label(node.status.value).classes(
                                         "text-xs font-mono"
                                     ).style(f"color:{color};")
-                                obj = node.objective or "—"
+                                obj = node.objective or ""
                                 if len(obj) > _MAX_DAG_NODE_LABEL_LEN:
                                     obj = obj[:_MAX_DAG_NODE_LABEL_LEN] + "…"
                                 ui.label(obj).classes("text-xs").style("color:#94a3b8;")
