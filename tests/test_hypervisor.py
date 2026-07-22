@@ -8,6 +8,7 @@ loading for libvirt-python.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -48,9 +49,11 @@ def _make_valid_payload(**overrides: object) -> dict[str, object]:
 
 
 def _temp_audit() -> tuple[AuditLogger, Path]:
-    tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
-    tmp.close()
-    path = Path(tmp.name)
+    fd, raw_path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+    path = Path(raw_path)
+    path.unlink(missing_ok=True)
+    path.touch()
     return AuditLogger(path=path), path
 
 

@@ -53,7 +53,7 @@ ALLOWED_BASE_IMAGES: dict[str, str] = {
 LIBVIRT_UNAVAILABLE_MESSAGE = (
     "libvirt-python is not installed. Per the supply-chain policy in "
     "docs/approved-dependency-baseline.md, libvirt-python must be vendored "
-    "(a point-in-time release copied into the project's trusted dependency "
+    "(a point-in-time release copy in the project's trusted dependency "
     "store, pinned with SHA256 hashes, and added to the approved baseline) "
     "before it can be used. Do not install it from PyPI at runtime."
 )
@@ -94,7 +94,7 @@ class DomainPlan:
         )
 
     def as_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable representation of the rendered plan."""
+        """Return a JSON-serializable representation of the rendered plan."""
         return {
             "name": self.name,
             "vcpus": self.vcpus,
@@ -260,12 +260,15 @@ def validate_against_host(
 
 def _build_domain_xml(clean_request: dict[str, Any]) -> str:
     domain = ET.Element("domain", {"type": "kvm"})
-    memory_mib = str(clean_request["memory_mib"])
+    maximum_memory_mib = str(clean_request["memory_mib"])
+    current_memory_mib = maximum_memory_mib
     domain_vcpus = str(clean_request["vcpus"])
 
     ET.SubElement(domain, "name").text = clean_request["name"]
-    ET.SubElement(domain, "memory", {"unit": "MiB"}).text = memory_mib
-    ET.SubElement(domain, "currentMemory", {"unit": "MiB"}).text = memory_mib
+    # libvirt distinguishes the domain's maximum memory from its current
+    # allocation, even when both start at the same value for a fixed-size VM.
+    ET.SubElement(domain, "memory", {"unit": "MiB"}).text = maximum_memory_mib
+    ET.SubElement(domain, "currentMemory", {"unit": "MiB"}).text = current_memory_mib
     ET.SubElement(domain, "vcpu", {"placement": "static"}).text = domain_vcpus
 
     os_element = ET.SubElement(domain, "os")
