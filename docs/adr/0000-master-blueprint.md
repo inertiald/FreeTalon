@@ -70,5 +70,5 @@ All new dependencies (Netmiko, libvirt-python, lldpctl bindings) follow the supp
 - [ ] **Task 3.1: Libvirt Environment Management.** Create `freetalon/orchestrator/claws/hypervisor.py`. Write a module that accepts resource parameters (CPU/RAM) and uses `libvirt-python` to provision and teardown KVM virtual machines for isolated task execution.
 
 ### Phase 4: UI & Pipeline Validation
-- [ ] **Task 4.1: DAG Visualization.** Update `dashboard.py`. Enhance the NiceGUI interface to render deeply nested DAG structures to monitor complex pipeline executions.
+- [x] **Task 4.1: DAG Visualization.** Update `dashboard.py`. Enhance the NiceGUI interface to render deeply nested DAG structures to monitor complex pipeline executions. *(Done: DAG Progress now derives per-node depth from dependency edges and renders nested, clamped indentation with preserved status/objective/dependency/error details for deeply nested execution plans.)*
 - [ ] **Task 4.2: E2E Pipeline Test.** Build an integration test for a "Data Aggregation, Simulation, and Model-Development Pipeline". The test should prompt for mock API keys, generate a plan that aggregates external data (e.g. weather and financial feeds), runs a localized trading simulation to produce a dataset, feeds that dataset into a test/train stage, and outputs the resulting model artifact and evaluation results.
