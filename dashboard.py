@@ -77,6 +77,7 @@ try:
         PlanStatus,
         ToolRegistry,
     )
+    from freetalon.orchestrator.dag import compute_dag_levels
     from freetalon.orchestrator.intake import (
         LLMBackendError,
         LLMResponseError,
@@ -184,11 +185,15 @@ def _notify_error(msg: str) -> None:
 
 # DAG progress tree section styles (shared base + visibility toggle).
 _TREE_STYLE_BASE = (
-    "flex-shrink:0;max-height:14rem;overflow-y:auto;"
+    "flex-shrink:0;max-height:14rem;overflow-x:auto;overflow-y:auto;"
     "border-top:1px solid #1e293b;"
 )
 _TREE_STYLE_HIDDEN = _TREE_STYLE_BASE + "display:none;"
 _TREE_STYLE_VISIBLE = _TREE_STYLE_BASE + "display:block;"
+_MAX_DAG_INDENT_DEPTH = 8
+_DAG_INDENT_PX = 20
+_DAG_CONNECTOR_COLOR = "#334155"
+_DAG_CONNECTOR_WIDTH_REM = 1.8
 
 # ---------------------------------------------------------------------------
 # Inline CSS injected once into every page
@@ -312,17 +317,38 @@ def index() -> None:
                     ui.label("DAG Progress").classes("text-xs font-mono").style(
                         "color:#94a3b8;"
                     )
-                plan_tree_rows = ui.column().classes("w-full gap-1 pb-1")
+                plan_tree_rows = ui.column().classes("w-full gap-1 pb-1").style(
+                    "min-width:max-content;"
+                )
 
             def _render_plan_tree(plan: _ExecutionPlan) -> None:
                 """Render DAG node rows in *plan_tree_rows* from the current plan state."""
                 plan_tree_rows.clear()
+                dag_levels = compute_dag_levels(plan)
                 with plan_tree_rows:
-                    for node in plan.nodes:
+                    for _, node in sorted(
+                        enumerate(plan.nodes),
+                        key=lambda item: (dag_levels.get(item[1].id, 0), item[0]),
+                    ):
                         # node.status is a PlanStatus (str Enum) — use directly as key.
                         color = _NODE_STATUS_COLORS.get(node.status, _NODE_STATUS_FALLBACK_COLOR)
                         deps = ", ".join(node.depends_on) if node.depends_on else ""
-                        with ui.row().classes("w-full items-start gap-2 py-1"):
+                        depth = dag_levels.get(node.id, 0)
+                        indent_depth = min(depth, _MAX_DAG_INDENT_DEPTH)
+                        indent_px = indent_depth * _DAG_INDENT_PX
+                        connector = ""
+                        if depth > 0:
+                            connector = "└─"
+                            if depth > _MAX_DAG_INDENT_DEPTH:
+                                connector = "⋯ " + connector
+                        with ui.row().classes("w-full items-start gap-2 py-1").style(
+                            f"padding-left:{indent_px}px;min-width:max-content;"
+                        ):
+                            if depth > 0:
+                                ui.label(connector).classes("text-xs font-mono").style(
+                                    f"color:{_DAG_CONNECTOR_COLOR};"
+                                    f"width:{_DAG_CONNECTOR_WIDTH_REM}rem;flex-shrink:0;"
+                                )
                             ui.icon("circle").style(
                                 f"color:{color};font-size:0.55rem;"
                                 "margin-top:5px;flex-shrink:0;"
@@ -335,7 +361,7 @@ def index() -> None:
                                     ui.label(node.status.value).classes(
                                         "text-xs font-mono"
                                     ).style(f"color:{color};")
-                                obj = node.objective
+                                obj = node.objective or "—"
                                 if len(obj) > _MAX_DAG_NODE_LABEL_LEN:
                                     obj = obj[:_MAX_DAG_NODE_LABEL_LEN] + "…"
                                 ui.label(obj).classes("text-xs").style("color:#94a3b8;")
