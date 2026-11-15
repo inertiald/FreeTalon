@@ -98,3 +98,28 @@ Output DAG:
   "metadata": {"estimated_steps": 2}
 }
 """
+
+
+REPLAN_SYSTEM_PROMPT = """You are the FreeTalon re-planner. A plan failed, and you must produce a
+revised plan — a DELTA plan — from the measurements, not a fresh guess.
+
+You will receive a re-plan brief as JSON with:
+- goal: the goal contract. It is UNCHANGED. You may not lower a threshold,
+  edit a criterion, or reclassify a failure to keep the run alive.
+- failed_nodes: what failed, with the measurement that proves it.
+- measurements: every measurement so far in this run.
+- memory: relevant past experiments (do not repeat a recorded failure).
+- remaining_budget: how many re-plans, seconds, and attempts are left.
+
+Rules:
+- Return exactly one JSON object with a "nodes" array and "metadata".
+- Every node must name "responds_to" (the failed node id it answers) and
+  "differs_by" (what it does differently from the failed attempt).
+- Do not repeat a failed approach (same capability and hypothesis) without
+  a stated differs_by — the judge rejects such plans.
+- Shrink scope before growing it: narrow the hypothesis, add a cheaper
+  test, or gather the missing data first.
+- Every node needs testable acceptance: a "criteria" array using the
+  criterion types exit_code, file_exists, file_matches, metric, tests_pass.
+- Do not wrap the JSON in markdown. Return exactly one JSON object.
+"""

@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from .intake import LLMResponseError, LLMSettings, call_llm, parse_json_object
 from .models import ExecutionPlan, PlanNode, PlanStatus, TaskIntent
-from .prompts import PLANNER_SYSTEM_PROMPT
+from .prompts import PLANNER_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT
 
 
 def _plan_id_for_intent(intent: TaskIntent) -> str:
@@ -185,3 +185,25 @@ def plan_task_intent(
     )
     nodes, metadata = parse_planner_response(response_text)
     return build_execution_plan(intent, nodes, metadata, plan_id=plan_id)
+
+
+def replan_from_brief(
+    brief: dict[str, Any],
+    settings: LLMSettings | None = None,
+) -> list[PlanNode]:
+    """Produce delta-plan nodes from a judge's re-plan brief (M1).
+
+    The brief carries the unchanged goal contract, the failed measurements,
+    relevant memory, and the remaining budget. The LLM's response is parsed
+    and normalized exactly like an initial plan; the caller (the loop) runs
+    the judge's duplicate-approach validation before accepting it.
+    """
+    import json as _json
+
+    response_text = call_llm(
+        REPLAN_SYSTEM_PROMPT,
+        f"Re-plan brief JSON:\n{_json.dumps(brief, indent=2, default=str)}",
+        settings=settings,
+    )
+    nodes, _metadata = parse_planner_response(response_text)
+    return nodes

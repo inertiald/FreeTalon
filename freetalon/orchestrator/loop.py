@@ -2,9 +2,10 @@
 
 M0: one pass — build the plan, execute it with measurement (via the
 executor), record everything in the run directory, and evaluate the goal
-contract. M1 extends this with the judge and re-plan loop; the runner then
-iterates until the goal is met, the budget is spent, or a gate/escalation
-stops it.
+contract. M1: the judge loop — after each executor pass the judge decides
+CONTINUE / RETRY / REPLAN / ESCALATE from the measurements; re-plans are
+delta plans from a structured brief, numbered and kept in the run
+directory; the run ends honestly when the budget is spent.
 """
 
 from __future__ import annotations
@@ -14,9 +15,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .executor import Executor
+from .judge import Decision, Judge
 from .measure import VERDICT_FAIL, VERDICT_PASS, VERDICT_UNMEASURABLE, _compare
 from .models import (
     ExecutionPlan,
@@ -25,13 +27,16 @@ from .models import (
     PlanStatus,
     TaskIntent,
 )
-from .planner import build_execution_plan
+from .planner import build_execution_plan, replan_from_brief
 from .run_store import RunStore, new_run_id
 from .state_store import ExecutionPlanStateStore
 from .tool_registry import ToolRegistry
 
 if True:  # TYPE_CHECKING-friendly import for audit logger
     from freetalon.audit import AuditLogger
+
+# A re-plan function takes a brief dict and returns delta-plan nodes.
+ReplanFn = Callable[[dict[str, Any]], list[PlanNode]]
 
 
 @dataclass
@@ -47,10 +52,13 @@ class RunResult:
     elapsed_s: float = 0.0
     summary_path: str = ""
     plan_versions: int = 1
+    attempts: list[dict[str, Any]] = field(default_factory=list)
+    escalation: str | None = None
+    decision_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 class LoopRunner:
-    """Drives a goal contract through plan → run → measure → (M1: judge)."""
+    """Drives a goal contract through plan → run → measure → judge."""
 
     def __init__(
         self,
@@ -72,12 +80,18 @@ class LoopRunner:
     # ── Public entry points ──────────────────────────────────────────────
 
     def run_plan(
-        self, plan: ExecutionPlan, contract: GoalContract, *, run_id: str | None = None
+        self,
+        plan: ExecutionPlan,
+        contract: GoalContract,
+        *,
+        run_id: str | None = None,
+        replan_fn: ReplanFn | None = None,
     ) -> RunResult:
-        """Execute an already-built plan under a goal contract, measured."""
+        """Execute a plan under a goal contract, with judge + re-plan (M1)."""
         run_id = run_id or new_run_id()
         started = time.monotonic()
         started_at = datetime.now(UTC).isoformat()
+        judge = Judge(contract.budget)
 
         if len(plan.nodes) > contract.budget.max_nodes:
             raise ValueError(
@@ -86,32 +100,133 @@ class LoopRunner:
             )
 
         self._run_store.create_run(run_id, contract.model_dump(mode="json"))
-        self._run_store.write_plan_version(run_id, 1, plan)
         self._log("loop.run.started", run_id=run_id, plan_id=plan.plan_id)
 
-        executor = Executor(
-            self._store,
-            self._registry,
-            max_concurrency=self._max_concurrency,
-            run_store=self._run_store,
-            run_id=run_id,
-            custom_checkers=self._custom_checkers,
-            audit_logger=self._audit_logger,
-        )
-        plan = asyncio.run(executor.run(plan.plan_id))
+        version = 1
+        attempts: list[dict[str, Any]] = []
+        decision_history: list[dict[str, Any]] = []
+        escalation: str | None = None
+
+        while True:
+            self._run_store.write_plan_version(run_id, version, plan)
+            self._log(
+                "loop.plan.version",
+                run_id=run_id,
+                plan_id=plan.plan_id,
+                version=version,
+            )
+            before = {n.id: n.status for n in plan.nodes}
+            executor = Executor(
+                self._store,
+                self._registry,
+                max_concurrency=self._max_concurrency,
+                run_store=self._run_store,
+                run_id=run_id,
+                custom_checkers=self._custom_checkers,
+                audit_logger=self._audit_logger,
+                plan_version=version,
+            )
+            plan = asyncio.run(executor.run(plan.plan_id))
+            ran = [
+                n
+                for n in plan.nodes
+                if before.get(n.id) != n.status
+                and n.status in (PlanStatus.COMPLETED, PlanStatus.FAILED)
+            ]
+            judge.record_pass(ran)
+            all_measurements = self._run_store.read_measurements(run_id)
+            version_measurements = [
+                m for m in all_measurements if m.get("plan_version", 1) == version
+            ]
+            progressed = judge.progress.observe(version_measurements)
+            attempts.append(
+                {
+                    "version": version,
+                    "status": plan.status.value,
+                    "failed": [n.id for n in plan.nodes if n.status == PlanStatus.FAILED],
+                    "verdicts": {
+                        m.get("node_id"): m.get("verdict") for m in version_measurements
+                    },
+                }
+            )
+
+            if plan.status == PlanStatus.COMPLETED:
+                decision_history.append(
+                    {"version": version, "decision": "continue", "reason": "all nodes succeeded"}
+                )
+                break
+
+            decision = judge.decide(plan, version_measurements)
+            decision_history.append(
+                {
+                    "version": version,
+                    "decision": decision.decision.value,
+                    "reason": decision.reason,
+                }
+            )
+            self._log(
+                "loop.judge.decision",
+                run_id=run_id,
+                version=version,
+                decision=decision.decision.value,
+                reason=decision.reason,
+            )
+
+            if decision.decision == Decision.RETRY:
+                self._reset_nodes(plan, decision.retry_node_ids)
+                continue
+
+            if decision.decision == Decision.REPLAN:
+                judge.replans_used += 1
+                judge.progress.note_replan(progressed)
+                brief = judge.build_replan_brief(
+                    contract, plan, version_measurements, memory=[], plan_version=version
+                )
+                replan = replan_fn or (lambda b: replan_from_brief(b))
+                try:
+                    new_nodes = replan(brief)
+                except Exception as exc:  # noqa: BLE001 - re-planner failure escalates
+                    escalation = f"re-planner failed: {exc}"
+                    break
+                rejection = judge.validate_delta_plan(brief, new_nodes)
+                if rejection is not None:
+                    escalation = f"delta plan rejected: {rejection}"
+                    break
+                version += 1
+                plan = build_execution_plan(
+                    plan.intent, new_nodes, plan_id=plan.plan_id
+                )
+                self._store.save(plan)
+                continue
+
+            # ESCALATE (or any other terminal decision): end honestly.
+            escalation = decision.reason
+            break
 
         measurements = self._run_store.read_measurements(run_id)
-        # Fall back to the measurements recorded on the nodes themselves
-        # (e.g. when the executor ran without a run store).
         if not measurements:
             measurements = [n.measurement for n in plan.nodes if n.measurement]
 
         elapsed_s = time.monotonic() - started
-        goal_verdict, goal_detail = self._evaluate_goal(contract, plan, measurements, elapsed_s)
-        summary_path = str(self._write_summary(
-            run_id, plan, contract, measurements, goal_verdict, goal_detail,
-            started_at, elapsed_s, plan_versions=1,
-        ))
+        goal_verdict, goal_detail = self._evaluate_goal(
+            contract, plan, measurements, elapsed_s, escalation
+        )
+        summary_path = str(
+            self._write_summary(
+                run_id,
+                plan,
+                contract,
+                measurements,
+                goal_verdict,
+                goal_detail,
+                started_at,
+                elapsed_s,
+                plan_versions=version,
+                attempts=attempts,
+                decision_history=decision_history,
+                escalation=escalation,
+            )
+        )
         self._log(
             "loop.run.finished",
             run_id=run_id,
@@ -128,7 +243,10 @@ class LoopRunner:
             goal_detail=goal_detail,
             elapsed_s=elapsed_s,
             summary_path=summary_path,
-            plan_versions=1,
+            plan_versions=version,
+            attempts=attempts,
+            escalation=escalation,
+            decision_history=decision_history,
         )
 
     def run_goal(
@@ -139,6 +257,7 @@ class LoopRunner:
         *,
         run_id: str | None = None,
         plan_id: str | None = None,
+        replan_fn: ReplanFn | None = None,
     ) -> RunResult:
         """Build a plan for a goal (from explicit nodes) and run it.
 
@@ -151,7 +270,19 @@ class LoopRunner:
             )
         plan = build_execution_plan(intent, nodes, plan_id=plan_id)
         self._store.save(plan)
-        return self.run_plan(plan, contract, run_id=run_id)
+        return self.run_plan(plan, contract, run_id=run_id, replan_fn=replan_fn)
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+
+    def _reset_nodes(self, plan: ExecutionPlan, node_ids: list[str]) -> None:
+        """Return nodes to READY for a retry, unchanged (M1)."""
+        for node in plan.nodes:
+            if node.id in node_ids:
+                node.status = PlanStatus.READY
+                node.error = None
+                node.measurement = {}
+        plan.touch()
+        self._store.save(plan)
 
     # ── Goal evaluation ──────────────────────────────────────────────────
 
@@ -161,6 +292,7 @@ class LoopRunner:
         plan: ExecutionPlan,
         measurements: list[dict[str, Any]],
         elapsed_s: float,
+        escalation: str | None,
     ) -> tuple[str, str]:
         """Evaluate the contract's success measures against run measurements.
 
@@ -173,6 +305,8 @@ class LoopRunner:
                 f"wall-clock budget exceeded: {elapsed_s:.1f}s > "
                 f"{contract.budget.max_wall_clock_s}s"
             )
+        if escalation is not None:
+            return VERDICT_FAIL, f"escalated: {escalation}"
         if plan.status == PlanStatus.FAILED:
             failed = [n.id for n in plan.nodes if n.status == PlanStatus.FAILED]
             return VERDICT_FAIL, f"plan failed; failed nodes: {failed}"
@@ -219,6 +353,9 @@ class LoopRunner:
         elapsed_s: float,
         *,
         plan_versions: int,
+        attempts: list[dict[str, Any]],
+        decision_history: list[dict[str, Any]],
+        escalation: str | None,
     ) -> Path:
         lines = [
             f"# Run {run_id}",
@@ -231,9 +368,23 @@ class LoopRunner:
             f"{plan_versions} version(s))",
             f"- Goal verdict: **{goal_verdict}** — {goal_detail}",
             "",
-            "## Nodes",
+            "## Attempts",
             "",
         ]
+        for attempt in attempts:
+            lines.append(
+                f"- v{attempt['version']}: {attempt['status']} "
+                f"(failed: {attempt['failed'] or 'none'}, "
+                f"verdicts: {attempt['verdicts']})"
+            )
+        lines += ["", "## Judge decisions", ""]
+        for entry in decision_history:
+            lines.append(
+                f"- v{entry['version']}: {entry['decision']} — {entry['reason']}"
+            )
+        if escalation:
+            lines += ["", f"Escalation: {escalation}", ""]
+        lines += ["", "## Nodes (final version)", ""]
         by_id = {m.get("node_id"): m for m in measurements}
         for node in plan.nodes:
             measurement = by_id.get(node.id, node.measurement or {})
@@ -250,7 +401,8 @@ class LoopRunner:
         lines += ["", "## Measurements", ""]
         for measurement in measurements:
             lines.append(
-                f"- `{measurement.get('node_id')}`: {measurement.get('verdict')} "
+                f"- `{measurement.get('node_id')}` (v{measurement.get('plan_version', 1)}): "
+                f"{measurement.get('verdict')} "
                 f"(exit {measurement.get('exit_code')}, "
                 f"{measurement.get('duration_s')}s)"
             )

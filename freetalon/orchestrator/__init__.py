@@ -1,6 +1,7 @@
 """FreeTalon orchestrator sub-package."""
 
 from .executor import Executor, ExecutorError
+from .judge import Decision, Judge, JudgeDecision
 from .loop import LoopRunner, RunResult
 from .measure import (
     VERDICT_FAIL,
@@ -24,10 +25,13 @@ from .state_store import ExecutionPlanStateStore
 from .tool_registry import ToolRegistry, UnknownCapabilityError
 
 __all__ = [
+    "Decision",
     "Executor",
     "ExecutorError",
     "ExecutionPlan",
     "ExecutionPlanStateStore",
+    "Judge",
+    "JudgeDecision",
     "GoalContract",
     "LoopRunner",
     "PlanNode",

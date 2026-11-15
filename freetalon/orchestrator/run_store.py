@@ -52,8 +52,13 @@ class RunStore:
     def run_dir(self, run_id: str) -> Path:
         return self.base_dir / run_id
 
-    def node_dir(self, run_id: str, node_id: str) -> Path:
-        return self.run_dir(run_id) / "nodes" / node_id
+    def node_dir(self, run_id: str, node_id: str, version: int = 1) -> Path:
+        """Node working directory. Version 1 keeps the M0 layout
+        (nodes/<node-id>/); later plan versions nest under
+        nodes/v002/<node-id>/ so attempts never overwrite each other."""
+        if version <= 1:
+            return self.run_dir(run_id) / "nodes" / node_id
+        return self.run_dir(run_id) / "nodes" / f"v{version:03d}" / node_id
 
     # ── Run lifecycle ────────────────────────────────────────────────────
 
@@ -89,9 +94,10 @@ class RunStore:
         stdout: str = "",
         stderr: str = "",
         artifacts: list[dict[str, Any]] | None = None,
+        version: int = 1,
     ) -> dict[str, str]:
         """Write a node's stdout/stderr to its directory. Returns paths."""
-        node_dir = self.node_dir(run_id, node_id)
+        node_dir = self.node_dir(run_id, node_id, version)
         node_dir.mkdir(parents=True, exist_ok=True)
         out_path = node_dir / "stdout.txt"
         err_path = node_dir / "stderr.txt"

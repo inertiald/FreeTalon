@@ -27,6 +27,11 @@ from freetalon.orchestrator.state_store import ExecutionPlanStateStore
 from freetalon.orchestrator.tool_registry import ToolRegistry, register_default_claws
 
 
+def _no_replanner(brief):
+    """Re-plan function for M0 tests: re-planning is out of scope here."""
+    raise RuntimeError("re-planner disabled in this test")
+
+
 def _make_runner(tmpdir: str):
     store = ExecutionPlanStateStore(db_path=Path(tmpdir) / "state.db")
     registry = ToolRegistry(strict=True)
@@ -60,7 +65,7 @@ class TestLoopRunnerM0(unittest.TestCase):
             )
             plan = _plan("plan-fail", [node])
             store.save(plan)
-            result = runner.run_plan(plan, _contract())
+            result = runner.run_plan(plan, _contract(), replan_fn=_no_replanner)
             finished = result.plan.nodes[0]
             self.assertEqual(finished.status, PlanStatus.FAILED)
             self.assertEqual(finished.measurement["verdict"], "FAIL")
@@ -116,7 +121,7 @@ class TestLoopRunnerM0(unittest.TestCase):
             ]
             plan = _plan("plan-dep", nodes)
             store.save(plan)
-            result = runner.run_plan(plan, _contract())
+            result = runner.run_plan(plan, _contract(), replan_fn=_no_replanner)
             self.assertEqual(result.plan.status, PlanStatus.FAILED)
             self.assertEqual(result.plan.nodes[1].status, PlanStatus.DRAFT)
 

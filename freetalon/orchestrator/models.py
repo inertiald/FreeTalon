@@ -163,6 +163,14 @@ class PlanNode(BaseModel):
         default="",
         description="What this node tests; recorded in experiment memory",
     )
+    responds_to: str = Field(
+        default="",
+        description="Failed node id this node answers (delta plans, M1)",
+    )
+    differs_by: str = Field(
+        default="",
+        description="What this node does differently from the failed attempt (M1)",
+    )
     measurement: dict[str, Any] = Field(
         default_factory=dict,
         description="Last measurement record (verdict + per-criterion results)",

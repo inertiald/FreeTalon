@@ -58,6 +58,7 @@ class Executor:
         run_store: "RunStore | None" = None,
         run_id: str | None = None,
         custom_checkers: dict | None = None,
+        plan_version: int = 1,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -71,6 +72,7 @@ class Executor:
         self._run_store = run_store
         self._run_id = run_id
         self._custom_checkers = custom_checkers
+        self._plan_version = plan_version
 
     async def run(self, plan_id: str) -> ExecutionPlan:
         plan = self._store.load(plan_id)
@@ -336,7 +338,9 @@ class Executor:
     def _node_workdir(self, node_id: str) -> Path:
         """Working directory for a node: its run directory, else the cwd."""
         if self._run_store is not None and self._run_id is not None:
-            node_dir = self._run_store.node_dir(self._run_id, node_id)
+            node_dir = self._run_store.node_dir(
+                self._run_id, node_id, self._plan_version
+            )
             node_dir.mkdir(parents=True, exist_ok=True)
             return node_dir
         return Path.cwd()
@@ -350,12 +354,16 @@ class Executor:
         node.measurement = measurement
         node.exit_code = envelope.get("exit_code")
         node.duration_s = envelope.get("duration_s")
+        # Stamp the plan version on the measurement so attempt history
+        # stays attributable across re-plans.
+        measurement["plan_version"] = self._plan_version
         if self._run_store is not None and self._run_id is not None:
             paths = self._run_store.write_node_output(
                 self._run_id,
                 node.id,
                 stdout=envelope.get("stdout", ""),
                 stderr=envelope.get("stderr", ""),
+                version=self._plan_version,
             )
             envelope["stdout_path"] = paths["stdout_path"]
             envelope["stderr_path"] = paths["stderr_path"]
