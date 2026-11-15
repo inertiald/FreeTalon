@@ -153,3 +153,41 @@ is the standup update — no separate meeting notes.
 - Approvals: approve in the dashboard, or in chat with Muse?
 - The two Copilot branches (section 5): merge, rework, or drop?
 - Switch model, when known.
+
+## 9. Design document alignment (2026-11-14)
+
+The full loop design is "FreeTalon Autonomous Loop Design" (12-page PDF,
+home-lab goal docs, 2026-11-14). This plan is its execution schedule.
+Alignment notes, read from the finished document:
+
+- Milestones M0-M4 map to the design's five phases: 1 Run and measure,
+  2 Judge and re-plan, 3 Experiment memory, 4 Research tools,
+  5 Approval gates. M5 (verticals) and M6 (fleet) sit on top of those.
+- Phase 1 also includes the small fixes: input sanitizer (still rejects
+  ordinary text like "don't") and a decision on the vLLM path's fate.
+- Measurement contract: verdicts are PASS / FAIL / UNMEASURABLE, from
+  deterministic evaluators (exit_code, file_exists, file_matches, metric,
+  tests_pass, custom_check). A node is SUCCEEDED only when execution
+  completed AND measurement passed - the false-success bug becomes
+  structurally impossible. The judge may not lower a threshold or edit a
+  criterion to keep a run alive; changing the contract is a human act.
+- Runs live under freetalon-workspace/runs/<run-id>/ with contract.json,
+  numbered plan.json versions, per-node stdout/stderr/artifacts,
+  measurements.jsonl, memory.jsonl, gates/, summary.md.
+- Gate packets carry the exact action, evidence, risks and undoability;
+  approvals are per-action, expiring, and bound to the packet hash - a
+  modified packet invalidates the approval. Denial is recorded data, and
+  the loop never re-asks the same gate in the same run.
+- Fleet boundary (design doc): no compute connection until the loop
+  passes its done tests on one node; fleet work returns after Phase 2.
+  This plan's M6 says the same thing (after M0-M2).
+
+Decisions for Pat before Phase 1 (from the design doc, defaults assumed
+until Pat says otherwise):
+
+- Default budgets: conservative caps for time, attempts, re-plans per run.
+- Gate delivery: gate packets in the FreeTalon interface (assumed).
+- Data sources: which market/data providers and research sources are
+  in bounds for Phase 4.
+- Risk limits: default loss/drawdown language for finance contracts.
+- Memory retention: keep everything indefinitely on seeker7 (assumed).

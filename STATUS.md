@@ -46,3 +46,12 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
 2. Triage the two Copilot branches (merge / rework / drop).
 3. Read the finished loop design doc, align PLAN.md milestones with it.
 4. M0: run-and-measure loop (executor judges exit codes + acceptance).
+
+## Update - 2026-11-14 16:24
+
+- Loop design doc finished, read, and aligned into PLAN.md (section 9):
+  five phases, measurement contract (PASS/FAIL/UNMEASURABLE, SUCCEEDED
+  only when execution completed AND measurement passed), run-directory
+  layout, gate packets bound to packet hash, five decisions for Pat
+  before Phase 1.
+- GitHub still not connected - branch push + CI still blocked on Pat.
