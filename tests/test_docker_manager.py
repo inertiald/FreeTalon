@@ -235,8 +235,13 @@ class HardwareRdmaNcclTests(unittest.TestCase):
 
     def test_detect_rdma_false_when_tools_absent(self) -> None:
         from freetalon.hardware import _detect_rdma
+        # _detect_rdma also probes the kernel-module list via /proc/modules
+        # (see _rxe_module_loaded), which neither shutil.which nor
+        # subprocess.run covers. GitHub-hosted runners load ib_core, so the
+        # module probe must be mocked too for this test to be hermetic.
         with patch("shutil.which", return_value=None), \
-             patch("subprocess.run", return_value=MagicMock(stdout="")):
+             patch("subprocess.run", return_value=MagicMock(stdout="")), \
+             patch("freetalon.hardware._rxe_module_loaded", return_value=False):
             result = _detect_rdma()
         self.assertFalse(result)
 

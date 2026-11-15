@@ -76,3 +76,13 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   workflow only triggers on main pushes and PRs, so it never ran here
   either. Once tests.yml lands (via a git push from seeker7), pushes to
   dev/* will run the suite.
+
+## Update - 2026-11-14 19:53
+
+- CI ran for the first time on the branch (Tests #1): 228/229 passed,
+  1 failure — test_detect_rdma_false_when_tools_absent. Root cause: the
+  test mocked the tool probes but not the kernel-module probe
+  (_rxe_module_loaded reads /proc/modules directly), and the GitHub
+  runner loads ib_core, so detection returned True. Fix: mock the
+  module probe in the test too (tests/test_docker_manager.py).
+  Pushed as a new commit; waiting on the re-run.
