@@ -145,8 +145,12 @@ class TestPlanner(unittest.TestCase):
             """
             {
               "nodes": [
-                {"id": "deploy", "objective": "Deploy service", "depends_on": ["build"]},
-                {"id": "build", "objective": "Build image", "depends_on": []}
+                {"id": "deploy", "objective": "Deploy service", "depends_on": ["build"],
+                 "assigned_claw": "bash", "inputs": {"command": "docker run app"},
+                 "criteria": [{"type": "exit_code", "equals": 0}]},
+                {"id": "build", "objective": "Build image", "depends_on": [],
+                 "assigned_claw": "bash", "inputs": {"command": "docker build -t app ."},
+                 "criteria": [{"type": "exit_code", "equals": 0}]}
               ],
               "metadata": {"strategy": "serial"}
             }
@@ -176,8 +180,12 @@ class TestPlanner(unittest.TestCase):
         response = """
         {
           "nodes": [
-            {"id": "verify", "objective": "Verify inputs", "depends_on": []},
-            {"id": "execute", "objective": "Execute rollout", "depends_on": ["verify"]}
+            {"id": "verify", "objective": "Verify inputs", "depends_on": [],
+             "assigned_claw": "bash", "inputs": {"command": "ls inputs"},
+             "criteria": [{"type": "exit_code", "equals": 0}]},
+            {"id": "execute", "objective": "Execute rollout", "depends_on": ["verify"],
+             "assigned_claw": "bash", "inputs": {"command": "deploy.sh"},
+             "criteria": [{"type": "exit_code", "equals": 0}]}
           ],
           "metadata": {"planner": "llm"}
         }
@@ -193,3 +201,180 @@ class TestPlanner(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPlannerHardening(unittest.TestCase):
+    """Planner hardening: claw allowlist, criteria, repair retry."""
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(goal="Write and verify a script", project_type="script")
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _scaffold_node(self, **overrides: object) -> dict:
+        node: dict = {
+            "id": "step_1",
+            "objective": "Write the script",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": "/home/seeker/freetalon-workspace/fib.py",
+                "content": "print(1)\n",
+            },
+            "outputs": ["/home/seeker/freetalon-workspace/fib.py"],
+            "criteria": [
+                {
+                    "type": "file_exists",
+                    "path": "/home/seeker/freetalon-workspace/fib.py",
+                }
+            ],
+        }
+        node.update(overrides)
+        return node
+
+    def test_parse_rejects_unknown_claw(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "unknown claw"):
+            parse_planner_response(
+                self._dag([self._scaffold_node(assigned_claw="script")])
+            )
+
+    def test_parse_rejects_node_without_criteria(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "no 'criteria'"):
+            parse_planner_response(self._dag([self._scaffold_node(criteria=[])]))
+
+    def test_parse_rejects_criterion_with_foreign_path(self) -> None:
+        node = self._scaffold_node(
+            criteria=[{"type": "file_exists", "path": "/tmp/other.py"}]
+        )
+        with self.assertRaisesRegex(LLMResponseError, "not a file this node"):
+            parse_planner_response(self._dag([node]))
+
+    def test_parse_accepts_criterion_path_inside_bash_command(self) -> None:
+        nodes, _ = parse_planner_response(
+            self._dag(
+                [
+                    {
+                        "id": "run",
+                        "objective": "Run the script",
+                        "depends_on": [],
+                        "assigned_claw": "bash",
+                        "inputs": {
+                            "command": "python3 /home/seeker/freetalon-workspace/fib.py"
+                        },
+                        "criteria": [
+                            {
+                                "type": "file_exists",
+                                "path": "/home/seeker/freetalon-workspace/fib.py",
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+        self.assertEqual(nodes[0].assigned_claw, "bash")
+
+    def test_parse_rejects_bad_metric_criterion(self) -> None:
+        node = self._scaffold_node(
+            criteria=[{"type": "metric", "name": "r2", "op": ">=", "value": "high"}]
+        )
+        with self.assertRaisesRegex(LLMResponseError, "numeric 'value'"):
+            parse_planner_response(self._dag([node]))
+
+    def test_parse_rejects_unknown_criterion_type(self) -> None:
+        node = self._scaffold_node(criteria=[{"type": "vibes", "value": 1}])
+        with self.assertRaisesRegex(LLMResponseError, "unknown criterion type"):
+            parse_planner_response(self._dag([node]))
+
+    def test_plan_repairs_unknown_claw_then_succeeds(self) -> None:
+        bad = self._dag([self._scaffold_node(assigned_claw="script")])
+        good = self._dag([self._scaffold_node()])
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(plan.nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(call_mock.call_count, 2)
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("unknown claw", repair_prompt)
+
+    def test_plan_gives_up_after_repair_budget(self) -> None:
+        bad = self._dag([self._scaffold_node(assigned_claw="script")])
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=bad
+        ) as call_mock:
+            with self.assertRaisesRegex(LLMResponseError, "unknown claw"):
+                plan_task_intent(self.intent, settings=self.settings)
+        # Initial attempt + 2 repair retries, then the last error is raised.
+        self.assertEqual(call_mock.call_count, 3)
+
+    def test_replan_repairs_echoed_brief_then_succeeds(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        echo = '{"goal": {"objective": "x"}, "failed_nodes": [], "instruction": "fix it"}'
+        good = self._dag(
+            [
+                self._scaffold_node(
+                    responds_to="node-1",
+                    differs_by="use the registered scaffold claw",
+                )
+            ]
+        )
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[echo, good]
+        ) as call_mock:
+            nodes = replan_from_brief({"goal": {}, "failed_nodes": []})
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(call_mock.call_count, 2)
+
+    def test_replan_raises_after_exhausted_repairs(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        echo = '{"goal": {"objective": "x"}, "failed_nodes": []}'
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=echo
+        ) as call_mock:
+            with self.assertRaisesRegex(LLMResponseError, "'nodes' array"):
+                replan_from_brief({"goal": {}, "failed_nodes": []})
+        self.assertEqual(call_mock.call_count, 3)
+
+    def test_prompts_state_allowlist_criteria_and_anti_echo(self) -> None:
+        from freetalon.orchestrator.prompts import (
+            PLANNER_SYSTEM_PROMPT,
+            REPLAN_SYSTEM_PROMPT,
+        )
+
+        self.assertIn('There is no "script" claw', PLANNER_SYSTEM_PROMPT)
+        self.assertIn("MEASURABLE CRITERIA", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("COVER EVERY STEP", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("echo the brief", REPLAN_SYSTEM_PROMPT)
+        self.assertIn("Never invent a claw name", REPLAN_SYSTEM_PROMPT)
+
+    def test_known_claw_allowlist_matches_registered_claws(self) -> None:
+        from freetalon.orchestrator.ecu import register_ecu_claws
+        from freetalon.orchestrator.finance import register_finance_claws
+        from freetalon.orchestrator.research import register_research_claws
+        from freetalon.orchestrator.sandbox import register_sandbox_claws
+        from freetalon.orchestrator.tool_registry import (
+            KNOWN_CLAW_NAMES,
+            ToolRegistry,
+            register_default_claws,
+        )
+
+        self.assertNotIn("script", KNOWN_CLAW_NAMES)
+        self.assertIn("scaffold", KNOWN_CLAW_NAMES)
+        self.assertIn("bash", KNOWN_CLAW_NAMES)
+        registry = ToolRegistry(strict=True)
+        register_default_claws(registry)
+        register_research_claws(registry)
+        register_sandbox_claws(registry)
+        register_finance_claws(registry)
+        register_ecu_claws(registry)
+        self.assertEqual(set(registry.capabilities()), set(KNOWN_CLAW_NAMES))

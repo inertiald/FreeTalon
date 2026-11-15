@@ -80,6 +80,50 @@ def _make_docker_handler(
     return _docker_handler
 
 
+# Canonical claw allowlist (planner hardening): every assigned_claw an
+# LLM plan may use, including aliases. The planner rejects any other name
+# so an invented claw ("script", "write_file", ...) fails at plan time,
+# where the repair retry can fix it, instead of at execution time.
+# Keep in sync with the register_* functions:
+#   scaffold/file_writer, bash/shell_exec, llm_synthesis/summarize:
+#       _register_default_claws below
+#   research/web_search, fetch_dataset/data_fetch:
+#       research.register_research_claws
+#   sandbox_analyze: sandbox.register_sandbox_claws
+#   backtest/train_model/paper_trade/invest/engage_kill_switch:
+#       finance.register_finance_claws
+#   can_capture/verify_backup/tune_surface/flash_ecu: ecu.register_ecu_claws
+KNOWN_CLAW_NAMES: frozenset[str] = frozenset(
+    {
+        "scaffold",
+        "file_writer",
+        "bash",
+        "shell_exec",
+        "llm_synthesis",
+        "summarize",
+        "research",
+        "web_search",
+        "fetch_dataset",
+        "data_fetch",
+        "sandbox_analyze",
+        "backtest",
+        "train_model",
+        "paper_trade",
+        "invest",
+        "engage_kill_switch",
+        "can_capture",
+        "verify_backup",
+        "tune_surface",
+        "flash_ecu",
+    }
+)
+
+
+def is_known_claw(name: str) -> bool:
+    """True if ``name`` is a registered claw the planner may assign."""
+    return name in KNOWN_CLAW_NAMES
+
+
 class ToolRegistry:
     def __init__(self, *, strict: bool = True, scaffolder: Any | None = None) -> None:
         self._strict = strict
@@ -205,7 +249,13 @@ class ToolRegistry:
 
             summary = await asyncio.to_thread(call_llm, system_prompt, user_prompt)
             print(f"\n--- SYNTHESIS RESULT ---\n{summary}\n------------------------\n")
-            return {"status": "success", "summary": summary}
+            # Report a measurable metric: a plan can assert summary_chars >= 1
+            # to prove text was produced (content quality stays the LLM's job).
+            return {
+                "status": "success",
+                "summary": summary,
+                "metrics": {"summary_chars": len(summary)},
+            }
 
     def resolve(self, capability: str, node_inputs: dict[str, Any] | None = None) -> AsyncHandler:
         """Return the handler for capability, scaffolding dynamically if missing."""
