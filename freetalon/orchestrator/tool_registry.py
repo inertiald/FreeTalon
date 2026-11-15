@@ -137,6 +137,10 @@ class ToolRegistry:
                 raise ValueError("scaffold claw requires 'file_path' or 'path' in inputs.")
 
             target_path = Path(path_str).expanduser()
+            workdir = inputs.get("workdir")
+            if workdir and not target_path.is_absolute():
+                # Loop (M0): relative paths resolve under the node's run dir.
+                target_path = Path(workdir) / target_path
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(content, encoding="utf-8")
 
@@ -149,12 +153,37 @@ class ToolRegistry:
             if not cmd:
                 raise ValueError("bash claw requires a 'command' input string.")
 
+            # Loop (M0): hard timeout with process-group kill, and an
+            # optional workdir (the node's run directory). The process runs
+            # in its own session so a timeout kills the whole group, not
+            # just the shell.
+            timeout = float(inputs.get("timeout_s", 300))
+            workdir = inputs.get("workdir")
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                cwd=workdir or None,
+                start_new_session=True,
             )
-            stdout, stderr = await proc.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                _kill_process_group(proc)
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=5
+                    )
+                except Exception:  # noqa: BLE001 - best effort drain
+                    stdout, stderr = b"", b""
+                return {
+                    "exit_code": None,
+                    "status": "timeout",
+                    "stdout": stdout.decode("utf-8", errors="replace"),
+                    "stderr": stderr.decode("utf-8", errors="replace"),
+                }
             return {
                 "exit_code": proc.returncode,
                 "stdout": stdout.decode("utf-8", errors="replace"),
@@ -210,6 +239,20 @@ class ToolRegistry:
     def __repr__(self) -> str:  # pragma: no cover
         caps = ", ".join(self.capabilities())
         return f"ToolRegistry(capabilities=[{caps}])"
+
+
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Kill a subprocess's whole process group (best effort)."""
+    import os
+    import signal
+
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
 
 
 def register_default_claws(registry: ToolRegistry) -> None:

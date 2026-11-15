@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING, TypedDict
 
+from .measure import (
+    VERDICT_PASS,
+    build_envelope,
+    measure_node,
+    measurement_failed_detail,
+)
 from .models import ExecutionPlan, PlanNode, PlanStatus
 from .state_store import ExecutionPlanStateStore
 from .tool_registry import ToolRegistry, UnknownCapabilityError
 
 if TYPE_CHECKING:
     from freetalon.audit import AuditLogger
+    from .run_store import RunStore
     from .tool_scaffolder import ToolScaffolder
 
 logger = logging.getLogger(__name__)
@@ -46,6 +55,9 @@ class Executor:
         subdag_planner: Callable[[DependencyRequest], list[PlanNode]] | None = None,
         scaffolder: ToolScaffolder | None = None,
         audit_logger: AuditLogger | None = None,
+        run_store: "RunStore | None" = None,
+        run_id: str | None = None,
+        custom_checkers: dict | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -54,6 +66,11 @@ class Executor:
         self._injection_counts: dict[str, int] = {}
         self._scaffolder = scaffolder
         self._audit_logger = audit_logger
+        # Loop (M0): when a run store is attached, node outputs and
+        # measurements are recorded in the run directory.
+        self._run_store = run_store
+        self._run_id = run_id
+        self._custom_checkers = custom_checkers
 
     async def run(self, plan_id: str) -> ExecutionPlan:
         plan = self._store.load(plan_id)
@@ -114,6 +131,7 @@ class Executor:
 
             capability = target.assigned_claw or node.id
             logger.debug("Dispatching node %s (capability=%r).", node.id, capability)
+            started = time.monotonic()
 
             try:
                 handler = self._registry.resolve(capability)
@@ -125,8 +143,30 @@ class Executor:
                     if n.status == PlanStatus.COMPLETED
                 }
                 resolved_inputs = _resolve_input_variables(dict(target.inputs), completed_results)
+                # Loop (M0): handlers run in the node's run directory when a
+                # run store is attached, with the node's hard timeout.
+                workdir = self._node_workdir(node.id)
+                resolved_inputs.setdefault("workdir", str(workdir))
+                resolved_inputs.setdefault("timeout_s", target.timeout_s)
 
-                result = await handler(resolved_inputs)
+                try:
+                    result = await asyncio.wait_for(
+                        handler(resolved_inputs), timeout=target.timeout_s
+                    )
+                except asyncio.TimeoutError:
+                    duration_s = time.monotonic() - started
+                    envelope = build_envelope(
+                        node.id, None, duration_s=duration_s, status="timeout"
+                    )
+                    measurement = self._measure_and_record(target, envelope)
+                    self._record_failure(
+                        plan_id,
+                        node.id,
+                        f"Node timed out after {target.timeout_s}s.",
+                        measurement,
+                    )
+                    return
+                duration_s = time.monotonic() - started
 
                 if _is_dependency_missing(result):
                     dep_request: DependencyRequest = result[DEPENDENCY_MISSING_KEY]
@@ -164,23 +204,68 @@ class Executor:
                         return
                     return
 
+                # Loop (M0): the handler returning is only an input to
+                # measurement. The node is COMPLETED only when its
+                # measurement passes; a non-zero exit code or a failed
+                # criterion makes it FAILED with the reason attached.
+                # A handler may report its own execution status (e.g. the
+                # bash handler reports "timeout" when it kills the process
+                # group). Only execution statuses count here — handlers also
+                # return business statuses like "success", which mean the
+                # handler completed normally.
+                handler_status = "completed"
+                if isinstance(result, dict) and result.get("status") in {
+                    "timeout",
+                    "killed",
+                    "failed",
+                }:
+                    handler_status = result["status"]
+                envelope = build_envelope(
+                    node.id,
+                    result if isinstance(result, dict) else {},
+                    duration_s=duration_s,
+                    status=handler_status,
+                )
+                measurement = self._measure_and_record(target, envelope)
                 plan = self._load_or_raise(plan_id)
                 target = _find_node(plan, node.id)
                 if target is not None:
-                    target.status = PlanStatus.COMPLETED
+                    # The plan was reloaded after execution, so attach the
+                    # measurement to this fresh node object (the pre-run
+                    # object measured above is a different instance).
+                    target.measurement = measurement
+                    target.exit_code = envelope.get("exit_code")
+                    target.duration_s = envelope.get("duration_s")
                     if isinstance(result, dict):
                         target.inputs.update(result)
-                    target.error = None
+                    if measurement["verdict"] == VERDICT_PASS:
+                        target.status = PlanStatus.COMPLETED
+                        target.error = None
+                        logger.info("Node %s completed (measurement PASS).", node.id)
+                    else:
+                        target.status = PlanStatus.FAILED
+                        target.error = measurement_failed_detail(measurement)
+                        logger.info(
+                            "Node %s failed measurement: %s", node.id, target.error
+                        )
                     plan.touch()
                     self._store.save(plan)
-                logger.info("Node %s completed.", node.id)
             except UnknownCapabilityError as exc:
                 if self._scaffolder is not None:
                     self._handle_missing_capability(plan_id, node.id, capability, exc)
                 else:
                     self._record_failure(plan_id, node.id, str(exc))
             except Exception as exc:
-                self._record_failure(plan_id, node.id, str(exc))
+                duration_s = time.monotonic() - started
+                envelope = build_envelope(
+                    node.id,
+                    None,
+                    duration_s=duration_s,
+                    status="failed",
+                    error={"kind": type(exc).__name__, "message": str(exc)},
+                )
+                measurement = self._measure_and_record(target, envelope)
+                self._record_failure(plan_id, node.id, str(exc), measurement)
 
     def _handle_missing_capability(
         self,
@@ -226,17 +311,63 @@ class Executor:
         except ExecutorError:
             logger.error("Could not record NEEDS_TOOL for node %s.", node_id)
 
-    def _record_failure(self, plan_id: str, node_id: str, error: str) -> None:
+    def _record_failure(
+        self,
+        plan_id: str,
+        node_id: str,
+        error: str,
+        measurement: dict[str, Any] | None = None,
+    ) -> None:
         try:
             plan = self._load_or_raise(plan_id)
             node = _find_node(plan, node_id)
             if node is not None:
                 node.status = PlanStatus.FAILED
                 node.error = error
+                if measurement is not None:
+                    node.measurement = measurement
+                    node.exit_code = measurement.get("exit_code")
+                    node.duration_s = measurement.get("duration_s")
                 plan.touch()
                 self._store.save(plan)
         except ExecutorError:
             logger.error("Could not record failure for node %s.", node_id)
+
+    def _node_workdir(self, node_id: str) -> Path:
+        """Working directory for a node: its run directory, else the cwd."""
+        if self._run_store is not None and self._run_id is not None:
+            node_dir = self._run_store.node_dir(self._run_id, node_id)
+            node_dir.mkdir(parents=True, exist_ok=True)
+            return node_dir
+        return Path.cwd()
+
+    def _measure_and_record(
+        self, node: PlanNode, envelope: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Measure a finished node and persist the verdict (M0)."""
+        workdir = self._node_workdir(node.id)
+        measurement = measure_node(node, envelope, workdir, self._custom_checkers)
+        node.measurement = measurement
+        node.exit_code = envelope.get("exit_code")
+        node.duration_s = envelope.get("duration_s")
+        if self._run_store is not None and self._run_id is not None:
+            paths = self._run_store.write_node_output(
+                self._run_id,
+                node.id,
+                stdout=envelope.get("stdout", ""),
+                stderr=envelope.get("stderr", ""),
+            )
+            envelope["stdout_path"] = paths["stdout_path"]
+            envelope["stderr_path"] = paths["stderr_path"]
+            self._run_store.append_measurement(self._run_id, measurement)
+        if self._audit_logger is not None:
+            self._audit_logger.log(
+                "node.measured",
+                node_id=node.id,
+                verdict=measurement["verdict"],
+                exit_code=envelope.get("exit_code"),
+            )
+        return measurement
 
     def _load_or_raise(self, plan_id: str) -> ExecutionPlan:
         plan = self._store.load(plan_id)

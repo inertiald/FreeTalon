@@ -9,17 +9,21 @@ from .security import sanitize_inference_payload
 class VLLMInferenceEngine:
     """Wrapper around the vLLM ``LLM`` / ``AsyncLLMEngine`` interface.
 
+    DECISION (M0, 2026-11-14, recorded in PLAN.md): the vLLM path is
+    DEFERRED. The working inference path is Ollama via
+    ``freetalon.orchestrator.intake`` (gemma-3-abliterated:latest at
+    localhost:11434), and the loop is built on that. This class is kept as
+    the documented integration point for a future vendored vLLM snapshot —
+    it is NOT deleted — but until that snapshot lands (pinned with SHA256
+    hashes and recorded in ``docs/approved-dependency-baseline.md``),
+    initialization raises ``NotImplementedError`` rather than fetching
+    anything at runtime. Nothing in the loop may depend on this engine.
+
     Per ADR 0002, this engine is adopted for high-throughput, local and
     air-gapped LLM inference. It follows the task-payload + security-boundary
     pattern established in ADR 0001: the incoming payload is validated and
     sanitized before any engine-specific parameters are derived, and the raw
     payload never reaches framework internals directly.
-
-    The concrete implementation is intentionally deferred: vLLM must be
-    vendored (a point-in-time snapshot, pinned with SHA256 hashes and recorded
-    in ``docs/approved-dependency-baseline.md``) before it can be imported.
-    Until that vendored snapshot lands, initialization raises
-    ``NotImplementedError`` rather than fetching anything at runtime.
     """
 
     task_type = "inference"

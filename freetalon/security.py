@@ -7,6 +7,11 @@ import re
 from typing import Any
 
 SAFE_TEXT_PATTERN = re.compile(r"^[a-zA-Z0-9 _.,:@/+-]{0,256}$")
+# Free text (e.g. echo payloads): ordinary punctuation is fine — apostrophes,
+# exclamation marks, quotes, parentheses. Only control characters are
+# rejected, plus a length cap. Identifiers (model names, datasets) keep the
+# strict SAFE_TEXT_PATTERN above.
+_MAX_FREE_TEXT_LEN = 1000
 _DOCKER_PROFILES = frozenset({"default", "video", "youtube_upload"})
 _VLLM_DTYPES = frozenset({"auto", "float16", "bfloat16"})
 
@@ -55,7 +60,11 @@ def sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     if action == "echo":
         text = str(payload.get("text", "")).strip()
-        if not text or not SAFE_TEXT_PATTERN.fullmatch(text):
+        if not text:
+            raise ValueError("echo text contains unsupported characters or is empty")
+        if len(text) > _MAX_FREE_TEXT_LEN:
+            raise ValueError("echo text exceeds 1000 character limit")
+        if any(ord(c) < 0x20 and c not in {"\n", "\t", "\r"} for c in text):
             raise ValueError("echo text contains unsupported characters or is empty")
         clean["text"] = text
     elif action == "sum":

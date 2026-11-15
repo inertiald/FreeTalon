@@ -28,3 +28,27 @@ class SecurityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSanitizeFreeTextEcho(unittest.TestCase):
+    """M0: the echo sanitizer accepts ordinary text (was: rejected)."""
+
+    def test_apostrophe_accepted(self):
+        payload = sanitize_payload({"action": "echo", "text": "don't panic"})
+        self.assertEqual(payload["text"], "don't panic")
+
+    def test_exclamation_and_quotes_accepted(self):
+        payload = sanitize_payload({"action": "echo", "text": 'hello! say "hi"'})
+        self.assertEqual(payload["text"], 'hello! say "hi"')
+
+    def test_control_characters_still_rejected(self):
+        with self.assertRaises(ValueError):
+            sanitize_payload({"action": "echo", "text": "bad\x01text"})
+
+    def test_empty_still_rejected(self):
+        with self.assertRaises(ValueError):
+            sanitize_payload({"action": "echo", "text": "   "})
+
+    def test_overlong_still_rejected(self):
+        with self.assertRaises(ValueError):
+            sanitize_payload({"action": "echo", "text": "x" * 1001})
