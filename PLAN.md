@@ -38,6 +38,9 @@ before the fleet is worth cabling. See section 6.
   build). Fixed: JSON marshaling (freetalon/jsonutil.py + patched
   hive.py / audit.py / api.py), flat distributed config, strict tool
   registry, planner normalisation, prompt contracts, executor audit events.
+- M1 DONE 2026-11-14 (see section 4): judge (continue/retry/re-plan/
+  escalate), delta re-plans from structured briefs, budget accounting,
+  progress rule, duplicate-approach rejection. 289/289 tests green.
 - M0 DONE 2026-11-14 (see section 4): executor measures every node
   (freetalon/orchestrator/measure.py), run directories under
   freetalon-workspace/runs/<run-id>/, GoalContract with conservative
@@ -57,8 +60,8 @@ before the fleet is worth cabling. See section 6.
 | Plan | Produce a DAG with acceptance criteria per node | One-shot only: a single DAG, never re-planned |
 | Execute | Run nodes through the tool registry | Works, but dishonest: a node is COMPLETED if its handler returns, even when a bash script exits non-zero; exit_code is returned and never read; acceptance is stored and never checked |
 | Measure | Record what actually happened (exit codes, outputs, metrics) | DONE (M0): measure.py evaluates criteria deterministically; verdicts PASS/FAIL/UNMEASURABLE; measurements.jsonl per run |
-| Judge | Decide pass/fail against acceptance criteria | Missing (M1): executor judges per-node via measurement; the four-way judge (continue/retry/re-plan/escalate) is not built yet |
-| Re-plan | On failure, plan again from the measurements | Missing: no re-plan, no retry-with-a-changed-approach (only sub-DAG injection for missing dependencies, capped at 3) |
+| Judge | Decide pass/fail against acceptance criteria | DONE (M1): judge.py — CONTINUE/RETRY/REPLAN/ESCALATE from measurements; budget accounting; progress rule (stall after 2 re-plans without a newly passing criterion); repeated UNMEASURABLE escalates |
+| Re-plan | On failure, plan again from the measurements | DONE (M1): structured re-plan briefs; delta plans validated against repeating a failed approach; plan versions numbered and kept in the run directory |
 | Remember | Keep hypothesis, measurement, next try across runs | Missing: runs are stateless |
 | Research | Gather data, research risks, fetch files — with provenance | Missing: no research/data tools |
 | Gate | Pause for human approval before irreversible actions (invest, flash) | Missing: NEEDS_TOOL / FAILED exist, but no approval workflow |
@@ -82,13 +85,21 @@ Small fixes done: echo sanitizer accepts ordinary text ("don't",
 "hello!", quotes); vLLM decided DEFERRED — Ollama is the working path,
 the module is kept as the documented integration point (see inference.py).
 
-### M1 — Re-plan from measurements (next)
+### M1 — Re-plan from measurements (DONE 2026-11-14)
 Planner takes the failed plan + measurements and produces a revised DAG.
 Iteration budget (max re-plans per run) and stop conditions defined.
 Done when: a failing plan is automatically revised and re-run up to the
 budget, then fails honestly with the full attempt history.
+Evidence: 289/289 tests green. Seeded failing task re-plans once from its
+measurement, does something demonstrably different, and succeeds (v2);
+with re-plans exhausted it escalates with the full attempt history in
+summary.md; a duplicate re-plan (same approach, no differs_by) is
+rejected; a timed-out node retries once and succeeds; repeated
+UNMEASURABLE escalates. LLM re-planning is wired (replan_from_brief via
+Ollama); tests inject deterministic re-plan functions so the suite needs
+no LLM.
 
-### M2 — Experiment memory
+### M2 — Experiment memory (next)
 Persistent record of experiments: hypothesis, attempts, measurements,
 outcome. Stored in SQLite next to ExecutionPlanStateStore. The planner
 reads past attempts before planning. Done when: a second run of the same

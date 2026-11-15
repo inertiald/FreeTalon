@@ -107,3 +107,18 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   - Live smoke: run-20261115T041349Z-bc5c66 — exit-1 node FAILED,
     file-writing node COMPLETED, run dir + summary verified on disk.
 - Next: M1 Judge and re-plan.
+
+## Update - 2026-11-14 20:26 (M1 DONE)
+
+- M1 Judge and re-plan is DONE and green: 289/289 tests in ~9s (was 270).
+  - New: freetalon/orchestrator/judge.py (four decisions, budget
+    accounting, progress rule, re-plan briefs, duplicate-approach
+    validation); planner replan_from_brief via Ollama; LoopRunner now
+    loops through judge decisions with numbered plan versions.
+  - Verified: re-plan once and succeed; budget-exhausted escalation with
+    full attempt history; duplicate re-plan rejected; timeout retry;
+    repeated UNMEASURABLE escalation.
+  - Note: an early M1 run was slow (98s) because failing M0 tests
+    triggered live LLM re-plans; fixed by injecting a refusing re-plan
+    function in those tests. The suite needs no LLM.
+- Next: M2 Experiment memory.
