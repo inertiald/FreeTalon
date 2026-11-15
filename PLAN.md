@@ -111,9 +111,13 @@ See section 6.
 
 - main is the stable line. Work happens on dev/* branches; merge to
   main only with CI green.
-- CI: .github/workflows/tests.yml (unit suite, 229 tests) and the existing
-  trusted-dependency-policy.yml run on every push to main / dev/* and
-  every PR. A red build blocks the merge.
+- CI: .github/workflows/tests.yml runs the unit suite (229 tests) on
+  every push to main / dev/* and every PR. A red build blocks the merge.
+  The existing trusted-dependency-policy.yml runs only on pushes to
+  main and on PRs — not on dev/* pushes, so it never runs on a dev
+  branch until a PR targets main. (Corrected 2026-11-14: an earlier
+  version of this plan wrongly said it ran on dev/* too. Verified
+  2026-11-14: zero workflow runs exist on dev/seeker7-single-node.)
 - Commit in logical chunks with messages that say what and why. Never
   commit local-only artefacts: *.bak, *.db, .env, Modelfile,
   models/, generated/, .venv, logs. (See .gitignore.)

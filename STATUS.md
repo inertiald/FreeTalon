@@ -55,3 +55,24 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   layout, gate packets bound to packet hash, five decisions for Pat
   before Phase 1.
 - GitHub still not connected - branch push + CI still blocked on Pat.
+
+## Update - 2026-11-14 16:33
+
+- Branch dev/seeker7-single-node created on GitHub from main 2085f6cd.
+- GitHub App connected as inertiald; branch creation worked.
+- Snapshot push of the full branch content was refused (403, tree
+  creation) - the app integration could not write file contents.
+  Diagnosing with this single-file write; full push to follow once
+  the write path is confirmed.
+
+## Update - 2026-11-14 19:42
+
+- Push finished: 16 of 17 files on GitHub branch dev/seeker7-single-node
+  (head aa367d0c), content verified by blob SHA. The one missing file is
+  .github/workflows/tests.yml: GitHub refuses app writes under
+  .github/workflows/ (403, needs the separate workflow permission).
+- CI: zero workflow runs on this branch so far. The Tests workflow does
+  not exist on the branch (file missing), and the dependency-policy
+  workflow only triggers on main pushes and PRs, so it never ran here
+  either. Once tests.yml lands (via a git push from seeker7), pushes to
+  dev/* will run the suite.
