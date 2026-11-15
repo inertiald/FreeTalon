@@ -122,3 +122,17 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
     triggered live LLM re-plans; fixed by injecting a refusing re-plan
     function in those tests. The suite needs no LLM.
 - Next: M2 Experiment memory.
+
+## Update - 2026-11-14 20:35 (M2 DONE)
+
+- M2 Experiment memory is DONE and green: 300/300 tests in ~9s (was 289).
+  - New: freetalon/orchestrator/memory.py (ExperimentStore, SQLite table
+    next to execution_plans; goal_key + domain scoping; failed_approaches;
+    deterministic factual lessons).
+  - Loop now checks an initial plan against memory (repeat without
+    differs_by escalates before anything runs), feeds memory into
+    re-plan briefs, and validates re-plans against recorded failures.
+    Records land in SQLite and in the run's memory.jsonl.
+  - Fixed during M2: a bad patch had stranded the state store's
+    _write_lock inside a property getter (45 errors); repaired, all green.
+- Next: M3 Research and data tools.

@@ -38,6 +38,9 @@ before the fleet is worth cabling. See section 6.
   build). Fixed: JSON marshaling (freetalon/jsonutil.py + patched
   hive.py / audit.py / api.py), flat distributed config, strict tool
   registry, planner normalisation, prompt contracts, executor audit events.
+- M2 DONE 2026-11-14 (see section 4): experiment memory (SQLite,
+  append-only, goal+domain scoped); a second run of the same goal does
+  not repeat a measured-failed approach. 300/300 tests green.
 - M1 DONE 2026-11-14 (see section 4): judge (continue/retry/re-plan/
   escalate), delta re-plans from structured briefs, budget accounting,
   progress rule, duplicate-approach rejection. 289/289 tests green.
@@ -62,7 +65,7 @@ before the fleet is worth cabling. See section 6.
 | Measure | Record what actually happened (exit codes, outputs, metrics) | DONE (M0): measure.py evaluates criteria deterministically; verdicts PASS/FAIL/UNMEASURABLE; measurements.jsonl per run |
 | Judge | Decide pass/fail against acceptance criteria | DONE (M1): judge.py — CONTINUE/RETRY/REPLAN/ESCALATE from measurements; budget accounting; progress rule (stall after 2 re-plans without a newly passing criterion); repeated UNMEASURABLE escalates |
 | Re-plan | On failure, plan again from the measurements | DONE (M1): structured re-plan briefs; delta plans validated against repeating a failed approach; plan versions numbered and kept in the run directory |
-| Remember | Keep hypothesis, measurement, next try across runs | Missing: runs are stateless |
+| Remember | Keep hypothesis, measurement, next try across runs | DONE (M2): ExperimentStore (SQLite, same file as the plan store); lessons written at judge time from measurements; planner retrieves past attempts; repeats refused before running |
 | Research | Gather data, research risks, fetch files — with provenance | Missing: no research/data tools |
 | Gate | Pause for human approval before irreversible actions (invest, flash) | Missing: NEEDS_TOOL / FAILED exist, but no approval workflow |
 
@@ -99,13 +102,20 @@ UNMEASURABLE escalates. LLM re-planning is wired (replan_from_brief via
 Ollama); tests inject deterministic re-plan functions so the suite needs
 no LLM.
 
-### M2 — Experiment memory (next)
+### M2 — Experiment memory (DONE 2026-11-14)
 Persistent record of experiments: hypothesis, attempts, measurements,
 outcome. Stored in SQLite next to ExecutionPlanStateStore. The planner
 reads past attempts before planning. Done when: a second run of the same
 goal does not repeat a measured-failed approach.
+Evidence: 300/300 tests green. A second run of the same goal with the
+same approach escalates before executing anything (citing the recorded
+failure); the same approach with a stated differs_by is allowed and can
+succeed; a re-plan that repeats a recorded failure is rejected; a
+different goal is not blocked. Lessons are generated deterministically
+from measurements (no invented content). Memory is also mirrored to the
+run's memory.jsonl and fed into re-plan briefs.
 
-### M3 — Research and data tools
+### M3 — Research and data tools (next)
 Research claw (web/forum search with source capture), data claw (fetch and
 store datasets with provenance), sandbox for analysing untrusted files.
 Done when: the ECU flow can research brick risks and analyse a tune file
