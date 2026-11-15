@@ -260,12 +260,15 @@ class Judge:
         self,
         brief: dict[str, Any],
         new_nodes: list[PlanNode],
+        known_failures: set[tuple[str, str]] | None = None,
     ) -> str | None:
         """Reject a re-plan that repeats a failed approach without a reason.
 
         Returns an error string when the delta plan is rejected, else None.
         A node repeats a failed approach when its (capability, hypothesis)
         matches a failed node's and it states no ``differs_by``.
+        ``known_failures`` adds approaches recorded in experiment memory
+        (M2) to the current run's failures.
         """
         failed_approaches = {
             approach_key(
@@ -278,6 +281,8 @@ class Judge:
             )
             for f in brief.get("failed_nodes", [])
         }
+        if known_failures:
+            failed_approaches |= set(known_failures)
         if not failed_approaches:
             return None
         for node in new_nodes:

@@ -20,6 +20,7 @@ from typing import Any, Callable
 from .executor import Executor
 from .judge import Decision, Judge
 from .measure import VERDICT_FAIL, VERDICT_PASS, VERDICT_UNMEASURABLE, _compare
+from .memory import ExperimentStore, goal_key_for
 from .models import (
     ExecutionPlan,
     GoalContract,
@@ -69,6 +70,7 @@ class LoopRunner:
         audit_logger: "AuditLogger | None" = None,
         custom_checkers: dict | None = None,
         max_concurrency: int = 8,
+        memory_store: ExperimentStore | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -76,6 +78,15 @@ class LoopRunner:
         self._audit_logger = audit_logger
         self._custom_checkers = custom_checkers
         self._max_concurrency = max_concurrency
+        # M2: experiment memory shares the plan store's SQLite file, so the
+        # experiments table sits next to execution_plans.
+        if memory_store is not None:
+            self._memory_store = memory_store
+        else:
+            db_path = getattr(store, "db_path", None)
+            self._memory_store = (
+                ExperimentStore(db_path) if db_path is not None else ExperimentStore()
+            )
 
     # ── Public entry points ──────────────────────────────────────────────
 
@@ -107,7 +118,29 @@ class LoopRunner:
         decision_history: list[dict[str, Any]] = []
         escalation: str | None = None
 
-        while True:
+        # M2: before executing, the planner's retrieval — a second run of
+        # the same goal must not repeat a measured-failed approach. A node
+        # that repeats one without a stated differs_by escalates before
+        # anything runs; the earlier failure is cited, not repeated.
+        goal_key = goal_key_for(contract.objective)
+        domain = plan.intent.project_type
+        repeat = self._find_repeated_approach(plan, goal_key, domain)
+        skip_execution = False
+        if repeat is not None:
+            escalation = (
+                "plan repeats a measured-failed approach for this goal: "
+                f"{repeat}; the approach was already tried and failed "
+                "(see experiment memory)"
+            )
+            self._log(
+                "loop.memory.duplicate",
+                run_id=run_id,
+                plan_id=plan.plan_id,
+                repeat=repeat,
+            )
+            skip_execution = True
+
+        while not skip_execution:
             self._run_store.write_plan_version(run_id, version, plan)
             self._log(
                 "loop.plan.version",
@@ -154,6 +187,9 @@ class LoopRunner:
                 decision_history.append(
                     {"version": version, "decision": "continue", "reason": "all nodes succeeded"}
                 )
+                self._record_experiments(
+                    run_id, goal_key, domain, ran, version_measurements, "CONTINUE"
+                )
                 break
 
             decision = judge.decide(plan, version_measurements)
@@ -171,6 +207,15 @@ class LoopRunner:
                 decision=decision.decision.value,
                 reason=decision.reason,
             )
+            # M2: lessons are written at judge time, from the measurements.
+            self._record_experiments(
+                run_id,
+                goal_key,
+                domain,
+                ran,
+                version_measurements,
+                decision.decision.value,
+            )
 
             if decision.decision == Decision.RETRY:
                 self._reset_nodes(plan, decision.retry_node_ids)
@@ -180,7 +225,11 @@ class LoopRunner:
                 judge.replans_used += 1
                 judge.progress.note_replan(progressed)
                 brief = judge.build_replan_brief(
-                    contract, plan, version_measurements, memory=[], plan_version=version
+                    contract,
+                    plan,
+                    version_measurements,
+                    memory=self._memory_store.experiments_for_goal(goal_key, domain),
+                    plan_version=version,
                 )
                 replan = replan_fn or (lambda b: replan_from_brief(b))
                 try:
@@ -188,7 +237,13 @@ class LoopRunner:
                 except Exception as exc:  # noqa: BLE001 - re-planner failure escalates
                     escalation = f"re-planner failed: {exc}"
                     break
-                rejection = judge.validate_delta_plan(brief, new_nodes)
+                rejection = judge.validate_delta_plan(
+                    brief,
+                    new_nodes,
+                    known_failures=self._memory_store.failed_approaches(
+                        goal_key, domain
+                    ),
+                )
                 if rejection is not None:
                     escalation = f"delta plan rejected: {rejection}"
                     break
@@ -273,6 +328,62 @@ class LoopRunner:
         return self.run_plan(plan, contract, run_id=run_id, replan_fn=replan_fn)
 
     # ── Helpers ──────────────────────────────────────────────────────────
+
+    def _find_repeated_approach(
+        self, plan: ExecutionPlan, goal_key: str, domain: str
+    ) -> str | None:
+        """A node that repeats a recorded failed approach for this goal.
+
+        Returns a human description of the repeat, or None. A node with a
+        stated ``differs_by`` is not a repeat — the change is acknowledged.
+        """
+        known = self._memory_store.failed_approaches(goal_key, domain)
+        for node in plan.nodes:
+            key = (node.assigned_claw, node.hypothesis or node.objective)
+            if key in known and not node.differs_by:
+                return (
+                    f"{node.assigned_claw!r} / "
+                    f"{node.hypothesis or node.objective!r} (node {node.id})"
+                )
+        return None
+
+    def _record_experiments(
+        self,
+        run_id: str,
+        goal_key: str,
+        domain: str,
+        ran_nodes: list[PlanNode],
+        measurements: list[dict[str, Any]],
+        decision_value: str,
+    ) -> None:
+        """Append one experiment record per measured node (M2).
+
+        Written to the SQLite memory store (cross-run) and to the run's
+        memory.jsonl (per-run record). A node that passed records CONTINUE;
+        a failed node records the judge's decision for the pass.
+        """
+        by_id = {m.get("node_id"): m for m in measurements}
+        for node in ran_nodes:
+            measurement = by_id.get(node.id) or node.measurement or {}
+            if not measurement:
+                continue
+            # Decisions are stored uppercase (CONTINUE/RETRY/REPLAN/
+            # ESCALATE) to match the design doc's experiment schema; the
+            # judge's enum values are lowercase.
+            node_decision = (
+                "CONTINUE"
+                if measurement.get("verdict") == VERDICT_PASS
+                else decision_value.upper()
+            )
+            record = self._memory_store.record(
+                run_id=run_id,
+                goal_key=goal_key,
+                domain=domain,
+                node=node,
+                measurement=measurement,
+                decision=node_decision,
+            )
+            self._run_store.append_memory(run_id, record)
 
     def _reset_nodes(self, plan: ExecutionPlan, node_ids: list[str]) -> None:
         """Return nodes to READY for a retry, unchanged (M1)."""

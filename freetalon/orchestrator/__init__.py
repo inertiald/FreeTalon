@@ -3,6 +3,7 @@
 from .executor import Executor, ExecutorError
 from .judge import Decision, Judge, JudgeDecision
 from .loop import LoopRunner, RunResult
+from .memory import ExperimentStore, goal_key_for
 from .measure import (
     VERDICT_FAIL,
     VERDICT_PASS,
@@ -30,8 +31,10 @@ __all__ = [
     "ExecutorError",
     "ExecutionPlan",
     "ExecutionPlanStateStore",
+    "ExperimentStore",
     "Judge",
     "JudgeDecision",
+    "goal_key_for",
     "GoalContract",
     "LoopRunner",
     "PlanNode",

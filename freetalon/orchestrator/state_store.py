@@ -47,6 +47,11 @@ class ExecutionPlanStateStore:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(_CREATE_TABLE_SQL)
 
+    @property
+    def db_path(self) -> Path:
+        """Filesystem path of the SQLite file (M2: memory shares this file)."""
+        return self._db_path
+
     # ── Internal helpers ──────────────────────────────────────────────────
 
     @contextmanager
