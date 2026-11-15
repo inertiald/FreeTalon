@@ -38,6 +38,9 @@ before the fleet is worth cabling. See section 6.
   build). Fixed: JSON marshaling (freetalon/jsonutil.py + patched
   hive.py / audit.py / api.py), flat distributed config, strict tool
   registry, planner normalisation, prompt contracts, executor audit events.
+- M5 DONE 2026-11-14 (see section 4): finance + ECU verticals, both
+  worked examples end-to-end with a human gate before the irreversible
+  step. Live smoke verified on seeker7. 368/368 tests green.
 - M4 DONE 2026-11-14 (see section 4): approval gates (packets, API,
   dashboard). Live smoke verified: a gated flash pauses, an approval
   over HTTP unblocks it, the run completes. 346/346 tests green.
@@ -151,11 +154,22 @@ memory refuses the approach before it reaches the gate. Approvals are
 bound to a hash of (action, node, inputs) only: evidence is excluded
 because it grows during the run and would otherwise void approvals.
 
-### M5 — Verticals (finance + ECU) (next)
+### M5 — Verticals (finance + ECU) (DONE 2026-11-14)
 Finance: backtest claw, train claw, paper-trade mode (dry-run default),
 position caps, kill switch. ECU: CAN capture claw, tune-surface analysis,
 flash gate. Done when: each worked example runs end-to-end on one node
 with a human gate before the irreversible step.
+Evidence: 368/368 tests green. Live smoke on seeker7: finance
+(run-20261115T045041Z-f529e6) — backtest, train, paper-trade (2 trades,
+max position 10.0% at the cap) then paused at the invest gate; ECU
+(run-20261115T045041Z-666823) — real research, verified backup, simulated
+CAN capture (200 frames), sandbox analysis, tune surface (5 map terms)
+then paused at the flash gate. Approving either gated node fails it
+honestly: the invest/flash handlers are stubs that refuse, so no real
+money can move and no ECU can be flashed even after approval. Live CAN
+capture (source="live") is refused in code. Known behaviour: approving a
+gated stub records a failed experiment, so re-running the same goal needs
+a stated differs_by (the smoke script does this).
 
 ### M6 — Fleet (deferred)
 Only after M0-M2 are green on one node: switch configuration, isolated

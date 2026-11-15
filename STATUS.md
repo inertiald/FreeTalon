@@ -176,3 +176,24 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   - Fixed during M4: the packet hash must NOT include evidence
     (it grows during a run and would void approvals).
 - Next: M5 Verticals (finance + ECU).
+
+## Update - 2026-11-14 21:15 (M5 DONE — loop ready for hardware integration)
+
+- M5 Verticals is DONE and green: 368/368 tests in ~13s (was 346).
+  - New: freetalon/orchestrator/finance.py (backtest, train_model,
+    paper_trade, invest stub, kill switch) and
+    freetalon/orchestrator/ecu.py (can_capture simulated, verify_backup,
+    tune_surface, flash stub).
+  - Finance: paper mode is the only mode (non-paper refused); position
+    caps are hard constraints in sizing; kill switch file blocks trading.
+  - ECU: CAN capture is simulated or replayed from a file; live capture
+    refused; tune surface is built from the sandbox report, never the
+    raw file; a verified backup is a pre-step to the flash gate.
+  - Live smoke: finance run-20261115T045041Z-f529e6 and ECU
+    run-20261115T045041Z-666823 — both paused at their gates, both
+    gated handlers refuse after approval. No real money, no live ECU,
+    no flashing.
+  - Fixed during M5: the synthetic price series never crossed (0
+    trades); reshaped to fall-rise-fall so the SMA crossover fires.
+- M0–M5 are DONE. The loop is ready for hardware integration (M6 fleet
+  remains out of scope).
