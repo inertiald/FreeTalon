@@ -91,9 +91,13 @@ try:
     # Default claws must be registered explicitly — ToolRegistry no longer
     # auto-registers them, and without this even "bash" would be a noop.
     from freetalon.orchestrator.tool_registry import register_default_claws
+    from freetalon.orchestrator.research import register_research_claws
+    from freetalon.orchestrator.sandbox import register_sandbox_claws
 
     _tool_registry = ToolRegistry(strict=False)
     register_default_claws(_tool_registry)
+    register_research_claws(_tool_registry)
+    register_sandbox_claws(_tool_registry)
     # Node status → display colour mapping (keyed on PlanStatus enum members for
     # type safety; look up with node.status directly since PlanStatus is str Enum).
     _NODE_STATUS_COLORS: dict[PlanStatus, str] = {

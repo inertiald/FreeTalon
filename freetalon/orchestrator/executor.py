@@ -149,6 +149,13 @@ class Executor:
                 # run store is attached, with the node's hard timeout.
                 workdir = self._node_workdir(node.id)
                 resolved_inputs.setdefault("workdir", str(workdir))
+                # M3: the run directory is shared by every node in the run,
+                # so a dataset fetched by one node can be analysed by the
+                # next (research artifacts, sandbox quarantine live here).
+                if self._run_store is not None and self._run_id is not None:
+                    resolved_inputs.setdefault(
+                        "run_dir", str(self._run_store.run_dir(self._run_id))
+                    )
                 resolved_inputs.setdefault("timeout_s", target.timeout_s)
 
                 try:

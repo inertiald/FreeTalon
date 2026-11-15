@@ -7,6 +7,8 @@ import sys
 import textwrap
 from pathlib import Path
 from freetalon.orchestrator.tool_registry import ToolRegistry, register_default_claws
+from freetalon.orchestrator.research import register_research_claws
+from freetalon.orchestrator.sandbox import register_sandbox_claws
 from freetalon.orchestrator.tool_scaffolder import ToolScaffolder
 from freetalon.orchestrator.intake import call_llm
 
@@ -18,6 +20,11 @@ def initialize_orchestrator():
     
     # 1. Register foundational claws
     register_default_claws(registry)
+
+    # 1b. Research, data, and sandbox claws (M3): sourced research, dataset
+    # fetch with provenance, and read-only analysis of untrusted files.
+    register_research_claws(registry)
+    register_sandbox_claws(registry)
 
     # 2. Configure LLM codegen backend for dynamic capability generation
     def llm_codegen_backend(capability: str, node_inputs: dict) -> str:

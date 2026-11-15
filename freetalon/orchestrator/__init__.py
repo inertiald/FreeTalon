@@ -21,7 +21,9 @@ from .models import (
     SuccessMeasure,
     TaskIntent,
 )
+from .research import fetch_dataset, fetch_page, research_topic, search_web
 from .run_store import RunStore, new_run_id
+from .sandbox import Sandbox, analyze_file
 from .state_store import ExecutionPlanStateStore
 from .tool_registry import ToolRegistry, UnknownCapabilityError
 
@@ -43,6 +45,12 @@ __all__ = [
     "RunBudget",
     "RunResult",
     "RunStore",
+    "Sandbox",
+    "analyze_file",
+    "fetch_dataset",
+    "fetch_page",
+    "research_topic",
+    "search_web",
     "SuccessMeasure",
     "TaskIntent",
     "ToolRegistry",
