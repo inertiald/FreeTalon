@@ -47,7 +47,7 @@ class TestLoopM4(unittest.TestCase):
         )
         return store, registry, run_store, gates, runner, calls
 
-    def _plan(self):
+    def _plan(self, tmp):
         return ExecutionPlan(
             plan_id="ecu-flash",
             intent=TaskIntent(goal="Flash the ECU with the analysed tune"),
@@ -56,14 +56,14 @@ class TestLoopM4(unittest.TestCase):
                     id="prep",
                     objective="prepare the tune file",
                     assigned_claw="bash",
-                    inputs={"command": "echo tune > tune.bin"},
-                    criteria=[{"type": "file_exists", "path": "tune.bin"}],
+                    inputs={"command": f"echo tune > {tmp}/tune.bin"},
+                    criteria=[{"type": "file_exists", "path": f"{tmp}/tune.bin"}],
                 ),
                 PlanNode(
                     id="flash",
                     objective="flash the ECU with the tune file",
                     assigned_claw="flash_ecu",
-                    inputs={"action": "flash_ecu", "file": "tune.bin", "risk": "brick"},
+                    inputs={"action": "flash_ecu", "file": f"{tmp}/tune.bin", "risk": "brick"},
                     depends_on=["prep"],
                     reversible=False,
                     criteria=[
@@ -85,7 +85,7 @@ class TestLoopM4(unittest.TestCase):
     def test_gate_blocks_until_approved_then_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _, _, gates, runner, calls = self._setup(tmp)
-            plan = self._plan()
+            plan = self._plan(tmp)
             store.save(plan)
 
             # Pass 1: prep runs, flash pauses at the gate — handler not called.
@@ -115,7 +115,7 @@ class TestLoopM4(unittest.TestCase):
     def test_gate_denied_fails_the_node_and_is_never_reasked(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _, _, gates, runner, calls = self._setup(tmp)
-            plan = self._plan()
+            plan = self._plan(tmp)
             store.save(plan)
 
             result = runner.run_plan(plan, self._contract(), replan_fn=_no_replanner)
@@ -131,7 +131,7 @@ class TestLoopM4(unittest.TestCase):
             # A second run of the same goal with the same irreversible node
             # does not re-ask: M2 memory refuses the measured-failed
             # approach before anything runs, so no new packet is created.
-            plan2 = self._plan()
+            plan2 = self._plan(tmp)
             plan2.plan_id = "ecu-flash-2"
             store.save(plan2)
             result2 = runner.run_plan(plan2, self._contract(), replan_fn=_no_replanner)
@@ -144,7 +144,7 @@ class TestLoopM4(unittest.TestCase):
     def test_gate_expired_is_deny_on_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _, _, gates, runner, calls = self._setup(tmp)
-            plan = self._plan()
+            plan = self._plan(tmp)
             store.save(plan)
 
             result = runner.run_plan(plan, self._contract(), replan_fn=_no_replanner)
@@ -162,7 +162,7 @@ class TestLoopM4(unittest.TestCase):
     def test_resume_with_pending_packet_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _, _, _, runner, _ = self._setup(tmp)
-            plan = self._plan()
+            plan = self._plan(tmp)
             store.save(plan)
             result = runner.run_plan(plan, self._contract(), replan_fn=_no_replanner)
             with self.assertRaises(ValueError):
@@ -171,7 +171,7 @@ class TestLoopM4(unittest.TestCase):
     def test_decide_after_decision_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _, _, gates, runner, _ = self._setup(tmp)
-            plan = self._plan()
+            plan = self._plan(tmp)
             store.save(plan)
             result = runner.run_plan(plan, self._contract(), replan_fn=_no_replanner)
             assert result.gate_packet_id is not None
@@ -197,7 +197,7 @@ class TestLoopM4(unittest.TestCase):
                 return {"status": "success"}
 
             registry.register("flash_ecu", flash_handler)
-            plan = self._plan()
+            plan = self._plan(tmp)
             store.save(plan)
             executor = Executor(store, registry)
             finished = asyncio.run(executor.run("ecu-flash"))
