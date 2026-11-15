@@ -38,6 +38,9 @@ before the fleet is worth cabling. See section 6.
   build). Fixed: JSON marshaling (freetalon/jsonutil.py + patched
   hive.py / audit.py / api.py), flat distributed config, strict tool
   registry, planner normalisation, prompt contracts, executor audit events.
+- M4 DONE 2026-11-14 (see section 4): approval gates (packets, API,
+  dashboard). Live smoke verified: a gated flash pauses, an approval
+  over HTTP unblocks it, the run completes. 346/346 tests green.
 - M3 DONE 2026-11-14 (see section 4): research + data claws and
   sandbox analysis. Live ECU flow smoke-verified on seeker7 (run
   run-20261115T043909Z-504ac2, goal PASS). 320/320 tests green.
@@ -70,7 +73,7 @@ before the fleet is worth cabling. See section 6.
 | Re-plan | On failure, plan again from the measurements | DONE (M1): structured re-plan briefs; delta plans validated against repeating a failed approach; plan versions numbered and kept in the run directory |
 | Remember | Keep hypothesis, measurement, next try across runs | DONE (M2): ExperimentStore (SQLite, same file as the plan store); lessons written at judge time from measurements; planner retrieves past attempts; repeats refused before running |
 | Research | Gather data, research risks, fetch files — with provenance | DONE (M3): research claw (DuckDuckGo + Stack Exchange + Wikipedia, sourced/dated/trust-noted artifacts); failures recorded, never hidden |
-| Gate | Pause for human approval before irreversible actions (invest, flash) | Missing: NEEDS_TOOL / FAILED exist, but no approval workflow |
+| Gate | Pause for human approval before irreversible actions (invest, flash) | DONE (M4): gate packets bound to a hash, expiring (deny on timeout), denial never re-asked; dashboard + API approve/deny |
 
 The full loop design (phases, data model, safety, worked examples) lives in
 the design document in the home-lab goal docs, "FreeTalon Autonomous Loop
@@ -133,13 +136,22 @@ Stack Exchange API (forum, keyless, works), Wikipedia full-text search
 (reference, works). The executor now injects run_dir into node inputs so
 artifacts are shared across nodes in a run.
 
-### M4 — Approval gates (next)
+### M4 — Approval gates (DONE 2026-11-14)
 AWAITING_APPROVAL plan state, approval requests (what, why, risk, cost,
 reversible?), dashboard/API approve/deny, deny-on-timeout, full audit
 trail. Done when: a plan that would invest or flash pauses and only
 proceeds after an explicit approval.
+Evidence: 346/346 tests green. Live smoke on seeker7
+(run-20261115T044604Z-1a2ab1): the flash node paused at AWAITING_APPROVAL
+with the handler never called; GET /gates listed the packet; POST approve
+over HTTP unblocked it; resume completed the run with goal PASS. Deny and
+expiry both fail the node honestly (deny on timeout), and a denial is
+never re-asked — in the same run the node fails, and in a later run M2
+memory refuses the approach before it reaches the gate. Approvals are
+bound to a hash of (action, node, inputs) only: evidence is excluded
+because it grows during the run and would otherwise void approvals.
 
-### M5 — Verticals (finance + ECU)
+### M5 — Verticals (finance + ECU) (next)
 Finance: backtest claw, train claw, paper-trade mode (dry-run default),
 position caps, kill switch. ECU: CAN capture claw, tune-surface analysis,
 flash gate. Done when: each worked example runs end-to-end on one node

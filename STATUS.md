@@ -156,3 +156,23 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   - The first smoke run failed and M2 memory correctly refused the
     identical re-run; the re-run stated differs_by and proceeded.
 - Next: M4 Approval gates.
+
+## Update - 2026-11-14 21:05 (M4 DONE)
+
+- M4 Approval gates is DONE and green: 346/346 tests in ~13s (was 320).
+  - New: freetalon/orchestrator/gates.py (GatePacket, GateStore in the
+    plan store's SQLite file; hash-bound approvals; expiry sweep =
+    deny on timeout; denial recorded, never re-asked).
+  - Loop: irreversible nodes (reversible=False) pause at
+    AWAITING_APPROVAL; resume_run continues after approval, fails
+    honestly after denial/expiry. The executor refuses to run an
+    irreversible node with no gate configured.
+  - API: GET /gates (+ status/run filters), GET /gates/<id>,
+    POST /gates/<id>/approve|deny (token auth, same as /tasks).
+  - Dashboard: Approval Gates section in the right panel with
+    Approve / Deny buttons, refreshed every 2s.
+  - Live smoke (run-20261115T044604Z-1a2ab1): pause, API list,
+    HTTP approve, resume to COMPLETED, goal PASS.
+  - Fixed during M4: the packet hash must NOT include evidence
+    (it grows during a run and would void approvals).
+- Next: M5 Verticals (finance + ECU).
