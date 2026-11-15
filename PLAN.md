@@ -38,6 +38,9 @@ before the fleet is worth cabling. See section 6.
   build). Fixed: JSON marshaling (freetalon/jsonutil.py + patched
   hive.py / audit.py / api.py), flat distributed config, strict tool
   registry, planner normalisation, prompt contracts, executor audit events.
+- M3 DONE 2026-11-14 (see section 4): research + data claws and
+  sandbox analysis. Live ECU flow smoke-verified on seeker7 (run
+  run-20261115T043909Z-504ac2, goal PASS). 320/320 tests green.
 - M2 DONE 2026-11-14 (see section 4): experiment memory (SQLite,
   append-only, goal+domain scoped); a second run of the same goal does
   not repeat a measured-failed approach. 300/300 tests green.
@@ -66,7 +69,7 @@ before the fleet is worth cabling. See section 6.
 | Judge | Decide pass/fail against acceptance criteria | DONE (M1): judge.py — CONTINUE/RETRY/REPLAN/ESCALATE from measurements; budget accounting; progress rule (stall after 2 re-plans without a newly passing criterion); repeated UNMEASURABLE escalates |
 | Re-plan | On failure, plan again from the measurements | DONE (M1): structured re-plan briefs; delta plans validated against repeating a failed approach; plan versions numbered and kept in the run directory |
 | Remember | Keep hypothesis, measurement, next try across runs | DONE (M2): ExperimentStore (SQLite, same file as the plan store); lessons written at judge time from measurements; planner retrieves past attempts; repeats refused before running |
-| Research | Gather data, research risks, fetch files — with provenance | Missing: no research/data tools |
+| Research | Gather data, research risks, fetch files — with provenance | DONE (M3): research claw (DuckDuckGo + Stack Exchange + Wikipedia, sourced/dated/trust-noted artifacts); failures recorded, never hidden |
 | Gate | Pause for human approval before irreversible actions (invest, flash) | Missing: NEEDS_TOOL / FAILED exist, but no approval workflow |
 
 The full loop design (phases, data model, safety, worked examples) lives in
@@ -115,13 +118,22 @@ different goal is not blocked. Lessons are generated deterministically
 from measurements (no invented content). Memory is also mirrored to the
 run's memory.jsonl and fed into re-plan briefs.
 
-### M3 — Research and data tools (next)
-Research claw (web/forum search with source capture), data claw (fetch and
-store datasets with provenance), sandbox for analysing untrusted files.
-Done when: the ECU flow can research brick risks and analyse a tune file
-in the sandbox without touching the live ECU.
+### M3 — Research and data tools (DONE 2026-11-14)
+Research claw (web/forum search with source capture), data claw (fetch
+and store datasets with provenance), sandbox for analysing untrusted
+files. Done when: the ECU flow can research brick risks and analyse a
+tune file in the sandbox without touching the live ECU.
+Evidence: 320/320 tests green. Live smoke on seeker7
+(run-20261115T043909Z-504ac2): research node (3 sources, 2 pages fetched),
+dataset fetch (143,832 bytes with provenance sidecar), sandbox analysis
+(file type + sha256 + strings) — goal PASS, no live ECU touched.
+Engines: DuckDuckGo (best-effort — its HTML endpoint returns HTTP 202 to
+this VM's urllib, recorded as a failure in the artifact, never hidden),
+Stack Exchange API (forum, keyless, works), Wikipedia full-text search
+(reference, works). The executor now injects run_dir into node inputs so
+artifacts are shared across nodes in a run.
 
-### M4 — Approval gates
+### M4 — Approval gates (next)
 AWAITING_APPROVAL plan state, approval requests (what, why, risk, cost,
 reversible?), dashboard/API approve/deny, deny-on-timeout, full audit
 trail. Done when: a plan that would invest or flash pauses and only

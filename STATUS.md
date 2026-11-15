@@ -136,3 +136,23 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   - Fixed during M2: a bad patch had stranded the state store's
     _write_lock inside a property getter (45 errors); repaired, all green.
 - Next: M3 Research and data tools.
+
+## Update - 2026-11-14 20:50 (M3 DONE)
+
+- M3 Research and data tools is DONE and green: 320/320 tests in ~9s
+  (was 300).
+  - New: freetalon/orchestrator/research.py (research + fetch_dataset
+    claws; DuckDuckGo / Stack Exchange / Wikipedia engines; sourced,
+    dated artifacts with trust notes; dataset provenance sidecars) and
+    freetalon/orchestrator/sandbox.py (read-only analysis: hash, type,
+    strings, structure; refuses paths outside the run dir; never
+    executes the file).
+  - Executor now injects run_dir into node inputs so a dataset fetched
+    by one node can be analysed by the next.
+  - Live smoke on seeker7 (run-20261115T043909Z-504ac2): research,
+    fetch, and sandbox analysis all PASS; goal PASS. DuckDuckGo is
+    bot-blocked from this VM (HTTP 202) — recorded in the artifact,
+    Stack Exchange + Wikipedia carry the research.
+  - The first smoke run failed and M2 memory correctly refused the
+    identical re-run; the re-run stated differs_by and proceeded.
+- Next: M4 Approval gates.
