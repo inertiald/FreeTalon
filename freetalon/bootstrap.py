@@ -9,6 +9,8 @@ from pathlib import Path
 from freetalon.orchestrator.tool_registry import ToolRegistry, register_default_claws
 from freetalon.orchestrator.research import register_research_claws
 from freetalon.orchestrator.sandbox import register_sandbox_claws
+from freetalon.orchestrator.finance import register_finance_claws
+from freetalon.orchestrator.ecu import register_ecu_claws
 from freetalon.orchestrator.tool_scaffolder import ToolScaffolder
 from freetalon.orchestrator.intake import call_llm
 
@@ -25,6 +27,11 @@ def initialize_orchestrator():
     # fetch with provenance, and read-only analysis of untrusted files.
     register_research_claws(registry)
     register_sandbox_claws(registry)
+
+    # 1c. Verticals (M5): finance (paper-trade only) and ECU (simulated
+    # capture; the flash/invest handlers refuse — the gate is the boundary).
+    register_finance_claws(registry)
+    register_ecu_claws(registry)
 
     # 2. Configure LLM codegen backend for dynamic capability generation
     def llm_codegen_backend(capability: str, node_inputs: dict) -> str:

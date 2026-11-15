@@ -1,6 +1,8 @@
 """FreeTalon orchestrator sub-package."""
 
+from .ecu import register_ecu_claws
 from .executor import Executor, ExecutorError
+from .finance import check_kill_switch, engage_kill_switch, register_finance_claws
 from .gates import GatePacket, GateStatus, GateStore, build_packet, compute_packet_hash
 from .judge import Decision, Judge, JudgeDecision
 from .loop import LoopRunner, RunResult
@@ -47,6 +49,10 @@ __all__ = [
     "GatePacket",
     "GateStatus",
     "GateStore",
+    "check_kill_switch",
+    "engage_kill_switch",
+    "register_ecu_claws",
+    "register_finance_claws",
     "RunResult",
     "RunStore",
     "build_packet",

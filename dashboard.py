@@ -93,6 +93,8 @@ try:
     from freetalon.orchestrator.tool_registry import register_default_claws
     from freetalon.orchestrator.research import register_research_claws
     from freetalon.orchestrator.sandbox import register_sandbox_claws
+    from freetalon.orchestrator.finance import register_finance_claws
+    from freetalon.orchestrator.ecu import register_ecu_claws
     from freetalon.orchestrator.gates import GateStore
 
     # M4: approval gates — shares the plan store's SQLite file.
@@ -102,6 +104,8 @@ try:
     register_default_claws(_tool_registry)
     register_research_claws(_tool_registry)
     register_sandbox_claws(_tool_registry)
+    register_finance_claws(_tool_registry)
+    register_ecu_claws(_tool_registry)
     # Node status → display colour mapping (keyed on PlanStatus enum members for
     # type safety; look up with node.status directly since PlanStatus is str Enum).
     _NODE_STATUS_COLORS: dict[PlanStatus, str] = {
