@@ -197,3 +197,17 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
     trades); reshaped to fall-rise-fall so the SMA crossover fires.
 - M0–M5 are DONE. The loop is ready for hardware integration (M6 fleet
   remains out of scope).
+
+## Update - 2026-11-14 21:00
+
+- LLM end-to-end test (first real Gemma-planned run, run-20261115T045558Z-a052cd):
+  goal in plain language -> Gemma intake -> Gemma plan -> loop. FAILED honestly
+  in 24s. Gemma invented a claw name ("script", not registered), wrote to
+  /tmp instead of the workspace, planned 1 node (no run, no verify), and gave
+  no structured criteria. Executor failed the node ("No handler registered"),
+  judge chose REPLAN, then Gemma echoed the replan brief instead of a DAG
+  ("Planner output must contain a 'nodes' array") and the run escalated.
+  Loop machinery behaved as designed; the LLM planning is the weak link.
+  Fix queued for Pat: planner hardening (claw allowlist + plan repair retry
+  + structured criteria). The M5 smoke runs used hand-written plans, not
+  LLM plans -- that distinction is now on the record.
