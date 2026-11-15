@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .audit import AuditLogger
+from .jsonutil import json_default
 from .config import HiveConfig
 from .docker_manager import DockerManager
 from .hardware import HostCapabilities, detect_host_capabilities
@@ -375,7 +376,7 @@ class HiveController:
             "tasks": [asdict(t) for t in self._tasks.values()],
         }
         with self.config.state_path.open("w", encoding="utf-8") as fh:
-            json.dump(state, fh, separators=(",", ":"), sort_keys=True)
+            json.dump(state, fh, separators=(",", ":"), sort_keys=True, default=json_default)
 
     def _load_state(self) -> None:
         path: Path = self.config.state_path

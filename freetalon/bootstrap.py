@@ -6,8 +6,38 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from freetalon.orchestrator.tool_registry import ToolRegistry, register_default_claws
+from freetalon.orchestrator.tool_scaffolder import ToolScaffolder
+from freetalon.orchestrator.intake import call_llm
 
 _BOOTSTRAP_ENV_VAR = "FREETALON_BOOTSTRAPPED"
+
+
+def initialize_orchestrator():
+    registry = ToolRegistry(strict=False)
+    
+    # 1. Register foundational claws
+    register_default_claws(registry)
+
+    # 2. Configure LLM codegen backend for dynamic capability generation
+    def llm_codegen_backend(capability: str, node_inputs: dict) -> str:
+        prompt = f"""Write a Python handler function `handle(inputs: dict) -> dict` for the capability '{capability}'.
+Inputs schema context: {node_inputs}
+Return ONLY valid Python code containing the function definition."""
+        return call_llm("You are a Python code generator.", prompt)
+
+    # Absolute quarantine dir under the workspace: the relative default
+    # ("generated/proposed_tools") always resolves under the cwd, and the
+    # cwd is always on sys.path, so the scaffolder's security guard
+    # rejected every call. The workspace path is never on sys.path.
+    scaffolder = ToolScaffolder(
+        base_dir=Path.home() / "freetalon-workspace" / "generated" / "proposed_tools",
+        codegen_backend=llm_codegen_backend,
+    )
+
+    return registry, scaffolder
+
+
 
 
 def venv_python_path(project_root: Path, venv_dirname: str = ".venv") -> Path:

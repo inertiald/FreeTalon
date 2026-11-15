@@ -1,32 +1,10 @@
-"""Asyncio-driven DAG execution engine for FreeTalon.
-
-The :class:`Executor` walks an :class:`~freetalon.orchestrator.models.ExecutionPlan`
-stored in a :class:`~freetalon.orchestrator.state_store.ExecutionPlanStateStore`,
-schedules nodes whose dependencies are satisfied, dispatches them to
-:class:`~freetalon.orchestrator.tool_registry.ToolRegistry` handlers, and
-persists status updates back to the store.
-
-When a required capability is missing and a :class:`~freetalon.orchestrator.tool_scaffolder.ToolScaffolder`
-is injected, the executor emits a draft scaffold for human review (ADR 0000 Task 2.2)
-and marks the node ``NEEDS_TOOL``.  The generated file is **never** imported,
-registered, or executed — generation and execution are separated by a human and a
-commit.
-
-Typical usage::
-
-    registry = ToolRegistry()
-    registry.register("scaffold", my_scaffold_handler)
-
-    store = ExecutionPlanStateStore()
-    executor = Executor(store=store, registry=registry, max_concurrency=4)
-    await executor.run("plan-id-123")
-"""
+"""Asyncio-driven DAG execution engine for FreeTalon."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable,TYPE_CHECKING, TypedDict
+from typing import Any, Callable, TYPE_CHECKING, TypedDict
 
 from .models import ExecutionPlan, PlanNode, PlanStatus
 from .state_store import ExecutionPlanStateStore
@@ -38,55 +16,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Sentinel used to indicate a node completed without returning a dict result.
 _NO_RESULT: dict[str, Any] = {}
-
-# ── DependencyMissing result protocol ────────────────────────────────────────
-
-#: Key whose presence in a handler result dict signals that the node cannot
-#: proceed until one or more prerequisite tasks are fulfilled.  The value must
-#: be a :class:`DependencyRequest` mapping.
 DEPENDENCY_MISSING_KEY = "dependency_missing"
-
-#: Maximum number of times a single node may trigger sub-DAG injection before
-#: the executor gives up and marks it ``FAILED``.
 MAX_INJECTION_ATTEMPTS = 3
 
 
 class _DependencyRequestRequired(TypedDict):
-    """Required fields of a :class:`DependencyRequest` payload."""
-
     objectives: list[str]
 
 
 class DependencyRequest(_DependencyRequestRequired, total=False):
-    """Typed payload returned by a handler to signal missing prerequisites.
-
-    A handler that cannot proceed because upstream data or services are absent
-    returns::
-
-        return {
-            DEPENDENCY_MISSING_KEY: DependencyRequest(
-                objectives=["fetch dataset", "validate schema"],
-                inputs={"dataset_url": "s3://…"},
-            )
-        }
-
-    Fields
-    ------
-    objectives:
-        Human-readable descriptions of what each missing prerequisite must
-        deliver.  One :class:`~freetalon.orchestrator.models.PlanNode` will be
-        generated per objective (required).
-    inputs:
-        Optional seed inputs forwarded to every generated prerequisite node.
-    """
-
     inputs: dict[str, Any]
 
 
 def _is_dependency_missing(result: Any) -> bool:
-    """Return ``True`` when *result* is a :data:`DEPENDENCY_MISSING_KEY` payload."""
     return isinstance(result, dict) and DEPENDENCY_MISSING_KEY in result
 
 
@@ -95,36 +38,6 @@ class ExecutorError(RuntimeError):
 
 
 class Executor:
-    """Asyncio DAG executor that drives an :class:`ExecutionPlan` to completion.
-
-    Parameters
-    ----------
-    store:
-        Persistent store used to load and save the execution plan.
-    registry:
-        Tool registry that maps capability names to async handlers.
-    max_concurrency:
-        Maximum number of nodes that may be in-flight simultaneously.
-        Defaults to ``8``.
-    subdag_planner:
-        Optional callable used to resolve :data:`DEPENDENCY_MISSING_KEY`
-        payloads.  It receives a :class:`DependencyRequest` and must return a
-        list of :class:`~freetalon.orchestrator.models.PlanNode` objects
-        representing the sub-DAG required to satisfy the missing prerequisites.
-        When ``None`` (default), a ``DependencyMissing`` result marks the node
-        ``FAILED`` with a descriptive error rather than injecting any sub-DAG.
-    scaffolder:
-        Optional :class:`~freetalon.orchestrator.tool_scaffolder.ToolScaffolder`.
-        When provided, a missing capability triggers a draft scaffold proposal
-        (written to disk for human review) and the node is set to ``NEEDS_TOOL``
-        instead of ``FAILED``.  When ``None`` (default), the existing ``FAILED``
-        behaviour is preserved unchanged.
-    audit_logger:
-        Optional :class:`~freetalon.audit.AuditLogger`.  When provided,
-        scaffold events (``tool.scaffold.proposed``, ``tool.scaffold.rejected``,
-        node ``needs_tool`` transitions) are written to the audit log.
-    """
-
     def __init__(
         self,
         store: ExecutionPlanStateStore,
@@ -138,41 +51,11 @@ class Executor:
         self._registry = registry
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._subdag_planner = subdag_planner
-        # Tracks how many times each node has triggered sub-DAG injection.
         self._injection_counts: dict[str, int] = {}
         self._scaffolder = scaffolder
         self._audit_logger = audit_logger
 
-    # ── Public interface ──────────────────────────────────────────────────
-
     async def run(self, plan_id: str) -> ExecutionPlan:
-        """Execute the plan identified by *plan_id* until completion or stall.
-
-        The method repeatedly identifies *runnable* nodes (all dependencies
-        met, status ``READY`` or ``DRAFT``), dispatches them concurrently up
-        to *max_concurrency*, collects results, and persists each state
-        transition.  The loop ends when:
-
-        - all nodes reach a terminal status (``COMPLETED`` / ``FAILED`` /
-          ``CANCELLED``), **or**
-        - no runnable nodes remain but non-terminal nodes still exist (stall).
-
-        Parameters
-        ----------
-        plan_id:
-            Identifier of the persisted :class:`ExecutionPlan` to execute.
-
-        Returns
-        -------
-        ExecutionPlan
-            The final state of the plan after execution.
-
-        Raises
-        ------
-        ExecutorError
-            If the plan cannot be found in the store, or if no progress can
-            be made (cyclic / unfulfillable dependencies).
-        """
         plan = self._store.load(plan_id)
         if plan is None:
             raise ExecutorError(f"Plan {plan_id!r} not found in store.")
@@ -186,14 +69,12 @@ class Executor:
             plan = self._load_or_raise(plan_id)
 
             if _is_terminal(plan.status):
-                # Plan was externally cancelled or otherwise terminated.
                 break
 
             runnable = _collect_runnable(plan)
             in_flight = _count_in_flight(plan)
 
             if not runnable and in_flight == 0:
-                # Nothing running, nothing can run — decide final status.
                 break
 
             if runnable:
@@ -205,11 +86,9 @@ class Executor:
                     for node in runnable
                 ]
                 await asyncio.gather(*tasks, return_exceptions=True)
-                # Reload plan after the batch so the next iteration sees fresh state.
                 continue
 
             if in_flight > 0:
-                # Something else is running (e.g. external caller); yield briefly.
                 await asyncio.sleep(0.05)
                 continue
 
@@ -223,21 +102,11 @@ class Executor:
         logger.info("Executor finished plan %s — status: %s.", plan_id, plan.status)
         return plan
 
-    # ── Internal helpers ──────────────────────────────────────────────────
-
     async def _execute_node(self, plan_id: str, node: PlanNode) -> None:
-        """Dispatch *node* to its handler and persist the result.
-
-        The semaphore limits the number of concurrently running nodes.
-        All exceptions are caught and recorded as node failures so they
-        do not abort sibling nodes.
-        """
         async with self._semaphore:
-            # Mark as RUNNING and persist before dispatching.
             plan = self._load_or_raise(plan_id)
             target = _find_node(plan, node.id)
             if target is None or _is_terminal(target.status):
-                # Node was already handled (race guard).
                 return
             target.status = PlanStatus.RUNNING
             plan.touch()
@@ -248,9 +117,17 @@ class Executor:
 
             try:
                 handler = self._registry.resolve(capability)
-                result = await handler(dict(target.inputs))
 
-                # ── DependencyMissing branch ──────────────────────────────
+                # Resolve context piping placeholders (e.g. {{step_1.stdout}})
+                completed_results = {
+                    n.id: n.inputs
+                    for n in plan.nodes
+                    if n.status == PlanStatus.COMPLETED
+                }
+                resolved_inputs = _resolve_input_variables(dict(target.inputs), completed_results)
+
+                result = await handler(resolved_inputs)
+
                 if _is_dependency_missing(result):
                     dep_request: DependencyRequest = result[DEPENDENCY_MISSING_KEY]
 
@@ -260,9 +137,6 @@ class Executor:
                             node.id,
                             "DependencyMissing returned but no subdag_planner is configured.",
                         )
-                        logger.error(
-                            "Node %s failed: DependencyMissing with no planner.", node.id
-                        )
                         return
 
                     count = self._injection_counts.get(node.id, 0)
@@ -270,11 +144,7 @@ class Executor:
                         self._record_failure(
                             plan_id,
                             node.id,
-                            f"Injection loop guard: node {node.id!r} exceeded "
-                            f"the maximum of {MAX_INJECTION_ATTEMPTS} sub-DAG injections.",
-                        )
-                        logger.error(
-                            "Node %s failed: injection loop guard triggered.", node.id
+                            f"Injection loop guard triggered for node {node.id!r}.",
                         )
                         return
 
@@ -285,31 +155,20 @@ class Executor:
                         plan = _inject_subdag(plan, node.id, sub_nodes)
                         plan.touch()
                         self._store.save(plan)
-                    except Exception as planner_exc:  # noqa: BLE001
+                    except Exception as planner_exc:
                         self._record_failure(
                             plan_id,
                             node.id,
                             f"sub-DAG planner raised an error: {planner_exc}",
                         )
-                        logger.exception(
-                            "Node %s failed: sub-DAG planner error.", node.id
-                        )
                         return
-                    logger.info(
-                        "Node %s: injected %d sub-DAG node(s); node reset to DRAFT.",
-                        node.id,
-                        len(sub_nodes),
-                    )
                     return
 
-                # ── Normal success branch ─────────────────────────────────
                 plan = self._load_or_raise(plan_id)
                 target = _find_node(plan, node.id)
                 if target is not None:
                     target.status = PlanStatus.COMPLETED
                     if isinstance(result, dict):
-                        # Merge handler output back into inputs so downstream
-                        # nodes can read the produced values.
                         target.inputs.update(result)
                     target.error = None
                     plan.touch()
@@ -320,12 +179,8 @@ class Executor:
                     self._handle_missing_capability(plan_id, node.id, capability, exc)
                 else:
                     self._record_failure(plan_id, node.id, str(exc))
-                    logger.error(
-                        "Node %s failed: unknown capability %r.", node.id, capability
-                    )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self._record_failure(plan_id, node.id, str(exc))
-                logger.exception("Node %s failed with exception.", node.id)
 
     def _handle_missing_capability(
         self,
@@ -334,55 +189,25 @@ class Executor:
         capability: str,
         exc: UnknownCapabilityError,
     ) -> None:
-        """Invoke the scaffolder for a missing capability and set node to NEEDS_TOOL.
-
-        The scaffolder writes a draft stub to the quarantine directory for
-        human review.  The executor NEVER imports, registers, or executes the
-        generated file.  Resolving the capability always goes through the
-        ``ToolRegistry`` allowlist.
-        """
         from .tool_scaffolder import CapabilityNameError
 
-        assert self._scaffolder is not None  # Guarded by caller (_handle_missing_capability is only called when scaffolder is set)
+        assert self._scaffolder is not None
         try:
             proposal = self._scaffolder.propose(capability)
             error_msg = (
-                f"Missing capability {capability!r}: draft scaffold proposed at "
-                f"{proposal.path!s} (hash={proposal.content_hash}).  "
-                "Review, implement, and register it before re-running this plan."
+                f"Missing capability {capability!r}: draft scaffold proposed at {proposal.path!s}."
             )
             if self._audit_logger is not None:
                 self._audit_logger.log(
                     "tool.scaffold.proposed",
                     capability=capability,
                     path=str(proposal.path),
-                    content_hash=proposal.content_hash,
                     node_id=node_id,
                     plan_id=plan_id,
                 )
-            logger.warning(
-                "Node %s: capability %r missing — draft scaffold written to %s.",
-                node_id,
-                capability,
-                proposal.path,
-            )
         except CapabilityNameError as val_exc:
-            error_msg = (
-                f"Missing capability {capability!r} and scaffold rejected: {val_exc}"
-            )
-            if self._audit_logger is not None:
-                self._audit_logger.log(
-                    "tool.scaffold.rejected",
-                    capability=capability,
-                    reason=str(val_exc),
-                    node_id=node_id,
-                    plan_id=plan_id,
-                )
-            logger.error(
-                "Node %s: capability %r scaffold rejected: %s", node_id, capability, val_exc
-            )
+            error_msg = f"Missing capability {capability!r} and scaffold rejected: {val_exc}"
 
-        # Record NEEDS_TOOL — a non-runnable terminal state for this run.
         try:
             plan = self._load_or_raise(plan_id)
             node = _find_node(plan, node_id)
@@ -391,21 +216,17 @@ class Executor:
                 node.error = error_msg
                 plan.touch()
                 self._store.save(plan)
-            if self._audit_logger is not None:
-                self._audit_logger.log(
-                    "node.needs_tool",
-                    node_id=node_id,
-                    plan_id=plan_id,
-                    capability=capability,
-                    error=error_msg,
-                )
+                if self._audit_logger is not None:
+                    self._audit_logger.log(
+                        "node.needs_tool",
+                        capability=capability,
+                        node_id=node_id,
+                        plan_id=plan_id,
+                    )
         except ExecutorError:
-            logger.error(
-                "Could not record NEEDS_TOOL for node %s — plan gone.", node_id
-            )
+            logger.error("Could not record NEEDS_TOOL for node %s.", node_id)
 
     def _record_failure(self, plan_id: str, node_id: str, error: str) -> None:
-        """Persist a FAILED status and error message for *node_id*."""
         try:
             plan = self._load_or_raise(plan_id)
             node = _find_node(plan, node_id)
@@ -415,21 +236,32 @@ class Executor:
                 plan.touch()
                 self._store.save(plan)
         except ExecutorError:
-            logger.error("Could not record failure for node %s — plan gone.", node_id)
+            logger.error("Could not record failure for node %s.", node_id)
 
     def _load_or_raise(self, plan_id: str) -> ExecutionPlan:
-        """Load plan from the store or raise :class:`ExecutorError`."""
         plan = self._store.load(plan_id)
         if plan is None:
             raise ExecutorError(f"Plan {plan_id!r} disappeared from store mid-run.")
         return plan
 
 
-# ── Module-level helpers (pure functions, easy to unit-test) ──────────────────
+def _resolve_input_variables(inputs: dict[str, Any], completed_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    resolved = {}
+    for key, value in inputs.items():
+        if isinstance(value, str) and value.startswith("{{") and value.endswith("}}"):
+            target_ref = value[2:-2].strip()
+            if "." in target_ref:
+                step_id, field = target_ref.split(".", 1)
+                parent_result = completed_results.get(step_id, {})
+                resolved[key] = parent_result.get(field, value)
+            else:
+                resolved[key] = value
+        else:
+            resolved[key] = value
+    return resolved
 
 
 def _is_terminal(status: PlanStatus) -> bool:
-    """Return ``True`` if *status* is a terminal (non-running) state."""
     return status in {
         PlanStatus.COMPLETED,
         PlanStatus.FAILED,
@@ -439,11 +271,6 @@ def _is_terminal(status: PlanStatus) -> bool:
 
 
 def _all_dependencies_met(node: PlanNode, node_map: dict[str, PlanNode]) -> bool:
-    """Return ``True`` if every upstream node has ``COMPLETED`` status.
-
-    A dependency that is not found in *node_map* is treated as not yet
-    complete so execution is deferred (safe default).
-    """
     for dep_id in node.depends_on:
         dep = node_map.get(dep_id)
         if dep is None or dep.status != PlanStatus.COMPLETED:
@@ -452,12 +279,6 @@ def _all_dependencies_met(node: PlanNode, node_map: dict[str, PlanNode]) -> bool
 
 
 def _collect_runnable(plan: ExecutionPlan) -> list[PlanNode]:
-    """Return nodes that are ready to be dispatched.
-
-    A node is runnable when its status is ``DRAFT`` or ``READY`` **and** all
-    of its declared ``depends_on`` nodes are ``COMPLETED``.  Nodes in
-    ``NEEDS_TOOL`` are never re-dispatched (they are terminal for this run).
-    """
     node_map = plan.node_map()
     return [
         node
@@ -468,38 +289,19 @@ def _collect_runnable(plan: ExecutionPlan) -> list[PlanNode]:
 
 
 def _count_in_flight(plan: ExecutionPlan) -> int:
-    """Return the number of nodes currently in ``RUNNING`` status."""
     return sum(1 for node in plan.nodes if node.status == PlanStatus.RUNNING)
 
 
 def _find_node(plan: ExecutionPlan, node_id: str) -> PlanNode | None:
-    """Return the :class:`PlanNode` with *node_id*, or ``None``."""
     return plan.node_map().get(node_id)
 
 
 def _derive_plan_status(plan: ExecutionPlan) -> PlanStatus:
-    """Infer the overall plan status from the terminal state of all nodes.
-
-    Rules:
-    - Any node ``FAILED`` → plan ``FAILED``
-    - Any node ``CANCELLED`` → plan ``CANCELLED``
-    - Any node ``NEEDS_TOOL`` (and no ``FAILED``) → plan ``FAILED``
-      (surface as ``FAILED`` so callers know the plan did not complete; the
-      individual node's ``NEEDS_TOOL`` status plus its ``error`` field carry
-      the scaffold-proposal details).
-    - All nodes ``COMPLETED`` → plan ``COMPLETED``
-    - Otherwise → ``RUNNING`` (still in progress)
-    """
     statuses = {node.status for node in plan.nodes}
-    if PlanStatus.FAILED in statuses:
+    if PlanStatus.FAILED in statuses or PlanStatus.NEEDS_TOOL in statuses:
         return PlanStatus.FAILED
     if PlanStatus.CANCELLED in statuses:
         return PlanStatus.CANCELLED
-    if PlanStatus.NEEDS_TOOL in statuses:
-        # At least one node needs a missing tool; surface plan as FAILED so
-        # callers know the plan did not complete successfully.  Individual
-        # NEEDS_TOOL nodes retain their status for inspection.
-        return PlanStatus.FAILED
     if all(_is_terminal(s) for s in statuses):
         return PlanStatus.COMPLETED
     return PlanStatus.RUNNING
@@ -510,38 +312,13 @@ def _inject_subdag(
     orig_node_id: str,
     sub_nodes: list[PlanNode],
 ) -> ExecutionPlan:
-    """Insert *sub_nodes* into *plan* and rewire *orig_node_id* to run after them.
-
-    Each injected node receives a fresh, non-colliding id of the form
-    ``injected-{orig_node_id}-{k}`` (with a numeric suffix if that id already
-    exists).  Internal dependency wiring among the sub-nodes is preserved.
-    The originating node is reset to ``DRAFT`` so the main run-loop reschedules
-    it once all injected prerequisites complete.
-
-    Parameters
-    ----------
-    plan:
-        The live :class:`ExecutionPlan` to mutate.
-    orig_node_id:
-        Id of the node that raised the :data:`DEPENDENCY_MISSING_KEY` signal.
-    sub_nodes:
-        Nodes returned by the sub-DAG planner (may have arbitrary internal
-        ids; those ids are remapped to avoid collisions with *plan*).
-
-    Returns
-    -------
-    ExecutionPlan
-        The same *plan* object, mutated in place (returned for convenience).
-    """
     if not sub_nodes:
-        # Nothing to inject; reset originating node so it can be retried.
         orig = _find_node(plan, orig_node_id)
         if orig is not None:
             orig.status = PlanStatus.DRAFT
             orig.error = None
         return plan
 
-    # 1. Build unique ids for each injected node.
     existing_ids = {n.id for n in plan.nodes}
     id_map: dict[str, str] = {}
     for k, sub_node in enumerate(sub_nodes):
@@ -554,7 +331,6 @@ def _inject_subdag(
         id_map[sub_node.id] = candidate
         existing_ids.add(candidate)
 
-    # 2. Remap ids and internal depends_on references.
     remapped: list[PlanNode] = []
     for sub_node in sub_nodes:
         new_deps = [id_map.get(d, d) for d in sub_node.depends_on]
@@ -571,16 +347,11 @@ def _inject_subdag(
             )
         )
 
-    # 3. Determine terminal nodes of the sub-DAG (nothing else in the sub-DAG
-    #    depends on them); the originating node must wait for all of them.
     all_sub_deps = {d for n in remapped for d in n.depends_on}
     terminal_ids = [n.id for n in remapped if n.id not in all_sub_deps]
 
-    # 4. Append injected nodes to the plan.
     plan.nodes.extend(remapped)
 
-    # 5. Rewire the originating node: add terminals as new prerequisites and
-    #    reset it to DRAFT so the scheduler picks it up after they complete.
     orig = _find_node(plan, orig_node_id)
     if orig is not None:
         for tid in terminal_ids:

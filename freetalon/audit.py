@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from .jsonutil import json_default
 
 
 @dataclass(slots=True)
@@ -18,4 +19,4 @@ class AuditLogger:
             **fields,
         }
         with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+            fh.write(json.dumps(entry, sort_keys=True, default=json_default) + "\n")

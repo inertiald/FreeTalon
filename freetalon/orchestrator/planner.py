@@ -1,7 +1,7 @@
 """LLM-backed planner for producing validated execution DAGs."""
 
 from __future__ import annotations
-
+import re
 import hashlib
 import heapq
 from typing import Any
@@ -102,27 +102,56 @@ def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[P
         )
     return normalized_nodes
 
+def sanitize_llm_output(raw_text: str) -> str:
+    """Clean raw SentencePiece UNK_BYTE token artifacts output by Gemma models."""
+    # Replaces patterns like '[UNK_BYTE_0xe29681▁a]a' with ' a'
+    cleaned = re.sub(r'\[UNK_BYTE_[^\]]+▁?([^\]]*)\]', r' \1', raw_text)
+    # Clean up any leftover lower block characters or non-breaking spaces
+    cleaned = cleaned.replace("\xe2\x96\x81", " ").replace("▁", "")
+    return cleaned
 
 def parse_planner_response(raw_text: str) -> tuple[list[PlanNode], dict[str, Any]]:
     """Validate raw planner output into normalized PlanNodes plus metadata."""
+    raw_text = sanitize_llm_output(raw_text)
+    print(f"\n--- RAW PLANNER OUTPUT ---\n{raw_text}\n--------------------------\n")
+    
     payload = parse_json_object(raw_text)
-    allowed_keys = {"nodes", "metadata"}
-    unexpected_keys = sorted(set(payload) - allowed_keys)
-    if unexpected_keys:
-        raise LLMResponseError(
-            f"Planner response contained unexpected top-level fields: {unexpected_keys}"
-        )
+    if not isinstance(payload, dict):
+        raise LLMResponseError("Planner response must be a JSON object.")
 
-    raw_nodes = payload.get("nodes")
-    if not isinstance(raw_nodes, list):
-        raise LLMResponseError("Planner response must include a 'nodes' array.")
+    nodes_raw = payload.get("nodes")
+    if not isinstance(nodes_raw, list):
+        raise LLMResponseError("Planner output must contain a 'nodes' array.")
 
-    metadata = payload.get("metadata", {})
+    # Defensive normalization: coerce plain strings into single-element lists
+    for node in nodes_raw:
+        if isinstance(node, dict):
+            if isinstance(node.get("acceptance"), str):
+                node["acceptance"] = [node["acceptance"]]
+            elif node.get("acceptance") is None:
+                node["acceptance"] = []
+
+            if isinstance(node.get("outputs"), str):
+                node["outputs"] = [node["outputs"]]
+            elif node.get("outputs") is None:
+                node["outputs"] = []
+
+            if isinstance(node.get("depends_on"), str):
+                node["depends_on"] = [node["depends_on"]]
+            elif node.get("depends_on") is None:
+                node["depends_on"] = []
+
+    # Normalize: topologically order the DAG and assign deterministic
+    # node-1, node-2, ... ids, remapping depends_on. Without this the raw
+    # LLM ids/order leak through and downstream code cannot rely on
+    # dependency order.
+    nodes = normalize_plan_nodes(nodes_raw)
+
+    metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
-        raise LLMResponseError("Planner response 'metadata' field must be a JSON object.")
+        metadata = {"estimated_steps": len(nodes)}
 
-    return normalize_plan_nodes(_validate_raw_nodes(raw_nodes)), metadata
-
+    return nodes, metadata
 
 def build_execution_plan(
     intent: TaskIntent,

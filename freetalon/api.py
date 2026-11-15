@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 from .docker_manager import resource_summary_safe
 from .hive import HiveController
 from .security import authorize
+from .jsonutil import json_default
 
 
 class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -130,7 +131,7 @@ class HiveAPIServer:
                     return None
 
             def _send(self, code: int, data: dict[str, Any]) -> None:
-                encoded = json.dumps(data).encode("utf-8")
+                encoded = json.dumps(data, default=json_default).encode("utf-8")
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))

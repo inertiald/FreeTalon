@@ -1,7 +1,7 @@
 """LLM-backed intake pipeline for structured TaskIntent generation."""
 
 from __future__ import annotations
-
+import re
 import json
 import os
 import urllib.error
@@ -15,8 +15,7 @@ from .models import TaskIntent
 from .prompts import INTAKE_SYSTEM_PROMPT
 
 _OLLAMA_BASE_URL = "http://localhost:11434"
-_OLLAMA_MODEL = "llama3.1"
-# Local development default for self-hosted OpenAI-compatible endpoints.
+_OLLAMA_MODEL = "gemma-3-abliterated:latest"
 _OPENAI_BASE_URL = "http://localhost:8000/v1"
 _OPENAI_MODEL = "gpt-4o-mini"
 _DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -32,17 +31,14 @@ class LLMResponseError(ValueError):
 
 @dataclass(frozen=True)
 class LLMSettings:
-    """Runtime configuration for the intake/planner LLM backend.
-
-    ``api_key`` is optional so local or self-hosted OpenAI-compatible
-    deployments can run without authentication.
-    """
+    """Runtime configuration for the intake/planner LLM backend."""
 
     backend: Literal["ollama", "openai_compatible"] = "ollama"
     base_url: str = _OLLAMA_BASE_URL
     model: str = _OLLAMA_MODEL
     api_key: str | None = None
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS
+    format_schema: dict[str, Any] | None = None
 
     @classmethod
     def from_env(cls) -> "LLMSettings":
@@ -161,9 +157,41 @@ def parse_json_object(raw_text: str) -> dict[str, Any]:
     )
 
 
-def parse_task_intent_response(raw_text: str) -> TaskIntent:
-    """Validate raw model output as a TaskIntent."""
+def sanitize_llm_output(raw_text: str) -> str:
+    """Clean raw SentencePiece UNK_BYTE token artifacts output by Gemma models."""
+    cleaned = re.sub(r'\[UNK_BYTE_[^\]]+▁?([^\]]*)\]', r' \1', raw_text)
+    cleaned = cleaned.replace("\xe2\x96\x81", " ").replace("▁", "")
+    return cleaned
+
+def parse_task_intent_response(raw_text: str, user_request: str | None = None) -> TaskIntent:
+    """Validate raw model output as a TaskIntent with defensive fallbacks."""
+    # 1. Sanitize Gemma tokenizer artifacts
+    raw_text = sanitize_llm_output(raw_text)
+    
+    # 2. Print RAW output for live terminal logs
+    print(f"\n--- RAW INTAKE OUTPUT ---\n{raw_text}\n--------------------------\n")
+    
     payload = parse_json_object(raw_text)
+    # ... rest of function remains the same ...
+    if not isinstance(payload, dict):
+        payload = {}
+
+    # 3. Defensive fallbacks if LLM returns null/missing values
+    if not payload.get("goal") or not isinstance(payload.get("goal"), str):
+        payload["goal"] = user_request or "Unspecified task"
+
+    if not isinstance(payload.get("capabilities"), list):
+        payload["capabilities"] = []
+
+    if not isinstance(payload.get("constraints"), dict):
+        payload["constraints"] = {}
+
+    if not isinstance(payload.get("missing_inputs"), list):
+        payload["missing_inputs"] = []
+
+    if not payload.get("project_type") or not isinstance(payload.get("project_type"), str):
+        payload["project_type"] = "general"
+
     try:
         return TaskIntent.model_validate(payload)
     except ValidationError as exc:
@@ -174,11 +202,13 @@ def _call_ollama(settings: LLMSettings, system_prompt: str, user_prompt: str) ->
     payload = {
         "model": settings.model,
         "stream": False,
+        "format": settings.format_schema if settings.format_schema else "json",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "options": {"temperature": 0},
+        "options": {"temperature": 0,
+        	"num_ctx": 4096},
     }
     response = _post_json(
         f"{_normalize_base_url(settings.base_url)}/api/chat",
@@ -239,5 +269,14 @@ def intake_request(raw_request: str, settings: LLMSettings | None = None) -> Tas
     request_text = raw_request.strip()
     if not request_text:
         raise ValueError("Raw user request must not be empty.")
-    response_text = call_llm(INTAKE_SYSTEM_PROMPT, request_text, settings=settings)
-    return parse_task_intent_response(response_text)
+
+    llm_settings = settings or LLMSettings.from_env()
+    
+    # Inject Pydantic schema for Ollama JSON schema enforcement
+    strict_settings = llm_settings.__class__(
+        **{**llm_settings.__dict__, "format_schema": TaskIntent.model_json_schema()}
+    )
+    
+    # Send strict_settings (NOT settings) to enforce schema output in Ollama
+    response_text = call_llm(INTAKE_SYSTEM_PROMPT, request_text, settings=strict_settings)
+    return parse_task_intent_response(response_text, user_request=request_text)

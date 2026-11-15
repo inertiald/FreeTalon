@@ -120,16 +120,62 @@ class HiveConfig(BaseModel):
     heartbeat_timeout_seconds: float = Field(default=20.0, ge=1.0, le=300.0)
     poll_interval_seconds: float = Field(default=0.1, ge=0.01, le=5.0)
 
-    # ADR 0002 — distributed parameters, namespaced.
-    distributed: DistributedConfig = Field(default_factory=DistributedConfig)
+    # ADR 0002 — distributed parameters, flat on HiveConfig.
+    # Tests, inference.py and training.py all read these directly
+    # (config.topology, config.world_size, config.vllm_dtype, ...);
+    # the namespaced form broke them, so the fields live here and
+    # `distributed` below is a read-only view of the same values.
+    topology: Literal["star", "ring"] = Field(default="star")
+    transport: Literal["tcp", "rdma"] = Field(default="tcp")
+    tensor_parallel_size: int = Field(default=1, ge=1, le=512)
+    pipeline_parallel_size: int = Field(default=1, ge=1, le=128)
+    data_parallel_size: int = Field(default=1, ge=1, le=1024)
+    nccl_socket_ifname: str = Field(default="lo", max_length=32)
+    nccl_debug: bool = Field(default=False)
+    deepspeed_zero_stage: int = Field(default=0, ge=0, le=3)
+    vllm_max_model_len: int = Field(default=4096, ge=1, le=1_048_576)
+    vllm_dtype: Literal["auto", "float16", "bfloat16"] = Field(default="auto")
 
     @field_validator("workspace", "state_path", "audit_log_path", mode="before")
     @classmethod
     def _expand_path(cls, value: object) -> Path:
         return Path(value).expanduser().resolve()
 
+    @field_validator("nccl_socket_ifname")
+    @classmethod
+    def _non_empty_ifname(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("nccl_socket_ifname must not be empty")
+        return stripped
+
+    @property
+    def world_size(self) -> int:
+        """Combined GPU world size (tensor x pipeline x data parallelism)."""
+        return (
+            self.tensor_parallel_size
+            * self.pipeline_parallel_size
+            * self.data_parallel_size
+        )
+
+    @property
+    def distributed(self) -> DistributedConfig:
+        """Read-only namespaced view of the flat distributed fields."""
+        return DistributedConfig(
+            topology=self.topology,
+            transport=self.transport,
+            tensor_parallel_size=self.tensor_parallel_size,
+            pipeline_parallel_size=self.pipeline_parallel_size,
+            data_parallel_size=self.data_parallel_size,
+            nccl_socket_ifname=self.nccl_socket_ifname,
+            nccl_debug=self.nccl_debug,
+            deepspeed_zero_stage=self.deepspeed_zero_stage,
+            vllm_max_model_len=self.vllm_max_model_len,
+            vllm_dtype=self.vllm_dtype,
+        )
+
     def validate_against_host(self, host: HostCapabilities | None = None) -> None:
-        """Delegate distributed host cross-checks to the distributed namespace.
+        """Delegate distributed host cross-checks to :class:`DistributedConfig`.
 
         Host-level validation for HiveConfig proper stays here; the distributed
         parallelism/transport checks live on :class:`DistributedConfig`.

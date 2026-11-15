@@ -88,7 +88,12 @@ try:
     _plan_store = ExecutionPlanStateStore()
     # Non-strict: nodes with unrecognised capabilities receive a no-op handler
     # instead of raising UnknownCapabilityError, so demo DAGs can reach COMPLETED.
+    # Default claws must be registered explicitly — ToolRegistry no longer
+    # auto-registers them, and without this even "bash" would be a noop.
+    from freetalon.orchestrator.tool_registry import register_default_claws
+
     _tool_registry = ToolRegistry(strict=False)
+    register_default_claws(_tool_registry)
     # Node status → display colour mapping (keyed on PlanStatus enum members for
     # type safety; look up with node.status directly since PlanStatus is str Enum).
     _NODE_STATUS_COLORS: dict[PlanStatus, str] = {

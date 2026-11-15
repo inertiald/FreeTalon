@@ -4,33 +4,20 @@ Handlers can be:
 - Synchronous Python callables (wrapped transparently in an executor thread).
 - Asynchronous Python callables (awaited directly).
 - Docker run command descriptors (executed via async subprocess).
-
-Usage::
-
-    registry = ToolRegistry()
-
-    # Register a plain Python function
-    @registry.register("lint")
-    def run_lint(node_inputs: dict) -> dict:
-        ...
-        return {"exit_code": 0}
-
-    # Register a Docker command handler
-    registry.register_docker("browser", image="ghcr.io/freetalon/claw-browser:latest")
-
-    # Resolve and invoke
-    handler = registry.resolve("lint")
-    result = await handler({"file": "main.py"})
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
+import warnings
 from collections.abc import Callable, Coroutine
+from pathlib import Path
 from typing import Any
 
-# Type alias for an async handler: receives node inputs dict, returns result dict.
+from .intake import call_llm
+
 AsyncHandler = Callable[[dict[str, Any]], Coroutine[Any, Any, dict[str, Any]]]
 
 
@@ -58,20 +45,7 @@ def _make_docker_handler(
     extra_args: list[str] | None = None,
     timeout: float = 300.0,
 ) -> AsyncHandler:
-    """Return an async handler that runs ``docker run`` with *image*.
-
-    The handler passes node inputs as ``--env KEY=VALUE`` flags and returns
-    stdout, stderr, and the exit code.
-
-    Parameters
-    ----------
-    image:
-        Docker image to run (e.g. ``"ghcr.io/freetalon/claw-browser:latest"``).
-    extra_args:
-        Additional ``docker run`` arguments inserted before the image name.
-    timeout:
-        Maximum seconds to wait for the container to finish.
-    """
+    """Return an async handler that runs ``docker run`` with *image*."""
     extra_args = extra_args or []
 
     async def _docker_handler(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -107,53 +81,23 @@ def _make_docker_handler(
 
 
 class ToolRegistry:
-    """Registry mapping capability names to async handlers.
-
-    Parameters
-    ----------
-    strict:
-        When ``True`` (default), :meth:`resolve` raises
-        :class:`UnknownCapabilityError` for unregistered capabilities.
-        When ``False``, it returns a no-op handler that logs a warning.
-    """
-
-    def __init__(self, *, strict: bool = True) -> None:
+    def __init__(self, *, strict: bool = True, scaffolder: Any | None = None) -> None:
         self._strict = strict
         self._handlers: dict[str, AsyncHandler] = {}
+        self._scaffolder = scaffolder
 
-    # ── Registration ──────────────────────────────────────────────────────
+        # Default claws are NOT auto-registered: callers that want them
+        # (bootstrap.py) call register_default_claws(registry) explicitly.
+        # An empty registry must stay empty so unknown capabilities fail
+        # loudly instead of silently running a default or noop handler.
 
     def register(
         self,
         capability: str,
         handler: Callable[..., Any] | None = None,
     ) -> Callable[..., Any]:
-        """Register *handler* for *capability*.
-
-        Can be used as a decorator or called directly::
-
-            registry.register("lint", my_async_fn)
-
-            @registry.register("lint")
-            async def my_handler(inputs): ...
-
-        If *handler* is a regular (sync) callable it is automatically
-        wrapped to run in a thread-pool executor.
-
-        Parameters
-        ----------
-        capability:
-            Capability name string (case-sensitive).
-        handler:
-            Callable to register; if omitted the method returns a
-            decorator.
-
-        Returns
-        -------
-        The original callable (enabling decorator usage).
-        """
+        """Register *handler* for *capability*."""
         if handler is None:
-            # Decorator mode: @registry.register("cap")
             def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
                 self.register(capability, fn)
                 return fn
@@ -173,37 +117,87 @@ class ToolRegistry:
         extra_args: list[str] | None = None,
         timeout: float = 300.0,
     ) -> None:
-        """Register a Docker-run handler for *capability*.
-
-        Parameters
-        ----------
-        capability:
-            Capability name.
-        image:
-            Docker image to execute.
-        extra_args:
-            Additional ``docker run`` arguments (e.g. volume mounts).
-        timeout:
-            Container timeout in seconds.
-        """
+        """Register a Docker-run handler for *capability*."""
         self._handlers[capability] = _make_docker_handler(image, extra_args, timeout)
 
-    # ── Resolution ────────────────────────────────────────────────────────
+    def _register_default_claws(self) -> None:
+        """Register essential built-in capabilities."""
 
-    def resolve(self, capability: str) -> AsyncHandler:
-        """Return the async handler registered for *capability*.
+        @self.register("scaffold")
+        @self.register("file_writer")
+        async def scaffold_handler(inputs: dict[str, Any]) -> dict[str, Any]:
+            path_str = (
+                inputs.get("file_path")
+                or inputs.get("path")
+                or (inputs.get("outputs") and inputs["outputs"][0])
+            )
+            content = inputs.get("content") or inputs.get("file_content") or ""
 
-        Raises
-        ------
-        UnknownCapabilityError
-            If *capability* is not registered and ``strict=True``.
-        """
+            if not path_str:
+                raise ValueError("scaffold claw requires 'file_path' or 'path' in inputs.")
+
+            target_path = Path(path_str).expanduser()
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(content, encoding="utf-8")
+
+            return {"status": "success", "path": str(target_path), "bytes_written": len(content)}
+
+        @self.register("bash")
+        @self.register("shell_exec")
+        async def bash_handler(inputs: dict[str, Any]) -> dict[str, Any]:
+            cmd = inputs.get("command") or inputs.get("cmd")
+            if not cmd:
+                raise ValueError("bash claw requires a 'command' input string.")
+
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            return {
+                "exit_code": proc.returncode,
+                "stdout": stdout.decode("utf-8", errors="replace"),
+                "stderr": stderr.decode("utf-8", errors="replace"),
+            }
+
+        @self.register("llm_synthesis")
+        @self.register("summarize")
+        async def llm_synthesis_handler(inputs: dict[str, Any]) -> dict[str, Any]:
+            """Runs an LLM pass over input text or parent node outputs to synthesize findings."""
+            context_data = inputs.get("context") or inputs.get("text") or inputs.get("raw_data") or ""
+            instruction = inputs.get("instruction") or "Summarize the provided context clearly and concisely."
+
+            if not context_data:
+                return {"status": "skipped", "summary": "No context provided to synthesize."}
+
+            system_prompt = "You are an analytical assistant. Process the provided context data according to the instructions."
+            user_prompt = f"INSTRUCTION: {instruction}\n\nCONTEXT DATA:\n{context_data}"
+
+            summary = await asyncio.to_thread(call_llm, system_prompt, user_prompt)
+            print(f"\n--- SYNTHESIS RESULT ---\n{summary}\n------------------------\n")
+            return {"status": "success", "summary": summary}
+
+    def resolve(self, capability: str, node_inputs: dict[str, Any] | None = None) -> AsyncHandler:
+        """Return the handler for capability, scaffolding dynamically if missing."""
         handler = self._handlers.get(capability)
         if handler is not None:
             return handler
+
+        if self._scaffolder is not None:
+            try:
+                proposal = self._scaffolder.propose(capability, node_inputs or {})
+                if hasattr(proposal, "handler") and callable(proposal.handler):
+                    self.register(capability, proposal.handler)
+                    return self._handlers[capability]
+            except Exception as exc:
+                if self._strict:
+                    raise
+                warnings.warn(f"Failed to scaffold missing capability '{capability}': {exc}")
+
         if self._strict:
             raise UnknownCapabilityError(capability)
-        # Non-strict: return a no-op handler.
+
         return _make_noop_handler(capability)
 
     def capabilities(self) -> list[str]:
@@ -218,10 +212,13 @@ class ToolRegistry:
         return f"ToolRegistry(capabilities=[{caps}])"
 
 
+def register_default_claws(registry: ToolRegistry) -> None:
+    """Module-level alias for registering default claws on a registry instance."""
+    registry._register_default_claws()
+
+
 def _make_noop_handler(capability: str) -> AsyncHandler:
     """Return a handler that does nothing and warns about the missing capability."""
-    import warnings
-
     async def _noop(inputs: dict[str, Any]) -> dict[str, Any]:
         warnings.warn(
             f"No handler registered for capability {capability!r}; skipping.",
