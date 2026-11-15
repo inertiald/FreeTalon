@@ -145,5 +145,106 @@ class APIEndpointTests(unittest.TestCase):
         self.assertIn("metrics", resp)
 
 
+
+# ── M4: approval gates ───────────────────────────────────────────────────
+
+class APIGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from freetalon.orchestrator.gates import GateStore, build_packet
+
+        self.tmpdir = tempfile.TemporaryDirectory()
+        base = Path(self.tmpdir.name)
+        self.config = HiveConfig(
+            workspace=base,
+            state_path=base / "state.json",
+            audit_log_path=base / "audit.log",
+            worker_cap=2,
+            queue_multiplier=3,
+            poll_interval_seconds=0.02,
+        )
+        self.controller = HiveController(self.config)
+        self.controller.start()
+        self.gates = GateStore(base / "state.db")
+        self.server = HiveAPIServer(self.controller, _TOKEN, gate_store=self.gates)
+        self.server.start("127.0.0.1", 0)
+        port = self.server._httpd.server_address[1]
+        self.base = f"http://127.0.0.1:{port}"
+        self.packet = self.gates.create(
+            build_packet(
+                run_id="run-1",
+                plan_id="plan-1",
+                node_id="flash",
+                action="flash_ecu",
+                what="Flash the ECU",
+                why="next step",
+                risk="brick",
+                cost=0.0,
+                reversible=False,
+                evidence=[],
+                inputs={"file": "tune.bin"},
+            )
+        )
+
+    def tearDown(self) -> None:
+        self.server.stop()
+        self.controller.stop()
+        self.tmpdir.cleanup()
+
+    def test_list_gates(self) -> None:
+        resp = _get(f"{self.base}/gates")
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["count"], 1)
+        self.assertEqual(resp["gates"][0]["packet_id"], self.packet.packet_id)
+
+    def test_list_gates_pending_filter(self) -> None:
+        resp = _get(f"{self.base}/gates?status=pending")
+        self.assertEqual(resp["count"], 1)
+        _post(
+            f"{self.base}/gates/{self.packet.packet_id}/approve",
+            payload={"decided_by": "pat"},
+        )
+        resp = _get(f"{self.base}/gates?status=pending")
+        self.assertEqual(resp["count"], 0)
+
+    def test_get_one_gate(self) -> None:
+        resp = _get(f"{self.base}/gates/{self.packet.packet_id}")
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["gate"]["action"], "flash_ecu")
+
+    def test_approve_gate(self) -> None:
+        resp = _post(
+            f"{self.base}/gates/{self.packet.packet_id}/approve",
+            payload={"decided_by": "pat", "note": "go"},
+        )
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["gate"]["status"], "approved")
+        self.assertEqual(resp["gate"]["decided_by"], "pat")
+
+    def test_deny_gate(self) -> None:
+        resp = _post(
+            f"{self.base}/gates/{self.packet.packet_id}/deny",
+            payload={"decided_by": "pat"},
+        )
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["gate"]["status"], "denied")
+
+    def test_approve_twice_is_rejected(self) -> None:
+        _post(
+            f"{self.base}/gates/{self.packet.packet_id}/approve",
+            payload={"decided_by": "pat"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            _post(
+                f"{self.base}/gates/{self.packet.packet_id}/approve",
+                payload={"decided_by": "pat"},
+            )
+        self.assertEqual(cm.exception.code, 400)
+
+    def test_gates_require_auth(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            _get(f"{self.base}/gates", token="wrong")
+        self.assertEqual(cm.exception.code, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

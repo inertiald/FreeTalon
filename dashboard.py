@@ -93,6 +93,10 @@ try:
     from freetalon.orchestrator.tool_registry import register_default_claws
     from freetalon.orchestrator.research import register_research_claws
     from freetalon.orchestrator.sandbox import register_sandbox_claws
+    from freetalon.orchestrator.gates import GateStore
+
+    # M4: approval gates — shares the plan store's SQLite file.
+    _gate_store = GateStore()
 
     _tool_registry = ToolRegistry(strict=False)
     register_default_claws(_tool_registry)
@@ -951,6 +955,80 @@ def index() -> None:
                 _render_plan_tree(plan)
 
             ui.timer(0.75, _tick_plan)
+
+            # ============================================================= #
+            # APPROVAL GATES (M4) — human decisions on irreversible actions  #
+            # ============================================================= #
+
+            with ui.row().classes("w-full px-4 py-2 items-center gap-2"):
+                ui.icon("gavel").style("color:#f59e0b;font-size:1.3rem;")
+                ui.label("Approval Gates").classes("text-lg font-semibold").style(
+                    "color:#f59e0b;"
+                )
+
+            gates_list = ui.column().classes("w-full px-4 gap-2")
+
+            def _render_gates() -> None:
+                """List pending gate packets with Approve / Deny buttons."""
+                gates_list.clear()
+                with gates_list:
+                    if _gate_store is None:
+                        ui.label("Gate store unavailable").classes(
+                            "text-xs italic"
+                        ).style("color:#ef4444;")
+                        return
+                    pending = _gate_store.pending()
+                    if not pending:
+                        ui.label("No pending approvals").classes(
+                            "text-xs italic"
+                        ).style("color:#475569;")
+                        return
+                    for packet in pending:
+                        with ui.card().classes("w-full").style("background:#1e293b;"):
+                            ui.label(packet.what).classes(
+                                "text-xs font-semibold"
+                            ).style("color:#f1f5f9;")
+                            ui.label(
+                                f"Action: {packet.action} · Node: {packet.node_id}"
+                                f" · Cost: ${packet.cost:.2f}"
+                            ).classes("text-xs").style("color:#94a3b8;")
+                            ui.label(f"Risk: {packet.risk}").classes(
+                                "text-xs"
+                            ).style("color:#fbbf24;")
+                            ui.label(f"Expires: {packet.expires_at}").classes(
+                                "text-xs"
+                            ).style("color:#64748b;")
+                            with ui.row().classes("gap-2"):
+                                def _approve(p=packet):
+                                    _gate_store.decide(
+                                        p.packet_id, "approve", "dashboard"
+                                    )
+                                    ui.notify(
+                                        f"Approved {p.packet_id}",
+                                        type="positive",
+                                        position="top-right",
+                                    )
+                                    _render_gates()
+
+                                def _deny(p=packet):
+                                    _gate_store.decide(
+                                        p.packet_id, "deny", "dashboard"
+                                    )
+                                    ui.notify(
+                                        f"Denied {p.packet_id}",
+                                        type="warning",
+                                        position="top-right",
+                                    )
+                                    _render_gates()
+
+                                ui.button("Approve", on_click=_approve).style(
+                                    "background:#059669;color:#fff;"
+                                )
+                                ui.button("Deny", on_click=_deny).style(
+                                    "background:#7f1d1d;color:#fecaca;"
+                                )
+
+            ui.timer(2.0, _render_gates)
 
     # ====================================================================== #
     # FLOATING UPLOAD PANEL                                                  #

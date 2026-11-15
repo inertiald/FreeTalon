@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .docker_manager import resource_summary_safe
 from .hive import HiveController
+from .orchestrator.gates import GateStore
 from .security import authorize
 from .jsonutil import json_default
 
@@ -18,9 +19,16 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class HiveAPIServer:
-    def __init__(self, controller: HiveController, token: str) -> None:
+    def __init__(
+        self,
+        controller: HiveController,
+        token: str,
+        gate_store: GateStore | None = None,
+    ) -> None:
         self.controller = controller
         self.token = token
+        # M4: gate packets share the plan store's SQLite file by default.
+        self.gate_store = gate_store if gate_store is not None else GateStore()
         self._httpd: _ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -75,6 +83,36 @@ class HiveAPIServer:
                         return
                     return self._send(200, {"ok": True, "resources": resource_summary_safe()})
 
+                # M4: approval gates — list packets, optionally filtered.
+                if path == "/gates":
+                    if not self._authorized():
+                        return
+                    status_filter = qs.get("status", [None])[0]
+                    run_filter = qs.get("run_id", [None])[0]
+                    if run_filter:
+                        packets = api.gate_store.list_for_run(run_filter)
+                    elif status_filter == "pending":
+                        packets = api.gate_store.pending()
+                    else:
+                        packets = api.gate_store.all()
+                    return self._send(
+                        200,
+                        {
+                            "ok": True,
+                            "gates": [pkt.model_dump(mode="json") for pkt in packets],
+                            "count": len(packets),
+                        },
+                    )
+
+                if path.startswith("/gates/") and len(path.split("/")) == 3:
+                    if not self._authorized():
+                        return
+                    packet_id = path.split("/")[2]
+                    packet = api.gate_store.get(packet_id)
+                    if packet is None:
+                        return self._send(404, {"ok": False, "error": "Gate not found"})
+                    return self._send(200, {"ok": True, "gate": packet.model_dump(mode="json")})
+
                 return self._send(404, {"ok": False, "error": "Not Found"})
 
             def do_POST(self) -> None:  # noqa: N802
@@ -104,6 +142,32 @@ class HiveAPIServer:
                     task_id = path.split("/")[2]
                     ok = api.controller.cancel_task(task_id)
                     return self._send(200 if ok else 404, {"ok": ok, "task_id": task_id})
+
+                # M4: approve / deny a gate packet. Body: {decided_by, note?}.
+                if path.startswith("/gates/") and (
+                    path.endswith("/approve") or path.endswith("/deny")
+                ):
+                    if not self._authorized():
+                        return
+                    parts = path.split("/")
+                    packet_id, action = parts[2], parts[3]
+                    body = self._json_body()
+                    if body is None:
+                        return
+                    decided_by = str(body.get("decided_by") or "api")
+                    try:
+                        packet = api.gate_store.decide(
+                            packet_id, action, decided_by, note=body.get("note")
+                        )
+                    except ValueError as exc:
+                        return self._send(400, {"ok": False, "error": str(exc)})
+                    return self._send(
+                        200,
+                        {
+                            "ok": True,
+                            "gate": packet.model_dump(mode="json"),
+                        },
+                    )
 
                 return self._send(404, {"ok": False, "error": "Not Found"})
 

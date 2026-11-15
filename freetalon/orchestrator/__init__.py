@@ -1,6 +1,7 @@
 """FreeTalon orchestrator sub-package."""
 
 from .executor import Executor, ExecutorError
+from .gates import GatePacket, GateStatus, GateStore, build_packet, compute_packet_hash
 from .judge import Decision, Judge, JudgeDecision
 from .loop import LoopRunner, RunResult
 from .memory import ExperimentStore, goal_key_for
@@ -43,8 +44,13 @@ __all__ = [
     "PlanStatus",
     "RiskClass",
     "RunBudget",
+    "GatePacket",
+    "GateStatus",
+    "GateStore",
     "RunResult",
     "RunStore",
+    "build_packet",
+    "compute_packet_hash",
     "Sandbox",
     "analyze_file",
     "fetch_dataset",

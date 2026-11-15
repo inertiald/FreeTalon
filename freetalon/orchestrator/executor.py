@@ -59,6 +59,7 @@ class Executor:
         run_id: str | None = None,
         custom_checkers: dict | None = None,
         plan_version: int = 1,
+        gate_callback: "Callable[[PlanNode], bool] | None" = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -73,6 +74,11 @@ class Executor:
         self._run_id = run_id
         self._custom_checkers = custom_checkers
         self._plan_version = plan_version
+        # M4: called before an irreversible node (reversible is False)
+        # runs. Returns True when a human has approved the action; False
+        # pauses the node at AWAITING_APPROVAL. None means no gate is
+        # configured — an irreversible node then fails rather than running.
+        self._gate_callback = gate_callback
 
     async def run(self, plan_id: str) -> ExecutionPlan:
         plan = self._store.load(plan_id)
@@ -127,6 +133,21 @@ class Executor:
             target = _find_node(plan, node.id)
             if target is None or _is_terminal(target.status):
                 return
+            # M4: an irreversible node never runs without a human approval.
+            if target.reversible is False:
+                if self._gate_callback is None:
+                    self._record_failure(
+                        plan_id,
+                        node.id,
+                        "irreversible node requires an approval gate"
+                        " (no gate callback configured).",
+                    )
+                    return
+                if not self._gate_callback(target):
+                    target.status = PlanStatus.AWAITING_APPROVAL
+                    plan.touch()
+                    self._store.save(plan)
+                    return
             target.status = PlanStatus.RUNNING
             plan.touch()
             self._store.save(plan)
@@ -448,6 +469,8 @@ def _derive_plan_status(plan: ExecutionPlan) -> PlanStatus:
         return PlanStatus.FAILED
     if PlanStatus.CANCELLED in statuses:
         return PlanStatus.CANCELLED
+    if PlanStatus.AWAITING_APPROVAL in statuses:
+        return PlanStatus.AWAITING_APPROVAL
     if all(_is_terminal(s) for s in statuses):
         return PlanStatus.COMPLETED
     return PlanStatus.RUNNING

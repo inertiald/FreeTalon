@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .executor import Executor
+from .gates import GateStatus, GateStore, build_packet, compute_packet_hash
 from .judge import Decision, Judge
 from .measure import VERDICT_FAIL, VERDICT_PASS, VERDICT_UNMEASURABLE, _compare
 from .memory import ExperimentStore, goal_key_for
@@ -56,6 +57,7 @@ class RunResult:
     attempts: list[dict[str, Any]] = field(default_factory=list)
     escalation: str | None = None
     decision_history: list[dict[str, Any]] = field(default_factory=list)
+    gate_packet_id: str | None = None
 
 
 class LoopRunner:
@@ -71,6 +73,7 @@ class LoopRunner:
         custom_checkers: dict | None = None,
         max_concurrency: int = 8,
         memory_store: ExperimentStore | None = None,
+        gate_store: GateStore | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -87,6 +90,17 @@ class LoopRunner:
             self._memory_store = (
                 ExperimentStore(db_path) if db_path is not None else ExperimentStore()
             )
+        # M4: gate packets share the same SQLite file (gates table).
+        if gate_store is not None:
+            self._gate_store = gate_store
+        else:
+            db_path = getattr(store, "db_path", None)
+            self._gate_store = (
+                GateStore(db_path, audit_logger=audit_logger)
+                if db_path is not None
+                else GateStore(audit_logger=audit_logger)
+            )
+        self._gate_packets: dict[str, str] = {}
 
     # ── Public entry points ──────────────────────────────────────────────
 
@@ -158,6 +172,7 @@ class LoopRunner:
                 custom_checkers=self._custom_checkers,
                 audit_logger=self._audit_logger,
                 plan_version=version,
+                gate_callback=self._gate_callback_for(run_id, plan.plan_id),
             )
             plan = asyncio.run(executor.run(plan.plan_id))
             ran = [
@@ -182,6 +197,55 @@ class LoopRunner:
                     },
                 }
             )
+
+            # M4: a node paused at a gate ends this pass — the run waits
+            # for a human decision, it does not push through.
+            awaiting = [
+                n for n in plan.nodes if n.status == PlanStatus.AWAITING_APPROVAL
+            ]
+            if awaiting:
+                node = awaiting[0]
+                packets = [
+                    pkt
+                    for pkt in self._gate_store.list_for_run(run_id)
+                    if pkt.node_id == node.id
+                ]
+                if not packets:
+                    # No packet was created: this action was already denied
+                    # in this run. Never re-ask — fail honestly instead.
+                    node.status = PlanStatus.FAILED
+                    node.error = (
+                        "approval already denied for this action in this run;"
+                        " not re-asked"
+                    )
+                    self._store.save(plan)
+                    escalation = (
+                        f"gate denied previously for node {node.id}; not re-asked"
+                    )
+                    decision_history.append(
+                        {"version": version, "decision": "escalate", "reason": escalation}
+                    )
+                    break
+                packet = packets[-1]
+                self._gate_packets[run_id] = packet.packet_id
+                escalation = (
+                    f"awaiting approval: gate packet {packet.packet_id}"
+                    f" for node {node.id} ({packet.action})"
+                )
+                decision_history.append(
+                    {
+                        "version": version,
+                        "decision": "awaiting_approval",
+                        "reason": escalation,
+                    }
+                )
+                self._log(
+                    "loop.gate.awaiting",
+                    run_id=run_id,
+                    packet_id=packet.packet_id,
+                    node_id=node.id,
+                )
+                break
 
             if plan.status == PlanStatus.COMPLETED:
                 decision_history.append(
@@ -258,6 +322,32 @@ class LoopRunner:
             escalation = decision.reason
             break
 
+        return self._finish_run(
+            run_id,
+            plan,
+            contract,
+            version=version,
+            attempts=attempts,
+            decision_history=decision_history,
+            escalation=escalation,
+            started=started,
+            started_at=started_at,
+        )
+
+    def _finish_run(
+        self,
+        run_id: str,
+        plan: ExecutionPlan,
+        contract: GoalContract,
+        *,
+        version: int,
+        attempts: list[dict[str, Any]],
+        decision_history: list[dict[str, Any]],
+        escalation: str | None,
+        started: float,
+        started_at: str,
+    ) -> RunResult:
+        """Evaluate the goal, write the summary, and build the result."""
         measurements = self._run_store.read_measurements(run_id)
         if not measurements:
             measurements = [n.measurement for n in plan.nodes if n.measurement]
@@ -302,6 +392,204 @@ class LoopRunner:
             attempts=attempts,
             escalation=escalation,
             decision_history=decision_history,
+            gate_packet_id=self._gate_packets.get(run_id),
+        )
+
+    # ── Approval gates (M4) ──────────────────────────────────────────────
+
+    def _gate_evidence(self, run_id: str) -> list[str]:
+        """Artifact paths and measurement refs supporting a gate packet."""
+        evidence: list[str] = []
+        run_dir = self._run_store.run_dir(run_id)
+        for sub in ("research", "nodes", "sandbox", "gates"):
+            folder = run_dir / sub
+            if folder.is_dir():
+                for found in sorted(folder.rglob("*")):
+                    if found.is_file():
+                        evidence.append(str(found.relative_to(run_dir)))
+                        if len(evidence) >= 10:
+                            return evidence
+        for measurement in self._run_store.read_measurements(run_id):
+            evidence.append(
+                f"measurement:{measurement.get('node_id')}:{measurement.get('verdict')}"
+            )
+        return evidence[:10]
+
+    def _gate_callback_for(self, run_id: str, plan_id: str):
+        """Build the executor's gate callback for one run (M4).
+
+        The callback creates a gate packet for an irreversible node and
+        returns False, so the executor pauses the node at
+        AWAITING_APPROVAL instead of running it. It returns False without
+        creating a packet when the same action was already denied in this
+        run, or when an identical pending packet already exists.
+        """
+
+        def _callback(node: PlanNode) -> bool:
+            action = str(node.inputs.get("action") or node.assigned_claw or node.id)
+            evidence = self._gate_evidence(run_id)
+            packet_hash = compute_packet_hash(action, node.id, dict(node.inputs))
+            if packet_hash in self._gate_store.denied_hashes_for_run(run_id):
+                self._log(
+                    "loop.gate.denied_before",
+                    run_id=run_id,
+                    node_id=node.id,
+                    action=action,
+                )
+                return False
+            for existing in self._gate_store.list_for_run(run_id):
+                if existing.node_id == node.id and existing.packet_hash == packet_hash:
+                    # The approval is bound to this exact action: an
+                    # APPROVED packet with the same hash lets the node run;
+                    # a PENDING one means it is already waiting.
+                    if existing.status == GateStatus.APPROVED:
+                        return True
+                    if existing.status == GateStatus.PENDING:
+                        return False
+            packet = build_packet(
+                run_id=run_id,
+                plan_id=plan_id,
+                node_id=node.id,
+                action=action,
+                what=node.objective,
+                why=f"next step toward: {node.objective}",
+                risk=str(node.inputs.get("risk") or "not stated — see evidence"),
+                cost=float(node.inputs.get("cost", 0.0)),
+                reversible=node.reversible,
+                evidence=evidence,
+                inputs=dict(node.inputs),
+            )
+            self._gate_store.create(packet)
+            gates_dir = self._run_store.run_dir(run_id) / "gates"
+            gates_dir.mkdir(parents=True, exist_ok=True)
+            (gates_dir / f"{packet.packet_id}.json").write_text(
+                packet.model_dump_json(indent=2), encoding="utf-8"
+            )
+            self._gate_packets[run_id] = packet.packet_id
+            self._log(
+                "loop.gate.created",
+                run_id=run_id,
+                packet_id=packet.packet_id,
+                node_id=node.id,
+                action=action,
+            )
+            return False
+
+        return _callback
+
+    def resume_run(
+        self,
+        run_id: str,
+        plan_id: str,
+        contract: GoalContract,
+        *,
+        replan_fn: ReplanFn | None = None,
+    ) -> RunResult:
+        """Resume a run paused at a gate, after a human decision (M4).
+
+        Approved: the node returns to READY and the run continues.
+        Denied or expired: the node fails honestly (deny on timeout),
+        the denial is recorded in experiment memory, and the run ends
+        without re-asking. A packet whose hash no longer matches the
+        node is void — the action changed, so the approval does not apply.
+        """
+        plan = self._store.load(plan_id)
+        if plan is None:
+            raise ValueError(f"plan {plan_id!r} not found in store.")
+        awaiting = [n for n in plan.nodes if n.status == PlanStatus.AWAITING_APPROVAL]
+        if not awaiting:
+            raise ValueError(f"plan {plan_id!r} has no node awaiting approval.")
+        node = awaiting[0]
+        packets = [
+            pkt
+            for pkt in self._gate_store.list_for_run(run_id)
+            if pkt.node_id == node.id
+        ]
+        if not packets:
+            raise ValueError(f"no gate packet for node {node.id!r} in run {run_id!r}.")
+        packet = packets[-1]
+        if packet.status == GateStatus.PENDING:
+            raise ValueError(f"gate packet {packet.packet_id} is still pending.")
+        started = time.monotonic()
+        started_at = datetime.now(UTC).isoformat()
+        if packet.status == GateStatus.APPROVED:
+            current = compute_packet_hash(packet.action, node.id, dict(node.inputs))
+            if current != packet.packet_hash:
+                node.status = PlanStatus.FAILED
+                node.error = (
+                    "gate packet no longer matches the node (action or inputs"
+                    " changed); approval void"
+                )
+                self._store.save(plan)
+                return self._finish_run(
+                    run_id,
+                    plan,
+                    contract,
+                    version=1,
+                    attempts=[],
+                    decision_history=[
+                        {
+                            "version": 1,
+                            "decision": "escalate",
+                            "reason": "gate packet hash mismatch — approval void",
+                        }
+                    ],
+                    escalation="gate packet hash mismatch — approval void",
+                    started=started,
+                    started_at=started_at,
+                )
+            node.status = PlanStatus.READY
+            node.error = None
+            self._store.save(plan)
+            self._log(
+                "loop.gate.approved",
+                run_id=run_id,
+                packet_id=packet.packet_id,
+                node_id=node.id,
+            )
+            return self.run_plan(plan, contract, run_id=run_id, replan_fn=replan_fn)
+        # DENIED or EXPIRED: deny on timeout is a denial.
+        reason = (
+            f"gate denied by {packet.decided_by}"
+            if packet.status == GateStatus.DENIED
+            else "gate expired without a decision (deny on timeout)"
+        )
+        node.status = PlanStatus.FAILED
+        node.error = reason
+        node.measurement = {
+            "node_id": node.id,
+            "verdict": VERDICT_FAIL,
+            "detail": reason,
+            "plan_version": 1,
+        }
+        self._store.save(plan)
+        self._record_experiments(
+            run_id,
+            goal_key_for(contract.objective),
+            plan.intent.project_type,
+            [node],
+            [node.measurement],
+            "ESCALATE",
+        )
+        self._log(
+            "loop.gate.denied",
+            run_id=run_id,
+            packet_id=packet.packet_id,
+            node_id=node.id,
+            reason=reason,
+        )
+        return self._finish_run(
+            run_id,
+            plan,
+            contract,
+            version=1,
+            attempts=[],
+            decision_history=[
+                {"version": 1, "decision": "escalate", "reason": reason}
+            ],
+            escalation=reason,
+            started=started,
+            started_at=started_at,
         )
 
     def run_goal(
