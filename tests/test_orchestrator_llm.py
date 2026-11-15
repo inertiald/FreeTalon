@@ -30,6 +30,12 @@ class TestPrompts(unittest.TestCase):
         self.assertIn('"goal"', INTAKE_SYSTEM_PROMPT)
         self.assertIn("Do not wrap the JSON in markdown", INTAKE_SYSTEM_PROMPT)
 
+    def test_intake_prompt_has_no_full_example_to_echo(self) -> None:
+        # Greedy decoding copies a full few-shot JSON example verbatim;
+        # the schema enforces the shape, so no example JSON may appear.
+        self.assertNotIn("Summarize directory structure", INTAKE_SYSTEM_PROMPT)
+        self.assertIn("Keep the goal concrete", INTAKE_SYSTEM_PROMPT)
+
     def test_planner_prompt_requires_dag_constraints(self) -> None:
         self.assertIn("dependency-safe directed acyclic graph", PLANNER_SYSTEM_PROMPT)
         self.assertIn('"nodes"', PLANNER_SYSTEM_PROMPT)
@@ -103,6 +109,9 @@ class TestIntake(unittest.TestCase):
             intent = intake_request("Please automate my CI triage workflow.", settings=settings)
         self.assertEqual(intent.goal, "Automate CI triage")
         call_mock.assert_called_once()
+        user_prompt = call_mock.call_args[0][1]
+        self.assertTrue(user_prompt.startswith("User Request: "))
+        self.assertIn("Please automate my CI triage workflow.", user_prompt)
 
 
 class TestPlanner(unittest.TestCase):

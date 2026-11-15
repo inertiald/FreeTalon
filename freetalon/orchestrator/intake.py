@@ -277,6 +277,12 @@ def intake_request(raw_request: str, settings: LLMSettings | None = None) -> Tas
         **{**llm_settings.__dict__, "format_schema": TaskIntent.model_json_schema()}
     )
     
-    # Send strict_settings (NOT settings) to enforce schema output in Ollama
-    response_text = call_llm(INTAKE_SYSTEM_PROMPT, request_text, settings=strict_settings)
+    # Send strict_settings (NOT settings) to enforce schema output in Ollama.
+    # Frame the user message as the request line: with temperature 0 the
+    # model otherwise echoes whatever JSON it last saw in the prompt.
+    response_text = call_llm(
+        INTAKE_SYSTEM_PROMPT,
+        f"User Request: {request_text}\nJSON Output:",
+        settings=strict_settings,
+    )
     return parse_task_intent_response(response_text, user_request=request_text)

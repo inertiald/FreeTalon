@@ -19,16 +19,9 @@ step (write, run, verify, ...) in the "goal" string exactly as the user
 stated them. Do not compress a multi-step request into a single action,
 and do not drop a file name or location.
 
-FEW-SHOT EXAMPLES:
-User Request: "Summarize /home/seeker/projects/FreeTalon"
-JSON Output:
-{
-  "goal": "Summarize directory structure and contents of /home/seeker/projects/FreeTalon",
-  "project_type": "analysis",
-  "capabilities": ["bash", "llm_synthesis"],
-  "constraints": {},
-  "missing_inputs": []
-}
+The user request arrives as the user message, framed as "User Request:".
+Answer THAT request. Base every field on the user request, never on any
+text in this system prompt.
 """
 
 PLANNER_SYSTEM_PROMPT = """You convert a TaskIntent JSON object into an execution DAG JSON object.
@@ -125,41 +118,41 @@ Output DAG:
 }
 
 [Example 3: Write, Run, Verify]
-Input Goal: "Write a python script at /home/seeker/freetalon-workspace/fib.py that prints the first 10 Fibonacci numbers, run it, and verify the output is exactly 0 1 1 2 3 5 8 13 21 34"
+Input Goal: "Write a python script at /home/seeker/freetalon-workspace/squares.py that prints the squares of 1 through 5, run it, and verify the output is exactly 1 4 9 16 25"
 Output DAG:
 {
   "nodes": [
     {
       "id": "step_1",
-      "objective": "Write the Fibonacci script",
+      "objective": "Write the squares script",
       "depends_on": [],
       "assigned_claw": "scaffold",
       "status": "draft",
-      "inputs": {"file_path": "/home/seeker/freetalon-workspace/fib.py", "content": "a, b = 0, 1\\nfor _ in range(10):\\n    print(a)\\n    a, b = b, a + b\\n"},
-      "outputs": ["/home/seeker/freetalon-workspace/fib.py"],
+      "inputs": {"file_path": "/home/seeker/freetalon-workspace/squares.py", "content": "squares = [i * i for i in range(1, 6)]\\nfor x in squares:\\n    print(x)\\n"},
+      "outputs": ["/home/seeker/freetalon-workspace/squares.py"],
       "acceptance": ["File exists"],
-      "criteria": [{"type": "file_exists", "path": "/home/seeker/freetalon-workspace/fib.py"}],
+      "criteria": [{"type": "file_exists", "path": "/home/seeker/freetalon-workspace/squares.py"}],
       "error": null
     },
     {
       "id": "step_2",
-      "objective": "Run the Fibonacci script and save its output",
+      "objective": "Run the squares script and save its output",
       "depends_on": ["step_1"],
       "assigned_claw": "bash",
       "status": "draft",
-      "inputs": {"command": "python3 /home/seeker/freetalon-workspace/fib.py > /home/seeker/freetalon-workspace/fib_out.txt"},
-      "outputs": ["/home/seeker/freetalon-workspace/fib_out.txt"],
+      "inputs": {"command": "python3 /home/seeker/freetalon-workspace/squares.py > /home/seeker/freetalon-workspace/squares_out.txt"},
+      "outputs": ["/home/seeker/freetalon-workspace/squares_out.txt"],
       "acceptance": ["Command exits with code 0", "Output file exists"],
-      "criteria": [{"type": "exit_code", "equals": 0}, {"type": "file_exists", "path": "/home/seeker/freetalon-workspace/fib_out.txt"}],
+      "criteria": [{"type": "exit_code", "equals": 0}, {"type": "file_exists", "path": "/home/seeker/freetalon-workspace/squares_out.txt"}],
       "error": null
     },
     {
       "id": "step_3",
-      "objective": "Verify the Fibonacci output is exactly right",
+      "objective": "Verify the squares output is exactly right",
       "depends_on": ["step_2"],
       "assigned_claw": "bash",
       "status": "draft",
-      "inputs": {"command": "head -1 /home/seeker/freetalon-workspace/fib_out.txt | grep -qx '0' && tail -1 /home/seeker/freetalon-workspace/fib_out.txt | grep -qx '34' && grep -c . /home/seeker/freetalon-workspace/fib_out.txt | grep -qx '10'"},
+      "inputs": {"command": "head -1 /home/seeker/freetalon-workspace/squares_out.txt | grep -qx '1' && tail -1 /home/seeker/freetalon-workspace/squares_out.txt | grep -qx '25' && grep -c . /home/seeker/freetalon-workspace/squares_out.txt | grep -qx '5'"},
       "outputs": ["verification"],
       "acceptance": ["Output verified"],
       "criteria": [{"type": "exit_code", "equals": 0}],
