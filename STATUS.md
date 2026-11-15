@@ -211,3 +211,20 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   Fix queued for Pat: planner hardening (claw allowlist + plan repair retry
   + structured criteria). The M5 smoke runs used hand-written plans, not
   LLM plans -- that distinction is now on the record.
+
+## Update - 2026-11-14 21:12
+
+- Planner hardened (Pat: "harden the planner now"): claw allowlist
+  enforced in code (KNOWN_CLAW_NAMES; aliases accepted), structured
+  criteria required per node (paths must be files the node itself writes
+  or runs), plan repair retry (max 2, then honest raise) in
+  plan_task_intent + replan_from_brief, prompts state the allowlist /
+  criteria / cover-every-step / never-echo-the-brief. Intake fixed too:
+  with temperature 0 Gemma echoed the prompt's few-shot example verbatim
+  (3/3 calls) — example removed, user message framed as a request line;
+  intake now returns the full goal. Tests 368 -> 381, CI green.
+- Live proof, first attempt: run-20261115T051123Z-8cc0c1, same Fibonacci
+  goal, Gemma planned 3 nodes (scaffold fib.py, run it, verify output),
+  all PASS, goal PASS. fib.py verified independently: prints exactly
+  0 1 1 2 3 5 8 13 21 34. M5 smoke still passes unchanged.
+- Branch head: check git log (docs commit on top of 1ca667d).
