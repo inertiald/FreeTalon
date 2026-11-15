@@ -1,0 +1,36 @@
+name: Tests
+
+# Runs the FreeTalon unit suite on every push to main / dev branches and
+# on every pull request. Tests are hermetic: LLM calls are mocked
+# (unittest.mock.patch on call_llm) and Docker is mocked, so no Ollama
+# or live service is needed on the runner.
+on:
+  push:
+    branches:
+      - main
+      - "dev/**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
