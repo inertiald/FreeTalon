@@ -91,3 +91,19 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
 
 - CI green: Tests #2 (run 43674364531) passed — 229/229 on the branch.
   The RDMA test fix did it. Branch head a4409fc.
+
+## Update - 2026-11-14 20:13 (M0 DONE)
+
+- M0 Run and measure is DONE and green: 270/270 tests (was 229).
+  - New: freetalon/orchestrator/measure.py (deterministic evaluators,
+    verdicts PASS/FAIL/UNMEASURABLE), run_store.py (run directories),
+    loop.py (LoopRunner, GoalContract evaluation, summary.md).
+  - Executor now measures every node: non-zero exit code fails the node
+    even with no criteria; timeouts kill the process group; measurements
+    recorded on the node and in measurements.jsonl.
+  - GoalContract with conservative budgets (3600s, 3 attempts, 3 re-plans,
+    50 nodes, $0 real money). Sanitizer fixed (echo accepts "don't" etc.).
+    vLLM decided DEFERRED; Ollama is the working path.
+  - Live smoke: run-20261115T041349Z-bc5c66 — exit-1 node FAILED,
+    file-writing node COMPLETED, run dir + summary verified on disk.
+- Next: M1 Judge and re-plan.

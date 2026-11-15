@@ -34,10 +34,15 @@ before the fleet is worth cabling. See section 6.
 - Gemma 3 12B (gemma-3-abliterated:latest) runs in Docker via Ollama,
   43/49 layers on GPU, ~10 tok/s. FreeTalon intake via Ollama returns a
   validated TaskIntent.
-- Test suite: 229/229 green (was 26 broken on 2026-11-14: 10 fail, 16
-  error). Fixed: JSON marshaling (freetalon/jsonutil.py + patched
+- Test suite: 270/270 green (229 on 2026-11-14; +41 in the M0 loop
+  build). Fixed: JSON marshaling (freetalon/jsonutil.py + patched
   hive.py / audit.py / api.py), flat distributed config, strict tool
   registry, planner normalisation, prompt contracts, executor audit events.
+- M0 DONE 2026-11-14 (see section 4): executor measures every node
+  (freetalon/orchestrator/measure.py), run directories under
+  freetalon-workspace/runs/<run-id>/, GoalContract with conservative
+  budgets, input sanitizer fixed, vLLM path decided deferred (Ollama is
+  the working path).
 - What works on one node: Ollama intake, echo submit, hive-state
   persistence, dashboard pipeline (non-strict registry, demo behaviour).
 - What does not work yet: the autonomous loop (section 3). The vLLM
@@ -51,8 +56,8 @@ before the fleet is worth cabling. See section 6.
 | Intake | Turn a request into a validated TaskIntent, with budgets, risk limits and forbidden actions captured as constraints | Partial: goal parsing works but is loose ("check the GPU" became "summarise the directory"); constraints are not captured |
 | Plan | Produce a DAG with acceptance criteria per node | One-shot only: a single DAG, never re-planned |
 | Execute | Run nodes through the tool registry | Works, but dishonest: a node is COMPLETED if its handler returns, even when a bash script exits non-zero; exit_code is returned and never read; acceptance is stored and never checked |
-| Measure | Record what actually happened (exit codes, outputs, metrics) | Missing: no measurement step at all |
-| Judge | Decide pass/fail against acceptance criteria | Missing |
+| Measure | Record what actually happened (exit codes, outputs, metrics) | DONE (M0): measure.py evaluates criteria deterministically; verdicts PASS/FAIL/UNMEASURABLE; measurements.jsonl per run |
+| Judge | Decide pass/fail against acceptance criteria | Missing (M1): executor judges per-node via measurement; the four-way judge (continue/retry/re-plan/escalate) is not built yet |
 | Re-plan | On failure, plan again from the measurements | Missing: no re-plan, no retry-with-a-changed-approach (only sub-DAG injection for missing dependencies, capped at 3) |
 | Remember | Keep hypothesis, measurement, next try across runs | Missing: runs are stateless |
 | Research | Gather data, research risks, fetch files — with provenance | Missing: no research/data tools |
@@ -64,14 +69,20 @@ Design" (written 2026-11-14). This plan is the execution schedule for it.
 
 ## 4. Milestones
 
-### M0 — Run and measure (next)
+### M0 — Run and measure (DONE 2026-11-14)
 Executor judges every node result: non-zero exit_code fails the node,
 acceptance criteria are checked, measurements are recorded on the node.
 Done when: a script that exits 1 reports FAILED with its output attached;
 a script that passes its acceptance reports COMPLETED with measurements;
 tests cover both. New module orchestrator/measure.py.
+Evidence: 270/270 tests green (was 229); live smoke run
+run-20261115T041349Z-bc5c66 (exit-1 node FAILED with verdict, file-writing
+node COMPLETED with PASS, measurements.jsonl + summary.md on disk).
+Small fixes done: echo sanitizer accepts ordinary text ("don't",
+"hello!", quotes); vLLM decided DEFERRED — Ollama is the working path,
+the module is kept as the documented integration point (see inference.py).
 
-### M1 — Re-plan from measurements
+### M1 — Re-plan from measurements (next)
 Planner takes the failed plan + measurements and produces a revised DAG.
 Iteration budget (max re-plans per run) and stop conditions defined.
 Done when: a failing plan is automatically revised and re-run up to the
@@ -167,8 +178,9 @@ Alignment notes, read from the finished document:
 - Milestones M0-M4 map to the design's five phases: 1 Run and measure,
   2 Judge and re-plan, 3 Experiment memory, 4 Research tools,
   5 Approval gates. M5 (verticals) and M6 (fleet) sit on top of those.
-- Phase 1 also includes the small fixes: input sanitizer (still rejects
-  ordinary text like "don't") and a decision on the vLLM path's fate.
+- Phase 1 also includes the small fixes: input sanitizer (fixed in M0 —
+  echo now accepts ordinary text) and a decision on the vLLM path's fate
+  (decided in M0: DEFERRED, Ollama is the working path).
 - Measurement contract: verdicts are PASS / FAIL / UNMEASURABLE, from
   deterministic evaluators (exit_code, file_exists, file_matches, metric,
   tests_pass, custom_check). A node is SUCCEEDED only when execution
@@ -190,6 +202,8 @@ Decisions for Pat before Phase 1 (from the design doc, defaults assumed
 until Pat says otherwise):
 
 - Default budgets: conservative caps for time, attempts, re-plans per run.
+  Set in code (RunBudget, M0): 3600s wall clock, 3 attempts per hypothesis,
+  3 re-plans, 50 nodes, $0 real money (paper/dry-run only).
 - Gate delivery: gate packets in the FreeTalon interface (assumed).
 - Data sources: which market/data providers and research sources are
   in bounds for Phase 4.
