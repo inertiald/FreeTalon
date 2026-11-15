@@ -86,3 +86,8 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   runner loads ib_core, so detection returned True. Fix: mock the
   module probe in the test too (tests/test_docker_manager.py).
   Pushed as a new commit; waiting on the re-run.
+
+## Update - 2026-11-14 19:54
+
+- CI green: Tests #2 (run 43674364531) passed — 229/229 on the branch.
+  The RDMA test fix did it. Branch head a4409fc.
