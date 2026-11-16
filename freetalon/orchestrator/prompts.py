@@ -42,6 +42,14 @@ ALLOWED CLAWS — "assigned_claw" MUST be one of these exact names. Never invent
 - "can_capture", "verify_backup", "tune_surface", "flash_ecu": ECU steps. Use only for ECU goals.
 If no listed claw covers a step, use a "bash" node that reports the gap — never invent a claw name.
 
+GROUND IN THE REPO — before planning, read the REPO CONTEXT in your
+prompt. If an endpoint, module, or file already exists, EXTEND it — never
+create a new file that duplicates it. For example, GET /health already
+exists in freetalon/api.py: do not create api/health.py or any other new
+health file; put the work in freetalon/api.py itself. The FreeTalon API
+runs on port 8765. Port 8000 is the OpenAI-compatible LLM backend, not a
+service to curl or verify.
+
 CRITICAL SCHEMA RULES:
 1. "acceptance", "outputs", and "depends_on" MUST ALWAYS be JSON arrays of strings (e.g. ["Command exits with code 0"]), NEVER a bare string.
 2. Root nodes MUST have "depends_on": []. Downstream nodes MUST list parent step IDs in "depends_on".
@@ -51,7 +59,7 @@ MEASURABLE CRITERIA — every node MUST have a "criteria" array with at least on
 - {"type": "exit_code", "equals": 0} — for "bash" nodes: the command must exit 0.
 - {"type": "file_exists", "path": "<absolute path>"} — the file must exist after the node runs.
 - {"type": "file_matches", "path": "<absolute path>", "sha256": "<hex>"} — file contents must match a hash.
-- {"type": "metric", "name": "<metric>", "op": ">=", "value": <number>} — a numeric metric the handler reports (e.g. "summary_chars" for "llm_synthesis", "trade_count" for "backtest").
+- {"type": "metric", "name": "<metric>", "op": ">=", "value": <number>} — a numeric metric the node's claw reports (e.g. "summary_chars" for "llm_synthesis", "trade_count" for "backtest"). "bash" and "scaffold" report NO metrics — never put a metric criterion on them.
 - {"type": "tests_pass", "suite": "<path to a test file or directory>"} — the suite must pass.
 - "custom_check" is NOT available. Do not use it.
 A file criterion's "path" MUST be a file this node itself writes or runs: the same path string as the node's "file_path" input, an entry of its "outputs", or a path inside its "bash" command. Never point a criterion at a file another node creates.
@@ -188,6 +196,9 @@ Rules:
   "differs_by" (what it does differently from the failed attempt).
 - Do not repeat a failed approach (same capability and hypothesis) without
   a stated differs_by — the judge rejects such plans.
+- Ground in the repo: if an endpoint or module already exists, extend it;
+  never create a new file duplicating it. The FreeTalon API runs on port
+  8765; do not use port 8000 for service checks.
 - Shrink scope before growing it: narrow the hypothesis, add a cheaper
   test, or gather the missing data first.
 - Every node needs testable acceptance: a "criteria" array with at least

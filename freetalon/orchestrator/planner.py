@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 import re
+import shlex
 import hashlib
 import heapq
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
 from .intake import LLMResponseError, LLMSettings, call_llm, parse_json_object
+from .repo_index import (
+    build_repo_index,
+    duplicate_scaffold_error,
+    format_repo_context,
+)
 from .measure import (
     CRITERION_CUSTOM_CHECK,
     CRITERION_EXIT_CODE,
@@ -20,7 +27,7 @@ from .measure import (
 )
 from .models import ExecutionPlan, PlanNode, PlanStatus, TaskIntent
 from .prompts import PLANNER_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT
-from .tool_registry import KNOWN_CLAW_NAMES
+from .tool_registry import KNOWN_CLAW_NAMES, metrics_reported_by
 
 
 def _plan_id_for_intent(intent: TaskIntent) -> str:
@@ -120,8 +127,14 @@ def sanitize_llm_output(raw_text: str) -> str:
     cleaned = cleaned.replace("\xe2\x96\x81", " ").replace("▁", "")
     return cleaned
 
-def parse_planner_response(raw_text: str) -> tuple[list[PlanNode], dict[str, Any]]:
-    """Validate raw planner output into normalized PlanNodes plus metadata."""
+def parse_planner_response(
+    raw_text: str, *, repo_root: str | Path | None = None
+) -> tuple[list[PlanNode], dict[str, Any]]:
+    """Validate raw planner output into normalized PlanNodes plus metadata.
+
+    ``repo_root`` overrides the repo the grounding check reads; by default
+    it is the checkout holding this package.
+    """
     raw_text = sanitize_llm_output(raw_text)
     print(f"\n--- RAW PLANNER OUTPUT ---\n{raw_text}\n--------------------------\n")
     
@@ -163,6 +176,8 @@ def parse_planner_response(raw_text: str) -> tuple[list[PlanNode], dict[str, Any
     # build_execution_plan directly), so existing callers are unaffected.
     _validate_node_claws(nodes)
     _validate_node_criteria(nodes)
+    _validate_node_commands(nodes)
+    _validate_node_grounding(nodes, repo_root)
 
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
@@ -258,6 +273,21 @@ def _usable_criterion_error(criterion: Any, node: PlanNode) -> str | None:
         value = criterion.get("value")
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             return f"metric criterion {name!r} needs a numeric 'value'"
+        # Fix 3: the metric must be one the node's claw actually reports.
+        # A bash node can never report test_count — that is a plan error,
+        # not a measurement to record as "not reported" at execution time.
+        claw = node.assigned_claw or ""
+        reported = metrics_reported_by(claw)
+        if name not in reported:
+            if reported:
+                return (
+                    f"metric criterion {name!r} is not reported by claw {claw!r} "
+                    f"(it reports: {', '.join(sorted(reported))})"
+                )
+            return (
+                f"metric criterion {name!r} is not reported by claw {claw!r} "
+                "(that claw reports no metrics — use exit_code or file_exists)"
+            )
         return None
     if ctype == CRITERION_TESTS_PASS:
         suite = criterion.get("suite")
@@ -273,6 +303,117 @@ def _usable_criterion_error(criterion: Any, node: PlanNode) -> str | None:
     if name not in custom_checkers():
         return f"custom_check {name!r} is not a registered checker"
     return None
+
+
+# Services a plan may address by port. The API port is HiveConfig.port
+# (freetalon/config.py, default 8765); 11434 is Ollama. Port 8000 is the
+# OpenAI-compatible LLM backend base URL (intake._OPENAI_BASE_URL) — not a
+# service a plan should curl or verify, so it is deliberately absent here.
+# A test asserts these match config.py / intake.py so drift is caught.
+_KNOWN_SERVICE_PORTS: dict[int, str] = {
+    8765: "FreeTalon API",
+    11434: "Ollama",
+}
+_API_ROUTE_NAMES = frozenset(
+    {"health", "status", "metrics", "tasks", "resources", "gates", "shutdown"}
+)
+_PORT_RE = re.compile(r"(?:localhost|127\.0\.0\.1):(\d+)(/[^\s\"']*)?")
+_FLAG_PATH_RE = re.compile(r"^-[A-Za-z][^ ]*/")
+
+
+def _validate_bash_command(node: PlanNode) -> str | None:
+    """Return an error if a bash/shell_exec node's command is malformed.
+
+    Checks, in order: the command is a non-empty string; it tokenizes
+    (shlex.split — unbalanced quotes fail); it is not words glued together
+    (the failed /health run produced ``python3-munittestdiscover-s/...``
+    and ``curl-shttp://localhost:8000/health``); any localhost port it
+    addresses is a known service (FreeTalon API, Ollama). The glued-word
+    checks are heuristics for the observed failure shapes, not a shell
+    parser: a single token jamming a program, flags, and a path/URL
+    together cannot be a valid invocation.
+    """
+    cmd = node.inputs.get("command") or node.inputs.get("cmd")
+    if not isinstance(cmd, str) or not cmd.strip():
+        return "bash node needs a non-empty 'command' string"
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError as exc:
+        return f"bash command does not parse as a shell command: {exc}"
+    if not tokens:
+        return "bash node needs a non-empty 'command' string"
+    first = tokens[0]
+    if not first.startswith(("/", "./", "../")):
+        if "://" in first and not first.startswith(("http://", "https://")):
+            return (
+                f"bash command looks like words glued together (missing spaces): {cmd!r}"
+            )
+        if "/" in first and first.split("/", 1)[0].count("-") >= 2:
+            return (
+                f"bash command looks like words glued together (missing spaces): {cmd!r}"
+            )
+    for token in tokens[1:]:
+        if _FLAG_PATH_RE.match(token):
+            return (
+                f"bash command looks like a flag and a path glued together: "
+                f"{token!r} in {cmd!r}"
+            )
+        if "://" in token and not token.startswith(("http://", "https://")):
+            return (
+                f"bash command looks like words glued together (missing spaces): {cmd!r}"
+            )
+    for match in _PORT_RE.finditer(cmd):
+        port = int(match.group(1))
+        if port in _KNOWN_SERVICE_PORTS:
+            continue
+        path = match.group(2) or ""
+        segment = path.strip("/").split("/", 1)[0] if path else ""
+        if segment in _API_ROUTE_NAMES:
+            return (
+                f"bash command addresses localhost:{port}, but the FreeTalon API "
+                f"runs on port 8765, not {port} — use http://localhost:8765{path}"
+            )
+        return (
+            f"bash command addresses unknown service port localhost:{port} — "
+            "known services are the FreeTalon API on 8765 and Ollama on 11434"
+        )
+    return None
+
+
+def _validate_node_commands(nodes: list[PlanNode]) -> None:
+    """Reject bash/shell_exec nodes whose command is malformed (fix 2)."""
+    for node in nodes:
+        if node.assigned_claw not in ("bash", "shell_exec"):
+            continue
+        error = _validate_bash_command(node)
+        if error is not None:
+            raise LLMResponseError(
+                f"Planner node '{node.id}' has an invalid bash command: {error}."
+            )
+
+
+def _validate_node_grounding(
+    nodes: list[PlanNode], repo_root: str | Path | None = None
+) -> None:
+    """Reject scaffold nodes that duplicate an existing endpoint/module (fix 1)."""
+    index = None
+    for node in nodes:
+        if node.assigned_claw not in ("scaffold", "file_writer"):
+            continue
+        target = (
+            node.inputs.get("file_path")
+            or node.inputs.get("path")
+            or (node.outputs[0] if node.outputs else "")
+        )
+        if not isinstance(target, str) or not target:
+            continue
+        if index is None:
+            index = build_repo_index(repo_root)
+        error = duplicate_scaffold_error(target, index)
+        if error is not None:
+            raise LLMResponseError(
+                f"Planner node '{node.id}' duplicates existing code: {error}."
+            )
 
 
 def _validate_node_claws(nodes: list[PlanNode]) -> None:
@@ -365,16 +506,20 @@ def plan_task_intent(
     *,
     plan_id: str | None = None,
     max_repairs: int = 2,
+    repo_root: str | Path | None = None,
 ) -> ExecutionPlan:
     """Generate a validated execution plan DAG for a TaskIntent.
 
     Rejected output (bad JSON, unknown claw, unmeasurable node) is sent
-    back to the model for correction, up to ``max_repairs`` times.
+    back to the model for correction, up to ``max_repairs`` times. The
+    prompt carries the repo context (fix 1) so the model plans against
+    the code that actually exists.
     """
+    context = format_repo_context(build_repo_index(repo_root))
     prompt_input = intent.model_dump_json(indent=2)
     nodes, metadata = _call_llm_with_repair(
         PLANNER_SYSTEM_PROMPT,
-        f"TaskIntent JSON:\n{prompt_input}",
+        f"{context}\n\nTaskIntent JSON:\n{prompt_input}",
         settings,
         max_repairs=max_repairs,
     )
@@ -386,6 +531,7 @@ def replan_from_brief(
     settings: LLMSettings | None = None,
     *,
     max_repairs: int = 2,
+    repo_root: str | Path | None = None,
 ) -> list[PlanNode]:
     """Produce delta-plan nodes from a judge's re-plan brief (M1).
 
@@ -396,9 +542,10 @@ def replan_from_brief(
     """
     import json as _json
 
+    context = format_repo_context(build_repo_index(repo_root))
     nodes, _metadata = _call_llm_with_repair(
         REPLAN_SYSTEM_PROMPT,
-        f"Re-plan brief JSON:\n{_json.dumps(brief, indent=2, default=str)}",
+        f"{context}\n\nRe-plan brief JSON:\n{_json.dumps(brief, indent=2, default=str)}",
         settings,
         max_repairs=max_repairs,
     )

@@ -124,6 +124,59 @@ def is_known_claw(name: str) -> bool:
     return name in KNOWN_CLAW_NAMES
 
 
+# Metrics each claw's handler reports in its result envelope ("metrics"
+# dict), keyed by claw name including aliases. The planner rejects a
+# metric criterion naming a metric the node's claw cannot report, so a
+# plan fails at plan time instead of measuring "not reported" at
+# execution time (the failed /health run put test_count on a bash node).
+# Keep in sync with the handlers:
+#   llm_synthesis: summary_chars (tool_registry._register_default_claws)
+#   research: source_count, fetched_count; fetch_dataset: bytes
+#   sandbox_analyze: size_bytes, strings_count
+#   backtest: total_return_pct, max_drawdown_pct, trade_count, win_rate,
+#       max_position_pct; train_model: r2, mae
+#   paper_trade: final_equity, trade_count, max_position_pct
+#   can_capture: frames, unique_ids; verify_backup: backup_verified
+#   tune_surface: maps_found, risk_terms
+#   scaffold, bash, invest, engage_kill_switch, flash_ecu: no metrics —
+#       invest and flash_ecu are refusing stubs, the others return none.
+CLA_METRICS: dict[str, frozenset[str]] = {
+    "scaffold": frozenset(),
+    "file_writer": frozenset(),
+    "bash": frozenset(),
+    "shell_exec": frozenset(),
+    "llm_synthesis": frozenset({"summary_chars"}),
+    "summarize": frozenset({"summary_chars"}),
+    "research": frozenset({"source_count", "fetched_count"}),
+    "web_search": frozenset({"source_count", "fetched_count"}),
+    "fetch_dataset": frozenset({"bytes"}),
+    "data_fetch": frozenset({"bytes"}),
+    "sandbox_analyze": frozenset({"size_bytes", "strings_count"}),
+    "backtest": frozenset(
+        {
+            "total_return_pct",
+            "max_drawdown_pct",
+            "trade_count",
+            "win_rate",
+            "max_position_pct",
+        }
+    ),
+    "train_model": frozenset({"r2", "mae"}),
+    "paper_trade": frozenset({"final_equity", "trade_count", "max_position_pct"}),
+    "invest": frozenset(),
+    "engage_kill_switch": frozenset(),
+    "can_capture": frozenset({"frames", "unique_ids"}),
+    "verify_backup": frozenset({"backup_verified"}),
+    "tune_surface": frozenset({"maps_found", "risk_terms"}),
+    "flash_ecu": frozenset(),
+}
+
+
+def metrics_reported_by(claw: str) -> frozenset[str]:
+    """Metric names the named claw's handler reports (empty if none)."""
+    return CLA_METRICS.get(claw, frozenset())
+
+
 class ToolRegistry:
     def __init__(self, *, strict: bool = True, scaffolder: Any | None = None) -> None:
         self._strict = strict
