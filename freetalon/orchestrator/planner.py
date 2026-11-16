@@ -174,10 +174,19 @@ def parse_planner_response(
     # plan error here, where the repair retry can fix it — not at execution
     # time. Hand-built plans bypass this function (they use
     # build_execution_plan directly), so existing callers are unaffected.
-    _validate_node_claws(nodes)
-    _validate_node_criteria(nodes)
-    _validate_node_commands(nodes)
-    _validate_node_grounding(nodes, repo_root)
+    # All per-node errors are collected and reported in ONE rejection, so a
+    # plan with several independent errors can be fixed in a single repair
+    # round instead of burning the repair budget one error at a time.
+    errors = _collect_plan_errors(nodes, repo_root)
+    if errors:
+        noun = "error" if len(errors) == 1 else "errors"
+        lines = "\n".join(
+            f"{index}. {error}" for index, error in enumerate(errors, start=1)
+        )
+        raise LLMResponseError(
+            f"Planner output was rejected with {len(errors)} {noun} — "
+            f"fix ALL of them:\n{lines}"
+        )
 
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
@@ -321,47 +330,51 @@ _PORT_RE = re.compile(r"(?:localhost|127\.0\.0\.1):(\d+)(/[^\s\"']*)?")
 _FLAG_PATH_RE = re.compile(r"^-[A-Za-z][^ ]*/")
 
 
-def _validate_bash_command(node: PlanNode) -> str | None:
-    """Return an error if a bash/shell_exec node's command is malformed.
+def _validate_bash_command(node: PlanNode) -> list[str]:
+    """Return every error in a bash/shell_exec node's command (fix 2).
 
-    Checks, in order: the command is a non-empty string; it tokenizes
+    Checks: the command is a non-empty string; it tokenizes
     (shlex.split — unbalanced quotes fail); it is not words glued together
     (the failed /health run produced ``python3-munittestdiscover-s/...``
     and ``curl-shttp://localhost:8000/health``); any localhost port it
-    addresses is a known service (FreeTalon API, Ollama). The glued-word
-    checks are heuristics for the observed failure shapes, not a shell
-    parser: a single token jamming a program, flags, and a path/URL
-    together cannot be a valid invocation.
+    addresses is a known service (FreeTalon API, Ollama). All problems are
+    collected, not just the first, so one repair round can fix them all.
+    The glued-word checks are heuristics for the observed failure shapes,
+    not a shell parser: a single token jamming a program, flags, and a
+    path/URL together cannot be a valid invocation.
     """
+    errors: list[str] = []
     cmd = node.inputs.get("command") or node.inputs.get("cmd")
     if not isinstance(cmd, str) or not cmd.strip():
-        return "bash node needs a non-empty 'command' string"
+        return ["bash node needs a non-empty 'command' string"]
+    tokens: list[str] = []
     try:
         tokens = shlex.split(cmd)
     except ValueError as exc:
-        return f"bash command does not parse as a shell command: {exc}"
-    if not tokens:
-        return "bash node needs a non-empty 'command' string"
-    first = tokens[0]
-    if not first.startswith(("/", "./", "../")):
-        if "://" in first and not first.startswith(("http://", "https://")):
-            return (
-                f"bash command looks like words glued together (missing spaces): {cmd!r}"
-            )
-        if "/" in first and first.split("/", 1)[0].count("-") >= 2:
-            return (
-                f"bash command looks like words glued together (missing spaces): {cmd!r}"
-            )
-    for token in tokens[1:]:
-        if _FLAG_PATH_RE.match(token):
-            return (
-                f"bash command looks like a flag and a path glued together: "
-                f"{token!r} in {cmd!r}"
-            )
-        if "://" in token and not token.startswith(("http://", "https://")):
-            return (
-                f"bash command looks like words glued together (missing spaces): {cmd!r}"
-            )
+        errors.append(f"bash command does not parse as a shell command: {exc}")
+    if tokens:
+        first = tokens[0]
+        if not first.startswith(("/", "./", "../")):
+            if "://" in first and not first.startswith(("http://", "https://")):
+                errors.append(
+                    f"bash command looks like words glued together (missing spaces): {cmd!r}"
+                )
+            elif "/" in first and first.split("/", 1)[0].count("-") >= 2:
+                errors.append(
+                    f"bash command looks like words glued together (missing spaces): {cmd!r}"
+                )
+        for token in tokens[1:]:
+            if _FLAG_PATH_RE.match(token):
+                errors.append(
+                    f"bash command looks like a flag and a path glued together: "
+                    f"{token!r} in {cmd!r}"
+                )
+            if "://" in token and not token.startswith(("http://", "https://")):
+                errors.append(
+                    f"bash command looks like words glued together (missing spaces): {cmd!r}"
+                )
+    elif not errors:
+        errors.append("bash node needs a non-empty 'command' string")
     for match in _PORT_RE.finditer(cmd):
         port = int(match.group(1))
         if port in _KNOWN_SERVICE_PORTS:
@@ -369,81 +382,105 @@ def _validate_bash_command(node: PlanNode) -> str | None:
         path = match.group(2) or ""
         segment = path.strip("/").split("/", 1)[0] if path else ""
         if segment in _API_ROUTE_NAMES:
-            return (
+            errors.append(
                 f"bash command addresses localhost:{port}, but the FreeTalon API "
                 f"runs on port 8765, not {port} — use http://localhost:8765{path}"
             )
+        else:
+            errors.append(
+                f"bash command addresses unknown service port localhost:{port} — "
+                "known services are the FreeTalon API on 8765 and Ollama on 11434"
+            )
+    return errors
+
+
+def _claw_error(node: PlanNode) -> str | None:
+    """Return an error if the node's assigned_claw is not a registered claw."""
+    claw = node.assigned_claw or ""
+    if claw not in KNOWN_CLAW_NAMES:
+        allowed = ", ".join(sorted(KNOWN_CLAW_NAMES))
         return (
-            f"bash command addresses unknown service port localhost:{port} — "
-            "known services are the FreeTalon API on 8765 and Ollama on 11434"
+            f"Planner node '{node.id}' uses unknown claw {claw!r}. "
+            f"assigned_claw must be one of: {allowed}."
         )
     return None
 
 
-def _validate_node_commands(nodes: list[PlanNode]) -> None:
-    """Reject bash/shell_exec nodes whose command is malformed (fix 2)."""
-    for node in nodes:
-        if node.assigned_claw not in ("bash", "shell_exec"):
-            continue
-        error = _validate_bash_command(node)
+def _criteria_errors(node: PlanNode) -> list[str]:
+    """Return every unusable-criterion error for one node."""
+    errors: list[str] = []
+    criteria = list(node.criteria or [])
+    if not criteria:
+        return [
+            f"Planner node '{node.id}' has no 'criteria': every node needs "
+            "at least one measurable criterion (exit_code, file_exists, "
+            "file_matches, metric, or tests_pass)."
+        ]
+    for criterion in criteria:
+        error = _usable_criterion_error(criterion, node)
         if error is not None:
-            raise LLMResponseError(
-                f"Planner node '{node.id}' has an invalid bash command: {error}."
+            errors.append(
+                f"Planner node '{node.id}' has an unusable criterion: {error}."
             )
+    return errors
 
 
-def _validate_node_grounding(
+def _command_errors(node: PlanNode) -> list[str]:
+    """Return every malformed-command error for a bash/shell_exec node."""
+    if node.assigned_claw not in ("bash", "shell_exec"):
+        return []
+    return [
+        f"Planner node '{node.id}' has an invalid bash command: {error}."
+        for error in _validate_bash_command(node)
+    ]
+
+
+def _grounding_error(node: PlanNode, index: Any) -> str | None:
+    """Return an error if a scaffold node duplicates existing code (fix 1)."""
+    if node.assigned_claw not in ("scaffold", "file_writer"):
+        return None
+    target = (
+        node.inputs.get("file_path")
+        or node.inputs.get("path")
+        or (node.outputs[0] if node.outputs else "")
+    )
+    if not isinstance(target, str) or not target:
+        return None
+    error = duplicate_scaffold_error(target, index)
+    if error is not None:
+        return f"Planner node '{node.id}' duplicates existing code: {error}."
+    return None
+
+
+def _collect_plan_errors(
     nodes: list[PlanNode], repo_root: str | Path | None = None
-) -> None:
-    """Reject scaffold nodes that duplicate an existing endpoint/module (fix 1)."""
-    index = None
+) -> list[str]:
+    """Collect EVERY per-node validation error, grouped by node.
+
+    Each node is checked against every rule (claw allowlist, structured
+    criteria, command/port validation, repo grounding) and every failure is
+    reported, so a single rejection can drive one repair round that fixes
+    them all. Structural errors (bad JSON, duplicate ids, dependency
+    cycles) are not collected here — they are raised first by
+    normalize_plan_nodes, since the node list cannot be interpreted at all
+    until the DAG is structurally valid.
+    """
+    errors: list[str] = []
+    needs_index = any(
+        node.assigned_claw in ("scaffold", "file_writer") for node in nodes
+    )
+    index = build_repo_index(repo_root) if needs_index else None
     for node in nodes:
-        if node.assigned_claw not in ("scaffold", "file_writer"):
-            continue
-        target = (
-            node.inputs.get("file_path")
-            or node.inputs.get("path")
-            or (node.outputs[0] if node.outputs else "")
-        )
-        if not isinstance(target, str) or not target:
-            continue
-        if index is None:
-            index = build_repo_index(repo_root)
-        error = duplicate_scaffold_error(target, index)
+        error = _claw_error(node)
         if error is not None:
-            raise LLMResponseError(
-                f"Planner node '{node.id}' duplicates existing code: {error}."
-            )
-
-
-def _validate_node_claws(nodes: list[PlanNode]) -> None:
-    """Reject any node whose assigned_claw is not a registered claw."""
-    for node in nodes:
-        claw = node.assigned_claw or ""
-        if claw not in KNOWN_CLAW_NAMES:
-            allowed = ", ".join(sorted(KNOWN_CLAW_NAMES))
-            raise LLMResponseError(
-                f"Planner node '{node.id}' uses unknown claw {claw!r}. "
-                f"assigned_claw must be one of: {allowed}."
-            )
-
-
-def _validate_node_criteria(nodes: list[PlanNode]) -> None:
-    """Require at least one usable structured criterion per node."""
-    for node in nodes:
-        criteria = list(node.criteria or [])
-        if not criteria:
-            raise LLMResponseError(
-                f"Planner node '{node.id}' has no 'criteria': every node needs "
-                "at least one measurable criterion (exit_code, file_exists, "
-                "file_matches, metric, or tests_pass)."
-            )
-        for criterion in criteria:
-            error = _usable_criterion_error(criterion, node)
+            errors.append(error)
+        errors.extend(_criteria_errors(node))
+        errors.extend(_command_errors(node))
+        if index is not None:
+            error = _grounding_error(node, index)
             if error is not None:
-                raise LLMResponseError(
-                    f"Planner node '{node.id}' has an unusable criterion: {error}."
-                )
+                errors.append(error)
+    return errors
 
 
 def _call_llm_with_repair(
@@ -477,7 +514,7 @@ def _call_llm_with_repair(
                 f"Rejection reason: {exc}\n"
                 "Failed output (do not echo it back, fix it):\n"
                 f"{response_text[:_REPAIR_TRUNCATION]}\n\n"
-                "Return ONLY a corrected JSON object that fixes the rejection reason."
+                "Return ONLY a corrected JSON object that fixes ALL of the rejection reasons listed above."
             )
     assert last_error is not None
     raise last_error

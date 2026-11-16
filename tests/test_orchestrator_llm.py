@@ -643,3 +643,187 @@ class TestPlannerGroundingFixes(unittest.TestCase):
         self.assertIn("8765", PLANNER_SYSTEM_PROMPT)
         self.assertIn("report NO metrics", PLANNER_SYSTEM_PROMPT)
         self.assertIn("8765", REPLAN_SYSTEM_PROMPT)
+
+
+class TestPlannerCollectsAllErrors(unittest.TestCase):
+    """Validation must collect ALL errors into one rejection.
+
+    Previously parse_planner_response raised on the first failing check, so
+    a plan with several independent errors burned one repair retry per
+    error. Now every node is checked against every rule and the single
+    rejection lists them all, so one repair round can fix everything.
+    """
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(goal="Extend the health endpoint", project_type="api")
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    @staticmethod
+    def _failed_health_plan_nodes() -> list[dict]:
+        """The three nodes of the real failed /health plan, verbatim.
+
+        Embedded (not read from the run directory) so the test stays
+        hermetic in CI: the run directory is not part of the repo.
+        """
+        return [
+            {
+                "id": "node-1",
+                "objective": "ScaffoldAPIendpoint",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {
+                    "file_path": "/home/seeker/freetalon-workspace/api/health.py",
+                    "content": "#TODO:ImplementGET/healthendpoint",
+                },
+                "outputs": ["/home/seeker/freetalon-workspace/api/health.py"],
+                "criteria": [
+                    {
+                        "type": "file_exists",
+                        "path": "/home/seeker/freetalon-workspace/api/health.py",
+                    }
+                ],
+            },
+            {
+                "id": "node-2",
+                "objective": "RunAPIendpointtests",
+                "depends_on": ["node-1"],
+                "assigned_claw": "bash",
+                "inputs": {
+                    "command": "python3-munittestdiscover-s/home/seeker/freetalon-workspace/api/health.py"
+                },
+                "outputs": ["testresults"],
+                "criteria": [
+                    {"type": "exit_code", "equals": 0},
+                    {"type": "metric", "name": "test_count", "op": ">=", "value": 1},
+                ],
+            },
+            {
+                "id": "node-3",
+                "objective": "Verifyendpointlive",
+                "depends_on": ["node-2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl-shttp://localhost:8000/health"},
+                "outputs": ["verificationresults"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+
+    def _rejection(self, nodes: list[dict]) -> str:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(self._dag(nodes))
+        return str(caught.exception)
+
+    def test_failed_health_plan_surfaces_all_five_errors_at_once(self) -> None:
+        message = self._rejection(self._failed_health_plan_nodes())
+        self.assertIn("5 errors", message)
+        self.assertIn("fix ALL of them", message)
+        # node-1: scaffold duplicates the existing GET /health endpoint.
+        self.assertIn("node-1", message)
+        self.assertIn("duplicates", message)
+        self.assertIn("/health", message)
+        # node-2: glued test command AND a metric bash cannot report.
+        self.assertIn("node-2", message)
+        self.assertIn("glued together", message)
+        self.assertIn("test_count", message)
+        # node-3: glued curl AND the wrong API port (8765 named).
+        self.assertIn("node-3", message)
+        self.assertIn("8765", message)
+        self.assertIn("not 8000", message)
+
+    def test_single_error_rejection_names_the_one_error(self) -> None:
+        node = TestPlannerHardening()._scaffold_node(assigned_claw="script")
+        message = self._rejection([node])
+        self.assertIn("1 error", message)
+        self.assertNotIn("2 errors", message)
+        self.assertIn("unknown claw", message)
+
+    def test_valid_plan_still_passes(self) -> None:
+        nodes, _ = parse_planner_response(
+            self._dag(
+                [
+                    {
+                        "id": "build",
+                        "objective": "Build image",
+                        "depends_on": [],
+                        "assigned_claw": "bash",
+                        "inputs": {"command": "docker build -t app ."},
+                        "criteria": [{"type": "exit_code", "equals": 0}],
+                    },
+                    {
+                        "id": "deploy",
+                        "objective": "Deploy service",
+                        "depends_on": ["build"],
+                        "assigned_claw": "bash",
+                        "inputs": {"command": "docker run app"},
+                        "criteria": [{"type": "exit_code", "equals": 0}],
+                    },
+                ]
+            )
+        )
+        self.assertEqual([node.id for node in nodes], ["node-1", "node-2"])
+
+    def test_multiple_bad_criteria_on_one_node_all_named(self) -> None:
+        node = TestPlannerHardening()._scaffold_node(
+            criteria=[
+                {"type": "vibes", "value": 1},
+                {"type": "metric", "name": "r2", "op": ">=", "value": "high"},
+            ]
+        )
+        message = self._rejection([node])
+        self.assertIn("2 errors", message)
+        self.assertIn("unknown criterion type", message)
+        self.assertIn("numeric 'value'", message)
+
+    def test_repair_fixes_multi_error_plan_in_one_round(self) -> None:
+        api_path = str(Path(__file__).resolve().parent.parent / "freetalon" / "api.py")
+        fixed = self._dag(
+            [
+                {
+                    "id": "node-1",
+                    "objective": "Extend the health endpoint",
+                    "depends_on": [],
+                    "assigned_claw": "scaffold",
+                    "inputs": {"file_path": api_path, "content": "# extended\n"},
+                    "outputs": [api_path],
+                    "criteria": [{"type": "file_exists", "path": api_path}],
+                },
+                {
+                    "id": "node-2",
+                    "objective": "Run the tests",
+                    "depends_on": ["node-1"],
+                    "assigned_claw": "bash",
+                    "inputs": {"command": "python3 -m unittest discover -s tests"},
+                    "outputs": ["testresults"],
+                    "criteria": [{"type": "exit_code", "equals": 0}],
+                },
+                {
+                    "id": "node-3",
+                    "objective": "Verify the endpoint live",
+                    "depends_on": ["node-2"],
+                    "assigned_claw": "bash",
+                    "inputs": {"command": "curl -s http://localhost:8765/health"},
+                    "outputs": ["verificationresults"],
+                    "criteria": [{"type": "exit_code", "equals": 0}],
+                },
+            ]
+        )
+        bad = self._dag(self._failed_health_plan_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, fixed]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        # One repair round fixed all five errors — not five rounds.
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(plan.nodes[0].assigned_claw, "scaffold")
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        for marker in ("duplicates", "glued together", "test_count", "8765"):
+            self.assertIn(marker, repair_prompt)
