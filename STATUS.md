@@ -5,7 +5,7 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
 
 ## Health
 
-- Tests: 397/397 green (`python -m unittest discover -s tests`).
+- Tests: 402/402 green (`python -m unittest discover -s tests`).
 - OS: Ubuntu 24.04, kernel 7.0.0-43, Nvidia 595.91.07, zero packages upgradable.
 - Services: Tailscale + SSH up, Ollama up (gemma-3-abliterated, localhost-only),
   xrdp up but restricted to Tailscale.
@@ -309,3 +309,37 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   load after a cold boot) and the gh token is invalid — the /health
   goal retry waits for a working GPU, and this commit is local-only
   until Pat re-auths gh on seeker7.
+
+## Update - 2026-11-16 09:55 (planner validation collects all errors)
+
+- Follow-up to the three planner fixes: plan validation used to raise
+  on the first failing check, so a plan with several independent errors
+  burned one repair retry per error. Now every node is checked against
+  every rule (claw allowlist, structured criteria, command/port
+  validation, repo grounding) and ALL errors are collected into a
+  single rejection, grouped by node, so one repair round can fix them
+  all. The repair re-prompt now says to fix ALL of the listed reasons.
+- Implementation (freetalon/orchestrator/planner.py): the four
+  first-error validators are replaced by per-node collectors
+  (_claw_error, _criteria_errors, _command_errors, _grounding_error)
+  driven by _collect_plan_errors; _validate_bash_command now returns
+  every problem in a command (unbalanced quotes, each glued token,
+  each unknown port) instead of the first. Individual error wordings
+  are unchanged, so existing rejection assertions still match.
+  Structural errors (bad JSON, duplicate ids, dependency cycles) still
+  raise first in normalize_plan_nodes — the node list cannot be
+  interpreted until the DAG is structurally valid.
+- Tests 397 -> 402, all green; M5 smoke still passes unchanged
+  (finance run-20261116T174941Z-ab08e2, ECU
+  run-20261116T174941Z-ee0cd1). New TestPlannerCollectsAllErrors (5
+  tests): the real failed /health plan now surfaces all 5 of its
+  errors in one rejection (duplicate /health, test_count on bash,
+  glued test command, glued curl, port 8000 naming 8765);
+  single-error plans still reject naming the one error; valid plans
+  still pass; a mocked repair fixes the multi-error plan in ONE round
+  (2 LLM calls, repair prompt carries all five error markers).
+- Still blocked: the GPU is dead (fell off the bus a third time,
+  2026-11-16 ~08:32, while idle — Xid 79 + Xid 154, this time "GPU
+  Reset Required") and the gh token is invalid — this commit is
+  local-only until Pat re-auths gh on seeker7. No LLM loads until a
+  power limit is re-applied (Pat's decision).
