@@ -228,3 +228,39 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   all PASS, goal PASS. fib.py verified independently: prints exactly
   0 1 1 2 3 5 8 13 21 34. M5 smoke still passes unchanged.
 - Branch head: check git log (docs commit on top of 1ca667d).
+
+## Update - 2026-11-15 17:35
+
+- Harder planner goal (Pat: "keep developing"): extend GET /health in
+  freetalon/api.py to report Ollama reachability (localhost:11434) and
+  GPU temperature via nvidia-smi, add unit tests, keep the suite green,
+  verify live. Attempt 1, run-20261116T013052Z-917367: FAILED.
+- What Gemma planned (3 nodes): scaffold a NEW file
+  freetalon-workspace/api/health.py with a "#TODO" stub (never read the
+  existing api.py, never found the existing /health endpoint); run tests
+  with a malformed command ("python3-munittestdiscover-s ..." — exit
+  127); verify live with curl to localhost:8000 (wrong port; API is
+  8765). Node-1 PASS (stub file existed), node-2 FAIL (exit 127).
+  Judge chose REPLAN; the replan LLM call hit a CUDA error instead.
+- GPU FAILURE during the replan call: the RTX 3090 fell off the bus.
+  dmesg: "Xid 79, pid=127944, name=llama-server, GPU has fallen off
+  the bus", then "Xid 154, GPU recovery action changed to Node Reboot
+  Required". nvidia-smi now reports "No devices were found".
+  Peak temp during the run was 62C (fans manual 65%) — NOT a thermal
+  event; the card failed at moderate temperature. This is the failure
+  Pat warned about ("might literally jump off the bus").
+- LLM work STOPPED per the thermal rules. No attempt 2 or 3: the GPU
+  is gone and Ollama cannot run inference. Cleanup done: temp logger
+  stopped, Gemma's stub file deleted, repo tree clean.
+- Verified after the failure: full suite still 381/381 green, M5 smoke
+  still passes (finance run-20261116T013248Z-16f0c4, ECU
+  run-20261116T013248Z-a5fafe) — the loop machinery does not need the
+  GPU. Fans could not be restored to auto (nvidia-settings needs the
+  GPU); they reset to auto on reboot.
+- Blocked on: GPU recovery. Xid 154 says a node reboot is required.
+  Reboot is Pat's call — not done by the worker. Until the GPU is
+  back, no LLM work is possible on seeker7.
+- Also new weakness exposed (independent of the GPU): Gemma planned a
+  metric criterion ("test_count") on a bash node that cannot report
+  metrics — the executor records it as not reported. The planner's
+  criteria validation accepts metric criteria on any claw.
