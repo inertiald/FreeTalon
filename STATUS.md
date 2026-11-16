@@ -5,7 +5,7 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
 
 ## Health
 
-- Tests: 229/229 green (`python -m unittest discover -s tests`).
+- Tests: 397/397 green (`python -m unittest discover -s tests`).
 - OS: Ubuntu 24.04, kernel 7.0.0-43, Nvidia 595.91.07, zero packages upgradable.
 - Services: Tailscale + SSH up, Ollama up (gemma-3-abliterated, localhost-only),
   xrdp up but restricted to Tailscale.
@@ -264,3 +264,48 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   metric criterion ("test_count") on a bash node that cannot report
   metrics — the executor records it as not reported. The planner's
   criteria validation accepts metric criteria on any claw.
+
+## Update - 2026-11-16 08:05 (planner weaknesses fixed, CPU-only)
+
+- The three planner weaknesses from the failed /health goal are fixed,
+  with no LLM calls and no GPU. Tests 381 -> 397, all green; M5 smoke
+  still passes unchanged (finance run-20261116T160136Z-f1cec9, ECU
+  run-20261116T160136Z-5a0f5b — all real steps PASS, invest/flash stubs
+  refuse as designed).
+- Fix 1, repo grounding: new freetalon/orchestrator/repo_index.py builds
+  a read-only index of the repo (modules, HTTP routes from api.py, API
+  port from config.py) and renders it as REPO CONTEXT in the planner and
+  re-planner prompts. Plan validation now rejects any scaffold node that
+  creates a new file duplicating an existing route or module (e.g. a new
+  api/health.py while GET /health already exists in freetalon/api.py) —
+  the plan must extend the existing file instead. Prompts carry a
+  "GROUND IN THE REPO" rule. The exact failed node-1 is now rejected,
+  and a plan targeting freetalon/api.py itself is accepted.
+- Fix 2, command/port validation: plan validation now tokenizes bash
+  commands (shlex — unbalanced quotes rejected) and rejects words glued
+  together (the failed run's "python3-munittestdiscover-s ..." and
+  "curl-shttp://localhost:8000/health"). Localhost ports must be known
+  services: FreeTalon API on 8765, Ollama on 11434. Port 8000 is the
+  OpenAI-compatible LLM backend, not a service to curl — a plan using
+  it for an API route is rejected naming the correct port (8765). A
+  drift-guard test asserts the ports match HiveConfig.port and
+  intake._OLLAMA_BASE_URL.
+- Fix 3, metric/claw capability map: new CLA_METRICS in tool_registry.py
+  records which metrics each claw's handler actually reports (bash and
+  scaffold report none; llm_synthesis reports summary_chars; backtest
+  reports trade_count, etc.), with a drift-guard test that the map
+  covers every known claw. Plan validation now rejects a metric
+  criterion naming a metric the node's claw cannot report — the failed
+  run's test_count-on-bash is rejected at plan time instead of
+  measuring "not reported" at execution time.
+- Verified against the real failed plan: plan-v001.json from
+  run-20261116T013052Z-917367 is now rejected (metric test_count on
+  bash, the first of its three errors to surface).
+- Note: validation errors surface one at a time, so a plan with
+  several independent errors can exhaust the 2-repair budget before
+  all of them are fixed. Collecting all validation errors into one
+  rejection is a possible follow-up; not done here.
+- Still blocked: the GPU is dead (falls off the bus on first CUDA
+  load after a cold boot) and the gh token is invalid — the /health
+  goal retry waits for a working GPU, and this commit is local-only
+  until Pat re-auths gh on seeker7.
