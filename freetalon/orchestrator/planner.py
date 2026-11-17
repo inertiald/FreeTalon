@@ -1988,7 +1988,10 @@ def _placeholder_scaffold_errors(
     file and the fact that the content is a placeholder. A scaffold
     creating a NEW file with a comment stub is still allowed — that is
     how scaffolding starts — so the rule fires only when the target
-    already exists on disk. General: any code file, any route goal.
+    already exists in the repo the plan targets. Existence is resolved
+    repo-relatively (the _resolve_plan_target rule), never from a raw
+    absolute path, so the same plan is judged identically on any
+    machine. General: any code file, any route goal.
     When the goal names an existing route, the error also names the
     grounded move (extend the serving module, write real tests, curl
     the live API port), like the stand-in rejection does: the repair
@@ -2032,7 +2035,15 @@ def _placeholder_scaffold_errors(
             if not _is_placeholder_stub(content):
                 continue
             stub = True
-        if not _path_exists_on_disk(target, repo_root):
+        # Existence is judged against the repo the plan targets, not
+        # the raw path: an absolute target naming a repo file resolves
+        # repo-relatively (the _resolve_plan_target rule), so the same
+        # plan validates identically on any machine. The raw-path check
+        # fired on seeker7 but not in CI for the retry-#23 output-3
+        # fixture, whose absolute /home/seeker/... target does not
+        # exist on a GitHub runner (hosted run 44140283101 rejected
+        # output 3 with 2 errors; seeker7 rejected it with 3).
+        if not _resolve_plan_target(target, resolve_repo_root(repo_root)).exists():
             continue
         if stub:
             errors.append(

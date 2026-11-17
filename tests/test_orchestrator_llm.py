@@ -12136,6 +12136,33 @@ class TestPlannerFrameworkGuardFix(unittest.TestCase):
         self.assertEqual(message.count("does not parse as Python"), 1)
         self.assertIn("string_matches", message)
 
+    def test_placeholder_stub_fires_for_foreign_absolute_path(self) -> None:
+        # CI determinism (hosted run 44140283101): the output-3 step-1
+        # stub, but with the target written as an absolute path from a
+        # DIFFERENT machine (the /home/runner/... shape). Judged
+        # against this repo, that target is freetalon/api.py, which
+        # exists — so the stub rejection must fire identically
+        # everywhere. Before the repo-relative existence fix, the
+        # raw-path existence check silently skipped the node wherever
+        # the foreign path did not exist on disk: output 3 rejected
+        # with 3 errors on seeker7 but only 2 in CI.
+        foreign = "/home/runner/work/FreeTalon/FreeTalon/freetalon/api.py"
+        node = {
+            "id": "step_1",
+            "objective": "Modify freetalon/api.py to implement the /health endpoint.",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": foreign,
+                "content": self.RETRY23_OUTPUT3_STEP1_CONTENT,
+            },
+            "outputs": [foreign],
+            "acceptance": ["The /health endpoint returns JSON with status OK."],
+            "criteria": [{"type": "file_exists", "path": foreign}],
+        }
+        message = self._reject([node])
+        self.assertIn("placeholder stub", message)
+
     def test_retry23_output4_rejected_with_five_errors(self) -> None:
         # Was REJECTED live (restored probe) with 2 errors
         # (string_matches + step-1 Flask). Now: Flask step-1,
