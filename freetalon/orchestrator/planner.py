@@ -243,13 +243,16 @@ def parse_planner_response(
     *,
     repo_root: str | Path | None = None,
     goal_text: str | None = None,
+    workspace: str | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Validate raw planner output into normalized PlanNodes plus metadata.
 
     ``repo_root`` overrides the repo the grounding check reads; by default
     it is the checkout holding this package. ``goal_text`` is the goal the
     plan serves; when it names an existing API route, the plan must engage
-    that route (anti-fake rule).
+    that route (anti-fake rule). ``workspace`` is the run-outputs
+    directory; when known, a repo-tree path named under it is rejected
+    as a wrong-location hit.
     """
     raw_text = sanitize_llm_output(raw_text)
     print(f"\n--- RAW PLANNER OUTPUT ---\n{raw_text}\n--------------------------\n")
@@ -329,7 +332,7 @@ def parse_planner_response(
     # All per-node errors are collected and reported in ONE rejection, so a
     # plan with several independent errors can be fixed in a single repair
     # round instead of burning the repair budget one error at a time.
-    errors = _collect_plan_errors(nodes, repo_root, goal_text)
+    errors = _collect_plan_errors(nodes, repo_root, goal_text, workspace)
     if errors:
         noun = "error" if len(errors) == 1 else "errors"
         lines = "\n".join(
@@ -750,6 +753,90 @@ def _framework_errors(
     return errors
 
 
+# An absolute path inside a node string: used to spot workspace-prefixed
+# module paths. Stops at whitespace and quote/semicolon/pipe characters,
+# so a path followed by `|`, `&&`, or a quote ends cleanly.
+_ABS_PATH_RE = re.compile(r"/[^\s\"';&|]+")
+
+
+def _wrong_location_errors(
+    nodes: list[PlanNode], index: Any, workspace: str | None
+) -> list[str]:
+    """Reject repo module/test paths named under the workspace root.
+
+    The planner prompt names the workspace (from the TaskIntent
+    constraints), and the model sometimes uses it as the repo root:
+    retry #9 node-1 ran head/grep against
+    /home/seeker/freetalon-workspace/freetalon/api.py — a path that does
+    not exist — because the workspace was the only directory it had been
+    told. The workspace holds run outputs and generated files, not code:
+    a path under the workspace that runs inside a repo tree
+    (``freetalon/...`` or ``tests/...``) is a wrong-location hit,
+    rejected by name with the repo root as the correct location.
+    Genuine generated files (test_health.py, health.json, squares.py)
+    are not flagged — they sit at the workspace root, not inside a repo
+    tree — and a workspace path that actually exists on disk is not
+    flagged either: only a nonexistent workspace copy of a repo-tree
+    path counts. Heredoc bodies are stripped before scanning a bash
+    command: a path inside file content the node is writing is data,
+    not a file the node reads. (Retry #9 node-2 named
+    freetalon/tests/test_api.py under the workspace; the repo has no
+    freetalon/tests/ — its tests live at repo-root tests/ — but the
+    path is still a repo-tree path under the workspace, so it is
+    flagged the same way.)
+    """
+    if not workspace:
+        return []
+    ws = str(workspace).rstrip("/")
+    errors: list[str] = []
+    for node in nodes:
+        candidates: list[str] = []
+        claw = node.assigned_claw or ""
+        if claw in ("scaffold", "file_writer"):
+            target = (
+                node.inputs.get("file_path")
+                or node.inputs.get("path")
+                or (node.outputs[0] if node.outputs else "")
+            )
+            if isinstance(target, str) and target:
+                candidates.append(target)
+        elif claw in ("bash", "shell_exec"):
+            command = node.inputs.get("command") or node.inputs.get("cmd")
+            if isinstance(command, str) and command:
+                candidates.append(_strip_heredoc_bodies(command))
+        candidates.extend(str(item) for item in node.outputs)
+        for criterion in node.criteria or []:
+            if isinstance(criterion, dict) and isinstance(
+                criterion.get("path"), str
+            ):
+                candidates.append(criterion["path"])
+        seen: set[str] = set()
+        for text in candidates:
+            for match in _ABS_PATH_RE.finditer(text):
+                path = match.group(0).rstrip("),.")
+                if path in seen:
+                    continue
+                seen.add(path)
+                if not (path == ws or path.startswith(ws + "/")):
+                    continue
+                rel = path[len(ws) + 1 :] if path != ws else ""
+                first = rel.split("/", 1)[0] if rel else ""
+                if first not in ("freetalon", "tests"):
+                    continue
+                if Path(path).exists():
+                    continue
+                counterpart = index.root / rel
+                errors.append(
+                    f"Planner node '{node.id}' names {path!r} — a repo "
+                    f"module/test path under the workspace. The workspace "
+                    f"({ws}) holds run outputs and generated files, not "
+                    f"code: the repo root is {index.root}, so the code path "
+                    f"is {counterpart}. Use the repo path, not the "
+                    f"workspace path."
+                )
+    return errors
+
+
 # A shell redirect that writes a file: `> path`, `>> path`, `2> path`.
 # Heredoc targets are caught by _STRIP_HEREDOC_RE separately; a `>` inside
 # a quoted string is not a redirect, so callers strip quoted segments first.
@@ -874,6 +961,7 @@ def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
     goal_text: str | None = None,
+    workspace: str | None = None,
 ) -> list[str]:
     """Collect EVERY plan validation error, grouped by node, plus plan-level rules.
 
@@ -883,7 +971,8 @@ def _collect_plan_errors(
     them all. Plan-level rules run after the per-node checks: static
     stand-in files (a node that echo-writes a hardcoded answer and then
     claims it exists), unwritten files (a file_exists criterion on a
-    path no node writes and that does not exist on disk), and route
+    path no node writes and that does not exist on disk), wrong location
+    (a repo-tree path named under the workspace root), and route
     engagement (a goal naming an existing API route must have a node
     that reads, modifies, or calls it). Per-node
     schema errors (missing fields, invented fields) are collected the
@@ -914,6 +1003,7 @@ def _collect_plan_errors(
         errors.extend(_route_engagement_errors(nodes, index, goal_text))
         errors.extend(_tmp_write_errors(nodes, index, goal_text))
         errors.extend(_framework_errors(nodes, index, goal_text))
+        errors.extend(_wrong_location_errors(nodes, index, workspace))
     return errors
 
 
@@ -1060,6 +1150,8 @@ def _grounded_move_sentence(route: str, module: str, api_port: int) -> str:
     the serving module, write real tests, verify against the live API
     port. It is appended to the anti-fake rejection so the repair round
     is pointed TOWARD the real work, not just away from the fake.
+    ``module`` is the absolute repo path of the serving module, so the
+    model is never left guessing which directory the code lives in.
     """
     return (
         f"The grounded move is: extend {module} (scaffold claw, or a bash "
@@ -1096,7 +1188,9 @@ def _static_standin_errors(
         named = _routes_named_in_goal(goal_text, index)
         if named:
             grounded = " " + " ".join(
-                _grounded_move_sentence(route, module, index.api_port)
+                _grounded_move_sentence(
+                    route, str(index.root / module), index.api_port
+                )
                 for route, module in named
             )
     for node in nodes:
@@ -1411,9 +1505,13 @@ def _route_goal_shape(
     plan_word = "delta plan" if delta else "plan"
     lines = [f"ROUTE GOAL — the {plan_word} must follow this shape:"]
     for route, module in named:
+        # Absolute repo path, not the relative module name: the model
+        # must not have to guess which directory the code lives in
+        # (retry #9 named the module under the workspace path instead).
+        module_path = str(index.root / module)
         lines.append(
-            f"- {route} is served by {module} on port {index.api_port}: "
-            f"node 1 edits {module} (scaffold claw, or a bash heredoc) to "
+            f"- {route} is served by {module_path} on port {index.api_port}: "
+            f"node 1 edits {module_path} (scaffold claw, or a bash heredoc) to "
             f"implement the endpoint; node 2 writes the tests (scaffold or "
             f"heredoc) and runs them; node 3 verifies live with "
             f"curl http://localhost:{index.api_port}{route}. Do NOT probe "
@@ -1481,6 +1579,7 @@ def _call_llm_with_repair(
     *,
     max_repairs: int = 2,
     goal_text: str | None = None,
+    workspace: str | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
 
@@ -1496,7 +1595,9 @@ def _call_llm_with_repair(
     for attempt in range(max_repairs + 1):
         response_text = call_llm(system_prompt, prompt, settings=settings)
         try:
-            return parse_planner_response(response_text, goal_text=goal_text)
+            return parse_planner_response(
+                response_text, goal_text=goal_text, workspace=workspace
+            )
         except LLMResponseError as exc:
             last_error = exc
             if attempt >= max_repairs:
@@ -1549,7 +1650,10 @@ def plan_task_intent(
     attempt already has the valid move in front of it instead of having
     to discover it by trial and error.
     """
-    context = format_repo_context(build_repo_index(repo_root))
+    workspace = (intent.constraints or {}).get("workspace")
+    context = format_repo_context(
+        build_repo_index(repo_root), workspace=workspace
+    )
     shape = _route_goal_shape(intent.goal, repo_root, delta=False)
     shape_block = f"\n\n{shape}" if shape else ""
     nodes, metadata = _call_llm_with_repair(
@@ -1563,6 +1667,7 @@ def plan_task_intent(
         settings,
         max_repairs=max_repairs,
         goal_text=intent.goal,
+        workspace=workspace,
     )
     return build_execution_plan(intent, nodes, metadata, plan_id=plan_id)
 
@@ -1582,17 +1687,26 @@ def replan_from_brief(
     the judge's duplicate-approach validation before accepting it.
     """
 
-    context = format_repo_context(build_repo_index(repo_root))
+    context = format_repo_context(
+        build_repo_index(repo_root), workspace=brief.get("workspace")
+    )
     shape = _route_goal_shape(_goal_text_from_brief(brief), repo_root)
     shape_block = f"\n\n{shape}" if shape else ""
+    # The replan needs the node shape in front of it, not just as a
+    # rejection after the fact: retry #9's replan 1 invented a
+    # node/action schema and burned the budget before the shape was ever
+    # named. The ROUTE GOAL shape is route-scoped; the node shape is
+    # general, so it rides along on every replan.
+    node_shape_block = f"\n\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}"
     nodes, _metadata = _call_llm_with_repair(
         REPLAN_SYSTEM_PROMPT,
-        f"{context}\n\n{_format_brief_for_prompt(brief)}{shape_block}\n\n"
+        f"{context}\n\n{_format_brief_for_prompt(brief)}{shape_block}{node_shape_block}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
         "quote, or echo the brief — it is your input, not your output.\n"
         "JSON Output:",
         settings,
         max_repairs=max_repairs,
         goal_text=_goal_text_from_brief(brief),
+        workspace=brief.get("workspace"),
     )
     return nodes

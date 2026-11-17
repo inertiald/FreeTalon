@@ -179,9 +179,26 @@ def build_repo_index(repo_root: str | Path | None = None) -> RepoIndex:
     return index
 
 
-def format_repo_context(index: RepoIndex) -> str:
-    """Compact repo summary for the planner prompt (grounding context)."""
+def format_repo_context(index: RepoIndex, workspace: str | None = None) -> str:
+    """Compact repo summary for the planner prompt (grounding context).
+
+    ``workspace`` is the run-outputs directory from the TaskIntent
+    constraints, when known. The model must not confuse it with the repo
+    root: the retry-#9 plan named module paths under
+    /home/seeker/freetalon-workspace/freetalon/api.py — the workspace
+    used as the repo root — because the context never said where the
+    repo actually lives. Both roots are named explicitly here.
+    """
     lines = ["REPO CONTEXT — extend what exists; do not duplicate it:"]
+    lines.append(
+        f"- Repo root: {index.root} — code modules live here "
+        "(freetalon/..., tests/...)."
+    )
+    if workspace:
+        lines.append(
+            f"- Workspace: {workspace} — run outputs and generated files "
+            "live here; it is NOT the repo root."
+        )
     if index.routes:
         routes = ", ".join(
             f"{route} ({index.routes[route]})" for route in sorted(index.routes)

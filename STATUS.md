@@ -811,3 +811,33 @@ Deliberately left out:
   paths — repo grounding should name the repo root explicitly, and
   the replan still burns its budget on invented schemas instead of
   repairing toward the grounded shape.
+
+## Update - 2026-11-16 (evening, planner repo-root fix — CPU-only)
+
+  Planner fix for the two weaknesses that killed /health retry #9.
+  (1) Repo/workspace path confusion: the REPO CONTEXT now names the
+  repo root explicitly ("Repo root: /home/seeker/projects/FreeTalon
+  — code modules live here") and the workspace as NOT the repo root;
+  the grounded move and the ROUTE GOAL shape use the absolute repo
+  path of the serving module. New wrong-location validation: a node
+  path under the workspace that runs inside a repo tree
+  (freetalon/... or tests/) and does not exist on disk is rejected
+  by name, with the repo root as the correct location — genuine
+  generated files (test_health.py, health.json) at the workspace
+  root are not flagged. (2) Replan budget: the replan prompt now
+  carries the NODE SHAPE block on every replan (general, not
+  route-scoped) alongside the route-scoped ROUTE GOAL shape, so the
+  first replan attempt already has both shapes in front of it.
+  Tests 484 -> 498/498 green (+14 new TestPlannerRepoRootFix), M5
+  smoke passes, verbatim retry-#9 v1 plan now rejected at plan time
+  with exactly 2 errors naming the wrong location and the repo root,
+  mocked repair lands on a repo-pathed grounded plan in one round;
+  regression guards pass (retry-#8 unwritten file, retry-#7 invented
+  schema 11 errors, retry-#5 fake, retry-#4 wrong service, retry-#3
+  glued echo, bare-dict criteria coercion). Demo:
+  freetalon-workspace/tools/demo-repo-root.py, log
+  freetalon-workspace/logs/demo-repo-root.log; apply script
+  freetalon-workspace/tools/apply-planner-repo-root-fix.py (verified
+  byte-for-byte against a pristine 3b0cd16 worktree). Log:
+  freetalon-workspace/logs/planner-repo-root-fix-2026-11-16.log.
+  Next: /health retry #10 (GPU load, separate step).

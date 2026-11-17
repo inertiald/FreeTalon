@@ -3388,3 +3388,385 @@ class TestPlannerUnwrittenFileFix(unittest.TestCase):
         self.assertNotIn("did not match PlanNode schema", message)
         self.assertIn("criteria MUST be a JSON array", message)
         self.assertIn("has no 'type'", message)
+
+
+class TestPlannerRepoRootFix(unittest.TestCase):
+    """Name the repo root explicitly; replan prompt carries NODE SHAPE (retry #9).
+
+    Retry #9 (log llm-end-to-end-health-retry9-2026-11-16.log, run
+    run-20261117T073452Z-2e7e88) failed in 30.5s: the v1 plan was ACCEPTED
+    on the first attempt but was a probe plan — node-1 ran head/grep
+    against /home/seeker/freetalon-workspace/freetalon/api.py, the
+    WORKSPACE path for the module, which does not exist, so it failed
+    exit 1; node-2 was the same probe shape against a nonexistent
+    /home/seeker/freetalon-workspace/freetalon/tests/test_api.py; node-3
+    was a live curl that never ran. The judge chose REPLAN and the replan
+    failed 3x: (1) an invented node/action schema with no
+    objective/assigned_claw, (2) a scaffold writing /health.py at the
+    filesystem root, (3) {"nodes": []} — escalated FAIL. Two fixes: (1)
+    the REPO CONTEXT names the repo root and the workspace explicitly,
+    the grounded move and the ROUTE GOAL shape use the absolute repo
+    path, and a repo-tree path named under the workspace is rejected at
+    plan time as a wrong-location hit; (2) the replan prompt carries
+    BOTH the ROUTE GOAL shape and the NODE SHAPE block, so the first
+    replan attempt already has both shapes in front of it.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#9 v1 nodes, verbatim from
+    # runs/run-20261117T073452Z-2e7e88/plan-v001.json. Embedded (not read
+    # from the run directory) so the test stays hermetic in CI. The
+    # commands are the JSON-parsed values (plain double quotes).
+    @staticmethod
+    def _retry9_v1_nodes() -> list[dict]:
+        ws = "/home/seeker/freetalon-workspace"
+        return [
+            {
+                "id": "node-1",
+                "objective": "Implement the /health endpoint in freetalon/api.py",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {
+                    "command": (
+                        "head -n 1 " + ws + "/freetalon/api.py | grep -qx "
+                        "'def health(self)' && tail -n 1 " + ws
+                        + "/freetalon/api.py | grep -qx 'return {'"
+                    )
+                },
+                "outputs": [f"{ws}/freetalon/api.py"],
+                "acceptance": ["Output verified"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "error": None,
+            },
+            {
+                "id": "node-2",
+                "objective": "Write and run tests for the /health endpoint",
+                "depends_on": ["node-1"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {
+                    "command": (
+                        "head -n 1 " + ws + "/freetalon/tests/test_api.py | grep -qx "
+                        "'def test_health(self)' && tail -n 1 " + ws
+                        + "/freetalon/tests/test_api.py | grep -qx 'return {'"
+                    )
+                },
+                "outputs": [f"{ws}/freetalon/tests/test_api.py"],
+                "acceptance": ["Output verified"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "error": None,
+            },
+            {
+                "id": "node-3",
+                "objective": "Verify live with curl http://localhost:8765/health",
+                "depends_on": ["node-2"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "curl http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "acceptance": ["Output verified"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "error": None,
+            },
+        ]
+
+    # The exact retry-#9 replan attempt-1 output, verbatim from the
+    # second RAW PLANNER OUTPUT block of
+    # logs/llm-end-to-end-health-retry9-2026-11-16.log: an invented
+    # node/action schema with no objective and no assigned_claw.
+    # Embedded so the test stays hermetic in CI.
+    RETRY9_REPLAN1_INVENTED = (
+        '{"nodes":[{"id":"1","action":"scaffold_endpoint",'
+        '"description":"Implement the /health endpoint in freetalon/api.py",'
+        '"status":"pending"},{"id":"2","action":"test_endpoint",'
+        '"description":"Write and run tests for the /health endpoint",'
+        '"status":"pending"},{"id":"3","action":"verify_live",'
+        '"description":"Verify live with curl http://localhost:8765/health",'
+        '"status":"pending"}]}'
+    )
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
+        )
+        self.repo_root = str(Path(__file__).resolve().parent.parent)
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        """The grounded plan, from the previous fix's test class."""
+        grounded = TestPlannerGroundedShapeFix()
+        grounded.setUp()
+        return grounded._grounded_health_nodes()
+
+    # --- Fix 1a: the REPO CONTEXT names both roots ---
+
+    def test_repo_context_names_repo_root_and_workspace(self) -> None:
+        from freetalon.orchestrator.repo_index import (
+            build_repo_index,
+            format_repo_context,
+        )
+
+        context = format_repo_context(build_repo_index(), workspace=self.WS)
+        self.assertIn("Repo root:", context)
+        self.assertIn(self.repo_root, context)
+        self.assertIn("Workspace:", context)
+        self.assertIn(self.WS, context)
+        self.assertIn("NOT the repo root", context)
+
+    def test_repo_context_without_workspace_still_names_repo_root(self) -> None:
+        from freetalon.orchestrator.repo_index import (
+            build_repo_index,
+            format_repo_context,
+        )
+
+        context = format_repo_context(build_repo_index())
+        self.assertIn("Repo root:", context)
+        self.assertIn(self.repo_root, context)
+
+    # --- Fix 1b: workspace-prefixed module paths are wrong-location hits ---
+
+    def test_parse_rejects_retry9_plan_wrong_location(self) -> None:
+        # The exact retry-#9 v1 plan: node-1 greps the module under the
+        # workspace path, node-2 the same shape for the tests file. Both
+        # are repo-tree paths under the workspace root, and the workspace
+        # copy does not exist — the plan must be rejected at plan time
+        # naming the wrong location and the repo root.
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(self._retry9_v1_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("2 errors", message)
+        self.assertIn("workspace", message)
+        self.assertIn("repo root", message)
+        self.assertIn(self.repo_root, message)
+        self.assertIn(f"{self.WS}/freetalon/api.py", message)
+        self.assertIn(f"{self.WS}/freetalon/tests/test_api.py", message)
+
+    def test_workspace_module_plan_repairs_to_repo_plan_in_one_round(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        bad = self._dag(self._retry9_v1_nodes())
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        nodes = plan.nodes
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(nodes[0].inputs["file_path"], self.api_path)
+        self.assertIn("curl -s http://localhost:8765/health", nodes[-1].inputs["command"])
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("repo root", repair_prompt)
+        self.assertIn(self.repo_root, repair_prompt)
+        self.assertIn(f"{self.WS}/freetalon/api.py", repair_prompt)
+        # The first attempt already carried the repo-root grounding.
+        first_prompt = call_mock.call_args_list[0][0][1]
+        self.assertIn("Repo root:", first_prompt)
+        self.assertIn(self.repo_root, first_prompt)
+        self.assertIn("NOT the repo root", first_prompt)
+
+    # --- Fix 2: the replan prompt carries ROUTE GOAL + NODE SHAPE ---
+
+    def test_replan_prompt_carries_route_and_node_shapes(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        route = TestPlannerRouteEngagementFix()
+        route.setUp()
+        good = self._dag(route._good_delta_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=good
+        ) as call_mock:
+            nodes = replan_from_brief(route._brief())
+        self.assertEqual(len(nodes), 2)
+        prompt = call_mock.call_args[0][1]
+        self.assertIn("ROUTE GOAL", prompt)
+        self.assertIn("NODE SHAPE", prompt)
+        self.assertIn('"assigned_claw"', prompt)
+        self.assertIn('"id": "step_1"', prompt)
+        self.assertIn('There is NO "type" field', prompt)
+        # The node shape is general: a non-route replan carries it too,
+        # while the ROUTE GOAL shape stays route-scoped.
+        non_route_brief = {
+            "goal": {
+                "objective": "Run the test suite",
+                "success_measures": [],
+                "budget": {},
+                "risk_class": "read_only",
+                "stop_conditions": [],
+                "irreversible_actions": [],
+            },
+            "plan_id": "plan-x",
+            "plan_version": 1,
+            "failed_nodes": [],
+            "measurements": [],
+            "memory": [],
+            "remaining_budget": {"replans": 1},
+            "instruction": "Produce a delta plan.",
+        }
+        plain = self._dag(
+            [
+                {
+                    "id": "step_1",
+                    "objective": "Run the test suite",
+                    "depends_on": [],
+                    "assigned_claw": "bash",
+                    "inputs": {"command": "python3 -m unittest discover -s tests"},
+                    "outputs": ["test results"],
+                    "criteria": [{"type": "exit_code", "equals": 0}],
+                    "responds_to": "node-1",
+                    "differs_by": "run the suite to confirm the failure",
+                }
+            ]
+        )
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=plain
+        ) as call_mock:
+            nodes = replan_from_brief(non_route_brief)
+        self.assertEqual(len(nodes), 1)
+        prompt = call_mock.call_args[0][1]
+        self.assertIn("NODE SHAPE", prompt)
+        self.assertNotIn("ROUTE GOAL", prompt)
+
+    def test_replan_repairs_invented_schema_in_one_round(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        route = TestPlannerRouteEngagementFix()
+        route.setUp()
+        good = self._dag(route._good_delta_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm",
+            side_effect=[self.RETRY9_REPLAN1_INVENTED, good],
+        ) as call_mock:
+            nodes = replan_from_brief(route._brief())
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(nodes[0].inputs["file_path"], self.api_path)
+        first_prompt = call_mock.call_args_list[0][0][1]
+        self.assertIn("ROUTE GOAL", first_prompt)
+        self.assertIn("NODE SHAPE", first_prompt)
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("NODE SHAPE", repair_prompt)
+
+    # --- Fix 1b: genuine generated files are NOT flagged ---
+
+    def test_workspace_generated_file_is_not_flagged(self) -> None:
+        # A heredoc that writes a genuine generated file under the
+        # workspace — test_health.py — is not a repo-tree path: its first
+        # component is not freetalon/ or tests/. The heredoc body even
+        # imports from freetalon, which is file content, not a path the
+        # node reads.
+        node = {
+            "id": "step_1",
+            "objective": "Write the health endpoint test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": TestPlannerHeredocFix.HEREDOC_TEST},
+            "outputs": [f"{self.WS}/test_health.py"],
+            "criteria": [{"type": "file_exists", "path": f"{self.WS}/test_health.py"}],
+        }
+        nodes, _ = parse_planner_response(
+            self._dag([node]), goal_text=self.HEALTH_GOAL, workspace=self.WS
+        )
+        self.assertEqual(len(nodes), 1)
+
+    def test_parse_accepts_valid_heredoc_health_plan(self) -> None:
+        nodes, _ = parse_planner_response(
+            self._dag(self._grounded_health_nodes()),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+        )
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+
+    # --- Regression guards: the earlier fixes still hold ---
+
+    def test_parse_rejects_retry8_stdout_echo_fake(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerUnwrittenFileFix._retry8_v1_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        self.assertIn("unmeasurable", str(caught.exception))
+
+    def test_parse_rejects_retry7_invented_schema_numbered(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerNodeShapeFix._retry7_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 11 errors", message)
+        self.assertIn("every node MUST be a PlanNode object", message)
+        self.assertIn('There is NO "type" field', message)
+
+    def test_parse_still_rejects_retry5_fake(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "grounded move"):
+            parse_planner_response(
+                self._dag(TestPlannerGroundedShapeFix._retry5_fake_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+
+    def test_parse_still_rejects_retry4_plan_wrong_service(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "different service"):
+            parse_planner_response(
+                self._dag(TestPlannerRouteEngagementFix._retry4_plan_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+
+    def test_parse_still_rejects_retry3_glued_echo(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Write the health endpoint test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": TestPlannerHeredocFix.GLUED_ECHO},
+            "outputs": [f"{self.WS}/test_health.py"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        with self.assertRaisesRegex(LLMResponseError, "glued together") as ctx:
+            parse_planner_response(
+                self._dag([node]), goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        self.assertIn("heredoc", str(ctx.exception))
+        self.assertIn("scaffold", str(ctx.exception))
+
+    def test_bare_dict_criteria_still_coerces(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerCriteriaShapeFix._retry6_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertNotIn("did not match PlanNode schema", message)
+        self.assertIn("criteria MUST be a JSON array", message)
