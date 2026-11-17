@@ -70,6 +70,7 @@ CRITICAL SCHEMA RULES:
 1. "acceptance", "outputs", and "depends_on" MUST ALWAYS be JSON arrays of strings (e.g. ["Command exits with code 0"]), NEVER a bare string.
 2. Root nodes MUST have "depends_on": []. Downstream nodes MUST list parent step IDs in "depends_on".
 3. "error" MUST be null.
+4. "criteria" MUST ALWAYS be a JSON array (a LIST) of criterion objects (e.g. [{"type": "exit_code", "equals": 0}]), NEVER a single object like {"tests_pass": true}.
 
 MEASURABLE CRITERIA — every node MUST have a "criteria" array with at least one criterion, next to the human-readable "acceptance" strings. A node with no measurable criterion is rejected. Criterion shapes:
 - {"type": "exit_code", "equals": 0} — for "bash" nodes: the command must exit 0.
@@ -227,7 +228,9 @@ Rules:
   test, or gather the missing data first.
 - Every node needs testable acceptance: a "criteria" array with at least
   one criterion using the criterion types exit_code, file_exists,
-  file_matches, metric, tests_pass. A file criterion's "path" must be a
-  file this node itself writes or runs. "custom_check" is NOT available.
+  file_matches, metric, tests_pass — a LIST of criterion objects, never
+  a single object like {"tests_pass": true}. A file criterion's "path"
+  must be a file this node itself writes or runs. "custom_check" is NOT
+  available.
 - Do not wrap the JSON in markdown. Return exactly one JSON object.
 """

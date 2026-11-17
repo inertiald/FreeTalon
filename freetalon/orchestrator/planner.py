@@ -167,7 +167,8 @@ def parse_planner_response(
             )
         raise LLMResponseError("Planner output must contain a 'nodes' array.")
 
-    # Defensive normalization: coerce plain strings into single-element lists
+    # Defensive normalization: coerce plain strings into single-element
+    # lists, and a bare-dict "criteria" into a one-element list (retry #6).
     for node in nodes_raw:
         if isinstance(node, dict):
             if isinstance(node.get("acceptance"), str):
@@ -184,6 +185,15 @@ def parse_planner_response(
                 node["depends_on"] = [node["depends_on"]]
             elif node.get("depends_on") is None:
                 node["depends_on"] = []
+
+            if isinstance(node.get("criteria"), dict):
+                # Bare-dict criteria (retry #6: {"tests_pass": true}).
+                # Coerce to a one-element list so the shape guess becomes
+                # a validation error the repair loop can fix, instead of
+                # a structural PlanNode schema error that burns the whole
+                # repair budget. The coerced object still has no "type",
+                # so _usable_criterion_error rejects it by name below.
+                node["criteria"] = [node["criteria"]]
 
     # Normalize: topologically order the DAG and assign deterministic
     # node-1, node-2, ... ids, remapping depends_on. Without this the raw
@@ -226,6 +236,19 @@ _CRITERION_TYPES = frozenset(
     }
 )
 _COMPARISON_OPS = frozenset({"<", "<=", "==", ">=", ">"})
+
+
+# The criterion shape, spelled out wherever a criteria error is reported.
+# Retry #6: the model guessed criteria as a bare dict {"tests_pass": true}
+# because the rejection said "every node needs at least one measurable
+# criterion" but never showed the shape. Short on purpose: it rides along
+# in every criteria rejection and in the planner schema rules.
+_CRITERION_SHAPE_EXAMPLE = (
+    'criteria MUST be a JSON array (a LIST) of criterion objects, e.g. '
+    '[{"type": "exit_code", "equals": 0}]. A node that writes a file uses '
+    '[{"type": "file_exists", "path": "<the file the node writes>"}]. '
+    'Never a single object like {"tests_pass": true}'
+)
 
 
 def _node_path_strings(node: PlanNode) -> list[str]:
@@ -274,6 +297,12 @@ def _usable_criterion_error(criterion: Any, node: PlanNode) -> str | None:
         return f"criterion is not an object: {criterion!r}"
     ctype = criterion.get("type")
     if ctype not in _CRITERION_TYPES:
+        if ctype is None:
+            # A criterion object with no "type" at all — the usual shape
+            # of a coerced bare-dict guess (retry #6). Name the shape
+            # instead of just the missing key, so the repair round can
+            # fix it in one go.
+            return f"criterion has no 'type': {_CRITERION_SHAPE_EXAMPLE}"
         return f"unknown criterion type: {ctype!r}"
     if ctype == CRITERION_EXIT_CODE:
         return None
@@ -445,7 +474,7 @@ def _criteria_errors(node: PlanNode) -> list[str]:
         return [
             f"Planner node '{node.id}' has no 'criteria': every node needs "
             "at least one measurable criterion (exit_code, file_exists, "
-            "file_matches, metric, or tests_pass)."
+            f"file_matches, metric, or tests_pass). {_CRITERION_SHAPE_EXAMPLE}."
         ]
     for criterion in criteria:
         error = _usable_criterion_error(criterion, node)
@@ -481,6 +510,54 @@ def _grounding_error(node: PlanNode, index: Any) -> str | None:
     if error is not None:
         return f"Planner node '{node.id}' duplicates existing code: {error}."
     return None
+
+
+def _tmp_write_errors(
+    nodes: list[PlanNode], index: Any, goal_text: str | None
+) -> list[str]:
+    """Reject route-goal plans that write their deliverable to /tmp.
+
+    When the goal names an existing API route, the work belongs in the
+    serving module or the workspace — a /tmp scratch file is a stand-in,
+    not the deliverable. (Retry #6 attempt 2 wrote a Flask app to
+    /tmp/freetalon/api.py instead of extending freetalon/api.py, and it
+    passed route engagement because the /tmp path contains the module
+    name as a substring.) General: any write node targeting /tmp on a
+    route goal is flagged, naming the serving module(s).
+    """
+    if not goal_text:
+        return []
+    named = _routes_named_in_goal(goal_text, index)
+    if not named:
+        return []
+    modules = ", ".join(sorted({module for _, module in named}))
+    errors: list[str] = []
+    for node in nodes:
+        targets: list[str] = []
+        if node.assigned_claw in ("bash", "shell_exec"):
+            command = node.inputs.get("command") or node.inputs.get("cmd")
+            if isinstance(command, str):
+                written = _literal_write(command)
+                if written is not None:
+                    targets.append(written[0])
+        elif node.assigned_claw in ("scaffold", "file_writer"):
+            target = (
+                node.inputs.get("file_path")
+                or node.inputs.get("path")
+                or (node.outputs[0] if node.outputs else "")
+            )
+            if isinstance(target, str) and target:
+                targets.append(target)
+        for target in targets:
+            if target == "/tmp" or target.startswith("/tmp/"):
+                errors.append(
+                    f"Planner node '{node.id}' writes to {target!r} — for a "
+                    f"route goal the work belongs in the serving module "
+                    f"({modules}) or the workspace, not a /tmp scratch file. "
+                    f"Extend {modules} instead."
+                )
+                break
+    return errors
 
 
 def _collect_plan_errors(
@@ -519,6 +596,7 @@ def _collect_plan_errors(
     errors.extend(_static_standin_errors(nodes, index=index, goal_text=goal_text))
     if index is not None:
         errors.extend(_route_engagement_errors(nodes, index, goal_text))
+        errors.extend(_tmp_write_errors(nodes, index, goal_text))
     return errors
 
 

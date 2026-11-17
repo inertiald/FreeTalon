@@ -653,3 +653,31 @@ Deliberately left out:
     bare-dict criteria into a one-element list at parse time.
     Also consider flagging file-write nodes that target /tmp instead
     of the serving module for route goals.
+
+## Update - 2026-11-16 (evening, planner criteria-shape fix — CPU-only)
+
+  Fix for retry #6: the criteria shape is now shown to the model and a
+  bare-dict criteria is coerced at parse time (commit below).
+  - planner.py: a bare-dict "criteria" ({"tests_pass": true}) is coerced
+    to a one-element list in parse_planner_response, so the guess becomes
+    a validation error the repair loop can fix instead of a structural
+    PlanNode schema error that burned the whole repair budget. A
+    criterion with no "type" names the shape in its error, and the
+    no-criteria rejection shows the shape example:
+    [{"type": "exit_code", "equals": 0}] (file nodes:
+    [{"type": "file_exists", "path": "<the file the node writes>"}]).
+  - prompts.py: schema rule 4 — "criteria" MUST be a JSON array (a LIST)
+    of criterion objects, never a single object; same note on the replan
+    criteria bullet.
+  - Secondary: a route-goal plan whose write node targets /tmp is
+    rejected by name (attempt 2 wrote a Flask app to /tmp/freetalon/
+    api.py and passed route engagement because the /tmp path contains
+    the module name as a substring).
+  - Tests 444 -> 455/455 green (+11 TestPlannerCriteriaShapeFix);
+    M5 smoke passes (finance run-20261117T065859Z-875666, ECU
+    run-20261117T065859Z-45334c). Demo: verbatim retry-#6 attempt-3
+    bare-dict plan rejected with the shape named (not a schema error),
+    mocked repair lands on a grounded plan in one round.
+    Tool: freetalon-workspace/tools/demo-criteria-shape.py, log
+    freetalon-workspace/logs/demo-criteria-shape.log.
+  - Next: /health retry #7 (GPU load, separate step).
