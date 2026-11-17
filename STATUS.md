@@ -1543,3 +1543,65 @@ Deliberately left out:
   bare-dict criteria, duplicate ids / cycles / self-dependency).
   M5 smoke passes. Demo: tools/demo-placeholder-cheap.py.
 - Next: /health retry #18.
+
+
+## Update - 2026-11-17 (early, /health retry #18)
+
+- /health retry #18 FAILED at planning (DRIVER_EXIT:1, ~148s, no run
+  created). Pre-flight all green (GPU 52C idle, 300W, x16, zero Xid;
+  Ollama gemma-3-abliterated:latest; head ff299a2; suite 679/679).
+  Fans manual 85% during, restored to auto after. Three planner
+  attempts, all rejected (each re-run through parse_planner_response
+  to confirm exactly):
+  (1) The prose-command plan again -- rejected with exactly 3 errors
+  by the prose rule, each naming the grounded move.
+  (2) The retry-#15 Flask heredoc plan again -- rejected with exactly
+  1 error: step_2's test-file heredoc does not parse as Python
+  (expected an indented block after function definition on line 7).
+  The code-append parse check fired, but NOTHING else was named: the
+  Flask app heredoc overwriting api.py (no flask import in the body,
+  so the framework check misses it), the test path
+  freetalon/tests/test_api.py (that directory does not exist -- repo
+  tests live at repo-root tests/), and the /tmp redirect in step_3.
+  (3) A sed + heredoc plan (4 nodes, skeleton-shaped) -- rejected
+  with exactly 3 errors: step_4 invents a 'response_content'
+  criterion type; step_2's test heredoc does not parse (indented
+  block after class definition, line 6); step_2 writes a Flask app
+  (framework rule fired -- the body has 'from flask import jsonify').
+  NOT named: step_1's sed targets 'def health(self):', which does
+  not exist in api.py -- sed -i with a non-matching pattern is a
+  silent no-op; and the test path is still freetalon/tests/.
+  Budget exhausted (initial + 2 repairs; no free re-prompts used --
+  no empty plan, no placeholder-only rejection). Judge/replan never
+  ran.
+- Endpoint NOT extended, no new tests, no live curl. freetalon/api.py
+  untouched (219 lines, 0-line diff vs HEAD). Suite re-run 679/679
+  green after the failure. No stray files. GPU survived (post-run
+  68C cooling, 300W, x16, zero Xid).
+- Weaknesses, in priority order:
+  (1) Single-error signal loss: when the code-append parse check is
+  the only error, the framework / /tmp / wrong-location defects in
+  the same plan never reach the repair round -- the model fixes the
+  one named defect (indentation) and keeps the unnamed ones (Flask,
+  wrong test path) into the next attempt. The repair prompt needs the
+  per-node validation errors alongside the parse error, like the
+  duplicate-key and dependency rejections already do.
+  (2) The framework check misses Flask code with no flask import:
+  attempt 2's heredoc writes '@app.route' + 'jsonify' with no import
+  statement, so nothing flags the Flask overwrite of the serving
+  module. Detect framework usage (route decorators, jsonify, app
+  object) as well as imports.
+  (3) sed -i edits with a non-matching pattern are silent no-ops:
+  validate at plan time that a sed/replace target actually exists in
+  the file being edited (or require a validity measurement after).
+  (4) Heredoc/scaffold writes to a non-existent directory under the
+  repo (freetalon/tests/) are not flagged -- the test path is wrong
+  in both attempts 2 and 3 and nothing names it.
+  (5) The /tmp redirect inside a compound command ('curl ... | jq .
+  > /tmp/health_response.json') was not named by the /tmp rule.
+- Known gaps still open: file_matches outputs-only hole; literal
+  JSON answer to a NEW non-code file with only an exit_code
+  criterion; scaffold content not parse-checked; scaffold-with-
+  fragment overwriting a whole module; echo regex misses a '>'
+  inside a quoted echo body.
+- Next: fix weakness (1), then /health retry #19.
