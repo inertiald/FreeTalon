@@ -120,8 +120,13 @@ class CheapRejectionError(LLMResponseError):
     degenerate (no plan at all) or its only errors are stand-in /
     code-overwrite fakes: re-prompting costs the model nothing to fix,
     so the repair loop re-prompts for free, up to a small cap, instead
-    of burning a repair round. A subclass of LLMResponseError, so
-    callers that catch LLMResponseError are unaffected.
+    of burning a repair round. Retry #17: the model followed the
+    grounded skeleton shape but filled it with placeholder comments,
+    and the placeholder rejection spent the last repair round — so a
+    rejection whose only errors are placeholder scaffolds is cheap
+    too: a comment stub costs the model nothing to replace with real
+    code. A subclass of LLMResponseError, so callers that catch
+    LLMResponseError are unaffected.
     """
 
 
@@ -294,6 +299,7 @@ def normalize_plan_nodes(
     goal_text: str | None = None,
     repo_root: str | Path | None = None,
     workspace: str | None = None,
+    id_labels: dict[str, str] | None = None,
 ) -> list[PlanNode]:
     """Validate a DAG, topologically order it, and assign deterministic node ids.
 
@@ -302,7 +308,11 @@ def normalize_plan_nodes(
     optional (hand-built plans pass neither). ``repo_root``/``workspace``
     are threaded to the dependency check so the unknown-dependency
     rejection can also name the other validation errors (retry #15);
-    both optional.
+    both optional. ``id_labels`` is an optional out-parameter: when
+    given, it is filled with {normalized_id: original_id} so a caller
+    can name the model's own ids in a rejection (retry #17: the
+    placeholder error named 'node-1' while the plan's id was
+    'step-1').
     """
     nodes = _coerce_nodes(nodes, repo_index=repo_index, goal_text=goal_text)
     if not nodes:
@@ -385,6 +395,13 @@ def normalize_plan_nodes(
     original_to_normalized_id = {
         original_id: f"node-{index}" for index, original_id in enumerate(ordered_ids, start=1)
     }
+    if id_labels is not None:
+        id_labels.update(
+            {
+                normalized: original
+                for original, normalized in original_to_normalized_id.items()
+            }
+        )
     normalized_nodes: list[PlanNode] = []
     for original_id in ordered_ids:
         node = node_map[original_id]
@@ -590,6 +607,31 @@ def _duplicate_key_errors(
     return [], []
 
 
+def _relabel_nodes_for_errors(
+    nodes: list[PlanNode], id_labels: dict[str, str]
+) -> list[PlanNode]:
+    """Copies of ``nodes`` with ids relabeled to the model's original ids.
+
+    Retry #17: normalize renames the model's ids to deterministic
+    node-1, node-2, ... — but a rejection naming 'node-1' when the model
+    wrote 'step-1' points at a node the model cannot find in its own
+    output. Error messages name the original ids; depends_on is
+    remapped the same way so the copies stay a consistent DAG. The
+    returned nodes are unaffected (they keep normalized ids).
+    """
+    if not id_labels:
+        return nodes
+    return [
+        node.model_copy(
+            update={
+                "id": id_labels.get(node.id, node.id),
+                "depends_on": [id_labels.get(dep, dep) for dep in node.depends_on],
+            }
+        )
+        for node in nodes
+    ]
+
+
 def parse_planner_response(
     raw_text: str,
     *,
@@ -710,12 +752,14 @@ def parse_planner_response(
     # fake with wrong-typed ids is named as a fake instead of only as a
     # schema error — and the rejection is cheap, not repair-consuming.
     index = build_repo_index(repo_root) if goal_text else None
+    id_labels: dict[str, str] = {}
     nodes = normalize_plan_nodes(
         nodes_raw,
         repo_index=index,
         goal_text=goal_text,
         repo_root=repo_root,
         workspace=workspace,
+        id_labels=id_labels,
     )
 
     # Planner hardening: an invented claw name or an unmeasurable node is a
@@ -725,8 +769,17 @@ def parse_planner_response(
     # All per-node errors are collected and reported in ONE rejection, so a
     # plan with several independent errors can be fixed in a single repair
     # round instead of burning the repair budget one error at a time.
+    # The rejection must name the model's own ids ('step-1'), not the
+    # normalized node-1/node-2 ids normalize assigned (retry #17: the
+    # placeholder error named 'node-1' while the plan's id was
+    # 'step-1'). Error collection runs on relabeled copies; the
+    # returned nodes keep their normalized ids.
     errors, cheap = _collect_plan_errors(
-        nodes, repo_root, goal_text, workspace, index=index
+        _relabel_nodes_for_errors(nodes, id_labels),
+        repo_root,
+        goal_text,
+        workspace,
+        index=index,
     )
     if errors:
         noun = "error" if len(errors) == 1 else "errors"
@@ -1457,7 +1510,10 @@ def _unwritten_file_errors(
 
 
 def _placeholder_scaffold_errors(
-    nodes: list[PlanNode], repo_root: str | Path | None
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    index: Any | None = None,
+    goal_text: str | None = None,
 ) -> list[str]:
     """Reject scaffolds that overwrite an existing code file with placeholder content.
 
@@ -1470,8 +1526,26 @@ def _placeholder_scaffold_errors(
     creating a NEW file with a comment stub is still allowed — that is
     how scaffolding starts — so the rule fires only when the target
     already exists on disk. General: any code file, any route goal.
+    When the goal names an existing route, the error also names the
+    grounded move (extend the serving module, write real tests, curl
+    the live API port), like the stand-in rejection does: the repair
+    round is pointed TOWARD the real work, not just away from the
+    placeholder.
     """
     errors: list[str] = []
+    grounded = ""
+    if index is not None and goal_text:
+        named = _routes_named_in_goal(goal_text, index)
+        if named:
+            grounded = " " + " ".join(
+                _grounded_move_sentence(
+                    route,
+                    str(index.root / module),
+                    index.api_port,
+                    index.route_handlers.get(route),
+                )
+                for route, module in named
+            )
     for node in nodes:
         if node.assigned_claw not in ("scaffold", "file_writer"):
             continue
@@ -1497,7 +1571,7 @@ def _placeholder_scaffold_errors(
             "overwrite the existing module with a comment stub instead of "
             "implementing it. Write real code in the module (scaffold claw "
             "with real code, or a bash heredoc) and verify it by running the "
-            "tests and curling the live service."
+            f"tests and curling the live service.{grounded}"
         )
     return errors
 
@@ -1779,8 +1853,9 @@ def _collect_plan_errors(
     the driver dying on a bare raise.
 
     Returns (errors, cheap): ``cheap`` is True when every error is a
-    stand-in / code-overwrite fake (retry #12) — a rejection the repair
-    loop may re-prompt for free, without spending the repair budget.
+    stand-in / code-overwrite fake (retry #12) or a placeholder scaffold
+    (retry #17) — a rejection the repair loop may re-prompt for free,
+    without spending the repair budget.
     """
     errors: list[str] = []
     needs_index = any(
@@ -1799,7 +1874,10 @@ def _collect_plan_errors(
             if error is not None:
                 errors.append(error)
     errors.extend(_unwritten_file_errors(nodes, repo_root))
-    errors.extend(_placeholder_scaffold_errors(nodes, repo_root))
+    placeholder_errors = _placeholder_scaffold_errors(
+        nodes, repo_root, index=index, goal_text=goal_text
+    )
+    errors.extend(placeholder_errors)
     errors.extend(_code_append_errors(nodes, repo_root, goal_text, index))
     standin_errors = _static_standin_errors(nodes, index=index, goal_text=goal_text)
     errors.extend(standin_errors)
@@ -1810,9 +1888,14 @@ def _collect_plan_errors(
         errors.extend(_wrong_location_errors(nodes, index, workspace))
     # Cheap rejection (retry #12): the only errors are stand-in /
     # code-overwrite fakes, so re-prompting costs the model nothing to
-    # fix and must not spend the repair budget. Any other error mixed
-    # in makes it a real rejection.
-    cheap = bool(errors) and len(standin_errors) == len(errors)
+    # fix and must not spend the repair budget. A rejection whose only
+    # errors are placeholder scaffolds is cheap too (retry #17): a
+    # comment stub costs the model nothing to replace with real code.
+    # Any other error mixed in makes it a real rejection.
+    cheap = (
+        bool(errors)
+        and len(standin_errors) + len(placeholder_errors) == len(errors)
+    )
     return errors, cheap
 
 
@@ -2534,7 +2617,13 @@ def _grounded_skeleton(
     every "# TODO" line must be replaced with real code, and a TODO
     comment copied into a scaffold is rejected by the placeholder guard
     (it would overwrite the existing module with a comment stub), so a
-    verbatim copy cannot slip through as a plan.
+    verbatim copy cannot slip through as a plan. Step-1 shows the
+    existing branch as a commented sketch — the route literal and the
+    response fields named, read from the real module — so the model has
+    real code to extend instead of a blank to fill (retry #17: the
+    model followed the skeleton shape but filled it with placeholder
+    comments). A verbatim copy of the sketch is still placeholder-only
+    (all comment lines), so the guard rejects it, cheaply.
     Returns "" when the goal names no existing route.
     """
     if not goal_text:
@@ -2560,6 +2649,24 @@ def _grounded_skeleton(
         if workspace
         else str(index.root / "tests" / "test_health.py")
     )
+    branch = index.route_branches.get(route)
+    if branch is not None:
+        # The existing branch, as a commented sketch the model extends:
+        # the route literal and the response fields are named, so the
+        # model has real code to complete instead of a blank TODO — and
+        # a verbatim copy is still placeholder-only (all comment lines),
+        # so the guard rejects it instead of letting it through.
+        sketch = "\n".join(f"#     {line}" for line in branch.splitlines())
+        content = (
+            f"# Extend {module_path} in place — add the fields the goal asks "
+            f"for to the existing {route} branch in {handler}:\n"
+            f"{sketch}\n"
+            "# Write the FULL module with the extended branch — the scaffold "
+            "replaces the whole file, so a fragment alone is not a plan.\n"
+            "# Do NOT write a TODO comment — a comment-only scaffold is rejected."
+        )
+    else:
+        content = f"# TODO: replace this comment with the real code — {edit.lower()}"
     nodes: list[dict[str, Any]] = [
         {
             "id": "step-1",
@@ -2568,7 +2675,7 @@ def _grounded_skeleton(
             "assigned_claw": "scaffold",
             "inputs": {
                 "file_path": module_path,
-                "content": f"# TODO: replace this comment with the real code — {edit.lower()}",
+                "content": content,
             },
             "outputs": [module_path],
             "acceptance": [f"The {route} endpoint is implemented in {module_path}."],
@@ -2618,10 +2725,53 @@ def _grounded_skeleton(
         "skeleton below with REAL code and REAL tests, then return the "
         "completed JSON as your output. The skeleton is the SHAPE of your "
         "output, not instruction text to re-serialize: every \"# TODO\" line "
-        "must be replaced with real code. Copying a TODO comment into a "
-        "scaffold will be rejected — the scaffold must contain the real "
+        "must be replaced with real code. Step-1 shows the existing branch "
+        "as a commented sketch — extend it with the fields the goal asks "
+        "for and write the FULL module; do not copy the sketch's comment "
+        "lines into the scaffold. Copying a TODO comment into a scaffold "
+        "will be rejected — the scaffold must contain the real "
         f"implementation.\n{skeleton}"
     )
+
+
+# Rejection-message markers for approaches the model has already tried
+# and had rejected in this planning call. Retry #17: the Flask heredoc
+# came back verbatim after a rejection that named the fix — the model
+# never learns across attempts within one call, so the repair prompt
+# names the rejected approaches explicitly. Approach names only, never
+# quoted model content: the markers match the rejection's own wording
+# (the framework error names Flask, the /tmp error names /tmp, and so
+# on), so nothing the model wrote is echoed back.
+_APPROACH_MARKERS: tuple[tuple[str, str], ...] = (
+    (
+        "Flask",
+        "a Flask app — the serving module is built on stdlib http.server, "
+        "not Flask; extend it in place",
+    ),
+    (
+        "/tmp",
+        "writing files under /tmp — code lives in the repo, not /tmp",
+    ),
+    (
+        "placeholder",
+        "a placeholder/comment-only scaffold over an existing module — "
+        "write real code",
+    ),
+    (
+        "prose, not a shell command",
+        "prose commands — write shell commands, not sentences",
+    ),
+    (
+        "hardcoded answer",
+        "echoing a hardcoded JSON answer — run the real code or service "
+        "and check ITS output",
+    ),
+)
+
+
+def _rejected_approaches(message: str) -> list[str]:
+    """Approach names a rejection message shows the model already tried."""
+    return [label for marker, label in _APPROACH_MARKERS if marker in message]
 
 
 def _call_llm_with_repair(
@@ -2654,11 +2804,18 @@ def _call_llm_with_repair(
 
     Cheap rejections do not spend the repair budget (retry #12): an
     empty plan, or a rejection whose only errors are stand-in /
-    code-overwrite fakes, is re-prompted for free, up to
-    ``max_free_reprompts`` times. The budget is not raised — junk that
-    keeps coming eventually spends repairs and the loop still ends
-    (at most 1 + max_free_reprompts + max_repairs calls). A cheap
-    rejection past the free cap falls through to the repair budget.
+    code-overwrite fakes — or placeholder scaffolds (retry #17) — is
+    re-prompted for free, up to ``max_free_reprompts`` times. The budget
+    is not raised — junk that keeps coming eventually spends repairs and
+    the loop still ends (at most 1 + max_free_reprompts + max_repairs
+    calls). A cheap rejection past the free cap falls through to the
+    repair budget.
+
+    The repair prompt also names the approaches the model has already
+    tried and had rejected in this planning call (retry #17: the Flask
+    heredoc came back verbatim after a rejection that named the fix),
+    so the model is told not to repeat them instead of re-discovering
+    the same rejection.
 
     A run of empty plans is answered with a concrete grounded skeleton
     (retry #16): after any empty reply the next repair prompt carries a
@@ -2673,6 +2830,7 @@ def _call_llm_with_repair(
     repairs_used = 0
     free_used = 0
     empty_streak = 0
+    rejected_approaches: list[str] = []
     while True:
         response_text = call_llm(system_prompt, prompt, settings=settings)
         try:
@@ -2684,6 +2842,9 @@ def _call_llm_with_repair(
             )
         except LLMResponseError as exc:
             last_error = exc
+            for approach in _rejected_approaches(str(exc)):
+                if approach not in rejected_approaches:
+                    rejected_approaches.append(approach)
             if isinstance(exc, EmptyPlanError):
                 empty_streak += 1
             else:
@@ -2699,12 +2860,23 @@ def _call_llm_with_repair(
                 skeleton = _grounded_skeleton(goal_text, repo_root, workspace)
                 if skeleton:
                     skeleton_block = f"\n{skeleton}\n"
+            forbidden_block = ""
+            if rejected_approaches:
+                items = "\n".join(
+                    f"- {approach}" for approach in rejected_approaches
+                )
+                forbidden_block = (
+                    "\nDO NOT repeat approaches you have already tried and had "
+                    "rejected in this planning call:\n"
+                    f"{items}\n"
+                )
             prompt = (
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
                 f"Rejection reason: {exc}\n"
                 f"Previous output: {_describe_failed_output(response_text)}\n"
                 f"{_dropped_fields_note(prev_response_text, response_text)}"
+                f"{forbidden_block}"
                 f"\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n"
                 f"{skeleton_block}\n"
                 "Return ONLY a corrected JSON object with a \"nodes\" array that "

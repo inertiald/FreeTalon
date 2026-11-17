@@ -1506,3 +1506,40 @@ Deliberately left out:
   names the node 'node-1' while the plan's id is 'step-1' (lenient-view
   naming quirk, cosmetic).
 - Next: fix weakness (1), then /health retry #18.
+
+
+## Update - 2026-11-17 (early, planner placeholder-cheap fix)
+
+- Placeholder-cheap fix DONE (CPU-only, no LLM/e2e/push/reboot): the
+  three retry-#17 weaknesses are fixed in
+  freetalon/orchestrator/planner.py and repo_index.py. (1) A rejection
+  whose only errors are placeholder scaffolds is now CHEAP (free
+  re-prompt, like empty plans and stand-in fakes) -- the model gets a
+  repair round for the placeholder error instead of the budget dying
+  on prose + Flask first. The grounded skeleton's step-1 also shows
+  the existing handler branch as a commented sketch (new
+  RepoIndex.route_branches, read from the real module -- for /health
+  exactly 'if path == "/health": return self._send(200, {...})'), so
+  the model has real code to extend instead of a blank TODO; a
+  verbatim copy of the sketch is still placeholder-only, so the guard
+  rejects it cheaply. The placeholder error now names the grounded
+  move for route goals, like the stand-in rejection. (2) The repair
+  prompt names the approaches already tried and rejected in this
+  planning call (Flask, /tmp writes, placeholder scaffolds, prose
+  commands, hardcoded answers) -- approach names only, never quoted
+  model content -- so the model is told not to repeat them. (3) The
+  rejection names the model's own node ids: parse_planner_response
+  collects errors on copies of the nodes relabeled to their original
+  ids ('step-1', not 'node-1'); the returned nodes keep normalized
+  ids. The repair budget (max 2 repairs + 2 free re-prompts) is NOT
+  raised.
+- Tests: 653 + new TestPlannerPlaceholderCheapFix green. Mocked
+  [prose, Flask, empty, placeholder, grounded] lands on the grounded
+  plan in 5 calls (placeholder round free); mocked [Flask, Flask,
+  grounded] lands in 3 calls with Flask named as forbidden in the
+  second repair prompt. Verbatim retry-#17 attempt-4 is a CHEAP
+  placeholder rejection naming 'step-1' and freetalon/api.py.
+  Regression guards mirror the code-append fix (retries #16-#3,
+  bare-dict criteria, duplicate ids / cycles / self-dependency).
+  M5 smoke passes. Demo: tools/demo-placeholder-cheap.py.
+- Next: /health retry #18.

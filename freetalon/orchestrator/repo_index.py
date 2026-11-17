@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -117,6 +118,15 @@ class RepoIndex:
     # wrote two Flask scaffolds because "extend the module" read as
     # "write a new app"). Empty for a route with no recorded handler.
     route_handlers: dict[str, str] = field(default_factory=dict)
+    # HTTP route -> source text of the existing ``if`` branch dispatching
+    # on that route literal, read from the real module (e.g. "/health" ->
+    # 'if path == "/health":\n    return self._send(200, ...)'). Lets the
+    # grounded skeleton show the model the actual handler-branch shape
+    # with the route literal and the response fields named, so it extends
+    # the branch instead of writing a TODO comment (retry #17: the model
+    # followed the skeleton shape but filled it with placeholder
+    # comments). Empty for a route with no recorded branch.
+    route_branches: dict[str, str] = field(default_factory=dict)
 
     def route_names(self) -> set[str]:
         """First path segment of each route ("health", "tasks", ...)."""
@@ -220,6 +230,44 @@ def _handler_for_line(
     return None
 
 
+def _route_branch(
+    source: str, spans: list[tuple[int, int, str, str, str]], route: str
+) -> str | None:
+    """Source text of the ``if`` branch dispatching on ``route`` in a handler.
+
+    Walks the AST for an ``ast.If`` whose test is ``<something> == <route>``
+    inside one of the handler-method spans, and returns the branch source
+    dedented (so it reads as a stand-alone snippet). Read from the real
+    module, never guessed: for /health this is exactly
+    ``if path == "/health":\n    return self._send(200, ...)``.
+    Returns None when no such branch exists in a handler span.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value == route
+        ):
+            continue
+        if not any(start <= node.lineno <= end for start, end, _, _, _ in spans):
+            continue
+        segment = ast.get_source_segment(source, node)
+        if segment is None:
+            continue
+        return textwrap.dedent(segment).strip()
+    return None
+
+
 def _top_level_names(source: str) -> list[str]:
     try:
         tree = ast.parse(source)
@@ -261,6 +309,9 @@ def build_repo_index(repo_root: str | Path | None = None) -> RepoIndex:
             handler = _handler_for_line(spans, source, match.start())
             if handler is not None:
                 index.route_handlers.setdefault(route, handler)
+            branch = _route_branch(source, spans, route)
+            if branch is not None:
+                index.route_branches.setdefault(route, branch)
         for match in _ROUTE_STARTSWITH_RE.finditer(source):
             prefix = match.group(1)
             key = prefix.rstrip("/") + "/…"
