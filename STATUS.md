@@ -471,3 +471,27 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
 - Next: /health retry #3 - NOT run here (loads the GPU; separate step).
   Still blocked: gh token invalid - commits local-only until Pat re-auths
   gh on seeker7 (device flow, as before).
+
+- /health retry #3 (2026-11-16 evening, run under Pat's 12h mandate, no
+  approval gate for GPU tests): FAILED at the planning stage - no run
+  created, judge never involved, nothing touched disk (api.py untouched,
+  no new tests, no stray files). 3 planner attempts (initial + 2 repairs),
+  all rejected:
+  - Attempt 1 faked the endpoint AGAIN (echo hardcoded JSON > health.json
+    && mv to api/health.json, file_exists) - the new anti-fake rule caught
+    it and the repair DROPPED the fake node. The rule works as a steering
+    signal.
+  - But all 3 attempts wrote the Python test file as a single-line
+    echo '...' with the newlines collapsed (glued-word violation:
+    "import unittest, requests, json from freetalon.api import apiclass
+    TestHealthEndpoint..."), and neither repair fixed it. Final rejection:
+    1 error, glued bash command on node-1. The model has no working way
+    to emit a multi-line file through echo in this interface, and the
+    repair prompt offers no alternative (heredoc / scaffold claw).
+  - GPU: peak 83C (hottest yet, under the 85C pause), limit 300W held,
+    x16, zero Xid. Fans manual 65% during, auto after. Suite 419/419
+    green after. Log: logs/llm-end-to-end-health-retry3-2026-11-16.log.
+  - Next fix (same family): teach the planner a valid multi-line file
+    write (heredoc or scaffold claw) and name it in the repair message
+    when the glued-word rule fires; the validator is doing its job, the
+    model just has no valid move.
