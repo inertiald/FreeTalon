@@ -1701,3 +1701,41 @@ Deliberately left out:
   check, so a parse error in a plan that also has schema errors is
   still lost there.
 - Next: /health retry #19.
+
+## Update - 2026-11-17 (early, /health retry #19)
+
+- /health retry #19 FAILED at planning (DRIVER_EXIT:1, ~145s, no run
+  created). Pre-flight all green (GPU 52C idle, 300W, x16, zero Xid;
+  Ollama gemma-3-abliterated:latest; head faccbfa; suite 708/708).
+  Fans manual 85% during, restored to auto after. Three planner
+  attempts, all rejected (each re-run through parse_planner_response
+  to confirm exactly):
+  (1) The prose-command plan again -- rejected with exactly 3 errors
+  by the prose rule, each naming the grounded move.
+  (2) The retry-#15 Flask heredoc plan again -- rejected with exactly
+  4 errors: step_2 test-file heredoc does not parse as Python
+  (expected an indented block after function definition on line 7);
+  step_3 writes to /tmp/health_response.json (piped /tmp redirect
+  now named); step_1 writes a Flask app (framework rule now fires
+  with no flask import -- route decorator + jsonify detected);
+  step_2 writes to freetalon/tests/test_api.py but its directory
+  does not exist (missing-directory error names repo-root tests/).
+  The signal-loss fix WORKED as designed -- the parse error now
+  carries the framework / /tmp / missing-directory defects in the
+  same rejection.
+  (3) A Flask scaffold plan -- rejected with exactly 1 error:
+  step_1 writes a Flask app (framework rule, grounded move named).
+  Flask was named in the attempt-2 rejection, so the
+  forbid-repeated-approaches mechanism should have forbidden it in
+  the repair prompt -- but the model returned a Flask scaffold
+  anyway. The forbid mechanism did not steer the model this time.
+  Budget exhausted (initial + 2 repairs; no free re-prompts used --
+  no empty plan, no placeholder-only rejection). Judge/replan never
+  ran. Endpoint NOT extended, no new tests, no live curl.
+  freetalon/api.py untouched (219 lines, 0-line diff). Suite re-run
+  708/708 green. No stray files. GPU survived (post-run 50C idle,
+  43.36W, 300W, x16, zero Xid; mid-run peak not sampled -- planning
+  only). Log: logs/llm-end-to-end-health-retry19-2026-11-16.log
+  (294 lines).
+- Next: address the ignored forbidden-approach list, then
+  /health retry #20.
