@@ -367,6 +367,35 @@ def _top_level_names(source: str) -> list[str]:
     return sorted(names)
 
 
+def qualified_def_names(source: str) -> list[str]:
+    """Dotted names of every def/class in a module, at any nesting depth.
+
+    ``_top_level_names`` sees only the module surface; a wholesale
+    overwrite can keep a top-level name while gutting everything under
+    it (retry #26: the replacement freetalon/api.py kept a class named
+    HiveAPIServer but dropped HiveAPIServer.start, the Handler class
+    inside it, and every handler method). Qualified names make that
+    loss visible to the planner's scaffold-overwrite guard.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    names: list[str] = []
+
+    def _visit(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                qualified = prefix + child.name
+                names.append(qualified)
+                _visit(child, qualified + ".")
+
+    _visit(tree, "")
+    return names
+
+
 def build_repo_index(repo_root: str | Path | None = None) -> RepoIndex:
     """Walk ``<root>/freetalon/**/*.py`` and index routes, modules, and the API port."""
     root = resolve_repo_root(repo_root)

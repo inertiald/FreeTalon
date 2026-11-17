@@ -21,6 +21,7 @@ from .repo_index import (
     duplicate_scaffold_error,
     format_repo_context,
     framework_in_text,
+    qualified_def_names,
 )
 from .measure import (
     CRITERION_CUSTOM_CHECK,
@@ -1141,9 +1142,22 @@ def _bash_interpreter_errors(
     PATH varies by machine, so a which() check would answer
     differently on seeker7 and in CI. Heredoc bodies are stripped by
     the caller — file content is not shell.
+
+    Retry #26: the root is resolved UNCONDITIONALLY. The driver
+    calls plan_task_intent with repo_root=None, and this check used
+    to keep root=None in that case and skip every path token — so
+    the live path accepted ./venv/bin/python commands that every
+    test and probe (which pass the root explicitly) rejected, and
+    the plan was accepted and executed. resolve_repo_root(None) is
+    the checkout holding this package — the same fallback
+    build_repo_index uses — so the driver path now validates
+    against the same repo the grounding checks read. (Audit: every
+    other repo_root consumer in this module already resolves
+    unconditionally or reads the index; this was the only
+    None-sensitive check.)
     """
     errors: list[str] = []
-    root = resolve_repo_root(repo_root) if repo_root is not None else None
+    root = resolve_repo_root(repo_root)
     for segment in _INTERPRETER_SEGMENT_RE.split(command):
         tokens: list[str] = []
         try:
@@ -1170,8 +1184,6 @@ def _bash_interpreter_errors(
             continue
         # A path token: resolve against the repo root and require it
         # to exist. Outside the repo it is not judged.
-        if root is None:
-            continue
         if first.startswith("/"):
             rel = _repo_relative_target(first, root)
             if rel is None:
@@ -2479,6 +2491,114 @@ def _scaffold_parse_errors(
     return errors
 
 
+def _scaffold_overwrite_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    goal_text: str | None = None,
+    index: Any | None = None,
+) -> list[str]:
+    """Reject scaffold writes that delete most of an existing module.
+
+    Retry #26: the accepted plan's node-1 scaffold replaced
+    freetalon/api.py wholesale (219 lines -> 37) with a small handler
+    module and passed on a file_exists criterion — the real
+    HiveAPIServer (start/stop, the Handler class defined inside
+    start, every route branch), the auth check, and
+    _ThreadingHTTPServer were silently deleted, and only the next
+    node's exit 127 revealed the loss; api.py had to be restored from
+    git. The parse check (retry #23) rejects content that does not
+    parse, but a parseable fragment that omits most of the module was
+    unguarded.
+
+    General: a scaffold overwrites the whole file, so when it targets
+    an EXISTING Python module, every definition it omits is a
+    deletion. Compare the qualified def/class names (every nesting
+    depth — a same-named replacement class that drops the original's
+    methods is still a gutting; the top-level names of api.py are
+    only two) of the current file and the scaffold content: when the
+    existing module has at least four definitions and the scaffold
+    drops at least half of them (and at least three), the write is
+    rejected by name, listing what would be lost. A scaffold that
+    keeps the module's definitions (the grounded shape: the full
+    updated module) passes untouched; new files are exempt (nothing
+    exists to delete); tiny modules are exempt (too little structure
+    to judge a rewrite); an existing file that itself does not parse
+    is skipped (it is already broken, and this rule cannot judge the
+    write — the same stance as _code_append_errors). Content another
+    rule owns is skipped: unparseable content (the parse check),
+    placeholder content and placeholder stubs (the placeholder
+    check), and hardcoded literal answers (the stand-in check).
+
+    The replacement must itself be module-scale — at least four
+    qualified definitions — before its omissions count as
+    deletions. The retry-#26 replacement was a self-contained
+    module (5 definitions, its own server class); a fragment-scale
+    scaffold (a route-branch snippet, a two-definition Flask app)
+    is not a module replacement, and the fragment-scale defects
+    stay owned by the parse, placeholder, framework, and grounding
+    checks. (The grounded-plan fixtures scaffold api.py with a
+    three-line branch fragment — zero definitions — and must keep
+    passing.)
+    """
+    errors: list[str] = []
+    grounded = _grounded_move_text(index, goal_text)
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("scaffold", "file_writer"):
+            continue
+        target = (
+            node.inputs.get("file_path")
+            or node.inputs.get("path")
+            or (node.outputs[0] if node.outputs else "")
+        )
+        content = node.inputs.get("content")
+        if not isinstance(target, str) or not target:
+            continue
+        if not isinstance(content, str):
+            continue
+        if not is_code_path(target):
+            continue
+        if Path(target).suffix.lower() != ".py":
+            continue
+        if _literal_is_answer(content):
+            continue
+        if is_placeholder_content(content) or _is_placeholder_stub(content):
+            continue
+        try:
+            ast.parse(content)
+        except SyntaxError:
+            continue  # _scaffold_parse_errors owns unparseable content
+        path = _resolve_plan_target(target, root)
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except OSError:
+            continue  # a new file: nothing exists to delete
+        existing_names = qualified_def_names(existing)
+        if len(existing_names) < 4:
+            continue  # tiny module: too little structure to judge
+        scaffold_names = qualified_def_names(content)
+        if len(scaffold_names) < 4:
+            continue  # fragment-scale write, not a module replacement
+        kept = set(scaffold_names)
+        dropped = [name for name in existing_names if name not in kept]
+        if len(dropped) < 3 or len(dropped) * 2 < len(existing_names):
+            continue
+        shown = ", ".join(dropped[:8])
+        if len(dropped) > 8:
+            shown += f", ... ({len(dropped) - 8} more)"
+        errors.append(
+            f"Planner node '{node.id}' scaffolds {target!r} with content "
+            f"that drops {len(dropped)} of the existing module's "
+            f"{len(existing_names)} definitions ({shown}) — a scaffold "
+            "overwrites the whole file, so every definition it omits is "
+            "deleted, and a file_exists criterion cannot see the loss. "
+            "Scaffold the FULL updated module (every existing definition, "
+            "plus the new code) or extend the module in place with a bash "
+            f"heredoc instead.{grounded}"
+        )
+    return errors
+
+
 def _plan_runs_path_as_test(nodes: list[PlanNode], target: str) -> bool:
     """True when some node runs the target path as a test.
 
@@ -2655,6 +2775,7 @@ def _collect_plan_errors(
     errors.extend(placeholder_errors)
     errors.extend(_code_append_errors(nodes, repo_root, goal_text, index))
     errors.extend(_scaffold_parse_errors(nodes, repo_root, goal_text, index))
+    errors.extend(_scaffold_overwrite_errors(nodes, repo_root, goal_text, index))
     errors.extend(_sed_noop_errors(nodes, repo_root, goal_text, index))
     standin_errors = _static_standin_errors(nodes, index=index, goal_text=goal_text)
     errors.extend(standin_errors)

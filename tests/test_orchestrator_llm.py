@@ -796,9 +796,15 @@ class TestPlannerCollectsAllErrors(unittest.TestCase):
             parse_planner_response(self._dag(nodes))
         return str(caught.exception)
 
-    def test_failed_health_plan_surfaces_all_five_errors_at_once(self) -> None:
+    def test_failed_health_plan_surfaces_all_seven_errors_at_once(self) -> None:
         message = self._rejection(self._failed_health_plan_nodes())
-        self.assertIn("5 errors", message)
+        # 7 errors: the original five below, plus one interpreter
+        # existence error each for node-2's and node-3's glued tokens
+        # (they contain '/', so they are judged as repo paths that do
+        # not exist) -- repo-root fix (retry #26): _rejection parses
+        # with no repo_root (the driver path), where the interpreter
+        # existence check used to skip path tokens entirely.
+        self.assertIn("7 errors", message)
         self.assertIn("fix ALL of them", message)
         # node-1: scaffold duplicates the existing GET /health endpoint.
         self.assertIn("node-1", message)
@@ -5743,7 +5749,12 @@ class TestPlannerScaffoldGuardFix(unittest.TestCase):
         message = str(caught.exception)
         # One prose error per node: node-1 (citation + "Add a..."), node-2
         # (citation), node-3 (real curl with a " - Verify ..." prose tail).
-        self.assertIn("was rejected with 3 errors", message)
+        # Repo-root fix (retry #26): the total was 3; it is 5 now --
+        # node-1's and node-2's citation tokens are also named as repo
+        # paths that do not exist, because the parse passes no repo_root
+        # (the driver path), where the interpreter existence check used
+        # to skip path tokens entirely.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertIn("bash command is prose, not a shell command", message)
         self.assertEqual(
             message.count("bash command is prose, not a shell command"), 3
@@ -6247,12 +6258,18 @@ class TestPlannerDuplicateKeysFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        # Repo-root fix (retry #26): was 3 errors. Now 5 -- the parse
+        # passes no repo_root (the driver path), where the interpreter
+        # existence check used to skip path tokens entirely; node-1's
+        # and node-2's citation tokens ('.../freetalon/api.py:HiveAPIServer,'
+        # and '.../freetalon/api.py:Unit') are now also named as paths
+        # that do not exist in the repo. The 3 prose errors are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertEqual(
             message.count("bash command is prose, not a shell command"), 3
         )
 
-    def test_retry14_v2_two_errors(self) -> None:
+    def test_retry14_v2_three_errors(self) -> None:
         nodes = TestPlannerScaffoldGuardFix._retry14_v2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -6261,7 +6278,12 @@ class TestPlannerDuplicateKeysFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        # Repo-root fix (retry #26): was 2 errors. Now 3 -- node-3's
+        # './test.sh' is now also named as a path that does not exist
+        # in the repo: the parse passes no repo_root (the driver
+        # path), where the interpreter existence check used to skip
+        # path tokens entirely.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("placeholder", message)
 
@@ -6774,9 +6796,14 @@ class TestPlannerCodeAppendFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 7 = duplicate keys + nesting + 2 parse errors + 2 /tmp errors +
-        # 1 framework error.
-        self.assertIn("was rejected with 7 errors", message)
+        # 8 = duplicate keys + nesting + 2 parse errors + 2 /tmp errors +
+        # 1 framework error + 1 interpreter error.
+        # Repo-root fix (retry #26): the parse passes no repo_root
+        # (the driver path), where the interpreter existence check
+        # used to skip path tokens; node-1's mangled command now also
+        # names '@app.route(/health)' as a path that does not exist
+        # in the repo.
+        self.assertIn("was rejected with 8 errors", message)
         self.assertIn("duplicate JSON keys", message)
         self.assertIn("nests", message)
         self.assertIn("Flask", message)
@@ -6795,12 +6822,18 @@ class TestPlannerCodeAppendFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        # Repo-root fix (retry #26): was 3 errors. Now 5 -- the parse
+        # passes no repo_root (the driver path), where the interpreter
+        # existence check used to skip path tokens entirely; node-1's
+        # and node-2's citation tokens ('.../freetalon/api.py:HiveAPIServer,'
+        # and '.../freetalon/api.py:Unit') are now also named as paths
+        # that do not exist in the repo. The 3 prose errors are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertEqual(
             message.count("bash command is prose, not a shell command"), 3
         )
 
-    def test_retry14_v2_two_errors(self) -> None:
+    def test_retry14_v2_three_errors(self) -> None:
         nodes = TestPlannerScaffoldGuardFix._retry14_v2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -6809,7 +6842,12 @@ class TestPlannerCodeAppendFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        # Repo-root fix (retry #26): was 2 errors. Now 3 -- node-3's
+        # './test.sh' is now also named as a path that does not exist
+        # in the repo: the parse passes no repo_root (the driver
+        # path), where the interpreter existence check used to skip
+        # path tokens entirely.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("placeholder", message)
 
@@ -7362,9 +7400,14 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 7 = duplicate keys + nesting + 2 parse errors + 2 /tmp errors +
-        # 1 framework error.
-        self.assertIn("was rejected with 7 errors", message)
+        # 8 = duplicate keys + nesting + 2 parse errors + 2 /tmp errors +
+        # 1 framework error + 1 interpreter error.
+        # Repo-root fix (retry #26): the parse passes no repo_root
+        # (the driver path), where the interpreter existence check
+        # used to skip path tokens; node-1's mangled command now also
+        # names '@app.route(/health)' as a path that does not exist
+        # in the repo.
+        self.assertIn("was rejected with 8 errors", message)
         self.assertIn("duplicate JSON keys", message)
         self.assertIn("nests", message)
         self.assertIn("Flask", message)
@@ -7381,12 +7424,18 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        # Repo-root fix (retry #26): was 3 errors. Now 5 -- the parse
+        # passes no repo_root (the driver path), where the interpreter
+        # existence check used to skip path tokens entirely; node-1's
+        # and node-2's citation tokens ('.../freetalon/api.py:HiveAPIServer,'
+        # and '.../freetalon/api.py:Unit') are now also named as paths
+        # that do not exist in the repo. The 3 prose errors are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertEqual(
             message.count("bash command is prose, not a shell command"), 3
         )
 
-    def test_retry14_v2_two_errors(self) -> None:
+    def test_retry14_v2_three_errors(self) -> None:
         nodes = TestPlannerScaffoldGuardFix._retry14_v2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -7395,7 +7444,12 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        # Repo-root fix (retry #26): was 2 errors. Now 3 -- node-3's
+        # './test.sh' is now also named as a path that does not exist
+        # in the repo: the parse passes no repo_root (the driver
+        # path), where the interpreter existence check used to skip
+        # path tokens entirely.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("placeholder", message)
 
@@ -8143,9 +8197,14 @@ class TestPlannerSignalLossFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 7 = duplicate keys + nesting + 2 parse errors + 2 /tmp errors +
-        # 1 framework error.
-        self.assertIn("was rejected with 7 errors", message)
+        # 8 = duplicate keys + nesting + 2 parse errors + 2 /tmp errors +
+        # 1 framework error + 1 interpreter error.
+        # Repo-root fix (retry #26): the parse passes no repo_root
+        # (the driver path), where the interpreter existence check
+        # used to skip path tokens; node-1's mangled command now also
+        # names '@app.route(/health)' as a path that does not exist
+        # in the repo.
+        self.assertIn("was rejected with 8 errors", message)
         self.assertIn("duplicate JSON keys", message)
         self.assertIn("nests", message)
         self.assertIn("Flask", message)
@@ -8162,12 +8221,18 @@ class TestPlannerSignalLossFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        # Repo-root fix (retry #26): was 3 errors. Now 5 -- the parse
+        # passes no repo_root (the driver path), where the interpreter
+        # existence check used to skip path tokens entirely; node-1's
+        # and node-2's citation tokens ('.../freetalon/api.py:HiveAPIServer,'
+        # and '.../freetalon/api.py:Unit') are now also named as paths
+        # that do not exist in the repo. The 3 prose errors are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertEqual(
             message.count("bash command is prose, not a shell command"), 3
         )
 
-    def test_retry14_v2_two_errors(self) -> None:
+    def test_retry14_v2_three_errors(self) -> None:
         nodes = TestPlannerScaffoldGuardFix._retry14_v2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -8176,7 +8241,12 @@ class TestPlannerSignalLossFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        # Repo-root fix (retry #26): was 2 errors. Now 3 -- node-3's
+        # './test.sh' is now also named as a path that does not exist
+        # in the repo: the parse passes no repo_root (the driver
+        # path), where the interpreter existence check used to skip
+        # path tokens entirely.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("placeholder", message)
 
@@ -8997,9 +9067,14 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 7 = duplicate keys + nesting + 2 parse errors + 2 /tmp errors +
-        # 1 framework error.
-        self.assertIn("was rejected with 7 errors", message)
+        # 8 = duplicate keys + nesting + 2 parse errors + 2 /tmp errors +
+        # 1 framework error + 1 interpreter error.
+        # Repo-root fix (retry #26): the parse passes no repo_root
+        # (the driver path), where the interpreter existence check
+        # used to skip path tokens; node-1's mangled command now also
+        # names '@app.route(/health)' as a path that does not exist
+        # in the repo.
+        self.assertIn("was rejected with 8 errors", message)
         self.assertIn("duplicate JSON keys", message)
         self.assertIn("nests", message)
         self.assertIn("Flask", message)
@@ -9016,12 +9091,18 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        # Repo-root fix (retry #26): was 3 errors. Now 5 -- the parse
+        # passes no repo_root (the driver path), where the interpreter
+        # existence check used to skip path tokens entirely; node-1's
+        # and node-2's citation tokens ('.../freetalon/api.py:HiveAPIServer,'
+        # and '.../freetalon/api.py:Unit') are now also named as paths
+        # that do not exist in the repo. The 3 prose errors are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertEqual(
             message.count("bash command is prose, not a shell command"), 3
         )
 
-    def test_retry14_v2_two_errors(self) -> None:
+    def test_retry14_v2_three_errors(self) -> None:
         nodes = TestPlannerScaffoldGuardFix._retry14_v2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -9030,7 +9111,12 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        # Repo-root fix (retry #26): was 2 errors. Now 3 -- node-3's
+        # './test.sh' is now also named as a path that does not exist
+        # in the repo: the parse passes no repo_root (the driver
+        # path), where the interpreter existence check used to skip
+        # path tokens entirely.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("placeholder", message)
 
@@ -9855,7 +9941,12 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 7 errors", message)
+        # Repo-root fix (retry #26): the parse passes no repo_root
+        # (the driver path), where the interpreter existence check
+        # used to skip path tokens; node-1's mangled command now also
+        # names '@app.route(/health)' as a path that does not exist
+        # in the repo.
+        self.assertIn("was rejected with 8 errors", message)
         self.assertIn("duplicate", message)
         self.assertIn("Flask", message)
         self.assertIn("/tmp", message)
@@ -9869,10 +9960,16 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        # Repo-root fix (retry #26): was 3 errors. Now 5 -- the parse
+        # passes no repo_root (the driver path), where the interpreter
+        # existence check used to skip path tokens entirely; node-1's
+        # and node-2's citation tokens ('.../freetalon/api.py:HiveAPIServer,'
+        # and '.../freetalon/api.py:Unit') are now also named as paths
+        # that do not exist in the repo. The 3 prose errors are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertIn("prose, not a shell command", message)
 
-    def test_retry14_v2_two_errors(self) -> None:
+    def test_retry14_v2_three_errors(self) -> None:
         nodes = TestPlannerScaffoldGuardFix._retry14_v2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -9881,7 +9978,12 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        # Repo-root fix (retry #26): was 2 errors. Now 3 -- node-3's
+        # './test.sh' is now also named as a path that does not exist
+        # in the repo: the parse passes no repo_root (the driver
+        # path), where the interpreter existence check used to skip
+        # path tokens entirely.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("placeholder", message)
 
@@ -10249,17 +10351,27 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         self.assertIn("test_health.py", message)
         self.assertIn("grounded move", message)
 
-    def test_retry21_attempt5_is_cheap_placeholder_rejection(self) -> None:
+    def test_retry21_attempt5_rejected_with_3_errors_not_cheap(self) -> None:
         from freetalon.orchestrator.planner import CheapRejectionError
 
-        with self.assertRaises(CheapRejectionError) as caught:
+        with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag(self._retry21_attempt5_nodes()),
                 goal_text=self.HEALTH_GOAL,
                 workspace=self.WS,
             )
+        # Repo-root fix (retry #26): was 1 error, and cheap. The parse
+        # passes no repo_root -- the driver path -- where the
+        # interpreter existence check used to skip path tokens, so
+        # step-3's two ./venv/bin/python commands (the venv is .venv;
+        # the path does not exist) were never named and the placeholder
+        # error stood alone. Now 3 errors, and NOT cheap: cheap covers
+        # only stand-in/placeholder fakes, and this plan also carries
+        # two real interpreter defects a repair round must fix.
+        self.assertNotIsInstance(caught.exception, CheapRejectionError)
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("was rejected with 3 errors", message)
+        self.assertIn("./venv/bin/python", message)
         self.assertIn("placeholder content only", message)
         self.assertIn("test_health.py", message)
         self.assertIn("grounded move", message)
@@ -10625,7 +10737,7 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         self.assertIn(f"line {_expected_retry16_error_line()}", message)
         _assert_code_append_parse_error(self, message)
 
-    def test_retry15_attempt2_with_7_errors(self) -> None:
+    def test_retry15_attempt2_with_8_errors(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 TestPlannerDuplicateKeysFix.RETRY15_ATTEMPT2_RAW,
@@ -10633,7 +10745,12 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 7 errors", message)
+        # Repo-root fix (retry #26): the parse passes no repo_root
+        # (the driver path), where the interpreter existence check
+        # used to skip path tokens; node-1's mangled command now also
+        # names '@app.route(/health)' as a path that does not exist
+        # in the repo.
+        self.assertIn("was rejected with 8 errors", message)
         self.assertIn("duplicate", message.lower())
         self.assertIn("writes a Flask app", message)
         self.assertIn("/tmp", message)
@@ -10647,10 +10764,16 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        # Repo-root fix (retry #26): was 3 errors. Now 5 -- the parse
+        # passes no repo_root (the driver path), where the interpreter
+        # existence check used to skip path tokens entirely; node-1's
+        # and node-2's citation tokens ('.../freetalon/api.py:HiveAPIServer,'
+        # and '.../freetalon/api.py:Unit') are now also named as paths
+        # that do not exist in the repo. The 3 prose errors are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertIn("prose", message)
 
-    def test_retry14_v2_two_errors(self) -> None:
+    def test_retry14_v2_three_errors(self) -> None:
         nodes = TestPlannerScaffoldGuardFix._retry14_v2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -10659,7 +10782,12 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        # Repo-root fix (retry #26): was 2 errors. Now 3 -- node-3's
+        # './test.sh' is now also named as a path that does not exist
+        # in the repo: the parse passes no repo_root (the driver
+        # path), where the interpreter existence check used to skip
+        # path tokens entirely.
+        self.assertIn("was rejected with 3 errors", message)
 
     def test_retry14_v3_one_error_names_api(self) -> None:
         guard = TestPlannerScaffoldGuardFix()
@@ -11270,17 +11398,27 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         self.assertIn("test_health.py", message)
         self.assertIn("grounded move", message)
 
-    def test_retry21_attempt5_is_cheap_placeholder_rejection(self) -> None:
+    def test_retry21_attempt5_rejected_with_3_errors_not_cheap(self) -> None:
         from freetalon.orchestrator.planner import CheapRejectionError
 
-        with self.assertRaises(CheapRejectionError) as caught:
+        with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag(self._retry21_attempt5_nodes()),
                 goal_text=self.HEALTH_GOAL,
                 workspace=self.WS,
             )
+        # Repo-root fix (retry #26): was 1 error, and cheap. The parse
+        # passes no repo_root -- the driver path -- where the
+        # interpreter existence check used to skip path tokens, so
+        # step-3's two ./venv/bin/python commands (the venv is .venv;
+        # the path does not exist) were never named and the placeholder
+        # error stood alone. Now 3 errors, and NOT cheap: cheap covers
+        # only stand-in/placeholder fakes, and this plan also carries
+        # two real interpreter defects a repair round must fix.
+        self.assertNotIsInstance(caught.exception, CheapRejectionError)
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("was rejected with 3 errors", message)
+        self.assertIn("./venv/bin/python", message)
         self.assertIn("placeholder content only", message)
         self.assertIn("test_health.py", message)
         self.assertIn("grounded move", message)
@@ -11408,7 +11546,7 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         self.assertIn(f"line {_expected_retry16_error_line()}", message)
         _assert_code_append_parse_error(self, message)
 
-    def test_retry15_attempt2_with_7_errors(self) -> None:
+    def test_retry15_attempt2_with_8_errors(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 TestPlannerDuplicateKeysFix.RETRY15_ATTEMPT2_RAW,
@@ -11416,7 +11554,12 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 7 errors", message)
+        # Repo-root fix (retry #26): the parse passes no repo_root
+        # (the driver path), where the interpreter existence check
+        # used to skip path tokens; node-1's mangled command now also
+        # names '@app.route(/health)' as a path that does not exist
+        # in the repo.
+        self.assertIn("was rejected with 8 errors", message)
         self.assertIn("duplicate", message.lower())
         self.assertIn("writes a Flask app", message)
         self.assertIn("/tmp", message)
@@ -11430,10 +11573,16 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        # Repo-root fix (retry #26): was 3 errors. Now 5 -- the parse
+        # passes no repo_root (the driver path), where the interpreter
+        # existence check used to skip path tokens entirely; node-1's
+        # and node-2's citation tokens ('.../freetalon/api.py:HiveAPIServer,'
+        # and '.../freetalon/api.py:Unit') are now also named as paths
+        # that do not exist in the repo. The 3 prose errors are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertIn("prose", message)
 
-    def test_retry14_v2_two_errors(self) -> None:
+    def test_retry14_v2_three_errors(self) -> None:
         nodes = TestPlannerScaffoldGuardFix._retry14_v2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -11442,7 +11591,12 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        # Repo-root fix (retry #26): was 2 errors. Now 3 -- node-3's
+        # './test.sh' is now also named as a path that does not exist
+        # in the repo: the parse passes no repo_root (the driver
+        # path), where the interpreter existence check used to skip
+        # path tokens entirely.
+        self.assertIn("was rejected with 3 errors", message)
 
     def test_retry14_v3_one_error_names_api(self) -> None:
         guard = TestPlannerScaffoldGuardFix()
@@ -13164,3 +13318,359 @@ null
             workspace=self.WS,
         )
         self.assertEqual(len(nodes), 4)
+class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
+    """repo_root=None validation bypass + wholesale-overwrite hole (retry #26).
+
+    Retry #26 (log llm-end-to-end-health-retry26-2026-11-17.log, run
+    run-20261117T194345Z-f15fbd, goal verdict FAIL) broke new ground --
+    the first plan ACCEPTED since the framework-guard fix, and the
+    first live proof that exit_code criteria run their commands
+    (node-2 measured the real exit 127) -- but the acceptance came
+    through a measured validation asymmetry, and the accepted plan
+    then destroyed the module it was extending:
+
+    (1) The driver calls plan_task_intent with repo_root=None, and
+    _bash_interpreter_errors kept root=None in that case and skipped
+    EVERY path token. Output 2 (a good scaffold; both bash commands
+    ./venv/bin/python, missing the dot) rejects with 2 interpreter
+    errors under the explicit root every test and probe passes, yet
+    was ACCEPTED live. Fix A: the root is resolved unconditionally
+    (resolve_repo_root(None) is the checkout holding this package --
+    the same fallback build_repo_index uses). Audit of every other
+    repo_root consumer in planner.py: _sed_noop_errors,
+    _missing_directory_errors, _placeholder_scaffold_errors,
+    _code_append_errors, _unwritten_file_errors and every index-based
+    check already resolve unconditionally or read the index; the
+    interpreter check was the ONLY None-sensitive one (repo-wide grep:
+    the only `repo_root is not None else None` in freetalon/).
+
+    (2) The accepted plan's node-1 scaffold replaced freetalon/api.py
+    wholesale (219 lines -> 37) and passed on a file_exists criterion:
+    the parse check rejects only UNparseable scaffolds, so a parseable
+    fragment that deletes most of the module sailed through. Fix B:
+    _scaffold_overwrite_errors compares the QUALIFIED def/class names
+    (every nesting depth -- api.py has only 2 top-level names, and the
+    replacement kept a class NAMED HiveAPIServer while dropping
+    HiveAPIServer.start, the Handler inside it, and every handler
+    method: 11 of 12 qualified definitions) of the existing module
+    and the scaffold content, and rejects when a module-scale
+    replacement (the content itself defines >= 4 qualified
+    definitions) drops at least half (and at least 3) of an existing
+    module's >= 4 definitions. Fragment-scale scaffolds (the grounded
+    fixtures' branch snippet has zero definitions) and tiny modules
+    are exempt; new files are exempt; content another rule owns
+    (unparseable, placeholder, literal answer) is skipped.
+
+    Direction C (goal asks for tests -> plan must write tests) is
+    deliberately NOT implemented here: it would change this fix's own
+    pinned probe profile (retry-#26 output 1 has no test-writing node
+    and must stay at exactly 3 errors), and the /health goal text is
+    the fixture goal for ~25 retries of pinned counts, most without a
+    test-writing node -- that change deserves its own fixture audit.
+    The judge already caught the shortfall at run level in retry #26
+    (goal verdict FAIL).
+
+    Pinned counts changed by fix A elsewhere in this file (each named
+    in its test): retry-14 v1 3 -> 5, retry-14 v2 2 -> 3, retry-15
+    attempt-2 7 -> 8, the collects-all-errors plan 5 -> 7, and
+    retry-21 attempt-5 is no longer a cheap rejection (1 -> 3 errors).
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    GENERIC_GOAL = "Add a logging helper to the app and verify it works."
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#26 outputs 1 and 2, verbatim from the first two
+    # RAW PLANNER OUTPUT blocks of the retry-#26 driver section of
+    # logs/llm-end-to-end-health-retry26-2026-11-17.log. Embedded (not
+    # read from the log) so the tests stay hermetic in CI.
+    RETRY26_OUTPUT1_RAW = '{\n"nodes":\n[\n{\n"id":\n"step_1",\n"objective":\n"Add /health endpoint to FreeTalon\'s API",\n"depends_on":\n[],\n"assigned_claw":\n"scaffold",\n"status":\n"draft",\n"inputs":\n{\n"file_path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":\n"import os\\nimport json\\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\\n\\ndef handle_health(self):\\n self.send_response(200)\\n self.send_header(\'Content-type\', \'application/json\')\\n service_status = { \\"service\\": \\"FreeTalon\\", \\"status\\": \\"running\\"}\\n ollama_reachable = True # Placeholder, implement actual check\\n gpu_temp = \\"N/A\\" # Placeholder, implement actual check\\n response_data = json.dumps(service_status)\\n self.end_headers()\\n self.wfile.write(response_data.encode(\'utf-8\'))\\n\\nclass HiveAPIServer(BaseHTTPRequestHandler):\\n def do_GET(self):\\n if self.path == \'/health\':\\n handle_health(self)\\n else:\\n super().do_GET()\\n\\ndef start():\\n httpd = HTTPServer((\'localhost\', 8765), HiveAPIServer)\\n print(\'serving at port\', 8765)\\n httpd.serve_forever()"\n},\n"outputs":\n[\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n],\n"acceptance":\n"File exists",\n"criteria":\n[\n{\n"type":\n"file_exists",\n"path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_2",\n"objective":\n"Write and run unit tests for the /health endpoint",\n"depends_on":\n[\n"step_1"\n],\n"assigned_claw":\n"bash",\n"status":\n"draft",\n"inputs":\n{\n"command":\n"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m unittest discover -s tests"\n},\n"outputs":\n[\n"test_results"\n],\n"acceptance":\n"Tests pass",\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_3",\n"objective":\n"Start the API server and verify /health endpoint is live",\n"depends_on":\n[\n"step_2"\n],\n"assigned_claw":\n"bash",\n"status":\n"draft",\n"inputs":\n{\n"command":\n"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli start"\n},\n"outputs":\n[\n"server_running"\n],\n"acceptance":\n"Endpoint is live",\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_4",\n"objective":\n"Verify /health endpoint returns expected JSON",\n"depends_on":\n[\n"step_3"\n],\n"assigned_claw":\n"bash",\n"status":\n"draft",\n"inputs":\n{\n"command":\n"curl -sf http://localhost:8765/health | jq \'.service\' && curl -sf http://localhost:8765/health | jq \'.status\'"\n},\n"outputs":\n[\n"verification_result"\n],\n"acceptance":\n"Endpoint returns expected JSON",\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n}\n]\n}'
+    RETRY26_OUTPUT2_RAW = '{\n"nodes":[\n{"id":"step_1",\n"objective":"Extend /home/seeker/projects/FreeTalon/freetalon/api.py to implement the /health endpoint",\n"depends_on":[],\n"assigned_claw":"scaffold",\n"inputs":{"file_path":"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":"import json\\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\\n\\ndef handle_health(self):\\n    status = \\"OK\\"\\n    if not check_ollama_reachability():\\n        status = \\"Ollama unreachable\\"\\n    gpu_temp = get_gpu_temperature()\\n    response = json.dumps({\\"status\\": status, \\"gpu_temp\\": gpu_temp})\\n    self.send_response(200)\\n    self.send_header(\'Content-type\', \'application/json\')\\n    self.end_headers()\\n    self.wfile.write(response.encode())\\n\\ndef check_ollama_reachability():\\n    import urllib.request\\n    try:\\n        urllib.request.urlopen(\\"http://localhost:11434/api/health\\", timeout=1)\\n        return True\\n    except:\\n        return False\\n\\ndef get_gpu_temperature():\\n    import subprocess\\n    try:\\n        result = subprocess.run([\'nvidia-smi\', \'--query-gpu=temperature.gpu\', \'--format=csv,noheader\'], capture_output=True, text=True)\\n        temp = float(result.stdout.strip())\\n        return temp\\n    except:\\n        return \\"N/A\\"\\n\\nclass HiveAPIServer(BaseHTTPRequestHandler):\\n    def do_GET(self):\\n        if self.path == \'/health\':\\n            handle_health(self)\\n        else:\\n            super().do_GET()\\n"},\n"outputs":["/home/seeker/projects/FreeTalon/freetalon/api.py"],\n"acceptance":"File exists and parses as Python",\n"criteria":[{"type":"file_exists","path":"/home/seeker/projects/FreeTalon/freetalon/api.py"}],\n"error":null\n},\n{"id":"step_2",\n"objective":"Run tests after modifying api.py",\n"depends_on":["step_1"],\n"assigned_claw":"bash",\n"inputs":{"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m unittest discover -s tests"},\n"outputs":[],\n"acceptance":"Tests pass",\n"criteria":[{"type":"exit_code","equals":0}],\n"error":null\n},\n{"id":"step_3",\n"objective":"Start the API server and verify /health endpoint is live",\n"depends_on":["step_2"],\n"assigned_claw":"bash",\n"inputs":{"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli start"},\n"outputs":[],\n"acceptance":"API server started and /health endpoint returns 200 OK",\n"criteria":[{"type":"exit_code","equals":0}],\n"error":null\n}\n],\n"metadata":{"estimated_steps":3}\n}'
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _rejection(self, raw: str, **kwargs: object) -> str:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw, **kwargs)
+        return str(caught.exception)
+
+    # --- Fix A: repo_root=None validates identically to explicit root ---
+
+    def test_retry26_output2_rejected_identically_none_and_explicit(self) -> None:
+        none_message = self._rejection(
+            self.RETRY26_OUTPUT2_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        explicit_message = self._rejection(
+            self.RETRY26_OUTPUT2_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=str(self.repo_root),
+        )
+        # The driver path (repo_root=None) now produces the SAME
+        # rejection as the explicit-root path every test used to pin:
+        # both interpreter errors fire, plus the overwrite error (fix B).
+        self.assertEqual(none_message, explicit_message)
+        self.assertIn("was rejected with 3 errors", none_message)
+        self.assertEqual(none_message.count("does not exist in the repo"), 2)
+        self.assertIn("./venv/bin/python", none_message)
+
+    def test_retry26_output1_rejected_identically_none_and_explicit(self) -> None:
+        none_message = self._rejection(
+            self.RETRY26_OUTPUT1_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        explicit_message = self._rejection(
+            self.RETRY26_OUTPUT1_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=str(self.repo_root),
+        )
+        self.assertEqual(none_message, explicit_message)
+        # Parse error + both interpreter errors. No overwrite error:
+        # the scaffold does not parse, and the parse check owns it.
+        self.assertIn("was rejected with 3 errors", none_message)
+        self.assertEqual(none_message.count("does not exist in the repo"), 2)
+        self.assertIn("does not parse as Python", none_message)
+        self.assertNotIn("existing module's", none_message)
+
+    def test_criterion_command_interpreter_parity(self) -> None:
+        # The interpreter check also guards exit_code criterion
+        # commands (via _usable_criterion_error) -- the same bypass
+        # applied there. A criterion command naming ./venv/bin/python
+        # is rejected identically with repo_root=None and explicit.
+        node = {
+            "id": "step_1",
+            "objective": "Verify the endpoint live",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "curl -s http://localhost:8765/health"},
+            "outputs": ["verification"],
+            "criteria": [
+                {
+                    "type": "exit_code",
+                    "equals": 0,
+                    "command": "./venv/bin/python -m unittest discover -s tests",
+                }
+            ],
+        }
+        none_message = self._rejection(
+            self._dag([node]), goal_text=self.GENERIC_GOAL, repo_root=None
+        )
+        explicit_message = self._rejection(
+            self._dag([node]),
+            goal_text=self.GENERIC_GOAL,
+            repo_root=str(self.repo_root),
+        )
+        self.assertEqual(none_message, explicit_message)
+        self.assertIn("unusable criterion", none_message)
+        self.assertIn("./venv/bin/python", none_message)
+        # The grounded interpreter in a criterion command passes on
+        # both paths (the .venv exemption is machine-independent).
+        good = dict(node)
+        good["criteria"] = [
+            {
+                "type": "exit_code",
+                "equals": 0,
+                "command": "./.venv/bin/python -m unittest discover -s tests",
+            }
+        ]
+        for root in (None, str(self.repo_root)):
+            nodes, _ = parse_planner_response(
+                self._dag([good]), goal_text=self.GENERIC_GOAL, repo_root=root
+            )
+            self.assertEqual(len(nodes), 1)
+
+    def test_placeholder_rejection_identical_none_and_explicit(self) -> None:
+        # Audit control: the placeholder existence gate was already
+        # root-independent (the 7e7e13e CI-determinism fix) -- pin
+        # that None and explicit roots reject it identically, so the
+        # parity claim covers a check fix A did not need to touch.
+        node = {
+            "id": "step_1",
+            "objective": "Extend the health endpoint",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": self.api_path,
+                "content": "# Placeholder for health endpoint logic.\n",
+            },
+            "outputs": [self.api_path],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+        }
+        none_message = self._rejection(
+            self._dag([node]),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        explicit_message = self._rejection(
+            self._dag([node]),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=str(self.repo_root),
+        )
+        self.assertEqual(none_message, explicit_message)
+        self.assertIn("was rejected with 1 error", none_message)
+        self.assertIn("placeholder content only", none_message)
+
+    # --- Fix B: the scaffold-overwrite guard ---
+
+    def test_overwrite_guard_rejects_retry26_output2_naming_dropped(self) -> None:
+        message = self._rejection(
+            self.RETRY26_OUTPUT2_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=str(self.repo_root),
+        )
+        # The replacement keeps a class named HiveAPIServer but guts
+        # it: 11 of the module's 12 qualified definitions are dropped,
+        # and the error names them.
+        self.assertIn("drops 11 of the existing module's 12 definitions", message)
+        self.assertIn("_ThreadingHTTPServer", message)
+        self.assertIn("HiveAPIServer.__init__", message)
+        self.assertIn("HiveAPIServer.start", message)
+        self.assertIn("HiveAPIServer.start.Handler", message)
+        self.assertIn("HiveAPIServer.start.Handler.do_GET", message)
+        # (The message lists the first 8 dropped names, then a count
+        # of the rest -- HiveAPIServer.stop is among the unlisted 3.)
+        self.assertIn("Scaffold the FULL updated module", message)
+
+    def test_qualified_def_names_sees_nested_definitions(self) -> None:
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        source = (self.repo_root / "freetalon" / "api.py").read_text(
+            encoding="utf-8"
+        )
+        names = qualified_def_names(source)
+        # api.py's surface is mostly nested: the Handler class lives
+        # inside HiveAPIServer.start. (Other fixtures pin the same
+        # module shape -- its routes and handler names.)
+        self.assertEqual(len(names), 12)
+        self.assertIn("HiveAPIServer", names)
+        self.assertIn("HiveAPIServer.start.Handler.do_GET", names)
+        self.assertIn("_ThreadingHTTPServer", names)
+
+    def test_scaffold_preserving_definitions_passes(self) -> None:
+        # The grounded shape done literally: the FULL existing module
+        # plus the new code. Nothing is dropped, so the guard passes
+        # on both the driver path and the explicit-root path.
+        source = (self.repo_root / "freetalon" / "api.py").read_text(
+            encoding="utf-8"
+        )
+        content = source + "\n\ndef _health_probe() -> bool:\n    return True\n"
+        node = {
+            "id": "step_1",
+            "objective": "Extend the health endpoint in freetalon/api.py",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {"file_path": self.api_path, "content": content},
+            "outputs": [self.api_path],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+        }
+        for root in (None, str(self.repo_root)):
+            nodes, _ = parse_planner_response(
+                self._dag([node]),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertEqual(len(nodes), 1)
+
+    def test_new_file_scaffold_passes(self) -> None:
+        # A new file has nothing to delete: exempt however complete
+        # the module is.
+        target = str(
+            self.repo_root / "freetalon" / "orchestrator" / "health_helper.py"
+        )
+        content = (
+            "import json\n\n\n"
+            "def build_payload():\n    return json.dumps({'ok': True})\n\n\n"
+            "def check_a():\n    return True\n\n\n"
+            "def check_b():\n    return True\n\n\n"
+            "def check_c():\n    return True\n"
+        )
+        node = {
+            "id": "step_1",
+            "objective": "Add a health helper module",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {"file_path": target, "content": content},
+            "outputs": [target],
+            "criteria": [{"type": "file_exists", "path": target}],
+        }
+        nodes, _ = parse_planner_response(
+            self._dag([node]),
+            goal_text=self.GENERIC_GOAL,
+            repo_root=str(self.repo_root),
+        )
+        self.assertEqual(len(nodes), 1)
+
+    def test_small_module_overwrite_not_flagged(self) -> None:
+        # Tiny modules are exempt: too little structure to judge a
+        # rewrite (3 qualified definitions < the >= 4 floor), even
+        # when the replacement drops all of them.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp) / "freetalon"
+            package.mkdir()
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "tiny.py").write_text(
+                "class Widget:\n"
+                "    def start(self):\n        return 1\n"
+                "    def stop(self):\n        return 2\n",
+                encoding="utf-8",
+            )
+            content = (
+                "def alpha():\n    return 1\n\n\n"
+                "def beta():\n    return 2\n\n\n"
+                "def gamma():\n    return 3\n\n\n"
+                "def delta():\n    return 4\n\n\n"
+                "def epsilon():\n    return 5\n"
+            )
+            node = {
+                "id": "step_1",
+                "objective": "Rewrite the tiny helper module",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": "freetalon/tiny.py", "content": content},
+                "outputs": ["freetalon/tiny.py"],
+                "criteria": [
+                    {"type": "file_exists", "path": "freetalon/tiny.py"}
+                ],
+            }
+            nodes, _ = parse_planner_response(
+                self._dag([node]),
+                goal_text=self.GENERIC_GOAL,
+                repo_root=tmp,
+            )
+            self.assertEqual(len(nodes), 1)
+
+    def test_fragment_scaffold_not_flagged(self) -> None:
+        # Fragment-scale content (zero definitions -- the grounded
+        # fixtures' branch snippet) is not a module replacement and
+        # stays unflagged by the overwrite guard.
+        node = {
+            "id": "step_1",
+            "objective": "Extend the health endpoint",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+            "outputs": [self.api_path],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+        }
+        nodes, _ = parse_planner_response(self._dag([node]))
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
