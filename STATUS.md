@@ -1461,3 +1461,48 @@ Deliberately left out:
   stub. freetalon/api.py untouched (219 lines, 0-line diff vs HEAD).
   GPU baseline: 46C, 42.95W, limit 300W, link x16, zero Xid 79/154.
 - Next: push (CI check for this fix), then /health retry #17.
+- /health retry #17 FAILED at planning (DRIVER_EXIT:1, ~145s, no run
+  created; log logs/llm-end-to-end-health-retry17-2026-11-16.log, 317
+  lines). Pre-flight green (49C, 43.22W, limit 300W, link x16, zero Xid;
+  Ollama gemma-3-abliterated:latest; head 49a6a38; suite 653/653; fans
+  85%). Intake succeeded. Four planner attempts, all rejected (each
+  re-run through parse_planner_response to confirm exactly):
+  (1) The prose-command plan again -- rejected with exactly 3 errors by
+  the prose rule, each naming the grounded move (heredoc or scaffold
+  with real code). (2) The retry-#15 Flask heredoc plan again --
+  rejected with exactly 7 errors: duplicate keys
+  (id/objective/depends_on/assigned_claw/inputs each 3 times, naming
+  the missing },{ separators), nesting, 2 parse errors (the heredoc
+  bodies do not parse as Python -- unterminated string literal), 2 /tmp
+  errors, 1 Flask error. The b66c5ac weakness-3 fix AND the 1cfcc20
+  code-append parse check both worked as designed -- the structural
+  defect IS named and so are Flask//tmp. (3) {"nodes":[]} -- empty plan,
+  EmptyPlanError, cheap rejection, free re-prompt; the repair prompt
+  carried the concrete grounded skeleton. (4) A skeleton-shaped plan
+  (step-1 scaffold api.py, step-2 write tests, step-3 run tests,
+  step-4 curl live) -- the model DID follow the skeleton shape after
+  the empty plan, but filled it with placeholder comments: rejected
+  with 1 error, node-1 scaffolds api.py with placeholder content only
+  ("# TODO: replace this comment with the real code ..."). The
+  placeholder guard fired as designed. Budget exhausted (initial + 2
+  repairs spent on prose and Flask, 1 free re-prompt on the empty plan;
+  the placeholder rejection needed a 3rd repair) -> driver raised at
+  plan_task_intent. Endpoint NOT extended, no new tests, no live curl.
+  freetalon/api.py untouched (219 lines, 0-line diff). No stray files.
+  GPU survived (post-run 71C at 238.58W, then 56C cooling, 300W, x16,
+  zero Xid; fans auto). Suite re-run 653/653 green.
+- Next weaknesses, in priority order: (1) The model follows the
+  grounded skeleton shape but fills it with placeholder comments -- the
+  placeholder guard catches the api.py scaffold, but the repair budget
+  is already spent on prose + Flask by then, so the model never gets a
+  repair round for the placeholder error. Consider making the
+  placeholder rejection cheap (free re-prompt, like empty plans and
+  stand-in fakes), or giving the skeleton repair prompt a concrete
+  code sketch the model completes instead of a blank to fill. (2) The
+  Flask attempt keeps returning verbatim despite the framework//tmp
+  rejections naming the fix -- the model never learns across attempts
+  within one planning call; the repair prompt may need to forbid the
+  previously rejected approach by name. (3) The placeholder rejection
+  names the node 'node-1' while the plan's id is 'step-1' (lenient-view
+  naming quirk, cosmetic).
+- Next: fix weakness (1), then /health retry #18.
