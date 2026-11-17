@@ -1502,10 +1502,11 @@ def _framework_errors(
                 found = framework_in_text(content)
                 if found is not None and found != serving_framework:
                     errors.append(
-                        f"Planner node '{node.id}' writes a {found} app — "
-                        f"{route} is served by {module}, which is built on "
-                        f"{serving_framework}. {grounded} Do not rewrite it "
-                        f"in a different web framework."
+                        f"Planner node '{node.id}' writes a {found} app — do "
+                        f"NOT write a {found} app. {grounded} {route} is "
+                        f"served by {module}, which is built on "
+                        f"{serving_framework}. Do not rewrite it in a "
+                        f"different web framework."
                     )
                     break
     return errors
@@ -3058,29 +3059,46 @@ def _grounded_skeleton(
 # quoted model content: the markers match the rejection's own wording
 # (the framework error names Flask, the /tmp error names /tmp, and so
 # on), so nothing the model wrote is echoed back.
+# Retry #19 proved a bare prohibition does not steer the live model:
+# the attempt-3 repair prompt named Flask as forbidden and the model
+# wrote a Flask scaffold anyway. Each label now pairs the prohibition
+# with the concrete replacement to use instead — a temperature-0 model
+# follows a positive instruction ("do this") more reliably than a
+# negative one ("do not do that") — and the repair prompt states the
+# consequence (a repeat is rejected again and spends a repair).
 _APPROACH_MARKERS: tuple[tuple[str, str], ...] = (
     (
         "Flask",
-        "a Flask app — the serving module is built on stdlib http.server, "
-        "not Flask; extend it in place",
+        "Do NOT write a Flask app — the serving module is built on stdlib "
+        "http.server, not Flask. Instead, extend it in place: add a branch "
+        "to the handler method that already serves the route, write the "
+        "tests, and verify live with curl on the API port.",
     ),
     (
         "/tmp",
-        "writing files under /tmp — code lives in the repo, not /tmp",
+        "Do NOT repeat writing files under /tmp — code lives in the repo, "
+        "not /tmp. Instead, write the module in the repo and the tests in "
+        "the repo tests directory.",
     ),
     (
         "placeholder",
-        "a placeholder/comment-only scaffold over an existing module — "
-        "write real code",
+        "Do NOT scaffold a placeholder/comment-only stub over an existing "
+        "module — write real code. Instead, extend the existing handler "
+        "branch with the real implementation; a comment-only scaffold "
+        "will be rejected again.",
     ),
     (
         "prose, not a shell command",
-        "prose commands — write shell commands, not sentences",
+        "Do NOT write prose commands — write shell commands, not "
+        "sentences. Instead, write a real shell command (a heredoc that "
+        "writes real code, or a scaffold with real code) that performs "
+        "the step.",
     ),
     (
         "hardcoded answer",
-        "echoing a hardcoded JSON answer — run the real code or service "
-        "and check ITS output",
+        "Do NOT echo a hardcoded JSON answer — run the real code or "
+        "service and check ITS output. Instead, run the service and curl "
+        "its live endpoint, and check the real response.",
     ),
 )
 
@@ -3088,6 +3106,50 @@ _APPROACH_MARKERS: tuple[tuple[str, str], ...] = (
 def _rejected_approaches(message: str) -> list[str]:
     """Approach names a rejection message shows the model already tried."""
     return [label for marker, label in _APPROACH_MARKERS if marker in message]
+
+
+def _forbidden_block(
+    rejected_approaches: list[str],
+    goal_text: str | None,
+    repo_root: str | Path | None,
+    repairs_used: int,
+    max_repairs: int,
+    spent_repair: bool,
+) -> str:
+    """The DO NOT repeat block for the repair prompt, with replacements.
+
+    Retry #19: the attempt-3 repair prompt named Flask as forbidden and
+    the live model wrote a Flask scaffold anyway. A bare prohibition
+    does not steer a temperature-0 model whose prior for "implement a
+    web endpoint" is "write a Flask app" — so each forbidden approach
+    carries its concrete replacement (the labels in _APPROACH_MARKERS),
+    the Flask entry is followed by the goal's grounded-move sentence
+    when one exists, and the block states the consequence: a repeat is
+    rejected again, and it spends a repair.
+    """
+    if not rejected_approaches:
+        return ""
+    items = "\n".join(f"- {approach}" for approach in rejected_approaches)
+    grounded = ""
+    if any("Flask app" in approach for approach in rejected_approaches):
+        move = _grounded_move_for_goal(goal_text, repo_root).strip()
+        if move:
+            grounded = f"\n{move}\n"
+    consequence = (
+        "A plan that repeats a forbidden approach will be rejected again."
+    )
+    if spent_repair:
+        consequence += (
+            f" This is repair {repairs_used} of {max_repairs} — do not "
+            "spend it on an approach that has already failed."
+        )
+    return (
+        "\nDO NOT repeat approaches you have already tried and had "
+        "rejected in this planning call:\n"
+        f"{items}\n"
+        f"{grounded}"
+        f"{consequence}\n"
+    )
 
 
 def _call_llm_with_repair(
@@ -3147,6 +3209,7 @@ def _call_llm_with_repair(
     free_used = 0
     empty_streak = 0
     rejected_approaches: list[str] = []
+    spent_repair = False
     while True:
         response_text = call_llm(system_prompt, prompt, settings=settings)
         try:
@@ -3167,8 +3230,10 @@ def _call_llm_with_repair(
                 empty_streak = 0
             if isinstance(exc, CheapRejectionError) and free_used < max_free_reprompts:
                 free_used += 1
+                spent_repair = False
             elif repairs_used < max_repairs:
                 repairs_used += 1
+                spent_repair = True
             else:
                 break
             skeleton_block = ""
@@ -3176,16 +3241,14 @@ def _call_llm_with_repair(
                 skeleton = _grounded_skeleton(goal_text, repo_root, workspace)
                 if skeleton:
                     skeleton_block = f"\n{skeleton}\n"
-            forbidden_block = ""
-            if rejected_approaches:
-                items = "\n".join(
-                    f"- {approach}" for approach in rejected_approaches
-                )
-                forbidden_block = (
-                    "\nDO NOT repeat approaches you have already tried and had "
-                    "rejected in this planning call:\n"
-                    f"{items}\n"
-                )
+            forbidden_block = _forbidden_block(
+                rejected_approaches,
+                goal_text,
+                repo_root,
+                repairs_used,
+                max_repairs,
+                spent_repair,
+            )
             prompt = (
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"

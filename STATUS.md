@@ -26,6 +26,8 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   PLAN.md + this file added.
 
 ## Doing
+- Planner forbidden-steer fix DONE (retry #19): probe confirmed hypothesis (b) - the repair prompt named Flask as forbidden and the live model wrote a Flask scaffold anyway. Forbidden approaches now carry their concrete replacement, the Flask entry is followed by the grounded-move sentence, and the block states the consequence plus the repair count. Suite 737/737 green, M5 smoke passes, demo tools/demo-forbidden-steer.py ALL CHECKS PASSED.
+
 
 - Autonomous-loop design document (being written; will land in the home-lab
   goal docs).
