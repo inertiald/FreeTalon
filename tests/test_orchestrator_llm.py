@@ -5252,7 +5252,10 @@ class TestPlannerFrameworkSteerFix(unittest.TestCase):
         # Now 3 — the same rejection also names the unparseable Flask
         # scaffold (def health(): followed by a top-level try:) and
         # node-2's bare `python` (does not resolve on Ubuntu).
-        self.assertIn("was rejected with 3 errors", message)
+        # Interpreter normalization (retry #27 fix): now 2 -- node-2's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the Flask and scaffold-parse errors remain.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("stdlib http.server", message)
         self.assertIn("different web framework", message)
@@ -5868,7 +5871,10 @@ class TestPlannerScaffoldGuardFix(unittest.TestCase):
         # Framework-guard fix (retry #23): was 1 error (Flask only).
         # Now 3 — the rejection also names the unparseable Flask
         # scaffold and node-2's bare `python`.
-        self.assertIn("was rejected with 3 errors", message)
+        # Interpreter normalization (retry #27 fix): now 2 -- node-2's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the Flask and scaffold-parse errors remain.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_rejected_as_code_overwrite(self) -> None:
@@ -6326,7 +6332,10 @@ class TestPlannerDuplicateKeysFix(unittest.TestCase):
         # Framework-guard fix (retry #23): was 1 error (Flask only).
         # Now 3 — the rejection also names the unparseable Flask
         # scaffold and node-2's bare `python`.
-        self.assertIn("was rejected with 3 errors", message)
+        # Interpreter normalization (retry #27 fix): now 2 -- node-2's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the Flask and scaffold-parse errors remain.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_code_overwrite(self) -> None:
@@ -6890,7 +6899,10 @@ class TestPlannerCodeAppendFix(unittest.TestCase):
         # Framework-guard fix (retry #23): was 1 error (Flask only).
         # Now 3 — the rejection also names the unparseable Flask
         # scaffold and node-2's bare `python`.
-        self.assertIn("was rejected with 3 errors", message)
+        # Interpreter normalization (retry #27 fix): now 2 -- node-2's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the Flask and scaffold-parse errors remain.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_code_overwrite(self) -> None:
@@ -7492,7 +7504,10 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
         # Framework-guard fix (retry #23): was 1 error (Flask only).
         # Now 3 — the rejection also names the unparseable Flask
         # scaffold and node-2's bare `python`.
-        self.assertIn("was rejected with 3 errors", message)
+        # Interpreter normalization (retry #27 fix): now 2 -- node-2's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the Flask and scaffold-parse errors remain.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_code_overwrite(self) -> None:
@@ -7878,7 +7893,7 @@ class TestPlannerSignalLossFix(unittest.TestCase):
 
     # --- (a) Verbatim retry-#18 attempt-2: parse + framework + missing dir + /tmp ---
 
-    def test_retry18_attempt2_names_all_six_defects(self) -> None:
+    def test_retry18_attempt2_names_all_five_defects(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag(self._retry18_attempt2_nodes()),
@@ -7893,11 +7908,14 @@ class TestPlannerSignalLossFix(unittest.TestCase):
         # (retry #23): the interpreter check names the bare `python`
         # the old rejection missed.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
-        self.assertIn("was rejected with 6 errors", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertIn("hardcoded answer", message)
         self.assertIn('"ollama_reachable": True', message)
         self.assertIn('"gpu_temperature": 0', message)
-        self.assertIn("bare `python`", message)
+        self.assertNotIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
@@ -7920,8 +7938,11 @@ class TestPlannerSignalLossFix(unittest.TestCase):
         # no-op on step-1 + the missing-directory error on step-2
         # + step-3 bare `python`. Framework-guard fix (retry #23):
         # the interpreter check names the bare `python`.
-        self.assertIn("was rejected with 6 errors", message)
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
+        self.assertNotIn("bare `python`", message)
         self.assertIn("response_content", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -8289,7 +8310,10 @@ class TestPlannerSignalLossFix(unittest.TestCase):
         # Framework-guard fix (retry #23): was 1 error (Flask only).
         # Now 3 — the rejection also names the unparseable Flask
         # scaffold and node-2's bare `python`.
-        self.assertIn("was rejected with 3 errors", message)
+        # Interpreter normalization (retry #27 fix): now 2 -- node-2's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the Flask and scaffold-parse errors remain.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_code_overwrite(self) -> None:
@@ -8788,7 +8812,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
 
     # --- (b) Verbatim retry-#19 rejections ---
 
-    def test_retry19_attempt2_rejected_with_6_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self.RETRY19_ATTEMPT2_RAW,
@@ -8796,10 +8820,13 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertNotIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do NOT write a Flask app", message)
@@ -8808,7 +8835,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         self.assertIn("/tmp/health_response.json", message)
         self.assertIn("not a /tmp scratch file", message)
 
-    def test_retry19_attempt3_rejected_with_3_errors(self) -> None:
+    def test_retry19_attempt3_rejected_with_2_errors(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self.RETRY19_ATTEMPT3_RAW,
@@ -8816,10 +8843,12 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        self.assertIn("was rejected with 2 errors", message)
         # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
+        # Interpreter normalization (retry #27 fix): now 2 -- step-3's bare
+        # `python` is rewritten at parse time and no longer errors.
         self.assertIn("does not parse as Python", message)
-        self.assertIn("bare `python`", message)
+        self.assertNotIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do NOT write a Flask app", message)
         self.assertIn("The grounded move is:", message)
@@ -8964,7 +8993,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
 
     # --- (e) Regression guards: retry #18 still holds, then every earlier fix ---
 
-    def test_retry18_attempt2_names_all_six_defects(self) -> None:
+    def test_retry18_attempt2_names_all_five_defects(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag(self._retry18_attempt2_nodes()),
@@ -8979,11 +9008,14 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         # (retry #23): the interpreter check names the bare `python`
         # the old rejection missed.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
-        self.assertIn("was rejected with 6 errors", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
         self.assertIn("hardcoded answer", message)
         self.assertIn('"ollama_reachable": True', message)
         self.assertIn('"gpu_temperature": 0', message)
-        self.assertIn("bare `python`", message)
+        self.assertNotIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
@@ -9006,8 +9038,11 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         # no-op on step-1 + the missing-directory error on step-2
         # + step-3 bare `python`. Framework-guard fix (retry #23):
         # the interpreter check names the bare `python`.
-        self.assertIn("was rejected with 6 errors", message)
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertIn("was rejected with 5 errors", message)
+        self.assertNotIn("bare `python`", message)
         self.assertIn("response_content", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -9159,7 +9194,10 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         # Framework-guard fix (retry #23): was 1 error (Flask only).
         # Now 3 — the rejection also names the unparseable Flask
         # scaffold and node-2's bare `python`.
-        self.assertIn("was rejected with 3 errors", message)
+        # Interpreter normalization (retry #27 fix): now 2 -- node-2's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the Flask and scaffold-parse errors remain.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_code_overwrite(self) -> None:
@@ -9827,7 +9865,7 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
 
     # --- (f) Regression guards: every earlier fix still holds ---
 
-    def test_retry19_attempt2_rejected_with_6_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -9837,16 +9875,19 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertNotIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry19_attempt3_rejected_with_3_errors(self) -> None:
+    def test_retry19_attempt3_rejected_with_2_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -9856,15 +9897,17 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        self.assertIn("was rejected with 2 errors", message)
         # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
+        # Interpreter normalization (retry #27 fix): now 2 -- step-3's bare
+        # `python` is rewritten at parse time and no longer errors.
         self.assertIn("does not parse as Python", message)
-        self.assertIn("bare `python`", message)
+        self.assertNotIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("The grounded move is:", message)
         self.assertIn("do_GET method of the Handler class", message)
 
-    def test_retry18_attempt2_rejected_with_6_errors(self) -> None:
+    def test_retry18_attempt2_rejected_with_5_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -9873,16 +9916,19 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertNotIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry18_attempt3_rejected_with_6_errors(self) -> None:
+    def test_retry18_attempt3_rejected_with_5_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt3_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -9891,9 +9937,12 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         # Framework-guard fix (retry #23): was 5 errors. Now 6 — the rejection also names step-3's bare `python`.
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertNotIn("bare `python`", message)
         self.assertIn("response_content", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("sed -i", message)
@@ -10030,7 +10079,10 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
         # Framework-guard fix (retry #23): was 1 error (Flask only).
         # Now 3 — the rejection also names the unparseable Flask
         # scaffold and node-2's bare `python`.
-        self.assertIn("was rejected with 3 errors", message)
+        # Interpreter normalization (retry #27 fix): now 2 -- node-2's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the Flask and scaffold-parse errors remain.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET", message)
 
@@ -10351,7 +10403,7 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         self.assertIn("test_health.py", message)
         self.assertIn("grounded move", message)
 
-    def test_retry21_attempt5_rejected_with_3_errors_not_cheap(self) -> None:
+    def test_retry21_attempt5_rejected_with_1_error_cheap(self) -> None:
         from freetalon.orchestrator.planner import CheapRejectionError
 
         with self.assertRaises(LLMResponseError) as caught:
@@ -10368,10 +10420,14 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         # error stood alone. Now 3 errors, and NOT cheap: cheap covers
         # only stand-in/placeholder fakes, and this plan also carries
         # two real interpreter defects a repair round must fix.
-        self.assertNotIsInstance(caught.exception, CheapRejectionError)
+        # Interpreter normalization (retry #27 fix): step-3's two
+        # ./venv/bin/python commands are rewritten to ./.venv/bin/python at
+        # parse time, so the interpreter errors are gone and the placeholder
+        # error stands alone again -- 1 error, and cheap once more.
+        self.assertIsInstance(caught.exception, CheapRejectionError)
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
-        self.assertIn("./venv/bin/python", message)
+        self.assertIn("was rejected with 1 error", message)
+        self.assertNotIn("./venv/bin/python", message)
         self.assertIn("placeholder content only", message)
         self.assertIn("test_health.py", message)
         self.assertIn("grounded move", message)
@@ -10632,7 +10688,7 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         self.assertIn("health.py", message)
         self.assertIn("test_health.py", message)
 
-    def test_retry19_attempt2_rejected_with_6_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -10642,16 +10698,19 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertNotIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry19_attempt3_rejected_with_3_errors_naming_flask(self) -> None:
+    def test_retry19_attempt3_rejected_with_2_errors_naming_flask(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -10661,14 +10720,16 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        self.assertIn("was rejected with 2 errors", message)
         # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
+        # Interpreter normalization (retry #27 fix): now 2 -- step-3's bare
+        # `python` is rewritten at parse time and no longer errors.
         self.assertIn("does not parse as Python", message)
-        self.assertIn("bare `python`", message)
+        self.assertNotIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET method", message)
 
-    def test_retry18_attempt2_rejected_with_6_errors(self) -> None:
+    def test_retry18_attempt2_rejected_with_5_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -10677,16 +10738,19 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertNotIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry18_attempt3_rejected_with_6_errors(self) -> None:
+    def test_retry18_attempt3_rejected_with_5_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt3_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -10695,9 +10759,12 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         # Framework-guard fix (retry #23): was 5 errors. Now 6 — the rejection also names step-3's bare `python`.
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertNotIn("bare `python`", message)
         self.assertIn("response_content", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -10828,7 +10895,10 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         # Framework-guard fix (retry #23): was 1 error (Flask only).
         # Now 3 — the rejection also names the unparseable Flask
         # scaffold and node-2's bare `python`.
-        self.assertIn("was rejected with 3 errors", message)
+        # Interpreter normalization (retry #27 fix): now 2 -- node-2's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the Flask and scaffold-parse errors remain.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET method", message)
 
@@ -11398,7 +11468,7 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         self.assertIn("test_health.py", message)
         self.assertIn("grounded move", message)
 
-    def test_retry21_attempt5_rejected_with_3_errors_not_cheap(self) -> None:
+    def test_retry21_attempt5_rejected_with_1_error_cheap(self) -> None:
         from freetalon.orchestrator.planner import CheapRejectionError
 
         with self.assertRaises(LLMResponseError) as caught:
@@ -11415,10 +11485,14 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         # error stood alone. Now 3 errors, and NOT cheap: cheap covers
         # only stand-in/placeholder fakes, and this plan also carries
         # two real interpreter defects a repair round must fix.
-        self.assertNotIsInstance(caught.exception, CheapRejectionError)
+        # Interpreter normalization (retry #27 fix): step-3's two
+        # ./venv/bin/python commands are rewritten to ./.venv/bin/python at
+        # parse time, so the interpreter errors are gone and the placeholder
+        # error stands alone again -- 1 error, and cheap once more.
+        self.assertIsInstance(caught.exception, CheapRejectionError)
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
-        self.assertIn("./venv/bin/python", message)
+        self.assertIn("was rejected with 1 error", message)
+        self.assertNotIn("./venv/bin/python", message)
         self.assertIn("placeholder content only", message)
         self.assertIn("test_health.py", message)
         self.assertIn("grounded move", message)
@@ -11441,7 +11515,7 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         self.assertIn("health.py", message)
         self.assertIn("test_health.py", message)
 
-    def test_retry19_attempt2_rejected_with_6_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -11451,16 +11525,19 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertNotIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry19_attempt3_rejected_with_3_errors_naming_flask(self) -> None:
+    def test_retry19_attempt3_rejected_with_2_errors_naming_flask(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -11470,14 +11547,16 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 3 errors", message)
+        self.assertIn("was rejected with 2 errors", message)
         # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
+        # Interpreter normalization (retry #27 fix): now 2 -- step-3's bare
+        # `python` is rewritten at parse time and no longer errors.
         self.assertIn("does not parse as Python", message)
-        self.assertIn("bare `python`", message)
+        self.assertNotIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET method", message)
 
-    def test_retry18_attempt2_rejected_with_6_errors(self) -> None:
+    def test_retry18_attempt2_rejected_with_5_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -11486,16 +11565,19 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertNotIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry18_attempt3_rejected_with_6_errors(self) -> None:
+    def test_retry18_attempt3_rejected_with_5_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt3_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -11504,9 +11586,12 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         # Framework-guard fix (retry #23): was 5 errors. Now 6 — the rejection also names step-3's bare `python`.
-        self.assertIn("bare `python`", message)
+        # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the other five defects are unchanged.
+        self.assertNotIn("bare `python`", message)
         self.assertIn("response_content", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -11637,7 +11722,10 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         # Framework-guard fix (retry #23): was 1 error (Flask only).
         # Now 3 — the rejection also names the unparseable Flask
         # scaffold and node-2's bare `python`.
-        self.assertIn("was rejected with 3 errors", message)
+        # Interpreter normalization (retry #27 fix): now 2 -- node-2's bare
+        # `python` is rewritten to ./.venv/bin/python at parse time and no
+        # longer errors; the Flask and scaffold-parse errors remain.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET method", message)
 
@@ -12284,15 +12372,18 @@ class TestPlannerFrameworkGuardFix(unittest.TestCase):
 
     # --- (1b) Scaffold parse check + placeholder-stub rule ---
 
-    def test_retry23_output1_rejected_with_four_errors(self) -> None:
-        # Was ACCEPTED live (v1). Now: scaffold-parse on step-1 and
-        # step-2, bare `python` in step-2's criterion command, and the
-        # missing ./venv/bin/python in step-3's command.
+    def test_retry23_output1_rejected_with_two_errors(self) -> None:
+        # Was ACCEPTED live (v1). Then 4 errors: scaffold-parse on
+        # step-1 and step-2, bare `python` in step-2's criterion
+        # command, and the missing ./venv/bin/python in step-3's
+        # command. Interpreter normalization (retry #27 fix): both
+        # interpreter spellings are rewritten to ./.venv/bin/python
+        # at parse time -- now 2 errors, the two scaffold parses.
         message = self._reject(self._retry23_output1_nodes())
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 2 errors", message)
         self.assertEqual(message.count("does not parse as Python"), 2)
-        self.assertIn("bare `python`", message)
-        self.assertIn("./venv/bin/python", message)
+        self.assertNotIn("bare `python`", message)
+        self.assertNotIn("./venv/bin/python", message)
         self.assertIn("./.venv/bin/python", message)
 
     def test_retry23_output3_rejected_with_three_errors(self) -> None:
@@ -12333,28 +12424,33 @@ class TestPlannerFrameworkGuardFix(unittest.TestCase):
         message = self._reject([node])
         self.assertIn("placeholder stub", message)
 
-    def test_retry23_output4_rejected_with_five_errors(self) -> None:
+    def test_retry23_output4_rejected_with_four_errors(self) -> None:
         # Was REJECTED live (restored probe) with 2 errors
-        # (string_matches + step-1 Flask). Now: Flask step-1,
+        # (string_matches + step-1 Flask). Then: Flask step-1,
         # scaffold-parse step-1 and step-2, bare `python` step-3,
-        # string_matches step-4.
+        # string_matches step-4 (5 errors). Interpreter normalization
+        # (retry #27 fix): the bare `python` is rewritten at parse
+        # time -- now 4 errors.
         message = self._reject(self._retry23_output4_nodes())
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
         self.assertEqual(message.count("writes a Flask app"), 1)
         self.assertEqual(message.count("does not parse as Python"), 2)
-        self.assertIn("bare `python`", message)
+        self.assertNotIn("bare `python`", message)
         self.assertIn("string_matches", message)
 
-    def test_retry23_output2_rejected_with_five_errors(self) -> None:
+    def test_retry23_output2_rejected_with_four_errors(self) -> None:
         # Was REJECTED live (restored probe) with 2 errors (Flask
-        # step-1 + step-2). Now the unparseable scaffolds and the bare
-        # `python` in step-3 are named too. Step-4's ./freetalon/api.py
-        # exists in the repo, so no interpreter error fires there.
+        # step-1 + step-2). Then the unparseable scaffolds and the
+        # bare `python` in step-3 were named too (5 errors). Step-4's
+        # ./freetalon/api.py exists in the repo, so no interpreter
+        # error fires there. Interpreter normalization (retry #27
+        # fix): the bare `python` is rewritten at parse time -- now
+        # 4 errors.
         message = self._reject(self._retry23_output2_nodes())
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
         self.assertEqual(message.count("writes a Flask app"), 2)
         self.assertEqual(message.count("does not parse as Python"), 2)
-        self.assertIn("bare `python`", message)
+        self.assertNotIn("bare `python`", message)
 
     def test_is_placeholder_stub(self) -> None:
         from freetalon.orchestrator.planner import _is_placeholder_stub
@@ -12541,8 +12637,11 @@ class TestPlannerFrameworkGuardFix(unittest.TestCase):
         )
 
     def test_exit_code_criterion_command_validated_at_plan_time(self) -> None:
-        # A criterion command with bare `python` is rejected at plan
-        # time, naming the grounded form.
+        # A criterion command naming a nonexistent interpreter is
+        # rejected at plan time, naming the grounded form. (Bare
+        # `python` in a criterion command no longer reaches this
+        # check: interpreter normalization rewrites it at parse
+        # time -- pinned in TestPlannerInterpreterNormalizationFix.)
         node = {
             "id": "step_1",
             "objective": "Run the tests",
@@ -12552,11 +12651,13 @@ class TestPlannerFrameworkGuardFix(unittest.TestCase):
             "outputs": ["test results"],
             "acceptance": ["Tests pass"],
             "criteria": [
-                {"type": "exit_code", "equals": 0, "command": "python tests/test_api.py"},
+                {"type": "exit_code", "equals": 0, "command": "./bin/python tests/test_api.py"},
             ],
         }
         message = self._reject([node])
-        self.assertIn("bare `python`", message)
+        self.assertIn("unusable criterion", message)
+        self.assertIn("./bin/python", message)
+        self.assertIn("./.venv/bin/python", message)
         # A criterion command that resolves is fine — and a bare
         # exit_code criterion on a bash node stays valid (it measures
         # the node command). Both plans carry the scaffold step that
@@ -13140,13 +13241,27 @@ null
     # --- (2b) Shape steering: a scaffold plan one fix away keeps its shape ---
 
     def test_repair_prompt_steers_back_to_scaffold_shape(self) -> None:
-        # Retry #25 attempt 1 verbatim: a scaffold plan rejected ONLY
-        # for interpreter strings. The repair prompt must say the shape
-        # was right; the grounded plan is then accepted.
+        # Repair steering: a scaffold plan rejected ONLY for
+        # interpreter strings gets a repair prompt that says the
+        # shape was right; the grounded plan is then accepted. The
+        # verbatim retry-#25 attempt-1 output no longer reaches the
+        # repair loop -- interpreter normalization (retry #27 fix)
+        # rewrites its two spellings at parse time and it is accepted
+        # (pinned in TestPlannerInterpreterNormalizationFix) -- so
+        # this test drives the same path with both spellings swapped
+        # for ./bin/python, a nonexistent interpreter normalization
+        # does not cover: the rejection stays interpreter-only, via
+        # the validator backstop.
         good = self._dag(self._grounded_health_nodes())
+        attempt1 = self.RETRY25_ATTEMPT1_RAW.replace(
+            "./venv/bin/python", "./bin/python"
+        ).replace(
+            "python /home/seeker/freetalon-workspace/test_api.py",
+            "./bin/python /home/seeker/freetalon-workspace/test_api.py",
+        )
         with patch(
             "freetalon.orchestrator.planner.call_llm",
-            side_effect=[self.RETRY25_ATTEMPT1_RAW, good],
+            side_effect=[attempt1, good],
         ) as call_mock:
             plan = plan_task_intent(self.intent, settings=self.settings)
         self.assertEqual(call_mock.call_count, 2)
@@ -13200,14 +13315,17 @@ null
                 repo_root=self.repo_root,
             )
         message = str(caught.exception)
-        # 3 = bare `python` (step_2) + the sed no-op (step_1) + the NEW
-        # stand-in error naming the values attempt 3 hardcoded in its
-        # sed payload, which retry #25's live rejection (2 errors)
-        # never named.
-        self.assertIn("was rejected with 3 errors", message)
+        # 2 = the sed no-op (step_1) + the stand-in error naming the
+        # values attempt 3 hardcoded in its sed payload, which retry
+        # #25's live rejection (2 errors) never named. Was 3 errors
+        # here until interpreter normalization (retry #27 fix):
+        # step_2's bare `python` is rewritten to ./.venv/bin/python
+        # at parse time and no longer errors.
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("hardcoded answer", message)
         self.assertIn('"ollama_reachable": True', message)
         self.assertIn('"gpu_temp": "N/A"', message)
+        self.assertNotIn("bare `python`", message)
 
     def test_standin_fires_on_heredoc_payload_with_hardcoded_values(self) -> None:
         target = f"{self.WS}/health_impl.py"
@@ -13417,13 +13535,18 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
             workspace=self.WS,
             repo_root=str(self.repo_root),
         )
-        # The driver path (repo_root=None) now produces the SAME
-        # rejection as the explicit-root path every test used to pin:
-        # both interpreter errors fire, plus the overwrite error (fix B).
+        # The driver path (repo_root=None) produces the SAME rejection
+        # as the explicit-root path: was 3 errors (both interpreter
+        # errors plus the overwrite error, fix B). Interpreter
+        # normalization (retry #27 fix): the two ./venv/bin/python
+        # commands are rewritten to ./.venv/bin/python at parse time,
+        # so the overwrite error is the one rejection left -- 1 error,
+        # identical on both paths.
         self.assertEqual(none_message, explicit_message)
-        self.assertIn("was rejected with 3 errors", none_message)
-        self.assertEqual(none_message.count("does not exist in the repo"), 2)
-        self.assertIn("./venv/bin/python", none_message)
+        self.assertIn("was rejected with 1 error", none_message)
+        self.assertEqual(none_message.count("does not exist in the repo"), 0)
+        self.assertNotIn("./venv/bin/python", none_message)
+        self.assertIn("drops 11 of the existing module", none_message)
 
     def test_retry26_output1_rejected_identically_none_and_explicit(self) -> None:
         none_message = self._rejection(
@@ -13439,18 +13562,22 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
             repo_root=str(self.repo_root),
         )
         self.assertEqual(none_message, explicit_message)
-        # Parse error + both interpreter errors. No overwrite error:
-        # the scaffold does not parse, and the parse check owns it.
-        self.assertIn("was rejected with 3 errors", none_message)
-        self.assertEqual(none_message.count("does not exist in the repo"), 2)
+        # Parse error only. No overwrite error: the scaffold does not
+        # parse, and the parse check owns it. Was 3 errors (parse +
+        # both interpreter errors) until interpreter normalization
+        # (retry #27 fix) rewrote the two ./venv/bin/python commands
+        # at parse time.
+        self.assertIn("was rejected with 1 error", none_message)
+        self.assertEqual(none_message.count("does not exist in the repo"), 0)
         self.assertIn("does not parse as Python", none_message)
         self.assertNotIn("existing module's", none_message)
 
     def test_criterion_command_interpreter_parity(self) -> None:
         # The interpreter check also guards exit_code criterion
         # commands (via _usable_criterion_error) -- the same bypass
-        # applied there. A criterion command naming ./venv/bin/python
-        # is rejected identically with repo_root=None and explicit.
+        # applied there. A criterion command naming a nonexistent
+        # interpreter normalization does not cover (./bin/python) is
+        # rejected identically with repo_root=None and explicit.
         node = {
             "id": "step_1",
             "objective": "Verify the endpoint live",
@@ -13462,7 +13589,7 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
                 {
                     "type": "exit_code",
                     "equals": 0,
-                    "command": "./venv/bin/python -m unittest discover -s tests",
+                    "command": "./bin/python -m unittest discover -s tests",
                 }
             ],
         }
@@ -13476,7 +13603,28 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
         )
         self.assertEqual(none_message, explicit_message)
         self.assertIn("unusable criterion", none_message)
-        self.assertIn("./venv/bin/python", none_message)
+        self.assertIn("./bin/python", none_message)
+        # Interpreter normalization (retry #27 fix): the covered
+        # spelling ./venv/bin/python in a criterion command is
+        # rewritten to the grounded form at parse time and ACCEPTED
+        # on both paths, and the accepted node carries the rewrite.
+        covered = dict(node)
+        covered["criteria"] = [
+            {
+                "type": "exit_code",
+                "equals": 0,
+                "command": "./venv/bin/python -m unittest discover -s tests",
+            }
+        ]
+        for root in (None, str(self.repo_root)):
+            nodes, _ = parse_planner_response(
+                self._dag([covered]), goal_text=self.GENERIC_GOAL, repo_root=root
+            )
+            self.assertEqual(len(nodes), 1)
+            self.assertEqual(
+                nodes[0].criteria[0]["command"],
+                "./.venv/bin/python -m unittest discover -s tests",
+            )
         # The grounded interpreter in a criterion command passes on
         # both paths (the .venv exemption is machine-independent).
         good = dict(node)
@@ -13674,3 +13822,289 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
         }
         nodes, _ = parse_planner_response(self._dag([node]))
         self.assertEqual(nodes[0].assigned_claw, "scaffold")
+
+
+class TestPlannerInterpreterNormalizationFix(unittest.TestCase):
+    """Deterministic interpreter-token normalization (retry #27).
+
+    Retry #27 (log llm-end-to-end-health-retry27-2026-11-17.log,
+    DRIVER_EXIT 1) failed at planning with the repo-root bypass
+    already closed (9ea9a43): attempt 3 was the best scaffold yet --
+    parse-clean, real computed values, correct shape -- and was
+    rejected ONLY for the interpreter pair. Across retries #25-#27
+    the model never once copied './.venv/bin/python' verbatim into a
+    bash command (zero occurrences in #26 and #27); it writes
+    './venv/bin/python' instead, and the repair loop, handed the
+    exact rejection naming the grounded form, cannot steer the
+    string. Prompt grounding (69c0ece) and validation (9ea9a43) have
+    done what they can; the fix is deterministic: parse_planner_response
+    rewrites the interpreter token in command position --
+    './venv/bin/python', 'venv/bin/python', bare 'python' / 'python3'
+    -- to './.venv/bin/python' before validation
+    (_normalize_plan_interpreters / _normalize_bash_interpreters in
+    planner.py), identifying the token exactly as
+    _bash_interpreter_errors does (same segment split, same
+    env-assignment stripping, first token only; heredoc bodies and
+    quoted / argument occurrences are never rewritten). The validator
+    stays as the backstop: spellings outside the covered set (e.g.
+    ./bin/python) error exactly as before.
+
+    Pinned count changes elsewhere in this file (each named in its
+    test): the interpreter error disappears from the retry-#13
+    attempt-4 pins (3 -> 2), the retry-#18 / #19 attempt pins
+    (6 -> 5, 3 -> 2), the retry-#23 output pins (4 -> 2, 5 -> 4),
+    the retry-#25 attempt-3 pin (3 -> 2) and the retry-#26 output
+    pins (3 -> 1: output 1 keeps only its scaffold parse error,
+    output 2 only the overwrite error). Retry-#21 attempt-5 is a
+    cheap rejection again (3 -> 1: the placeholder stands alone once
+    the two interpreter errors are normalized away). The
+    criterion-parity and exit-code-criterion tests now drive the
+    validator backstop with ./bin/python, and the repair-steering
+    test drives the repair loop with ./bin/python in place of the
+    verbatim retry-#25 attempt-1 spellings, which are accepted at
+    parse time now.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    GENERIC_GOAL = "Add a logging helper to the app and verify it works."
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#27 outputs 1-3, verbatim from the RAW PLANNER
+    # OUTPUT blocks of the retry-#27 driver section of
+    # logs/llm-end-to-end-health-retry27-2026-11-17.log (the same
+    # extraction tools/probe-retry27-rejections.py performs). Embedded
+    # (not read from the log) so the tests stay hermetic in CI.
+    RETRY27_OUTPUT1_RAW = '{\n"nodes":\n[\n{\n"id":\n"step_1",\n"objective":\n"Add /health endpoint to FreeTalon\'s API",\n"depends_on":\n[],\n"assigned_claw":\n"scaffold",\n"status":\n"draft",\n"inputs":\n{\n"file_path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":\n"import os\\nimport json\\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\\n\\ndef handle_health(self):\\n self.send_response(200)\\n self.send_header(\'Content-type\', \'application/json\')\\n service_status = { \\"service\\": \\"FreeTalon\\", \\"status\\": \\"running\\"}\\n ollama_reachable = True # Placeholder, implement actual check\\n gpu_temp = \\"N/A\\" # Placeholder, implement actual check\\n response_data = json.dumps(service_status)\\n self.end_headers()\\n self.wfile.write(response_data.encode(\'utf-8\'))\\n\\nclass HiveAPIServer(BaseHTTPRequestHandler):\\n def do_GET(self):\\n if self.path == \'/health\':\\n handle_health(self)\\n else:\\n super().do_GET()\\n\\ndef start():\\n httpd = HTTPServer((\'localhost\', 8765), HiveAPIServer)\\n print(\'serving at port\', 8765)\\n httpd.serve_forever()"\n},\n"outputs":\n[\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n],\n"acceptance":\n"File exists",\n"criteria":\n[\n{\n"type":\n"file_exists",\n"path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_2",\n"objective":\n"Write and run unit tests for the /health endpoint",\n"depends_on":\n[\n"step_1"\n],\n"assigned_claw":\n"bash",\n"status":\n"draft",\n"inputs":\n{\n"command":\n"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m unittest discover -s tests"\n},\n"outputs":\n[\n"test_results"\n],\n"acceptance":\n"Tests pass",\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_3",\n"objective":\n"Start the API server and verify /health endpoint is live",\n"depends_on":\n[\n"step_2"\n],\n"assigned_claw":\n"bash",\n"status":\n"draft",\n"inputs":\n{\n"command":\n"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli start"\n},\n"outputs":\n[\n"server_running"\n],\n"acceptance":\n"Endpoint is live",\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_4",\n"objective":\n"Verify /health endpoint returns expected JSON",\n"depends_on":\n[\n"step_3"\n],\n"assigned_claw":\n"bash",\n"status":\n"draft",\n"inputs":\n{\n"command":\n"curl -sf http://localhost:8765/health | jq \'.service\' && curl -sf http://localhost:8765/health | jq \'.status\'"\n},\n"outputs":\n[\n"verification_result"\n],\n"acceptance":\n"Endpoint returns expected JSON",\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n}\n]\n}'
+    RETRY27_OUTPUT2_RAW = '{\n"nodes":[\n{"id":"step_1",\n"objective":"Extend /home/seeker/projects/FreeTalon/freetalon/api.py to implement the /health endpoint",\n"depends_on":[],\n"assigned_claw":"scaffold",\n"inputs":{"file_path":"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":"import json\\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\\n\\ndef handle_health(self):\\n    response = {\'status\': \'ok\', \'ollama_reachable\': True, \'gpu_temp\': \'N/A\'}\\n    self.send_response(200)\\n    self.send_header(\'Content-type\', \'application/json\')\\n    self.end_headers()\\n    self.wfile.write(json.dumps(response).encode())\\n\\nclass HiveAPIServer(BaseHTTPRequestHandler):\\n    def do_GET(self):\\n        if self.path == \'/health\':\\n            handle_health(self)\\n        else:\\n            super().do_GET()\\n\\nif __name__ == \'__main__\':\\n    server_address = (\'\', 8765)\\n    httpd = HTTPServer(server_address, HiveAPIServer)\\n    print(\'Starting server...\')\\n    httpd.serve_forever()"\n},'
+    RETRY27_OUTPUT3_RAW = '{\n"nodes":\n[\n{\n"id":\n"step_1",\n"objective":\n"Edit /home/seeker/projects/FreeTalon/freetalon/api.py to implement the /health endpoint",\n"depends_on":\n[],\n"assigned_claw":\n"scaffold",\n"inputs":\n{\n"file_path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":\n"import json\\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\\nimport socket\\nimport os\\nimport subprocess\\n\\ndef handle(request):\\n    if request.path == \'/health\':\\n        try:\\n            # Check if Ollama is reachable\\n            socket.create_connection((\'localhost\', 11434), timeout=2)\\n            # Check GPU temperature using nvidia-smi\\n            gpu_temp = subprocess.check_output([\'nvidia-smi\', \'--query-gpu=temperature.gpu\', \'--format=csv,noheader\']).decode().strip()\\n            response = json.dumps({\\n                \\"status\\": \\"OK\\",\\n                \\"ollama_reachable\\": True,\\n                \\"gpu_temperature\\": gpu_temp\\n            })\\n        except (socket.error, subprocess.CalledProcessError):\\n            response = json.dumps({\\n                \\"status\\": \\"ERROR\\",\\n                \\"ollama_reachable\\": False,\\n                \\"gpu_temperature\\": \\"N/A\\"\\n            })\\n        request.send_response(200)\\n        request.send_header(\'Content-type\', \'application/json\')\\n        request.end_headers()\\n        request.write(response.encode(\'utf-8\'))\\n    else:\\n        request.send_response(404)\\n        request.end_headers()\\n\\nclass HiveAPIServer(BaseHTTPRequestHandler):\\n    def do_GET(self):\\n        handle(self)\\n\\nif __name__ == \'__main__\':\\n    server_address = (\'\', 8765)\\n    httpd = HTTPServer(server_address, HiveAPIServer)\\n    print(\'Starting server...\')\\n    httpd.serve_forever()\\n"\n},\n"outputs":\n[\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n],\n"acceptance":\n"File exists and /health endpoint is implemented",\n"criteria":\n[\n{\n"type":\n"file_exists",\n"path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_2",\n"objective":\n"Run unit tests for the /health endpoint",\n"depends_on":\n[\n"step_1"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m unittest discover -s tests"\n},\n"outputs":\n[\n"test_results"\n],\n"acceptance":\n"All unit tests pass",\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_3",\n"objective":\n"Start the FreeTalon API server",\n"depends_on":\n[\n"step_2"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli start"\n},\n"outputs":\n[\n"server_running"\n],\n"acceptance":\n"Server is running and accessible",\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_4",\n"objective":\n"Verify the /health endpoint is live",\n"depends_on":\n[\n"step_3"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"curl -sf http://localhost:8765/health"\n},\n"outputs":\n[\n"verification_result"\n],\n"acceptance":\n"Endpoint returns a 200 OK status and valid JSON",\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n}\n]\n}'
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _rejection(self, raw: str, **kwargs: object) -> str:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw, **kwargs)
+        return str(caught.exception)
+
+    # --- The retry-#27 pins ---
+
+    def test_retry27_output3_accepted_both_roots_commands_normalized(self) -> None:
+        # Before this fix: rejected with 2 errors under BOTH roots --
+        # the interpreter pair on step_2 / step_3, nothing else. The
+        # scaffold was parse-clean with real computed values.
+        for root in (None, str(self.repo_root)):
+            nodes, _meta = parse_planner_response(
+                self.RETRY27_OUTPUT3_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertEqual(len(nodes), 4)
+            commands = {
+                node.id: node.inputs.get("command")
+                for node in nodes
+                if node.assigned_claw == "bash"
+            }
+            # The parsed plan the executor receives carries the
+            # normalized commands.
+            self.assertEqual(
+                commands["node-2"],
+                "cd /home/seeker/projects/FreeTalon"
+                " && ./.venv/bin/python -m unittest discover -s tests",
+            )
+            self.assertEqual(
+                commands["node-3"],
+                "cd /home/seeker/projects/FreeTalon"
+                " && ./.venv/bin/python -m freetalon.cli start",
+            )
+            self.assertEqual(
+                commands["node-4"], "curl -sf http://localhost:8765/health"
+            )
+
+    def test_retry27_output1_only_scaffold_parse_error_remains(self) -> None:
+        # Before this fix: 3 errors under both roots (the interpreter
+        # pair + the scaffold parse error). The interpreter errors are
+        # normalized away; the parse error -- the output's real defect
+        # -- is the one rejection left, identical on both paths.
+        none_message = self._rejection(
+            self.RETRY27_OUTPUT1_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        explicit_message = self._rejection(
+            self.RETRY27_OUTPUT1_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=str(self.repo_root),
+        )
+        self.assertEqual(none_message, explicit_message)
+        self.assertIn("was rejected with 1 error", none_message)
+        self.assertIn("does not parse as Python", none_message)
+        self.assertNotIn("does not exist in the repo", none_message)
+        self.assertNotIn("bare `python`", none_message)
+
+    def test_retry27_output2_still_invalid_json(self) -> None:
+        # The truncated second output never reached validation; it
+        # stays a JSON rejection on both paths.
+        for root in (None, str(self.repo_root)):
+            message = self._rejection(
+                self.RETRY27_OUTPUT2_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertIn("not valid JSON", message)
+
+    # --- The normalizer itself ---
+
+    def test_normalizer_rewrites_covered_tokens(self) -> None:
+        from freetalon.orchestrator.planner import _normalize_bash_interpreters
+
+        cases = [
+            (
+                "./venv/bin/python -m unittest discover -s tests",
+                "./.venv/bin/python -m unittest discover -s tests",
+            ),
+            (
+                "venv/bin/python -m freetalon.cli start",
+                "./.venv/bin/python -m freetalon.cli start",
+            ),
+            ("python -m unittest discover", "./.venv/bin/python -m unittest discover"),
+            ("python3 tests/test_api.py", "./.venv/bin/python tests/test_api.py"),
+            (
+                "cd /home/seeker/projects/FreeTalon"
+                " && ./venv/bin/python -m unittest discover -s tests",
+                "cd /home/seeker/projects/FreeTalon"
+                " && ./.venv/bin/python -m unittest discover -s tests",
+            ),
+            (
+                "./venv/bin/python -m a; python -m b | python3 -m c",
+                "./.venv/bin/python -m a; ./.venv/bin/python -m b"
+                " | ./.venv/bin/python -m c",
+            ),
+            ("FOO=1 python -m x", "FOO=1 ./.venv/bin/python -m x"),
+            (
+                "curl -sf http://localhost:8765/health"
+                " | ./venv/bin/python -m json.tool",
+                "curl -sf http://localhost:8765/health"
+                " | ./.venv/bin/python -m json.tool",
+            ),
+            (
+                "cd /repo\n./venv/bin/python -m x",
+                "cd /repo\n./.venv/bin/python -m x",
+            ),
+        ]
+        for given, expected in cases:
+            self.assertEqual(_normalize_bash_interpreters(given), expected, given)
+
+    def test_normalizer_leaves_uncovered_and_content_untouched(self) -> None:
+        from freetalon.orchestrator.planner import _normalize_bash_interpreters
+
+        untouched = [
+            # Already grounded: byte-identical.
+            "./.venv/bin/python -m freetalon.cli start",
+            # Quoted / argument occurrences are not command position.
+            'echo "./venv/bin/python"',
+            "echo python",
+            "grep -rn 'python' freetalon/",
+            # A filename argument containing the word.
+            "./.venv/bin/python scripts/python_helper.py",
+            # Outside the covered set: the validator's backstop case.
+            "./bin/python -m x",
+            # Heredoc bodies are file content, never rewritten.
+            "cat > /tmp/x.sh <<'EOF'\n./venv/bin/python -m foo\npython -m bar\nEOF",
+        ]
+        for given in untouched:
+            self.assertEqual(_normalize_bash_interpreters(given), given, given)
+        # A heredoc head line is shell: a command sharing it is
+        # rewritten, while the body lines stay content. (The bodies
+        # protected here are the ones _strip_heredoc_bodies strips --
+        # the cat-heredoc file-writing shape, the only heredoc the
+        # validator treats as content rather than shell.)
+        self.assertEqual(
+            _normalize_bash_interpreters(
+                "cat > /tmp/x.sh <<'EOF' && ./venv/bin/python /tmp/x.sh\n"
+                "./venv/bin/python -m foo\nEOF"
+            ),
+            "cat > /tmp/x.sh <<'EOF' && ./.venv/bin/python /tmp/x.sh\n"
+            "./venv/bin/python -m foo\nEOF",
+        )
+
+    def test_normalizer_walks_only_command_strings(self) -> None:
+        from freetalon.orchestrator.planner import _normalize_plan_interpreters
+
+        nodes = [
+            {
+                "id": "step_1",
+                "assigned_claw": "scaffold",
+                "inputs": {
+                    "file_path": "x.py",
+                    "content": "run ./venv/bin/python -m foo",
+                    "command": "./venv/bin/python -m foo",
+                },
+                "criteria": [],
+            },
+            {
+                "id": "step_2",
+                "assigned_claw": "bash",
+                "inputs": {"command": "./venv/bin/python -m foo"},
+                "criteria": [
+                    {"type": "exit_code", "equals": 0, "command": "python -m bar"}
+                ],
+            },
+        ]
+        _normalize_plan_interpreters(nodes)
+        # Scaffold content is file content: untouched. A non-bash
+        # node's 'command' input is not a validated command string:
+        # untouched (the walk mirrors the validator's scope exactly).
+        self.assertEqual(
+            nodes[0]["inputs"]["content"], "run ./venv/bin/python -m foo"
+        )
+        self.assertEqual(nodes[0]["inputs"]["command"], "./venv/bin/python -m foo")
+        self.assertEqual(
+            nodes[1]["inputs"]["command"], "./.venv/bin/python -m foo"
+        )
+        self.assertEqual(
+            nodes[1]["criteria"][0]["command"], "./.venv/bin/python -m bar"
+        )
+
+    def test_validator_backstop_still_errors_on_uncovered(self) -> None:
+        from freetalon.orchestrator.planner import _bash_interpreter_errors
+
+        errors = _bash_interpreter_errors("./bin/python -m x", self.repo_root)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("./bin/python", errors[0])
+        self.assertIn("./.venv/bin/python", errors[0])
+
+    def test_bare_python_criterion_command_normalized(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Verify the endpoint live",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "curl -s http://localhost:8765/health"},
+            "outputs": ["verification"],
+            "criteria": [
+                {
+                    "type": "exit_code",
+                    "equals": 0,
+                    "command": "python -m unittest discover -s tests",
+                }
+            ],
+        }
+        for root in (None, str(self.repo_root)):
+            nodes, _ = parse_planner_response(
+                self._dag([node]), goal_text=self.GENERIC_GOAL, repo_root=root
+            )
+            self.assertEqual(len(nodes), 1)
+            self.assertEqual(
+                nodes[0].criteria[0]["command"],
+                "./.venv/bin/python -m unittest discover -s tests",
+            )

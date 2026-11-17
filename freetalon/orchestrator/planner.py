@@ -796,6 +796,14 @@ def parse_planner_response(
                 # so _usable_criterion_error rejects it by name below.
                 node["criteria"] = [node["criteria"]]
 
+    # Deterministic interpreter normalization (retry #27): rewrite
+    # the model-spelled interpreter tokens in the plan's bash
+    # commands to the grounded ./.venv/bin/python before validation
+    # -- the model will not copy the string verbatim, and the repair
+    # loop cannot steer it. The validator remains as the backstop
+    # for every shape this does not cover.
+    _normalize_plan_interpreters(nodes_raw)
+
     # Normalize: topologically order the DAG and assign deterministic
     # node-1, node-2, ... ids, remapping depends_on. Without this the raw
     # LLM ids/order leak through and downstream code cannot rely on
@@ -1122,6 +1130,205 @@ _SHELL_SKIP_TOKENS = frozenset({
 # after &&, ||, ;, |, or a newline. Redirections and ` - ` splits are
 # NOT separators here — they belong to the segment's command.
 _INTERPRETER_SEGMENT_RE = re.compile(r"(?:\n|&&|\|\||;|\|)")
+
+
+# --- Deterministic interpreter normalization (retry #27) ---
+#
+# Measured across retries #25-#27: the model will not copy
+# './.venv/bin/python' verbatim into a bash command -- zero occurrences
+# across every planner output in #26 and #27 -- it writes
+# './venv/bin/python' (no dot) instead. _bash_interpreter_errors
+# correctly rejects that spelling, and the repair loop, even when handed
+# the exact error naming the grounded form, cannot steer the string
+# (retry #27 attempt 3 was otherwise fully valid and died on exactly
+# this). Prompt-layer grounding (69c0ece) and validation (9ea9a43) have
+# done what they can; the correction is deterministic, in code, at parse
+# time: rewrite the interpreter token in command position to the
+# grounded form BEFORE validation, so the parsed plan the executor
+# receives already carries it. The validator stays in place as the
+# backstop for every shape this does not cover.
+_GROUNDED_INTERPRETER = "./.venv/bin/python"
+_INTERPRETER_REWRITES = {
+    "./venv/bin/python": _GROUNDED_INTERPRETER,
+    "venv/bin/python": _GROUNDED_INTERPRETER,
+    "python": _GROUNDED_INTERPRETER,
+    "python3": _GROUNDED_INTERPRETER,
+}
+
+# _INTERPRETER_SEGMENT_RE with the separators kept, so a command can be
+# reassembled byte-identically apart from the rewritten tokens.
+_INTERPRETER_SEGMENT_SPLIT_RE = re.compile(r"(\n|&&|\|\||;|\|)")
+
+
+def _heredoc_body_spans(command: str) -> list[tuple[int, int]]:
+    """Character spans of heredoc bodies in a bash command.
+
+    Mirrors _strip_heredoc_bodies' detection (same regex, same line
+    walk): the head line and the closing marker line are shell and stay
+    unprotected; the lines between them are file content and are never
+    rewritten. An unterminated heredoc protects nothing past its head
+    line, exactly as the strip leaves the tail in place for validation.
+    """
+    spans: list[tuple[int, int]] = []
+    rest_start = 0
+    while True:
+        match = _STRIP_HEREDOC_RE.search(command, rest_start)
+        if not match:
+            return spans
+        head_end = command.find("\n", match.end())
+        if head_end == -1:
+            return spans
+        body_start = head_end + 1
+        marker = match.group("marker")
+        cursor = body_start
+        marker_start: int | None = None
+        while cursor < len(command):
+            line_end = command.find("\n", cursor)
+            if line_end == -1:
+                line_end = len(command)
+            if command[cursor:line_end].strip() == marker:
+                marker_start = cursor
+                rest_start = line_end
+                break
+            cursor = line_end + 1
+        if marker_start is None:
+            return spans
+        spans.append((body_start, marker_start))
+
+
+def _scan_token_span(text: str, start: int) -> tuple[int, int] | None:
+    """Raw span of the next shell token at/after ``start``.
+
+    Quote- and escape-aware, mirroring shlex's token boundaries for the
+    first tokens of a segment: whitespace separates, a backslash escapes
+    the next character, single quotes are literal, double quotes allow
+    backslash escapes. Returns None when only whitespace remains.
+    """
+    index = start
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    if index >= len(text):
+        return None
+    token_start = index
+    while index < len(text):
+        char = text[index]
+        if char in " \t":
+            break
+        if char == "\\":
+            index += 2
+            continue
+        if char == "'":
+            close = text.find("'", index + 1)
+            if close == -1:
+                return token_start, len(text)
+            index = close + 1
+            continue
+        if char == '"':
+            cursor = index + 1
+            while cursor < len(text):
+                if text[cursor] == "\\":
+                    cursor += 2
+                    continue
+                if text[cursor] == '"':
+                    break
+                cursor += 1
+            index = cursor + 1 if cursor < len(text) else len(text)
+            continue
+        index += 1
+    return token_start, index
+
+
+def _normalize_segment_interpreter(segment: str) -> str:
+    """Rewrite one shell segment's interpreter token, when covered.
+
+    The interpreter token is identified exactly as _bash_interpreter_errors
+    identifies it: shlex tokens, leading env assignments stripped, first
+    remaining token. Only an exact match against _INTERPRETER_REWRITES is
+    rewritten, at its raw span (a quoted command word loses its quotes --
+    the replacement needs none). Anything else -- skip tokens, other
+    binaries, paths outside the covered spellings, segments shlex cannot
+    tokenize -- is returned byte-identical for the validator to judge.
+    """
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return segment
+    index = 0
+    while index < len(tokens) and re.match(
+        r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[index]
+    ):
+        index += 1
+    if index >= len(tokens):
+        return segment
+    replacement = _INTERPRETER_REWRITES.get(tokens[index])
+    if replacement is None:
+        return segment
+    span: tuple[int, int] | None = None
+    position = 0
+    for _ in range(index + 1):
+        span = _scan_token_span(segment, position)
+        if span is None:
+            return segment
+        position = span[1]
+    return segment[: span[0]] + replacement + segment[span[1] :]
+
+
+def _normalize_bash_interpreters(command: str) -> str:
+    """Normalize every covered interpreter token in a bash command.
+
+    Segments are split exactly as the validator splits them
+    (_INTERPRETER_SEGMENT_RE); heredoc body lines are file content, not
+    shell, and are never rewritten. A command with no covered token is
+    returned byte-identical.
+    """
+    if not command:
+        return command
+    protected = _heredoc_body_spans(command)
+    parts = _INTERPRETER_SEGMENT_SPLIT_RE.split(command)
+    out: list[str] = []
+    offset = 0
+    for position, part in enumerate(parts):
+        start = offset
+        offset += len(part)
+        if position % 2 == 1 or not part:
+            out.append(part)
+            continue
+        if any(start < end and begin < offset for begin, end in protected):
+            out.append(part)
+            continue
+        out.append(_normalize_segment_interpreter(part))
+    return "".join(out)
+
+
+def _normalize_plan_interpreters(nodes_raw: list[Any]) -> None:
+    """Apply interpreter normalization to a raw plan's bash commands.
+
+    Walks exactly the strings the validator treats as bash commands:
+    the 'command'/'cmd' input of bash/shell_exec nodes (the strings
+    _command_errors validates) and the 'command' of exit_code criteria
+    (the strings _usable_criterion_error validates). Scaffold contents
+    and every other input are file content or data, never commands, and
+    are not touched. Runs on the raw node dicts before
+    normalize_plan_nodes, so the PlanNodes the executor receives carry
+    the normalized commands.
+    """
+    for node in nodes_raw:
+        if not isinstance(node, dict):
+            continue
+        if node.get("assigned_claw") in ("bash", "shell_exec"):
+            inputs = node.get("inputs")
+            if isinstance(inputs, dict):
+                for key in ("command", "cmd"):
+                    value = inputs.get(key)
+                    if isinstance(value, str):
+                        inputs[key] = _normalize_bash_interpreters(value)
+        criteria = node.get("criteria")
+        if isinstance(criteria, list):
+            for criterion in criteria:
+                if isinstance(criterion, dict):
+                    value = criterion.get("command")
+                    if isinstance(value, str):
+                        criterion["command"] = _normalize_bash_interpreters(value)
 
 
 def _bash_interpreter_errors(
