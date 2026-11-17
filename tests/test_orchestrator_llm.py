@@ -19,6 +19,7 @@ from freetalon.orchestrator.planner import (
     normalize_plan_nodes,
     parse_planner_response,
     plan_task_intent,
+    sanitize_llm_output,
 )
 from freetalon.orchestrator.prompts import INTAKE_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT
 
@@ -12479,3 +12480,101 @@ class TestPlannerFrameworkGuardFix(unittest.TestCase):
         self.assertTrue(
             any("Flask app" in a for a in brief.get("rejected_approaches", []))
         )
+
+
+class TestPlannerSanitizeFix(unittest.TestCase):
+    """Retry #24: sanitize_llm_output deleted bare U+2581 space markers.
+
+    Gemma 3 emits indentation in longer scaffold generations as runs of
+    U+2581 (the SentencePiece space marker), not ASCII spaces. The
+    sanitizer converted the mojibake form to a space but DELETED the
+    genuine marker, so every affected scaffold arrived flush-left and
+    failed the plan-time parse check -- all three retry-#24 attempts.
+    The fix converts bare markers to the spaces they are. The UNK_BYTE
+    pass runs first and consumes the bracketed artifacts whole; the
+    artifact hex (0xe29681) is U+2581's own UTF-8 encoding, so both
+    passes restore the same space arriving through two decode paths.
+    """
+
+    def test_bare_marker_runs_become_indentation(self) -> None:
+        raw = "def health():\n▁▁▁▁return {'ok': True}\n"
+        self.assertEqual(
+            sanitize_llm_output(raw),
+            "def health():\n    return {'ok': True}\n",
+        )
+
+    def test_bare_marker_mid_line_becomes_space(self) -> None:
+        self.assertEqual(sanitize_llm_output("import▁json"), "import json")
+        self.assertEqual(sanitize_llm_output("'a▁b'"), "'a b'")
+
+    def test_unk_byte_artifact_and_bare_runs_together(self) -> None:
+        # The interaction case from the captured wire response
+        # (logs/indent-measure-raw.json): mid-line spaces ride inside
+        # UNK_BYTE artifacts while the indentation is bare marker runs.
+        # Converting the markers alone leaves the artifacts mangling
+        # the lines; the artifact pass alone deletes the indentation.
+        # Both together reproduce the code the model emitted.
+        import ast
+
+        raw = (
+            "import[UNK_BYTE_0xe29681▁json]json\n"
+            "\n"
+            "def[UNK_BYTE_0xe29681▁health]health():\n"
+            "▁▁▁▁return[UNK_BYTE_0xe29681▁json]json.dumps("
+            "{'ok':[UNK_BYTE_0xe29681▁True]True})\n"
+        )
+        cleaned = sanitize_llm_output(raw)
+        self.assertEqual(
+            cleaned,
+            "import json\n"
+            "\n"
+            "def health():\n"
+            "    return json.dumps({'ok': True})\n",
+        )
+        ast.parse(cleaned)
+
+    def test_mojibake_marker_still_becomes_space(self) -> None:
+        # Pre-existing behavior, unchanged: the latin-1-mangled 3-char
+        # form of the marker converts to a space.
+        self.assertEqual(sanitize_llm_output("a\xe2\x96\x81b"), "a b")
+
+    def test_plain_text_unchanged(self) -> None:
+        text = "def f():\n    return 1\n"
+        self.assertEqual(sanitize_llm_output(text), text)
+
+    def test_marker_indented_scaffold_survives_parse(self) -> None:
+        # Regression: a scaffold whose indentation is U+2581 runs (the
+        # retry-#24 shape) must come through parse_planner_response
+        # with its content converted to real spaces that parse --
+        # before the fix the same plan was rejected for unparseable
+        # scaffold code. ensure_ascii=False keeps the markers literal
+        # in the raw text, exactly as the wire delivers them.
+        import ast
+        import json
+
+        api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
+        )
+        content = (
+            "# extended health endpoint\n"
+            "if path == \"/health\":\n"
+            "▁▁▁▁self._send({\"ok\": True, \"status\": \"ready\"})"
+        )
+        node = {
+            "id": "step_1",
+            "objective": "Extend the health endpoint",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {"file_path": api_path, "content": content},
+            "outputs": [api_path],
+            "criteria": [{"type": "file_exists", "path": api_path}],
+        }
+        raw = json.dumps(
+            {"nodes": [node], "metadata": {}}, ensure_ascii=False
+        )
+        nodes, _ = parse_planner_response(raw)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        converted = nodes[0].inputs["content"]
+        self.assertNotIn("▁", converted)
+        self.assertIn("\n    self._send(", converted)
+        ast.parse(converted)

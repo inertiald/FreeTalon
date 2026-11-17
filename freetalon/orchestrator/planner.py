@@ -463,10 +463,22 @@ def normalize_plan_nodes(
 
 def sanitize_llm_output(raw_text: str) -> str:
     """Clean raw SentencePiece UNK_BYTE token artifacts output by Gemma models."""
-    # Replaces patterns like '[UNK_BYTE_0xe29681▁a]a' with ' a'
+    # Replaces patterns like '[UNK_BYTE_0xe29681▁a]a' with ' a'. The hex in
+    # the artifact is the UTF-8 encoding of U+2581 itself, so the space
+    # this pass restores is the same space marker the bare-character pass
+    # below converts -- one artifact arriving through two decode paths.
     cleaned = re.sub(r'\[UNK_BYTE_[^\]]+▁?([^\]]*)\]', r' \1', raw_text)
-    # Clean up any leftover lower block characters or non-breaking spaces
-    cleaned = cleaned.replace("\xe2\x96\x81", " ").replace("▁", "")
+    # Convert any leftover lower block characters to the spaces they are.
+    # A bare U+2581 IS the SentencePiece space marker, and in longer
+    # generations Gemma emits whole indentation runs as bare markers;
+    # deleting them (the old behavior) stripped every indented line
+    # flush-left and the scaffold failed the plan-time parse check --
+    # retry #24 lost all three attempts to exactly that. The mojibake
+    # 3-char form is the same marker mangled by a latin-1 decode. Order
+    # matters: the UNK_BYTE pass above runs first and consumes the
+    # bracketed artifacts whole (the markers inside them included), so
+    # this pass only ever converts the bare runs.
+    cleaned = cleaned.replace("\xe2\x96\x81", " ").replace("▁", " ")
     return cleaned
 
 # Top-level keys a real planner response may carry. Anything else with
