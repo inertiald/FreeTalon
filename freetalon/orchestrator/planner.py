@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import ast
+from dataclasses import replace as dataclass_replace
 import json
 import re
 import shlex
@@ -3418,6 +3419,23 @@ def _forbidden_block(
     )
 
 
+# Context window for planner/replan LLM calls (Ollama num_ctx).
+# Retry #22: the planner prompts do not fit in the 4096-token
+# default, so the model never received the skeleton and could not
+# emit a full plan — five byte-identical {"nodes":[]} replies.
+# Measured 2026-11-17 with the Gemma 3 tokenizer from
+# models/tokenizer.json: initial call 4,255 tokens (system 3,030 +
+# user 1,225), first repair 6,415, grounded-plan output 1,687 — a
+# full repair round needs 8,102 tokens of context. 12288 covers
+# that with ~4,000 tokens spare for longer goals and replan briefs.
+# The intake path keeps the 4096 default (its prompts are small);
+# only planner/replan calls get the wider window. KV cost at 12288
+# is ~4.6 GB vs ~1.5 GB at 4096 (0.375 MB/token for this 12B
+# model) — Ollama fits it by offloading a few more layers to CPU
+# if VRAM runs short, which is a speed cost, not a failure.
+_PLANNER_NUM_CTX = 12288
+
+
 def _call_llm_with_repair(
     system_prompt: str,
     user_prompt: str,
@@ -3484,7 +3502,26 @@ def _call_llm_with_repair(
     the repair round after a placeholder stub carries the fill-in-the-
     blanks with the actual branch code and a runnable test, not just the
     prohibition.
+
+    The repair prompt only steers if the model receives it (retry
+    #22): the prompts exceed Ollama's 4096-token context window,
+    so planner/replan calls use _PLANNER_NUM_CTX instead. The
+    wider window is applied here, not in the driver or intake, so
+    the intake path keeps the 4096 default. An explicit num_ctx on
+    the caller's settings is respected, never overridden.
     """
+    # Retry #22: derive the effective settings once, before the loop,
+    # so every call in this planning call (initial + repairs) gets
+    # the planner context window. A caller that already set num_ctx
+    # keeps its value.
+    if settings is None:
+        effective_settings = LLMSettings.from_env()
+    else:
+        effective_settings = settings
+    if effective_settings.num_ctx is None:
+        effective_settings = dataclass_replace(
+            effective_settings, num_ctx=_PLANNER_NUM_CTX
+        )
     prompt = user_prompt
     last_error: LLMResponseError | None = None
     prev_response_text: str | None = None
@@ -3501,7 +3538,9 @@ def _call_llm_with_repair(
             rejected_approaches.append(seeded)
     spent_repair = False
     while True:
-        response_text = call_llm(system_prompt, prompt, settings=settings)
+        response_text = call_llm(
+            system_prompt, prompt, settings=effective_settings
+        )
         try:
             nodes, metadata = parse_planner_response(
                 response_text,
@@ -3656,14 +3695,23 @@ def plan_task_intent(
     )
     shape = _route_goal_shape(intent.goal, repo_root, delta=False)
     shape_block = f"\n\n{shape}" if shape else ""
-    nodes, metadata = _call_llm_with_repair(
-        PLANNER_SYSTEM_PROMPT,
+    # Retry #22: the shape sat at ~70% of the initial prompt (offset
+    # 2845 of 4093 chars), ahead of the instruction paragraph. The
+    # shape is the decision the model has to make, so it goes last —
+    # immediately before "JSON Output:" — instead of ahead of the
+    # instruction. Only ~13 chars ("\n\nJSON Output:") follow it.
+    user_prompt = (
         f"{context}\n\n"
-        f"{_format_intent_for_prompt(intent)}{shape_block}\n\n"
+        f"{_format_intent_for_prompt(intent)}\n\n"
         "Produce a NEW execution plan DAG for the goal above. Your output "
         "must be a JSON object with a \"nodes\" array — do NOT repeat the "
         "goal text or any JSON from this prompt.\n"
-        "JSON Output:",
+        f"{shape_block}\n\n"
+        "JSON Output:"
+    )
+    nodes, metadata = _call_llm_with_repair(
+        PLANNER_SYSTEM_PROMPT,
+        user_prompt,
         settings,
         max_repairs=max_repairs,
         goal_text=intent.goal,
@@ -3712,12 +3760,19 @@ def replan_from_brief(
     seed = seed_forbidden if seed_forbidden is not None else brief.get("seed_forbidden")
     if not isinstance(seed, list):
         seed = None
-    nodes, metadata = _call_llm_with_repair(
-        REPLAN_SYSTEM_PROMPT,
-        f"{context}\n\n{_format_brief_for_prompt(brief)}{shape_block}{node_shape_block}\n\n"
+    # Retry #22: as in plan_task_intent, the ROUTE GOAL shape goes
+    # last (after the node shape and the instruction), immediately
+    # before "JSON Output:" — it is the decision, not preamble.
+    user_prompt = (
+        f"{context}\n\n{_format_brief_for_prompt(brief)}{node_shape_block}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
         "quote, or echo the brief — it is your input, not your output.\n"
-        "JSON Output:",
+        f"{shape_block}\n\n"
+        "JSON Output:"
+    )
+    nodes, metadata = _call_llm_with_repair(
+        REPLAN_SYSTEM_PROMPT,
+        user_prompt,
         settings,
         max_repairs=max_repairs,
         goal_text=_goal_text_from_brief(brief),

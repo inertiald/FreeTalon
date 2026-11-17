@@ -38,6 +38,10 @@ class LLMSettings:
     model: str = _OLLAMA_MODEL
     api_key: str | None = None
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS
+    # Ollama context window for this call (num_ctx). None means the
+    # backend default (4096). The planner sets it explicitly: its
+    # prompts do not fit in 4096 (retry #22).
+    num_ctx: int | None = None
     format_schema: dict[str, Any] | None = None
 
     @classmethod
@@ -208,7 +212,7 @@ def _call_ollama(settings: LLMSettings, system_prompt: str, user_prompt: str) ->
             {"role": "user", "content": user_prompt},
         ],
         "options": {"temperature": 0,
-        	"num_ctx": 4096},
+        	"num_ctx": settings.num_ctx if settings.num_ctx else 4096},
     }
     response = _post_json(
         f"{_normalize_base_url(settings.base_url)}/api/chat",
