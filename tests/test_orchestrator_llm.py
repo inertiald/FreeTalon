@@ -12578,3 +12578,102 @@ class TestPlannerSanitizeFix(unittest.TestCase):
         self.assertNotIn("▁", converted)
         self.assertIn("\n    self._send(", converted)
         ast.parse(converted)
+
+
+class TestIntakeSanitizeFix(unittest.TestCase):
+    """Intake twin of the retry-#24 sanitize fix (planner: b3a0dfb).
+
+    freetalon/orchestrator/intake.py carries a duplicate
+    sanitize_llm_output for TaskIntent parsing, and it kept the old
+    behavior the planner fix removed: bare U+2581 markers (Gemma's
+    SentencePiece space marker) were DELETED instead of converted to
+    spaces, so a marker-carrying goal arrived fused
+    ("AddaGET/healthendpointtotheAPI") and any code-ish field lost its
+    indentation. The fix converts bare markers to the spaces they are.
+    The UNK_BYTE pass runs first and consumes the bracketed artifacts
+    whole; the artifact hex (0xe29681) is U+2581's own UTF-8 encoding,
+    so both passes restore the same space arriving through two decode
+    paths.
+    """
+
+    @staticmethod
+    def _sanitize(raw: str) -> str:
+        from freetalon.orchestrator.intake import sanitize_llm_output
+
+        return sanitize_llm_output(raw)
+
+    def test_bare_marker_runs_become_indentation(self) -> None:
+        raw = "def health():\n▁▁▁▁return {'ok': True}\n"
+        self.assertEqual(
+            self._sanitize(raw),
+            "def health():\n    return {'ok': True}\n",
+        )
+
+    def test_bare_marker_mid_line_becomes_space(self) -> None:
+        self.assertEqual(self._sanitize("import▁json"), "import json")
+        self.assertEqual(
+            self._sanitize("Add▁a▁health▁endpoint"),
+            "Add a health endpoint",
+        )
+
+    def test_unk_byte_artifact_and_bare_runs_together(self) -> None:
+        # The interaction case from the captured wire response
+        # (logs/indent-measure-raw.json): mid-line spaces ride inside
+        # UNK_BYTE artifacts while the indentation is bare marker runs.
+        # Converting the markers alone leaves the artifacts mangling
+        # the lines; the artifact pass alone deletes the indentation.
+        # Both together reproduce the code the model emitted.
+        import ast
+
+        raw = (
+            "import[UNK_BYTE_0xe29681▁json]json\n"
+            "\n"
+            "def[UNK_BYTE_0xe29681▁health]health():\n"
+            "▁▁▁▁return[UNK_BYTE_0xe29681▁json]json.dumps("
+            "{'ok':[UNK_BYTE_0xe29681▁True]True})\n"
+        )
+        cleaned = self._sanitize(raw)
+        self.assertEqual(
+            cleaned,
+            "import json\n"
+            "\n"
+            "def health():\n"
+            "    return json.dumps({'ok': True})\n",
+        )
+        ast.parse(cleaned)
+
+    def test_mojibake_marker_still_becomes_space(self) -> None:
+        # Pre-existing behavior, unchanged: the latin-1-mangled 3-char
+        # form of the marker converts to a space.
+        self.assertEqual(self._sanitize("a\xe2\x96\x81b"), "a b")
+
+    def test_plain_text_unchanged(self) -> None:
+        text = "def f():\n    return 1\n"
+        self.assertEqual(self._sanitize(text), text)
+
+    def test_marker_carrying_intent_survives_parse(self) -> None:
+        # Regression: a TaskIntent whose goal words and code-ish
+        # constraint value are separated by U+2581 markers (the wire
+        # shape) must come through parse_task_intent_response with real
+        # spaces -- before the fix the goal arrived fused and the
+        # constraint lost its indentation. ensure_ascii=False keeps
+        # the markers literal in the raw text, exactly as the wire
+        # delivers them.
+        import json
+
+        payload = {
+            "goal": "Add▁a▁GET▁/health▁endpoint▁to▁the▁API",
+            "project_type": "api",
+            "capabilities": ["scaffold"],
+            "constraints": {
+                "verify": "handler:\n▁▁▁▁return▁{'ok':▁True}",
+            },
+            "missing_inputs": [],
+        }
+        raw = json.dumps(payload, ensure_ascii=False)
+        intent = parse_task_intent_response(raw)
+        self.assertEqual(intent.goal, "Add a GET /health endpoint to the API")
+        self.assertEqual(
+            intent.constraints["verify"],
+            "handler:\n    return {'ok': True}",
+        )

@@ -163,8 +163,17 @@ def parse_json_object(raw_text: str) -> dict[str, Any]:
 
 def sanitize_llm_output(raw_text: str) -> str:
     """Clean raw SentencePiece UNK_BYTE token artifacts output by Gemma models."""
+    # Same two-pass decode as the planner's copy (see planner.py):
+    # the UNK_BYTE pass runs first and consumes the bracketed
+    # artifacts whole -- the artifact hex (0xe29681) is U+2581's own
+    # UTF-8 encoding, so it restores the same space the bare-marker
+    # conversion below restores. A bare U+2581 IS the SentencePiece
+    # space marker; deleting it (the old behavior here) fused words
+    # in goal text and stripped indentation from any marker-carrying
+    # field. This duplicate was flagged by the planner sanitize fix
+    # (b3a0dfb) and is corrected to match it.
     cleaned = re.sub(r'\[UNK_BYTE_[^\]]+▁?([^\]]*)\]', r' \1', raw_text)
-    cleaned = cleaned.replace("\xe2\x96\x81", " ").replace("▁", "")
+    cleaned = cleaned.replace("\xe2\x96\x81", " ").replace("▁", " ")
     return cleaned
 
 def parse_task_intent_response(raw_text: str, user_request: str | None = None) -> TaskIntent:
