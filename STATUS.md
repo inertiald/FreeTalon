@@ -622,3 +622,34 @@ Verification (all CPU-only, mocked, no LLM, no GPU):
 Deliberately left out:
 - Live /health retry #6 was NOT run - loads the GPU, separate step.
 - No push (per instructions).
+
+## Update - 2026-11-16 23:00
+
+- /health retry #6 FAILED at planning (no run created, DRIVER_EXIT:1,
+  ~115s, log logs/llm-end-to-end-health-retry6-2026-11-16.log).
+  The grounded-shape fix IS steering the model: attempt 1 named
+  freetalon/api.py + port 8765, attempt 2 used a heredoc and curled
+  :8765/health. But the failure mode moved again:
+  - Attempt 1: the retry-#2 fake shape again, rejected for the glued
+    echo on node-2 (with the heredoc/scaffold guidance named).
+  - Attempt 2: a real heredoc plan (Flask app via heredoc, test.sh,
+    curl :8765) but ALL THREE nodes had no criteria at all - rejected
+    with 3 errors. Also unflagged: it wrote to /tmp/freetalon/api.py
+    instead of the repo module, invented Flask instead of extending
+    the existing stdlib handler, and curled Ollama /health (which
+    does not exist).
+  - Attempt 3: the model "learned" criteria must exist but guessed
+    the shape wrong - criteria as a bare dict {"tests_pass": true}
+    instead of a list of criterion objects - PlanNode schema error,
+    repair budget (max 2) exhausted.
+  Endpoint NOT extended, no new tests, suite 444/444 green, no stray
+  files, api.py untouched. GPU survived: post-run 62C, 46W, 300W,
+  x16, zero Xid (fans 85% during, auto after).
+  - Next weakness to fix (CPU-only): the criteria shape is never
+    shown to the model - the repair says "every node needs at least
+    one measurable criterion" but gives no example, so the model
+    emits a dict. Show the criterion list shape in the prompt/repair
+    (e.g. [{"type": "exit_code", "equals": 0}]) and/or coerce a
+    bare-dict criteria into a one-element list at parse time.
+    Also consider flagging file-write nodes that target /tmp instead
+    of the serving module for route goals.
