@@ -33,6 +33,40 @@ GROUNDED_API_CONTENT = (
     "    self._send({\"ok\": True, \"status\": \"ready\"})"
 )
 
+# The retry-#10 attempt-3 fixture names the absolute seeker7 path
+# /home/seeker/projects/FreeTalon/freetalon/api.py (see
+# TestPlannerDependsOnFix._retry10_attempt3_nodes). The rejection count
+# for it is disk-dependent: _unwritten_file_errors fires only when that
+# path does not exist on disk, so on seeker7 (where the file exists) the
+# rejection has 7 errors and in CI (where the checkout lives elsewhere)
+# it has 9 -- the same 7 plus one unwritten-file error per node claiming
+# file_exists on it. Tests asserting on this fixture must use
+# _expected_retry10_error_count() instead of a hard-coded count.
+RETRY10_API_PATH = "/home/seeker/projects/FreeTalon/freetalon/api.py"
+
+
+def _expected_retry10_error_count() -> int:
+    """7 on a checkout where the fixture's api.py exists, 9 elsewhere."""
+    return 7 if os.path.exists(RETRY10_API_PATH) else 9
+
+
+def _assert_code_append_parse_error(
+    testcase: unittest.TestCase, message: str
+) -> None:
+    """The code-append parse rejection, worded either way.
+
+    _code_append_errors has two branches: against an existing file it
+    says the write leaves the file so it "no longer parses as Python";
+    against content alone (the file does not exist -- CI, where the
+    fixture's absolute seeker7 path is absent) it says the code "does
+    not parse as Python". Both wordings name the same defect.
+    """
+    testcase.assertTrue(
+        "parses as Python" in message
+        or "does not parse as Python" in message,
+        message,
+    )
+
 
 class TestPrompts(unittest.TestCase):
     """Prompt contracts should remain strict and centralized."""
@@ -3896,8 +3930,13 @@ class TestPlannerDependsOnFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 7 = 2 unknown-dependency + 2 unwritten file_exists + 2 comment-only commands + 1 bad criterion type.
-        self.assertIn("was rejected with 7 errors", message)
+        # 2 unknown-dependency + 2 unusable file_exists + 2 comment-only
+        # commands + 1 bad criterion type -- 7 on seeker7, 9 in CI (see
+        # _expected_retry10_error_count).
+        self.assertIn(
+            f"was rejected with {_expected_retry10_error_count()} errors",
+            message,
+        )
         self.assertIn("fix ALL of them", message)
         self.assertIn("depends on unknown node 'endpoint_implemented'", message)
         self.assertIn("depends on unknown node 'tests_written'", message)
@@ -4343,8 +4382,13 @@ class TestPlannerShapeSurvivesRepair(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 7 = 2 unknown-dependency + 2 unwritten file_exists + 2 comment-only commands + 1 bad criterion type.
-        self.assertIn("was rejected with 7 errors", message)
+        # 2 unknown-dependency + 2 unusable file_exists + 2 comment-only
+        # commands + 1 bad criterion type -- 7 on seeker7, 9 in CI (see
+        # _expected_retry10_error_count).
+        self.assertIn(
+            f"was rejected with {_expected_retry10_error_count()} errors",
+            message,
+        )
         self.assertIn("depends on unknown node 'endpoint_implemented'", message)
         self.assertIn("depend on 'step_1' (the node id)", message)
         self.assertIn('"depends_on" lists NODE IDS only', message)
@@ -6260,10 +6304,13 @@ class TestPlannerDuplicateKeysFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 7 = 2 unknown-dependency + 2 unwritten file_exists + 2 comment-only
-        # commands + 1 bad criterion type (the dependency rejection now
-        # carries the plan's other validation errors).
-        self.assertIn("was rejected with 7 errors", message)
+        # 2 unknown-dependency + 2 unusable file_exists + 2 comment-only
+        # commands + 1 bad criterion type -- 7 on seeker7, 9 in CI (see
+        # _expected_retry10_error_count).
+        self.assertIn(
+            f"was rejected with {_expected_retry10_error_count()} errors",
+            message,
+        )
         self.assertIn("depends on unknown node", message)
         self.assertIn("endpoint_implemented", message)
 
@@ -6523,7 +6570,7 @@ class TestPlannerCodeAppendFix(unittest.TestCase):
         self.assertIn("was rejected with 1 error", message)
         self.assertIn("node-2", message)
         self.assertIn("freetalon/api.py", message)
-        self.assertIn("parses as Python", message)
+        _assert_code_append_parse_error(self, message)
         self.assertIn("expected an indented block", message)
         self.assertIn("grounded move", message)
 
@@ -6543,7 +6590,7 @@ class TestPlannerCodeAppendFix(unittest.TestCase):
         self.assertEqual(nodes[0].inputs["file_path"], self.api_path)
         repair_prompt = call_mock.call_args[0][1]
         self.assertIn("REJECTED", repair_prompt)
-        self.assertIn("parses as Python", repair_prompt)
+        _assert_code_append_parse_error(self, repair_prompt)
         self.assertIn("freetalon/api.py", repair_prompt)
 
     # --- (c) Validity measurements, new files, and non-code files pass ---
@@ -6802,7 +6849,10 @@ class TestPlannerCodeAppendFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 7 errors", message)
+        self.assertIn(
+            f"was rejected with {_expected_retry10_error_count()} errors",
+            message,
+        )
         self.assertIn("depends on unknown node", message)
         self.assertIn("endpoint_implemented", message)
 

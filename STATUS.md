@@ -1435,3 +1435,29 @@ Deliberately left out:
   module is a pre-existing hazard (the scaffold handler replaces the
   file; the ROUTE GOAL shape already steers there).
 - Next: /health retry #17 on the fixed planner.
+- CI-only test failure fixed (Tests run 44065722972 on the ca55456 push:
+  3 failures, GPU tests green): the retry-#10 attempt-3 count assertions
+  expected 7 errors but CI saw 9. Root cause, not a validator bug: the
+  fixture names the absolute seeker7 path
+  /home/seeker/projects/FreeTalon/freetalon/api.py, and
+  _unwritten_file_errors fires only when that path does not exist on
+  disk -- on seeker7 it exists (7 errors), in CI the checkout lives
+  elsewhere (9: the same 7 plus one unwritten-file error per node).
+  Fix, tests only: new _expected_retry10_error_count() helper (7 where
+  the fixture path exists, 9 elsewhere) used by all 4 retry-#10 tests.
+  A second disk-dependent wording turned up in the same audit: the
+  code-append check says "no longer parses as Python" against an
+  existing file but "does not parse as Python" against content alone,
+  so the 2 retry-#16 tests now assert either phrasing via
+  _assert_code_append_parse_error(). The retry-#15 test (7 errors) is
+  unchanged -- probed stable at 7 in both disk states. Full-module
+  audit under a simulated-CI stub leaves only 5 failures, all known
+  false positives: their fixtures use __file__-derived paths, which
+  exist in real CI under /home/runner (4 of them passed in the real CI
+  626 run; the 5th uses the identical fixture as one that did).
+- Tests: 653/653 green, no new tests. M5 smoke passes (finance
+  run-20261117T111951Z-b4fc9a, ECU run-20261117T111951Z-33abf7). The 6
+  fixed tests pass both unpatched on seeker7 and under the simulated-CI
+  stub. freetalon/api.py untouched (219 lines, 0-line diff vs HEAD).
+  GPU baseline: 46C, 42.95W, limit 300W, link x16, zero Xid 79/154.
+- Next: push (CI check for this fix), then /health retry #17.
