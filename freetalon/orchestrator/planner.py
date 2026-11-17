@@ -3686,6 +3686,179 @@ def _existing_module_definitions(path: str | Path) -> list[str]:
         return []
     return names
 
+# Retry #30: the definition NAMES were not enough — retry #29's model
+# had all 12 of api.py's names and still guessed the layout (the
+# nested Handler class hoisted to module level twice; once written
+# as the dotted class name HiveAPIServer.start.Handler, a syntax
+# error). The grounding now also carries the module's STRUCTURE.
+# Budget (measured 2026-11-17 with the Gemma 3 tokenizer from
+# models/tokenizer.json; audit in freetalon-workspace/logs/
+# skeleton-grounding-fix-2026-11-17.log): num_ctx is 12288; the
+# initial call for the /health goal is 4,644 tokens; a successful
+# full-module plan costs ~2,642 tokens to emit. Full source for
+# api.py is 2,194 tokens — the worst realistic round (a repair
+# carrying the source in the shape plus the skeleton in the
+# extension block, then a full-module reply) totals ~10,850,
+# leaving ~1,400 spare. So: full source at or under 10,000 chars
+# (~2,350 tokens at api.py's density), the signature skeleton
+# above that, and the skeleton is hard-capped at 8,000 chars with
+# an explicit truncation marker. The qualified-definition list
+# itself is never truncated — only the illustrative structure is
+# capped.
+_STRUCTURE_FULL_SOURCE_MAX_CHARS = 10_000
+_STRUCTURE_SKELETON_MAX_CHARS = 8_000
+
+
+def _module_skeleton(source: str) -> str:
+    """A module's signature skeleton: real lines, bodies elided.
+
+    Every def/class header is reproduced verbatim from the source —
+    decorators included, multi-line signatures whole — so the
+    indentation and nesting shown are the file's own. A body holding
+    no nested definition collapses to a single ``...`` line at the
+    body's indentation; a body holding nested definitions keeps its
+    statements' first lines around them, so a nested class appears
+    exactly where the file defines it. Module-level imports are
+    kept verbatim and other module-level statements are reduced to
+    their first line. Returns "" when the source does not parse.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ""
+    lines = source.splitlines()
+
+    def _segment(start: int, end: int) -> list[str]:
+        return lines[start - 1 : end]
+
+    def _first_line(node: ast.stmt) -> list[str]:
+        seg = _segment(node.lineno, node.end_lineno or node.lineno)
+        if not seg:
+            return []
+        return [seg[0] + (" ..." if len(seg) > 1 else "")]
+
+    def _emit_def(
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+    ) -> list[str]:
+        start = node.lineno
+        for decorator in node.decorator_list:
+            start = min(start, decorator.lineno)
+        if node.body and node.body[0].lineno > node.lineno:
+            header_end = node.body[0].lineno - 1
+        else:
+            header_end = node.end_lineno or node.lineno
+        header = _segment(start, header_end)
+        while header and not header[-1].strip():
+            header.pop()
+        out = list(header)
+        if not node.body or node.body[0].lineno == node.lineno:
+            return out  # one-liner: the header IS the whole definition
+        out.extend(_emit_body(node.body))
+        return out
+
+    def _emit_body(body: list[ast.stmt]) -> list[str]:
+        has_defs = any(
+            isinstance(
+                stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            )
+            for stmt in body
+        )
+        if not has_defs:
+            if body:
+                return [" " * body[0].col_offset + "..."]
+            return []
+        out: list[str] = []
+        for stmt in body:
+            if isinstance(
+                stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                out.extend(_emit_def(stmt))
+            else:
+                out.extend(_first_line(stmt))
+        return out
+
+    out: list[str] = []
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            out.extend(
+                _segment(stmt.lineno, stmt.end_lineno or stmt.lineno)
+            )
+        elif isinstance(
+            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            if out:
+                out.append("")
+            out.extend(_emit_def(stmt))
+        else:
+            out.extend(_first_line(stmt))
+    return "\n".join(out)
+
+
+def _cap_skeleton(skeleton: str) -> str:
+    """Bound a skeleton for the prompt, marking any truncation.
+
+    Only the illustrative structure is capped; the qualified
+    definition list the grounding also carries is never truncated.
+    """
+    if len(skeleton) <= _STRUCTURE_SKELETON_MAX_CHARS:
+        return skeleton
+    cut = skeleton.rfind("\n", 0, _STRUCTURE_SKELETON_MAX_CHARS)
+    if cut <= 0:
+        cut = _STRUCTURE_SKELETON_MAX_CHARS
+    return (
+        skeleton[:cut]
+        + "\n# ... (structure truncated here — the definition list "
+        "above is complete)"
+    )
+
+
+def _grounded_module_source(path: str | Path) -> str | None:
+    """Source of an existing parseable module at the guard's floor.
+
+    The shared gate for the structure grounding: None when the file
+    does not exist, does not parse, or has fewer than four qualified
+    definitions — the same conditions under which
+    _existing_module_definitions returns [].
+    """
+    try:
+        source = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if len(qualified_def_names(source)) < 4:
+        return None
+    return source
+
+
+def _existing_module_structure(path: str | Path) -> tuple[str, str] | None:
+    """(kind, text) structure grounding for an existing module, or None.
+
+    kind is "source" — the module's full current source — when it
+    fits the prompt budget (_STRUCTURE_FULL_SOURCE_MAX_CHARS), else
+    "skeleton" — the capped signature skeleton. None under the same
+    conditions as _existing_module_definitions.
+    """
+    source = _grounded_module_source(path)
+    if source is None:
+        return None
+    if len(source) <= _STRUCTURE_FULL_SOURCE_MAX_CHARS:
+        return ("source", source)
+    return ("skeleton", _cap_skeleton(_module_skeleton(source)))
+
+
+def _existing_module_skeleton(path: str | Path) -> str:
+    """The capped signature skeleton of an existing module, or "".
+
+    The extension-steering block always carries the skeleton form,
+    even when the shape block carried the full source: the repair
+    decision needs the layout beside the dropped list, and the
+    skeleton is the bounded form of it. "" under the same
+    conditions as _existing_module_definitions.
+    """
+    source = _grounded_module_source(path)
+    if source is None:
+        return ""
+    return _cap_skeleton(_module_skeleton(source))
+
 
 def _route_goal_shape(
     goal_text: str | None,
@@ -3778,6 +3951,35 @@ def _route_goal_shape(
             "code. A scaffold that omits a listed definition deletes "
             "it and is rejected."
         )
+        # Retry #30: names alone left the model guessing the layout
+        # (retry #29 hoisted the nested Handler class to module
+        # level twice and once wrote it as a dotted class name).
+        # Show the structure itself — the full source when it fits
+        # the prompt budget, else the signature skeleton — with
+        # the file's real indentation, so the nesting is copied,
+        # not inferred.
+        structure = _existing_module_structure(module_path)
+        if structure is not None:
+            kind, text = structure
+            if kind == "source":
+                lines.append(
+                    "The module's full current source is below. Node "
+                    "1's scaffold is THIS source with the new code "
+                    "added in place: copy every existing definition "
+                    "exactly as written, at the indentation shown, "
+                    "and add the new code inside the definition it "
+                    f"belongs to.\n```python\n{text.rstrip()}\n```"
+                )
+            else:
+                lines.append(
+                    "The module's structure is below, with its real "
+                    "indentation (a line containing only ... stands "
+                    "for a definition's existing body — write the "
+                    "real body in your scaffold; never copy a ... "
+                    "line as a body). Definitions nested in the "
+                    "file appear nested here: keep every definition "
+                    f"at exactly this nesting.\n```python\n{text}\n```"
+                )
     # Retry #25: attempt 1's scaffold plan was good code and failed
     # ONLY on two interpreter strings the model composed from prose —
     # a bare `python` in a step-2 criterion command and
@@ -3998,7 +4200,10 @@ def _extension_steering_block(
     repair round the FULL dropped list (no truncation), the module's
     FULL definition list, and the concrete pattern to copy: the full
     updated module, every definition in its existing place, plus the
-    new code. Returns "" unless the rejection is the guard's and a
+    new code. Retry #30: the block also appends the module's
+    signature skeleton (real indentation, bodies elided) — the names
+    alone left the nesting to guesswork. Returns "" unless the
+    rejection is the guard's and a
     scaffold node in the failed output recomputes to a guard-scale
     drop.
     """
@@ -4050,6 +4255,21 @@ def _extension_steering_block(
         dropped = [name for name in existing_names if name not in kept]
         if len(dropped) < 3 or len(dropped) * 2 < len(existing_names):
             continue  # below the guard's own firing thresholds
+        # Retry #30: the dropped names map onto the layout only if
+        # the layout is in the block — append the module's skeleton
+        # (always the skeleton form: bounded, and the repair needs
+        # the nesting beside the dropped list, not the bodies).
+        skeleton = _existing_module_skeleton(
+            _resolve_plan_target(target, root)
+        )
+        structure_part = ""
+        if skeleton:
+            structure_part = (
+                " The module's structure, with its real indentation "
+                "(a line containing only ... stands for a "
+                "definition's existing body), is:\n"
+                f"```python\n{skeleton}\n```"
+            )
         blocks.append(
             f"\nEXISTING-MODULE EXTENSION — node '{raw.get('id')}' "
             f"scaffolds {target}, which already exists. Your scaffold "
@@ -4064,7 +4284,9 @@ def _extension_steering_block(
             "not move a definition to the top level, rename it, or "
             "drop it), plus your new code added. Do not write a new "
             "smaller module in its place — a scaffold that omits an "
-            "existing definition is rejected again.\n"
+            "existing definition is rejected again."
+            + structure_part
+            + "\n"
         )
     return "".join(blocks)
 

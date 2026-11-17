@@ -1417,7 +1417,13 @@ class TestPlannerFakeAndMemoryFix(unittest.TestCase):
             replan_from_brief(self._brief())
         user_prompt = call_mock.call_args[0][1]
         # No verbatim memory JSON anywhere in the prompt: no record keys.
-        self.assertNotIn('"run_id"', user_prompt)
+        # Retry #30: the bare '"run_id"' literal now legitimately
+        # appears — the replan prompt carries freetalon/api.py's full
+        # source as EXISTING MODULE grounding, and its /gates handler
+        # reads a run_id query parameter (qs.get("run_id", ...)).
+        # The anti-echo pin therefore targets the record's JSON KEY
+        # form ("run_id": <value>), which stays absent.
+        self.assertNotIn('"run_id":', user_prompt)
         self.assertNotIn('"goal_key"', user_prompt)
         self.assertNotIn('"node_id"', user_prompt)
         self.assertNotIn('"approach"', user_prompt)
@@ -1467,7 +1473,9 @@ class TestPlannerFakeAndMemoryFix(unittest.TestCase):
         # The failed output is described, never pasted back: the verbatim
         # memory record must not appear in the repair prompt.
         self.assertNotIn(echo, repair_prompt)
-        self.assertNotIn('"run_id"', repair_prompt)
+        # Retry #30: the record's JSON key form, as above — api.py's
+        # source in the prompt uses "run_id" as a query literal.
+        self.assertNotIn('"run_id":', repair_prompt)
         self.assertNotIn('"goal_key"', repair_prompt)
 
     def test_replan_gives_up_after_memory_echo_budget(self) -> None:
@@ -14487,3 +14495,514 @@ class TestPlannerExtensionSteeringFix(unittest.TestCase):
         # ...while a definition it kept is not in the dropped segment.
         self.assertNotIn("HiveAPIServer.__init__", segment)
         self.assertNotIn("SHAPE was right", repair_prompt)
+
+
+class TestPlannerSkeletonGroundingFix(unittest.TestCase):
+    """Show the model the existing module's structure, not just its names (retry #29).
+
+    Retry #29 (log llm-end-to-end-health-retry29-2026-11-17.log,
+    DRIVER_EXIT 1) was the first run with the extension-steering fix
+    (95a8c8e) live, and the steering measurably worked: the repair
+    outputs adopted the in-place framing verbatim and the scaffold
+    definition count rose 9 -> 11. All three outputs still failed,
+    and every failure was the same root cause — the model had the
+    module's definition NAMES but had never seen the module's BODY,
+    so it guessed the qualified-name layout:
+
+    - outputs 1 and 2 hoisted the Handler class to module level,
+      dropping the 7 nested HiveAPIServer.start.Handler.* names
+      (and, in output 2, _ThreadingHTTPServer) — the overwrite guard
+      fired (8 of 12 dropped) on both;
+    - output 3 wrote ``class HiveAPIServer.start.Handler(...)`` —
+      the dotted qualified name used as a class name, a syntax
+      error.
+
+    Fix: the EXISTING MODULE grounding now carries the module's
+    structure with its real indentation. _route_goal_shape appends
+    the module's FULL SOURCE when it fits the prompt budget
+    (_STRUCTURE_FULL_SOURCE_MAX_CHARS = 10,000 chars — measured
+    2026-11-17 with the Gemma 3 tokenizer: num_ctx 12288, the
+    current initial call is 4,644 tokens, api.py's source is 2,194
+    tokens, a successful full-module plan costs ~2,642 tokens to
+    emit, and the worst realistic repair round totals ~10,850), and
+    the signature skeleton from _module_skeleton (headers verbatim,
+    bodies elided to ``...``, hard-capped at 8,000 chars with an
+    explicit truncation marker) above it. _extension_steering_block
+    appends the skeleton beside the dropped list. The definition
+    list itself is never truncated. The overwrite guard and the
+    interpreter normalization are untouched: the retry-#29 outputs
+    (and retry-#28's) reject with exactly the same error profiles
+    as before, under both repo roots.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#29 outputs, verbatim from the RAW PLANNER
+    # OUTPUT blocks of the retry-#29 driver section of
+    # logs/llm-end-to-end-health-retry29-2026-11-17.log (the same
+    # extraction tools/probe-retry29-rejections.py performs).
+    # Embedded (not read from the log) so the tests stay hermetic
+    # in CI.
+    RETRY29_OUTPUT1_RAW = '{\n"nodes":[\n{"id":"step_1",\n"objective":"Add /health endpoint to freetalon/api.py",\n"depends_on":[],\n"assigned_claw":"scaffold",\n"status":"draft",\n"inputs":{"file_path":"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":"import http.server\\nimport socketserver\\nimport threading\\nimport json\\nimport os\\nfrom urllib.parse import urlparse, parse_qs\\n\\ndef _ThreadingHTTPServer(port):\\n    Handler = http.server.SimpleHTTPRequestHandler\\n    with socketserver.TCPServer((\'\', port), Handler) as httpd:\\n        print(\'serving at port\', port)\\n        httpd.serve_forever()\\n\\ndef HiveAPIServer():\\n    def start():\\n        port = 8765\\n        _ThreadingHTTPServer(port)\\n\\n    def stop():\\n        pass\\n\\n    return start\\n\\nstart = HiveAPIServer().start\\n\\ndef _authorized(request):\\n    return True\\n\\ndef _json_body(request):\\n    try:\\n        payload = json.loads(request.read().decode(\'utf-8\'))\\n        return payload\\n    except json.JSONDecodeError:\\n        return None\\n\\ndef _send(response, status_code, body=None):\\n    response.status = status_code\\n    if body is not None:\\n        response.write(body.encode(\'utf-8\'))\\n\\ndef do_GET(self):\\n    path = urlparse(self.path).path\\n    if path == \'/health\':\\n        import requests\\n        try:\\n            ollama_status = requests.get(\'http://localhost:11434/api/health\').status_code == 200\\n        except requests.exceptions.RequestException:\\n            ollama_status = False\\n\\n        try:\\n            import subprocess\\n            gpu_temp = subprocess.check_output([\'nvidia-smi\', \'--query-gpu=temperature.gpu\', \'--format=csv,noheader\']).decode(\'utf-8\').strip()\\n        except FileNotFoundError:\\n            gpu_temp = \'N/A\'\\n\\n        health_data = {\'status\': \'OK\', \'ollama_reachable\': ollama_status, \'gpu_temperature\': gpu_temp}\\n        self.send_response(200)\\n        self.send_header(\'Content-type\', \'application/json\')\\n        self.end_headers()\\n        self.wfile.write(json.dumps(health_data).encode(\'utf-8\'))\\n    else:\\n        super().do_GET(self)\\n\\ndef do_POST(self):\\n    pass"},\n"outputs":["/home/seeker/projects/FreeTalon/freetalon/api.py"],\n"acceptance":"/health endpoint returns JSON with status, ollama reachability and GPU temperature",\n"criteria":[{"type":"file_exists","path":"/home/seeker/projects/FreeTalon/freetalon/api.py"}],\n"error":null\n},\n{"id":"step_2",\n"objective":"Run tests",\n"depends_on":["step_1"],\n"assigned_claw":"bash",\n"status":"draft",\n"inputs":{"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m unittest discover -s tests"},\n"outputs":[],\n"acceptance":"Tests pass",\n"criteria":[{"type":"exit_code","equals":0}],\n"error":null\n},\n{"id":"step_3",\n"objective":"Start the server and verify /health endpoint",\n"depends_on":["step_2"],\n"assigned_claw":"bash",\n"status":"draft",\n"inputs":{"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli start"},\n"outputs":[],\n"acceptance":"Server starts and /health returns OK",\n"criteria":[{"type":"exit_code","equals":0},\n{"type":"file_exists","path":"/home/seeker/projects/FreeTalon/.venv"}],\n"error":null\n}\n]\n}'
+
+    RETRY29_OUTPUT2_RAW = '{\n"nodes":\n[\n{\n"id":\n"step_1",\n"objective":\n"Extend /home/seeker/projects/FreeTalon/freetalon/api.py with a /health branch to the do_GET method of the Handler class (defined inside HiveAPIServer.start)",\n"depends_on":\n[],\n"assigned_claw":\n"scaffold",\n"inputs":\n{\n"file_path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":\n"# coding=utf-8\\n# Import necessary modules\\nimport http.server\\nimport socketserver\\nimport threading\\nimport json\\nfrom urllib.parse import urlparse, parse_qs\\n\\nclass HiveAPIServer(socketserver.ThreadingMixIn, socketserver.TCPServer):\\n    def __init__(self, server_address, HandlerClass):\\n        super().__init__(server_address, HandlerClass)\\n        self.daemon = True\\n\\n    def start(self):\\n        self.socket = self.socket # Ensure the socket is accessible\\n        thread = threading.Thread(target=self.serve_forever)\\n        thread.daemon = True\\n        thread.start()\\n\\n    def stop(self):\\n        self.shutdown()\\n\\nclass Handler(http.server.SimpleHTTPRequestHandler):\\n    def do_GET(self):\\n        if self.path == \'/health\':\\n            self.send_response(200)\\n            self.send_header(\'Content-type\', \'application/json\')\\n            self.end_headers()\\n            data = {\'status\': \'OK\', \'ollama_reachable\': True, \'gpu_temperature\': \'N/A\'}\\n            self.wfile.write(json.dumps(data).encode(\'utf-8\'))\\n        else:\\n            super().do_GET()\\n\\n    def do_POST(self):\\n        pass\\n\\n    def _authorized(self):\\n        return True\\n\\n    def _json_body(self):\\n        try:\\n            length = int(self.headers[\'Content-Length\'])\\n            body = self.rfile.read(length)\\n            return json.loads(body)\\n        except (KeyError, ValueError):\\n            return None\\n\\n    def _send(self, data):\\n        self.send_response(200)\\n        self.send_header(\'Content-type\', \'application/json\')\\n        self.end_headers()\\n        self.wfile.write(json.dumps(data).encode(\'utf-8\'))\\n\\n    def log_message(self, format, *args):\\n        pass"\n},\n"outputs":\n[\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n],\n"acceptance":\n[\n"File exists and contains the /health endpoint"\n],\n"criteria":\n[\n{\n"type":\n"file_exists",\n"path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_2",\n"objective":\n"Run the tests and verify they pass",\n"depends_on":\n[\n"step_1"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m unittest discover -s tests"\n},\n"outputs":\n[\n"test results"\n],\n"acceptance":\n[\n"All tests pass"\n],\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_3",\n"objective":\n"Start the API server and verify it answers on /health",\n"depends_on":\n[\n"step_2"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli start"\n},\n"outputs":\n[\n"/health endpoint is reachable"\n],\n"acceptance":\n[\n"API server starts and responds to /health"\n],\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n}\n]\n}'
+
+    RETRY29_OUTPUT3_RAW = '{\n"nodes":\n[\n{\n"id":\n"step_1",\n"objective":\n"Extend /home/seeker/projects/FreeTalon/freetalon/api.py with a /health branch to the do_GET method of the Handler class (defined inside HiveAPIServer.start)",\n"depends_on":\n[],\n"assigned_claw":\n"scaffold",\n"inputs":\n{\n"file_path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":\n"# coding: utf-8\\n# flake8: noqa\\n\\"\\"\\"API for FreeTalon.\\"\\"\\"\\nimport logging\\nfrom threading import Thread\\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\\nimport json\\nimport os\\n\\nclass HiveAPIServer:\\n    def __init__(self):\\n        self._httpd = None\\n        self._thread = None\\n        self._port = 8765\\n        self._config = self.load_config()\\n\\n    def load_config(self):\\n        return { \\"port\\": 8765 } # Dummy config for now\\n\\n    def start(self):\\n        self._httpd = HTTPServer((\\"localhost\\", self._config[\\"port\\"]), HiveAPIServer.start.Handler)\\n        self._thread = Thread(target=self._httpd.serve_forever)\\n        self._thread.daemon = True\\n        self._thread.start()\\n\\n    def stop(self):\\n        if self._httpd:\\n            self._httpd.shutdown()\\n\\nclass HiveAPIServer.start.Handler(BaseHTTPRequestHandler):\\n    def do_GET(self):\\n        if self.path == \'/\': # Default route\\n            self.send_response(200)\\n            self.send_header(\'Content-type\', \'text/html\')\\n            self.end_headers()\\n            message = \\"<html><body><h1>FreeTalon API</h1></body></html>\\"\\n            self.wfile.write(bytes(message, \\"utf8\\"))\\n        elif self.path == \'/health\': # New health route\\n            self.send_response(200)\\n            self.send_header(\'Content-type\', \'application/json\')\\n            self.end_headers()\\n            # Check OLLAMA reachability (dummy check for now)\\n            ollama_reachable = True # Replace with actual check\\n            # Check GPU temperature (dummy check for now)\\n            gpu_temp = \\"N/A\\" # Replace with actual check\\n            response = { \\"status\\": \\"OK\\", \\"ollama_reachable\\": ollama_reachable, \\"gpu_temperature\\": gpu_temp}\\n            self.wfile.write(bytes(json.dumps(response), \\"utf8\\"))\\n        else:\\n            super().do_GET()\\n\\n    def do_POST(self):\\n        pass # Placeholder for POST requests\\n\\n    def _authorized(self):\\n        return True  # Dummy authorization\\n\\n    def _json_body(self):\\n        try:\\n            length = int(self.headers[\'Content-Length\']) if \'Content-Length\' in self.headers else 0\\n            if length > 0:\\n                body = self.rfile.read(length)\\n                return json.loads(body)\\n            else:\\n                return None\\n        except Exception as e:\\n            logging.error(f\\"Error parsing JSON body: {e}\\")\\n            return None\\n\\n    def _send(self, code, message):\\n        self.send_response(code)\\n        self.end_headers()\\n        if isinstance(message, str):\\n            self.wfile.write(bytes(message, \\"utf8\\"))\\n        else:\\n            self.wfile.write(bytes(json.dumps(message), \\"utf8\\"))\\n\\n    def log_message(self, format, *args, **kwargs):\\n        pass # Disable logging for now"\n},\n"outputs":\n[\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n],\n"acceptance":\n"API /health endpoint returns JSON reporting service status",\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n}\n]\n}'
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": self.WS},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _rejection(self, raw: str, **kwargs: object) -> str:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw, **kwargs)
+        return str(caught.exception)
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        """The grounded plan: edit the module, heredoc the tests, curl 8765."""
+        ws = self.WS
+        return [
+            {
+                "id": "step_1",
+                "objective": "Extend the health endpoint in freetalon/api.py",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+                "outputs": [self.api_path],
+                "criteria": [{"type": "file_exists", "path": self.api_path}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Write the health endpoint test file",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": TestPlannerHeredocFix.HEREDOC_TEST},
+                "outputs": [f"{ws}/test_health.py"],
+                "criteria": [{"type": "file_exists", "path": f"{ws}/test_health.py"}],
+            },
+            {
+                "id": "step_3",
+                "objective": "Run the health endpoint tests",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": f"python3 {ws}/test_health.py"},
+                "outputs": ["test results"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_4",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_3"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -s http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+
+    # --- The shape block carries the structure ---
+
+    def test_route_goal_shape_carries_module_source_with_real_nesting(self) -> None:
+        from freetalon.orchestrator.planner import _route_goal_shape
+
+        handler_line = "        class Handler(BaseHTTPRequestHandler):"
+        for delta in (False, True):
+            shape = _route_goal_shape(
+                self.HEALTH_GOAL, str(self.repo_root), delta=delta
+            )
+            self.assertIn("EXISTING MODULE", shape)
+            # api.py is 9,380 chars — under the full-source threshold,
+            # so the shape carries the module itself, not the skeleton.
+            self.assertIn("The module's full current source is below", shape)
+            # The Handler class line appears with its REAL leading
+            # indentation (8 spaces), as a whole line of the block.
+            self.assertIn(handler_line, shape.splitlines())
+            # ...inside the start method's region of the block: after
+            # start's header line and before stop's.
+            start_idx = shape.index("    def start(self, host: str, port: int) -> None:")
+            handler_idx = shape.index(handler_line)
+            stop_idx = shape.index("    def stop(self) -> None:")
+            self.assertLess(start_idx, handler_idx)
+            self.assertLess(handler_idx, stop_idx)
+            # Body fidelity: a line from deep inside do_GET rides
+            # along — this is the source, not a summary.
+            self.assertIn('                if path == "/health":', shape)
+            # The COMMANDS block still closes the shape.
+            self.assertLess(shape.index("EXISTING MODULE"), shape.index("COMMANDS"))
+
+    def test_route_goal_shape_skeleton_branch_when_source_too_big(self) -> None:
+        from freetalon.orchestrator import planner
+        from freetalon.orchestrator.planner import _module_skeleton, _route_goal_shape
+
+        source = (self.repo_root / "freetalon" / "api.py").read_text(
+            encoding="utf-8"
+        )
+        skeleton = _module_skeleton(source)
+        with patch.object(
+            planner,
+            "_existing_module_structure",
+            return_value=("skeleton", skeleton),
+        ):
+            shape = _route_goal_shape(
+                self.HEALTH_GOAL, str(self.repo_root), delta=False
+            )
+        self.assertIn("The module's structure is below, with its real", shape)
+        self.assertIn("never copy a ... ", shape)
+        self.assertIn(
+            "        class Handler(BaseHTTPRequestHandler):", shape.splitlines()
+        )
+        self.assertNotIn("The module's full current source is below", shape)
+
+    def test_initial_prompt_carries_module_structure(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[good]
+        ) as call_mock:
+            plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 1)
+        initial_prompt = call_mock.call_args_list[0][0][1]
+        self.assertIn("The module's full current source is below", initial_prompt)
+        self.assertIn(
+            "        class Handler(BaseHTTPRequestHandler):",
+            initial_prompt.splitlines(),
+        )
+
+    def test_replan_prompt_carries_module_structure(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        echo = '{"goal": {"objective": "x"}, "failed_nodes": []}'
+        good = self._dag(self._grounded_health_nodes())
+        brief = {
+            "goal": {"objective": self.HEALTH_GOAL},
+            "failed_nodes": [],
+            "workspace": self.WS,
+        }
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[echo, good]
+        ) as call_mock:
+            nodes = replan_from_brief(
+                brief, settings=self.settings, repo_root=str(self.repo_root)
+            )
+        self.assertEqual(len(nodes), 4)
+        initial_prompt = call_mock.call_args_list[0][0][1]
+        self.assertIn("The module's full current source is below", initial_prompt)
+        self.assertIn(
+            "        class Handler(BaseHTTPRequestHandler):",
+            initial_prompt.splitlines(),
+        )
+
+    # --- The skeleton builder ---
+
+    def test_module_skeleton_of_api_module(self) -> None:
+        from freetalon.orchestrator.planner import _module_skeleton
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        source = (self.repo_root / "freetalon" / "api.py").read_text(
+            encoding="utf-8"
+        )
+        skeleton = _module_skeleton(source)
+        lines = skeleton.splitlines()
+        # The nested layout, at the file's own indentation.
+        self.assertIn("class HiveAPIServer:", lines)
+        self.assertIn("        class Handler(BaseHTTPRequestHandler):", lines)
+        self.assertIn("            def do_GET(self) -> None:  # noqa: N802", lines)
+        self.assertIn("    def stop(self) -> None:", lines)
+        # The multi-line __init__ signature is reproduced whole.
+        self.assertIn("    def __init__(", lines)
+        self.assertIn("        gate_store: GateStore | None = None,", lines)
+        self.assertIn("    ) -> None:", lines)
+        # Bodies are elided, and the skeleton itself parses — and
+        # carries exactly the same qualified names as the source.
+        self.assertIn("        ...", lines)
+        import ast
+
+        ast.parse(skeleton)
+        self.assertEqual(
+            qualified_def_names(skeleton), qualified_def_names(source)
+        )
+        # Imports ride verbatim.
+        self.assertIn("from .hive import HiveController", lines)
+
+    def test_module_skeleton_constructs(self) -> None:
+        from freetalon.orchestrator.planner import _module_skeleton
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        source = "\n".join(
+            [
+                '"""Module docstring."""',
+                "import os",
+                "from typing import Any",
+                "",
+                "CONSTANT = (",
+                '    "a long value"',
+                ")",
+                "",
+                "",
+                "def deco(fn):",
+                "    return fn",
+                "",
+                "",
+                "@deco",
+                "def top_level(",
+                "    arg: int,",
+                ") -> int:",
+                "    return arg + 1",
+                "",
+                "",
+                "async def fetch(url: str) -> bytes:",
+                "    return b''",
+                "",
+                "",
+                "def one_liner() -> int: return 42",
+                "",
+                "",
+                "class Outer:",
+                "    kind = 'outer'",
+                "",
+                "    class Inner:",
+                "        def deep(self) -> None:",
+                "            return None",
+                "",
+                "    def method(self) -> None:",
+                "        def helper() -> int:",
+                "            return 1",
+                "        return None",
+                "",
+            ]
+        )
+        skeleton = _module_skeleton(source)
+        lines = skeleton.splitlines()
+        # Decorator rides directly above its definition.
+        deco_idx = lines.index("@deco")
+        self.assertEqual(lines[deco_idx + 1], "def top_level(")
+        # Multi-line signature whole; async header; one-liner whole.
+        self.assertIn("    arg: int,", lines)
+        self.assertIn("async def fetch(url: str) -> bytes:", lines)
+        self.assertIn("def one_liner() -> int: return 42", lines)
+        # Nesting at true indentation, at every depth.
+        self.assertIn("    class Inner:", lines)
+        self.assertIn("        def deep(self) -> None:", lines)
+        self.assertIn("        def helper() -> int:", lines)
+        # A multi-line module-level statement is reduced to its
+        # first line, marked as elided.
+        self.assertIn("CONSTANT = ( ...", lines)
+        # Every definition's header line survives at its nesting.
+        # (Checked line-wise here: this skeleton does NOT parse —
+        # a multi-line statement reduced to its first line, like
+        # CONSTANT above, can leave brackets open — so
+        # qualified_def_names, which needs a parse, cannot be the
+        # checker. The skeleton is prompt text, never executed.
+        # The api module's skeleton does parse, and the test above
+        # pins full qualified-name equality for the real target.)
+        self.assertIn("def deco(fn):", lines)
+        self.assertIn("class Outer:", lines)
+        self.assertIn("    def method(self) -> None:", lines)
+        # Unparseable source has no skeleton.
+        self.assertEqual(_module_skeleton("def nope(:\n"), "")
+
+    def test_existing_module_structure_threshold_and_floor(self) -> None:
+        import tempfile
+
+        from freetalon.orchestrator.planner import (
+            _existing_module_skeleton,
+            _existing_module_structure,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Missing, unparseable, and under-floor modules ground
+            # nothing — the same gate as _existing_module_definitions.
+            self.assertIsNone(_existing_module_structure(root / "nope.py"))
+            broken = root / "broken.py"
+            broken.write_text("def nope(:\n", encoding="utf-8")
+            self.assertIsNone(_existing_module_structure(broken))
+            tiny = root / "tiny.py"
+            tiny.write_text(
+                "class Widget:\n"
+                "    def start(self):\n        return 1\n"
+                "    def stop(self):\n        return 2\n",
+                encoding="utf-8",
+            )
+            self.assertIsNone(_existing_module_structure(tiny))
+            self.assertEqual(_existing_module_skeleton(tiny), "")
+            # A small module at the floor: full source, verbatim.
+            small = root / "small.py"
+            small_src = (
+                "def a():\n    return 1\n\n\n"
+                "def b():\n    return 2\n\n\n"
+                "def c():\n    return 3\n\n\n"
+                "def d():\n    return 4\n"
+            )
+            small.write_text(small_src, encoding="utf-8")
+            self.assertEqual(
+                _existing_module_structure(small), ("source", small_src)
+            )
+            # A module over the source threshold: the skeleton form.
+            big = root / "big.py"
+            big_src = "\n".join(
+                "def fn_%02d():\n    return %r\n" % (i, "x" * 200)
+                for i in range(60)
+            )
+            self.assertGreater(len(big_src), 10_000)
+            big.write_text(big_src, encoding="utf-8")
+            kind, text = _existing_module_structure(big)
+            self.assertEqual(kind, "skeleton")
+            self.assertIn("def fn_00():", text)
+            self.assertIn("def fn_59():", text)
+            self.assertLess(len(text), len(big_src))
+            # The api module's skeleton via the path helper carries
+            # the nested Handler line.
+            api_skeleton = _existing_module_skeleton(self.api_path)
+            self.assertIn(
+                "        class Handler(BaseHTTPRequestHandler):",
+                api_skeleton.splitlines(),
+            )
+
+    def test_skeleton_cap_marks_truncation(self) -> None:
+        import tempfile
+
+        from freetalon.orchestrator.planner import (
+            _STRUCTURE_SKELETON_MAX_CHARS,
+            _cap_skeleton,
+            _existing_module_structure,
+        )
+
+        long_skeleton = "\n".join(
+            "def function_number_%03d():" % i for i in range(400)
+        )
+        self.assertGreater(len(long_skeleton), _STRUCTURE_SKELETON_MAX_CHARS)
+        capped = _cap_skeleton(long_skeleton)
+        self.assertIn("structure truncated here", capped)
+        self.assertIn("the definition list above is complete", capped)
+        self.assertLessEqual(
+            len(capped), _STRUCTURE_SKELETON_MAX_CHARS + 120
+        )
+        # A module whose skeleton exceeds the cap: kind is skeleton
+        # and the marker is present (the definition LIST in the
+        # grounding is computed separately and stays complete).
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp) / "huge.py"
+            big.write_text(
+                "\n".join(
+                    "def a_very_long_function_name_%03d():\n"
+                    "    return %r\n" % (i, "y" * 120)
+                    for i in range(300)
+                ),
+                encoding="utf-8",
+            )
+            kind, text = _existing_module_structure(big)
+            self.assertEqual(kind, "skeleton")
+            self.assertIn("structure truncated here", text)
+
+    # --- The extension block carries the skeleton ---
+
+    def test_extension_block_carries_skeleton(self) -> None:
+        from freetalon.orchestrator.planner import _extension_steering_block
+
+        message = self._rejection(
+            self.RETRY29_OUTPUT2_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        self.assertIn("drops 8 of the existing module's 12 definitions", message)
+        block = _extension_steering_block(self.RETRY29_OUTPUT2_RAW, message, None)
+        self.assertIn("EXISTING-MODULE EXTENSION", block)
+        self.assertIn("dropped these 8 existing definitions", block)
+        self.assertIn("The module's structure, with its real indentation", block)
+        self.assertIn(
+            "        class Handler(BaseHTTPRequestHandler):", block.splitlines()
+        )
+        self.assertIn(
+            "            def do_GET(self) -> None:  # noqa: N802",
+            block.splitlines(),
+        )
+
+    def test_retry29_repair_prompt_carries_extension_skeleton(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm",
+            side_effect=[self.RETRY29_OUTPUT2_RAW, good],
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(len(plan.nodes), 4)
+        repair_prompt = call_mock.call_args_list[1][0][1]
+        self.assertIn("EXISTING-MODULE EXTENSION", repair_prompt)
+        self.assertIn("The module's structure, with its real indentation", repair_prompt)
+        self.assertIn(
+            "        class Handler(BaseHTTPRequestHandler):",
+            repair_prompt.splitlines(),
+        )
+
+    # --- The guard's behavior is unchanged on the fixtures ---
+
+    def test_retry29_outputs_still_rejected_as_before(self) -> None:
+        for root in (None, str(self.repo_root)):
+            message1 = self._rejection(
+                self.RETRY29_OUTPUT1_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertIn("was rejected with 2 errors", message1)
+            self.assertIn(
+                "drops 8 of the existing module's 12 definitions", message1
+            )
+            message2 = self._rejection(
+                self.RETRY29_OUTPUT2_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertIn("was rejected with 1 error", message2)
+            self.assertIn(
+                "drops 8 of the existing module's 12 definitions", message2
+            )
+            message3 = self._rejection(
+                self.RETRY29_OUTPUT3_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertIn("was rejected with 1 error", message3)
+            self.assertIn("does not parse as Python", message3)
+
+    def test_retry28_fixtures_still_rejected_with_one_error(self) -> None:
+        for raw, dropped in (
+            (TestPlannerExtensionSteeringFix.RETRY28_OUTPUT2_RAW, 11),
+            (TestPlannerExtensionSteeringFix.RETRY28_OUTPUT3_RAW, 8),
+        ):
+            for root in (None, str(self.repo_root)):
+                message = self._rejection(
+                    raw,
+                    goal_text=self.HEALTH_GOAL,
+                    workspace=self.WS,
+                    repo_root=root,
+                )
+                self.assertIn("was rejected with 1 error", message)
+                self.assertIn(
+                    "drops %d of the existing module's 12 definitions" % dropped,
+                    message,
+                )
