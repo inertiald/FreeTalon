@@ -343,3 +343,34 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   Reset Required") and the gh token is invalid — this commit is
   local-only until Pat re-auths gh on seeker7. No LLM loads until a
   power limit is re-applied (Pat's decision).
+
+## Update - 2026-11-16 21:00 (/health retry — planner echo, GPU survived)
+
+- GPU is BACK: Pat reseated the FTW3 in the top slot (PCIEX16_1), link
+  width x16 (was x4), 300W limit applied persistently via systemd unit
+  nvidia-power-limit.service (verified Current/Requested 300W). First
+  CUDA load survived (50-token generation, 40C, 172W).
+- /health retry (Pat: "Go — run the /health retry"): FAILED at the
+  planning stage, before any run was created — no run id, no judge
+  involvement. Gemma echoed the TaskIntent JSON verbatim 3/3 times
+  (initial attempt + 2 repairs) instead of producing a plan DAG;
+  parse_planner_response raised "Planner output must contain a 'nodes'
+  array" and plan_task_intent raised honestly. Nothing touched disk.
+  Log: freetalon-workspace/logs/llm-end-to-end-health-retry-2026-11-16.log.
+- Root cause — same failure family as the Nov 14 intake echo:
+  temperature 0 + the planner prompt embeds the intent JSON verbatim
+  ("TaskIntent JSON:\n{...}"), and at temp 0 Gemma copies the most
+  salient JSON in the prompt instead of generating a plan. The intake
+  code already documents this ("with temperature 0 the model otherwise
+  echoes whatever JSON it last saw in the prompt") — the planner has
+  the same flaw. The repair re-prompt re-includes the failed output,
+  which reinforces the echo instead of breaking it.
+- A blind re-run would almost certainly fail identically (same prompt,
+  temp 0, 3/3 identical echoes across differing repair prompts). The
+  fix belongs in the planner prompt/framing, not in another attempt.
+- GPU survived the retry: peak 48C, limit held at 300W, link x16,
+  zero Xid 79/154 after. Fans restored to auto. Suite still 402/402
+  green. The endpoint was NOT extended, no new tests were written,
+  no live verification happened — planning never produced a DAG.
+- Still blocked: gh token invalid — this commit is local-only until
+  Pat re-auths gh on seeker7 (classic PAT plan, 2026-11-17).
