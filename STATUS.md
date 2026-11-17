@@ -897,3 +897,34 @@ Deliberately left out:
   (verified byte-for-byte against a pristine 3b17997 worktree).
   Log: freetalon-workspace/logs/planner-depends-on-fix-2026-11-16.log.
   Next: /health retry #11 (GPU load, separate step).
+
+## Update - 2026-11-17 (early, /health retry #11 — FAIL at planning)
+
+  /health retry #11 FAILED at planning (~50s, DRIVER_EXIT:1, no run
+  created). Pre-flight green (51C, 300W, x16, 0 Xid, head 1cae79e,
+  514/514, Ollama gemma-3-abliterated:latest; fans 85% during,
+  auto after). Intake succeeded. Planner attempts: (1) {"nodes":
+  []} — empty; (2) the stdout-echo fake again (step_1 echo JSON
+  answer to stdout, step_2 echo "# Unit tests..." as the "tests",
+  step_3 curl :8765/health, no criteria on any node, depends_on
+  ["endpoint_implemented"] / ["tests_added"] — output names again)
+  — rejected; (3) a NEW invented schema: nodes with
+  "description"/"output" fields, no objective, no assigned_claw,
+  no inputs, no criteria — but depends_on now uses correct node
+  ids ["step_1"]/["step_2"] (the depends_on fix IS steering). The
+  node-shape fix worked as designed: attempt 3 was an 8-error
+  numbered rejection naming the missing objective and the unknown
+  description/output fields, NOT a structural raise — but the
+  repair budget was already spent. Judge/replan never ran, no run
+  directory created. Endpoint NOT extended, no new tests, suite
+  514/514 green, no stray files. GPU survived (59C peak sampled
+  mid-run, 55C after, 300W, x16, zero Xid).
+  Log: freetalon-workspace/logs/llm-end-to-end-health-retry11-2026-
+  11-16.log. Next weakness: the model fixes the named error but
+  drops the rest of the PlanNode shape — attempt 3 fixed depends_on
+  and invented description/output nodes instead. Same family as
+  the node-shape fix (091ebfd): the shape must survive repair
+  rounds. Candidate: show the full minimal valid node in the
+  repair prompt itself, so a repair that drops required fields
+  (objective, assigned_claw, inputs, criteria) is corrected
+  rather than invented around.
