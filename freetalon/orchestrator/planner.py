@@ -3661,6 +3661,32 @@ def _goal_text_from_brief(brief: dict[str, Any]) -> str:
     return ""
 
 
+def _existing_module_definitions(path: str | Path) -> list[str]:
+    """Qualified def names of an existing parseable module, or [].
+
+    The grounding counterpart of _scaffold_overwrite_errors: the guard
+    rejects a module-scale scaffold that drops at least half (and at
+    least three) of an existing module's definitions, but until retry
+    #28 nothing ever TOLD the model what those definitions are — the
+    repo context lists only top-level names, so the nested definitions
+    (for freetalon/api.py, 10 of its 12) were invisible until the
+    guard named the first eight dropped ones in a rejection. Returns
+    [] when there is nothing to preserve: the file does not exist (a
+    new file), does not parse (already broken — the checks that own
+    that state judge writes to it), or has fewer than four qualified
+    definitions (the guard's own floor: too little structure to judge
+    a rewrite, so no preservation contract is stated for it either).
+    """
+    try:
+        source = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    names = qualified_def_names(source)
+    if len(names) < 4:
+        return []
+    return names
+
+
 def _route_goal_shape(
     goal_text: str | None,
     repo_root: str | Path | None = None,
@@ -3720,6 +3746,37 @@ def _route_goal_shape(
             f"another service's {route} path, and do NOT echo a JSON answer. "
             f"Do NOT re-serialize these instructions as JSON — they are "
             f"guidance, not output; your output is a NEW 'nodes' array."
+        )
+    # Retry #28: attempts 2 and 3 were parse-clean scaffolds that
+    # REPLACED the serving module with a new smaller one (dropping 11
+    # and 8 of its 12 definitions) and were rejected by the overwrite
+    # guard — the model was never told what the module contains. The
+    # repo context names only top-level definitions, so the nested
+    # ones were invisible until a rejection listed them. Name every
+    # qualified definition of each serving module here, with the
+    # preservation contract the guard enforces, so the first attempt
+    # already knows the full-module shape it must produce.
+    seen_modules: set[str] = set()
+    for _route, module in named:
+        if module in seen_modules:
+            continue
+        seen_modules.add(module)
+        module_path = str(index.root / module)
+        definitions = _existing_module_definitions(module_path)
+        if not definitions:
+            continue
+        lines.append(
+            f"EXISTING MODULE — {module_path} already exists with "
+            f"{len(definitions)} definitions: "
+            + ", ".join(definitions)
+            + ". Node 1 EXTENDS this module — it does not write a new "
+            "one. A scaffold overwrites the WHOLE file, so node 1's "
+            "scaffold content must be the full updated module: every "
+            "definition listed above, kept in the same place with the "
+            "same nesting (a name like A.B.C is defined inside B, "
+            "which is defined inside A — keep it there), plus the new "
+            "code. A scaffold that omits a listed definition deletes "
+            "it and is rejected."
         )
     # Retry #25: attempt 1's scaffold plan was good code and failed
     # ONLY on two interpreter strings the model composed from prose —
@@ -3863,6 +3920,14 @@ _CONTENT_DEFECT_MARKERS = (
     "hardcoded answer",
     "Flask",
     "FastAPI",
+    # Retry #28: the overwrite guard's phrase ("drops N of the
+    # existing module's M definitions"). Attempts 2 and 3 were
+    # parse-clean wholesale replacements whose ONLY defect was the
+    # scaffold content itself, yet this block told the repair round
+    # "none of its code was rejected — keep the same code; fix ONLY
+    # the named strings", contradicting the rejection in the same
+    # prompt. The guard's wording is a content defect like the others.
+    "of the existing module's",
 )
 
 
@@ -3907,6 +3972,101 @@ def _shape_steering_block(response_text: str, error_text: str) -> str:
         "different mechanism (such as a sed -i text substitution) to "
         "work around a command-string defect.\n"
     )
+
+
+# The overwrite guard's distinctive phrase, shared by the steering
+# triggers below: it appears in exactly one rejection (the guard's),
+# never in model output or in the node-shape block.
+_OVERWRITE_MARKER = "of the existing module's"
+
+
+def _extension_steering_block(
+    response_text: str,
+    error_text: str,
+    repo_root: str | Path | None = None,
+) -> str:
+    """The concrete in-place pattern for a repair after an overwrite rejection.
+
+    Retry #28: attempts 2 and 3 scaffolded parse-clean REPLACEMENTS of
+    the serving module (dropping 11 and 8 of its 12 definitions). The
+    repair prompt they produced carried only the guard's error text —
+    which truncates the dropped list at eight names — and the
+    shape-steering block actively blessed the replacement (now fixed:
+    the guard's phrase is a content-defect marker, so that block stays
+    silent). This block recomputes the failed scaffold against the
+    module on disk with the guard's own thresholds and hands the
+    repair round the FULL dropped list (no truncation), the module's
+    FULL definition list, and the concrete pattern to copy: the full
+    updated module, every definition in its existing place, plus the
+    new code. Returns "" unless the rejection is the guard's and a
+    scaffold node in the failed output recomputes to a guard-scale
+    drop.
+    """
+    if _OVERWRITE_MARKER not in error_text:
+        return ""
+    try:
+        payload = parse_json_object(sanitize_llm_output(response_text))
+    except Exception:
+        return ""
+    raw_nodes = payload.get("nodes")
+    if not isinstance(raw_nodes, list):
+        return ""
+    root = resolve_repo_root(repo_root)
+    blocks: list[str] = []
+    for raw in raw_nodes:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("assigned_claw") not in ("scaffold", "file_writer"):
+            continue
+        inputs = raw.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        outputs = raw.get("outputs")
+        target = (
+            inputs.get("file_path")
+            or inputs.get("path")
+            or (outputs[0] if isinstance(outputs, list) and outputs else None)
+        )
+        content = inputs.get("content")
+        if not isinstance(target, str) or not target:
+            continue
+        if not isinstance(content, str):
+            continue
+        if Path(target).suffix.lower() != ".py":
+            continue
+        try:
+            ast.parse(content)
+        except SyntaxError:
+            continue  # the parse check owns unparseable content
+        existing_names = _existing_module_definitions(
+            _resolve_plan_target(target, root)
+        )
+        if not existing_names:
+            continue
+        scaffold_names = qualified_def_names(content)
+        if len(scaffold_names) < 4:
+            continue  # fragment-scale: the guard did not fire on it
+        kept = set(scaffold_names)
+        dropped = [name for name in existing_names if name not in kept]
+        if len(dropped) < 3 or len(dropped) * 2 < len(existing_names):
+            continue  # below the guard's own firing thresholds
+        blocks.append(
+            f"\nEXISTING-MODULE EXTENSION — node '{raw.get('id')}' "
+            f"scaffolds {target}, which already exists. Your scaffold "
+            f"dropped these {len(dropped)} existing definitions: "
+            + ", ".join(dropped)
+            + f". The module's full definition list is: "
+            + ", ".join(existing_names)
+            + ". Rewrite the scaffold as the FULL updated module: "
+            "every definition in that list, kept in the same place "
+            "with the same nesting (a name like A.B.C is defined "
+            "inside B, which is defined inside A — it stays there; do "
+            "not move a definition to the top level, rename it, or "
+            "drop it), plus your new code added. Do not write a new "
+            "smaller module in its place — a scaffold that omits an "
+            "existing definition is rejected again.\n"
+        )
+    return "".join(blocks)
 
 
 def _grounded_move_for_goal(goal_text: str | None, repo_root: str | Path | None) -> str:
@@ -4237,6 +4397,21 @@ _APPROACH_MARKERS: tuple[tuple[str, str], ...] = (
         "the edit with the scaffold claw (the full file with the real "
         "code) or a bash heredoc containing the real code.",
     ),
+    (
+        # Retry #28: attempts 2 and 3 answered the goal with a new,
+        # smaller module in place of the existing one (dropping 11 and
+        # 8 of its 12 definitions). The marker is the overwrite guard's
+        # own wording ("drops N of the existing module's M
+        # definitions"), so a guard rejection forbids the approach in
+        # later repair prompts — and, via the returned
+        # rejected_approaches metadata, in the replan that follows.
+        "of the existing module's",
+        "Do NOT replace an existing module with a new, smaller module "
+        "— a scaffold overwrites the whole file, so every definition "
+        "it omits is deleted. Instead, scaffold the FULL updated "
+        "module: every existing definition, kept in the same place "
+        "with the same nesting, plus the new code.",
+    ),
 )
 
 
@@ -4446,6 +4621,15 @@ def _call_llm_with_repair(
     prompt says the shape was right and to fix only the named strings
     (_shape_steering_block).
 
+    After an overwrite-guard rejection the repair prompt instead
+    carries the extension block (retry #28): the failed scaffold's
+    FULL dropped-definition list recomputed against the module on
+    disk, the module's full definition list, and the concrete pattern
+    (the full updated module, definitions in place, plus the new
+    code) — and the shape-steering block stays silent, because the
+    guard's phrase is a content-defect marker
+    (_extension_steering_block).
+
     The repair prompt only steers if the model receives it (retry
     #22): the prompts exceed Ollama's 4096-token context window,
     so planner/replan calls use _PLANNER_NUM_CTX instead. The
@@ -4566,6 +4750,9 @@ def _call_llm_with_repair(
                 spent_repair,
             )
             steering_block = _shape_steering_block(response_text, str(exc))
+            extension_block = _extension_steering_block(
+                response_text, str(exc), repo_root
+            )
             prompt = (
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
@@ -4574,6 +4761,7 @@ def _call_llm_with_repair(
                 f"{_dropped_fields_note(prev_response_text, response_text)}"
                 f"{forbidden_block}"
                 f"{steering_block}"
+                f"{extension_block}"
                 f"\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n"
                 f"{skeleton_block}\n"
                 "Return ONLY a corrected JSON object with a \"nodes\" array that "

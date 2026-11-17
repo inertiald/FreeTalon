@@ -14108,3 +14108,382 @@ class TestPlannerInterpreterNormalizationFix(unittest.TestCase):
                 nodes[0].criteria[0]["command"],
                 "./.venv/bin/python -m unittest discover -s tests",
             )
+
+
+class TestPlannerExtensionSteeringFix(unittest.TestCase):
+    """Ground an existing module's definitions + steer repairs to extend it (retry #28).
+
+    Retry #28 (log llm-end-to-end-health-retry28-2026-11-17.log,
+    DRIVER_EXIT 1) was the first run with interpreter normalization
+    live: zero interpreter errors across all three outputs. Attempts 2
+    and 3 were parse-clean scaffolds for freetalon/api.py that
+    REPLACED the module wholesale -- a new 38-line module dropping 11
+    of the existing 12 qualified definitions, then a 107-line
+    restructure that hoisted the Handler class out of
+    HiveAPIServer.start to module level, dropping the 8 nested
+    HiveAPIServer.start.Handler.* definitions -- and both were
+    correctly rejected by the overwrite guard (its first live
+    exercise). The repair loop could not steer out of the shape:
+
+    (1) Nothing in the initial prompt ever named the module's
+    existing definitions. The repo context lists only TOP-LEVEL names
+    (for api.py: HiveAPIServer, _ThreadingHTTPServer), and the ROUTE
+    GOAL shape said "add a /health branch to the do_GET method of the
+    Handler class (defined inside HiveAPIServer.start)" without
+    listing what else lives in the file or stating that a scaffold
+    must contain all of it. The model was asked to reproduce a
+    219-line module it had never seen. Fix A: _route_goal_shape now
+    appends an EXISTING MODULE block for each serving module --
+    every qualified definition (repo_index.qualified_def_names via
+    the _existing_module_definitions helper, same >= 4 floor as the
+    guard) plus the preservation contract: the scaffold content is
+    the full updated module, every definition in the same place with
+    the same nesting, plus the new code.
+
+    (2) The repair prompt after a guard rejection carried only the
+    error text (whose dropped list truncates at 8 names -- attempt
+    2's last three dropped definitions never reached the model), and
+    two steering mechanisms misfired around it: the guard's wording
+    matched no _APPROACH_MARKERS entry, so no DO-NOT-repeat block
+    fired; and _shape_steering_block DID fire, telling the model
+    "none of its code was rejected -- keep the same code; fix ONLY
+    the named strings", because the guard's phrase was not a content
+    defect marker. Fix B: the guard's phrase ("of the existing
+    module's") is now a _CONTENT_DEFECT_MARKERS entry (the shape
+    block stays silent on overwrite rejections) and an
+    _APPROACH_MARKERS entry (later repairs name wholesale replacement
+    as forbidden, with its replacement); and a new
+    _extension_steering_block recomputes the failed scaffold against
+    the module on disk with the guard's own thresholds and puts the
+    FULL dropped list, the FULL existing list, and the concrete
+    in-place pattern into the repair prompt.
+
+    The node model cannot express a partial scaffold (the scaffold
+    handler write_text()s the whole content; a bash heredoc can
+    append but cannot insert a branch inside an existing method), so
+    no new node type is introduced: the full-updated-module shape is
+    the in-place pattern, grounded and steered at the prompt layer.
+    The overwrite guard itself is untouched -- attempts 2 and 3 still
+    reject with exactly 1 error each.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#28 outputs 2 and 3, verbatim from the RAW
+    # PLANNER OUTPUT blocks of the retry-#28 driver section of
+    # logs/llm-end-to-end-health-retry28-2026-11-17.log (the same
+    # extraction tools/probe-retry28-rejections.py performs). Embedded
+    # (not read from the log) so the tests stay hermetic in CI.
+    # (Output 2 is byte-identical to retry #26's output 2 -- the
+    # temperature-0 model produced the same replacement again.)
+    RETRY28_OUTPUT2_RAW = '{\n"nodes":[\n{"id":"step_1",\n"objective":"Extend /home/seeker/projects/FreeTalon/freetalon/api.py to implement the /health endpoint",\n"depends_on":[],\n"assigned_claw":"scaffold",\n"inputs":{"file_path":"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":"import json\\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\\n\\ndef handle_health(self):\\n    status = \\"OK\\"\\n    if not check_ollama_reachability():\\n        status = \\"Ollama unreachable\\"\\n    gpu_temp = get_gpu_temperature()\\n    response = json.dumps({\\"status\\": status, \\"gpu_temp\\": gpu_temp})\\n    self.send_response(200)\\n    self.send_header(\'Content-type\', \'application/json\')\\n    self.end_headers()\\n    self.wfile.write(response.encode())\\n\\ndef check_ollama_reachability():\\n    import urllib.request\\n    try:\\n        urllib.request.urlopen(\\"http://localhost:11434/api/health\\", timeout=1)\\n        return True\\n    except:\\n        return False\\n\\ndef get_gpu_temperature():\\n    import subprocess\\n    try:\\n        result = subprocess.run([\'nvidia-smi\', \'--query-gpu=temperature.gpu\', \'--format=csv,noheader\'], capture_output=True, text=True)\\n        temp = float(result.stdout.strip())\\n        return temp\\n    except:\\n        return \\"N/A\\"\\n\\nclass HiveAPIServer(BaseHTTPRequestHandler):\\n    def do_GET(self):\\n        if self.path == \'/health\':\\n            handle_health(self)\\n        else:\\n            super().do_GET()\\n"},\n"outputs":["/home/seeker/projects/FreeTalon/freetalon/api.py"],\n"acceptance":"File exists and parses as Python",\n"criteria":[{"type":"file_exists","path":"/home/seeker/projects/FreeTalon/freetalon/api.py"}],\n"error":null\n},\n{"id":"step_2",\n"objective":"Run tests after modifying api.py",\n"depends_on":["step_1"],\n"assigned_claw":"bash",\n"inputs":{"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m unittest discover -s tests"},\n"outputs":[],\n"acceptance":"Tests pass",\n"criteria":[{"type":"exit_code","equals":0}],\n"error":null\n},\n{"id":"step_3",\n"objective":"Start the API server and verify /health endpoint is live",\n"depends_on":["step_2"],\n"assigned_claw":"bash",\n"inputs":{"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli start"},\n"outputs":[],\n"acceptance":"API server started and /health endpoint returns 200 OK",\n"criteria":[{"type":"exit_code","equals":0}],\n"error":null\n}\n],\n"metadata":{"estimated_steps":3}\n}'
+    RETRY28_OUTPUT3_RAW = '{\n"nodes":\n[\n{\n"id":\n"step_1",\n"objective":\n"Scaffold /home/seeker/projects/FreeTalon/freetalon/api.py with full updated module content",\n"depends_on":\n[],\n"assigned_claw":\n"scaffold",\n"inputs":\n{\n"file_path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":\n"# -*- coding: utf-8 -*-\\n\\n\\"\\"\\"API server for FreeTalon.\\"\\"\\"\\n\\nimport logging\\nimport os\\nimport sys\\nfrom threading import Thread\\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\\n\\n# Import modules from the project directory.\\n# Add the project root to the Python path.\\nproject_root = os.path.dirname(os.path.abspath(__file__))  # noqa: E501\\nsys.path.append(project_root)\\n\\nfrom freetalon import audit, bootstrap, config, docker_manager, hardware, hive, inference, jsonutil, mesh, orchestrator\\n\\n# Configure logging.\\nlogging.basicConfig(level=logging.INFO, format=\'%(asctime)s - %(name)s - %(levelname)s - %(message)s\')\\nlogger = logging.getLogger(__name__)\\n\\nclass HiveAPIServer:\\n    def __init__(self, config):\\n        self.config = config\\n        self.server = None\\n        self.thread = None\\n\\n    def start(self):\\n        \\"\\"\\"Start the API server.\\"\\"\\"\\n        try:\\n            # Create a handler for the HTTP requests.\\n            handler = Handler(self.config)\\n\\n            # Create an HTTP server.\\n            self.server = HTTPServer((self.config.host, self.config.port), handler)\\n\\n            # Start the server in a separate thread.\\n            self.thread = Thread(target=self.server.serve_forever)\\n            self.thread.daemon = True\\n            self.thread.start()\\n\\n            logger.info(\\"API server started on %s:%d\\", self.config.host, self.config.port)\\n        except Exception as e:\\n            logger.error(\\"Failed to start API server: %s\\", str(e))\\n\\n    def stop(self):\\n        \\"\\"\\"Stop the API server.\\"\\"\\"\\n        try:\\n            if self.server:\\n                self.server.shutdown()\\n                self.server.server_close()\\n                logger.info(\\"API server stopped.\\")\\n            else:\\n                logger.warning(\\"API server is not running.\\")\\n        except Exception as e:\\n            logger.error(\\"Failed to stop API server: %s\\", str(e))\\n\\nclass Handler(BaseHTTPRequestHandler):\\n    def __init__(self, config):\\n        self.config = config\\n        super().__init__()\\n\\n    def _authorized(self):\\n        \\"\\"\\"Check if the request is authorized.\\"\\"\\"\\n        # TODO: Implement authorization logic.\\n        return True\\n\\n    def _json_body(self):\\n        \\"\\"\\"Parse the JSON body of the request.\\"\\"\\"\\n        try:\\n            from json import loads\\n            content_length = int(self.headers[\'Content-Length\'])\\n            body = self.rfile.read(content_length)\\n            return loads(body)\\n        except Exception as e:\\n            logger.error(\\"Failed to parse JSON body: %s\\", str(e))\\n            return None\\n\\n    def do_GET(self):\\n        \\"\\"\\"Handle GET requests.\\"\\"\\"\\n        if self.path == \'/health\':\\n            self._send_response(200)\\n            self._headers[\'Content-Type\'] = \'application/json\'\\n            response = {  # noqa: E501\\n                \'status\': \'OK\',\\n                \'ollama_reachable\': True,  # Replace with actual check.\\n                \'gpu_temperature\': \'N/A\'  # Replace with actual check.\\n            }\\n            self._send_header(\'Content-Type\', \'application/json\')\\n            self._write_end_headers()\\n            self._write(jsonutil.dumps(response))\\n        else:\\n            super().do_GET()\\n\\n    def do_POST(self):\\n        \\"\\"\\"Handle POST requests.\\"\\"\\"\\n        if self.path == \'/shutdown\':\\n            # TODO: Implement shutdown logic.\\n            pass\\n        else:\\n            super().do_POST()\\n\\n\\nif __name__ == \'__main__\':\\n    config = config.HiveConfig()\\n    server = HiveAPIServer(config)\\n    server.start()"\n},\n"outputs":\n[\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n],\n"acceptance":\n[\n"File exists"\n],\n"criteria":\n[\n{\n"type":\n"file_exists",\n"path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_2",\n"objective":\n"Run the squares script and save its output",\n"depends_on":\n[\n"step_1"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"python3 /home/seeker/projects/FreeTalon/freetalon/api.py > /home/seeker/freetalon-workspace/squares_out.txt"\n},\n"outputs":\n[\n"/home/seeker/freetalon-workspace/squares_out.txt"\n],\n"acceptance":\n[\n"Command exits with code 0",\n"Output file exists"\n],\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n},\n{\n"type":\n"file_exists",\n"path":\n"/home/seeker/freetalon-workspace/squares_out.txt"\n}\n],\n"error":\nnull\n},\n{\n"id":\n"step_3",\n"objective":\n"Verify the squares output is exactly right",\n"depends_on":\n[\n"step_2"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"head -1 /home/seeker/freetalon-workspace/squares_out.txt | grep -qx \'1\' && tail -1 /home/seeker/freetalon-workspace/squares_out.txt | grep -qx \'25\' && grep -c . /home/seeker/freetalon-workspace/squares_out.txt | grep -qx \'5\'"\n},\n"outputs":\n[\n"verification"\n],\n"acceptance":\n[\n"Output verified"\n],\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n],\n"error":\nnull\n}\n]\n}'
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": self.WS},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _rejection(self, raw: str, **kwargs: object) -> str:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw, **kwargs)
+        return str(caught.exception)
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        """The grounded plan: edit the module, heredoc the tests, curl 8765."""
+        ws = self.WS
+        return [
+            {
+                "id": "step_1",
+                "objective": "Extend the health endpoint in freetalon/api.py",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+                "outputs": [self.api_path],
+                "criteria": [{"type": "file_exists", "path": self.api_path}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Write the health endpoint test file",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": TestPlannerHeredocFix.HEREDOC_TEST},
+                "outputs": [f"{ws}/test_health.py"],
+                "criteria": [{"type": "file_exists", "path": f"{ws}/test_health.py"}],
+            },
+            {
+                "id": "step_3",
+                "objective": "Run the health endpoint tests",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": f"python3 {ws}/test_health.py"},
+                "outputs": ["test results"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_4",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_3"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -s http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+
+    # --- Fix A: the shape block names the existing definitions ---
+
+    def test_route_goal_shape_names_existing_definitions(self) -> None:
+        from freetalon.orchestrator.planner import _route_goal_shape
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        source = (self.repo_root / "freetalon" / "api.py").read_text(
+            encoding="utf-8"
+        )
+        names = qualified_def_names(source)
+        self.assertEqual(len(names), 12)
+        for delta in (False, True):
+            shape = _route_goal_shape(
+                self.HEALTH_GOAL, str(self.repo_root), delta=delta
+            )
+            self.assertIn("EXISTING MODULE", shape)
+            self.assertIn(self.api_path, shape)
+            # Every qualified definition is named -- including the
+            # nested ones the repo context never showed.
+            for name in names:
+                self.assertIn(name, shape)
+            self.assertIn("full updated module", shape)
+            self.assertIn("same nesting", shape)
+            # The COMMANDS block still closes the shape (retry #25's
+            # arrangement: the copyable commands stay last).
+            self.assertLess(shape.index("EXISTING MODULE"), shape.index("COMMANDS"))
+
+    def test_initial_prompt_carries_existing_module_block(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[good]
+        ) as call_mock:
+            plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 1)
+        initial_prompt = call_mock.call_args_list[0][0][1]
+        self.assertIn("EXISTING MODULE", initial_prompt)
+        self.assertIn("HiveAPIServer.start.Handler.do_GET", initial_prompt)
+        self.assertIn("HiveAPIServer.stop", initial_prompt)
+
+    def test_existing_module_definitions_helper(self) -> None:
+        import tempfile
+
+        from freetalon.orchestrator.planner import _existing_module_definitions
+
+        # An existing parseable module: every qualified name, nested
+        # ones included.
+        names = _existing_module_definitions(self.api_path)
+        self.assertEqual(len(names), 12)
+        self.assertIn("HiveAPIServer.start.Handler.do_GET", names)
+        self.assertIn("_ThreadingHTTPServer", names)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # A new file: nothing exists to preserve.
+            self.assertEqual(
+                _existing_module_definitions(root / "brand_new.py"), []
+            )
+            # An unparseable file: already broken, no contract stated.
+            broken = root / "broken.py"
+            broken.write_text("def nope(:\n", encoding="utf-8")
+            self.assertEqual(_existing_module_definitions(broken), [])
+            # A tiny module (< 4 definitions, the guard's floor): no
+            # preservation contract.
+            tiny = root / "tiny.py"
+            tiny.write_text(
+                "class Widget:\n"
+                "    def start(self):\n        return 1\n"
+                "    def stop(self):\n        return 2\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_existing_module_definitions(tiny), [])
+            # Exactly at the floor: the names are returned.
+            four = root / "four.py"
+            four.write_text(
+                "def a():\n    return 1\n\n\n"
+                "def b():\n    return 2\n\n\n"
+                "def c():\n    return 3\n\n\n"
+                "def d():\n    return 4\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _existing_module_definitions(four), ["a", "b", "c", "d"]
+            )
+
+    # --- The guard itself is unchanged ---
+
+    def test_retry28_attempt2_still_rejected_with_one_error(self) -> None:
+        for root in (None, str(self.repo_root)):
+            message = self._rejection(
+                self.RETRY28_OUTPUT2_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertIn("was rejected with 1 error", message)
+            self.assertIn(
+                "drops 11 of the existing module's 12 definitions", message
+            )
+
+    def test_retry28_attempt3_still_rejected_with_one_error(self) -> None:
+        for root in (None, str(self.repo_root)):
+            message = self._rejection(
+                self.RETRY28_OUTPUT3_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertIn("was rejected with 1 error", message)
+            self.assertIn(
+                "drops 8 of the existing module's 12 definitions", message
+            )
+
+    # --- Fix B: repair steering ---
+
+    def test_steering_blocks_on_overwrite_rejections(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _extension_steering_block,
+            _shape_steering_block,
+        )
+
+        for raw, dropped_count in (
+            (self.RETRY28_OUTPUT2_RAW, 11),
+            (self.RETRY28_OUTPUT3_RAW, 8),
+        ):
+            message = self._rejection(
+                raw,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=None,
+            )
+            # The shape block no longer blesses a wholesale
+            # replacement: the guard's phrase is a content defect.
+            self.assertEqual(_shape_steering_block(raw, message), "")
+            # The extension block fires with the full dropped list.
+            block = _extension_steering_block(raw, message, None)
+            self.assertIn("EXISTING-MODULE EXTENSION", block)
+            self.assertIn(
+                f"dropped these {dropped_count} existing definitions", block
+            )
+            self.assertIn("The module's full definition list is:", block)
+            self.assertIn("FULL updated module", block)
+        # Attempt 2's dropped list in the block is NOT truncated at
+        # eight names the way the guard's error is: the last three
+        # dropped definitions are named.
+        message2 = self._rejection(
+            self.RETRY28_OUTPUT2_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        block2 = _extension_steering_block(self.RETRY28_OUTPUT2_RAW, message2, None)
+        dropped_segment = block2.split("The module's full definition list")[0]
+        self.assertIn("HiveAPIServer.start.Handler._send", dropped_segment)
+        self.assertIn("HiveAPIServer.start.Handler.log_message", dropped_segment)
+        self.assertIn("HiveAPIServer.stop", dropped_segment)
+
+    def test_extension_block_silent_for_string_only_rejection(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _extension_steering_block,
+            _shape_steering_block,
+        )
+
+        # A scaffold plan whose only defect is an interpreter spelling
+        # normalization does not cover (the validator backstop,
+        # ./bin/python): the retry-#25 shape steering still fires and
+        # the extension block stays out of it.
+        nodes = self._grounded_health_nodes()
+        nodes[2]["inputs"]["command"] = "./bin/python -m unittest discover -s tests"
+        raw = self._dag(nodes)
+        message = self._rejection(
+            raw,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        self.assertIn("./bin/python", message)
+        self.assertNotIn("existing module's", message)
+        self.assertIn("SHAPE was right", _shape_steering_block(raw, message))
+        self.assertEqual(_extension_steering_block(raw, message, None), "")
+
+    def test_retry28_attempt2_repair_prompt_carries_extension_block(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm",
+            side_effect=[self.RETRY28_OUTPUT2_RAW, good],
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(len(plan.nodes), 4)
+        repair_prompt = call_mock.call_args_list[1][0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        # The forbidden-approach block now names wholesale replacement
+        # with its replacement (the _APPROACH_MARKERS entry).
+        self.assertIn("DO NOT repeat approaches", repair_prompt)
+        self.assertIn(
+            "Do NOT replace an existing module with a new, smaller module",
+            repair_prompt,
+        )
+        # The extension block carries the full dropped list (all 11,
+        # not the guard error's truncated 8) and the full module list.
+        self.assertIn("EXISTING-MODULE EXTENSION", repair_prompt)
+        self.assertIn("dropped these 11 existing definitions", repair_prompt)
+        segment = repair_prompt.split("EXISTING-MODULE EXTENSION")[1].split(
+            "The module's full definition list"
+        )[0]
+        self.assertIn("HiveAPIServer.stop", segment)
+        self.assertIn("HiveAPIServer.start.Handler.log_message", segment)
+        self.assertIn("The module's full definition list is:", repair_prompt)
+        # The misfiring shape-steering text is gone.
+        self.assertNotIn("SHAPE was right", repair_prompt)
+        self.assertNotIn("none of its code was rejected", repair_prompt)
+
+    def test_retry28_attempt3_repair_prompt_carries_extension_block(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm",
+            side_effect=[self.RETRY28_OUTPUT3_RAW, good],
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(len(plan.nodes), 4)
+        repair_prompt = call_mock.call_args_list[1][0][1]
+        self.assertIn("EXISTING-MODULE EXTENSION", repair_prompt)
+        self.assertIn("dropped these 8 existing definitions", repair_prompt)
+        segment = repair_prompt.split("EXISTING-MODULE EXTENSION")[1].split(
+            "The module's full definition list"
+        )[0]
+        # The definitions attempt 3 dropped by hoisting Handler out of
+        # HiveAPIServer.start are named as dropped...
+        self.assertIn("HiveAPIServer.start.Handler", segment)
+        self.assertIn("HiveAPIServer.start.Handler.do_GET", segment)
+        self.assertIn("HiveAPIServer.start.Handler.log_message", segment)
+        # ...while a definition it kept is not in the dropped segment.
+        self.assertNotIn("HiveAPIServer.__init__", segment)
+        self.assertNotIn("SHAPE was right", repair_prompt)
