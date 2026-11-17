@@ -841,3 +841,31 @@ Deliberately left out:
   byte-for-byte against a pristine 3b0cd16 worktree). Log:
   freetalon-workspace/logs/planner-repo-root-fix-2026-11-16.log.
   Next: /health retry #10 (GPU load, separate step).
+
+## Update - 2026-11-16 (evening, /health retry #10 — FAIL at planning)
+
+  /health retry #10 FAILED at planning (~80s, DRIVER_EXIT:1, no run
+  created). Pre-flight green (51C, 300W, x16, 0 Xid, head 9461914,
+  498/498, Ollama gemma-3-abliterated:latest; fans 85% during,
+  auto after). Intake succeeded. Planner attempts: (1) {"nodes":
+  []} — empty; (2) the stdout-echo fake again (echo JSON answer to
+  stdout, echo "# Unit tests..." as the "tests", no criteria on any
+  node) — rejected; (3) a comment-only plan whose step_1/2 commands
+  are just "# Add code..." comments, with file_exists criteria on
+  the correct repo paths (/home/seeker/projects/FreeTalon/freetalon/
+  api.py — the repo-root fix IS steering) — but step_2 depends_on
+  ["endpoint_implemented"], an OUTPUT name, not a node id, so
+  normalize_plan_nodes raised "Planner node 'step_2' depends on
+  unknown node 'endpoint_implemented'" before validation could
+  produce a numbered rejection -> repair budget exhausted. Judge/
+  replan never ran, no run directory created. Endpoint NOT
+  extended, no new tests, suite 498/498 green, no stray files. GPU
+  survived (63C cooling at fan restore, 300W, x16, zero Xid).
+  Log: freetalon-workspace/logs/llm-end-to-end-health-retry10-2026-
+  11-16.log. Next weakness: the model keeps putting OUTPUT names
+  in depends_on instead of node ids, and an unknown depends_on is
+  still a budget-burning structural raise instead of a numbered
+  rejection — same family as the bare-dict criteria fix (798a116)
+  and the node-shape fix (091ebfd): show the depends_on shape
+  (node ids only) and convert unknown-dependency errors into
+  repairable rejections.
