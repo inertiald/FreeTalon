@@ -827,3 +827,151 @@ class TestPlannerCollectsAllErrors(unittest.TestCase):
         self.assertIn("REJECTED", repair_prompt)
         for marker in ("duplicates", "glued together", "test_count", "8765"):
             self.assertIn(marker, repair_prompt)
+
+
+class TestPlannerEchoFix(unittest.TestCase):
+    """Planner echo fix: no copyable JSON at the end of the prompt, and
+    the repair re-prompt never pastes the failed output back verbatim.
+
+    Regression case: the /health retry (2026-11-16), where Gemma returned
+    the TaskIntent JSON verbatim 3/3 times instead of a plan DAG, because
+    plan_task_intent embedded the intent JSON at the end of the prompt and
+    the repair loop pasted the echo back in. At temperature 0 the model
+    copies the JSON it last saw; the fix removes the copyable JSON and
+    the reinforcement.
+    """
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal="Add a GET /health endpoint to FreeTalon's API that returns JSON reporting the service status, whether Ollama at localhost:11434 is reachable, and the GPU temperature when nvidia-smi is available. Add unit tests for the endpoint, keep the full test suite green, and verify the endpoint live.",
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _good_node(self) -> dict:
+        return {
+            "id": "step_1",
+            "objective": "Extend the health endpoint",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {"file_path": self.api_path, "content": "# extended"},
+            "outputs": [self.api_path],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+        }
+
+    def test_plan_prompt_contains_no_intent_json(self) -> None:
+        response = self._dag([self._good_node()])
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=response
+        ) as call_mock:
+            plan_task_intent(self.intent, settings=self.settings)
+        user_prompt = call_mock.call_args[0][1]
+        # The raw intent JSON must not appear anywhere in the prompt:
+        # it is the text a temp-0 model copies verbatim.
+        self.assertNotIn(self.intent.model_dump_json(indent=2), user_prompt)
+        self.assertNotIn('"project_type": "bash"', user_prompt)
+        self.assertNotIn('"capabilities":', user_prompt)
+        # The same facts are present as prose, and the prompt ends by
+        # demanding a NEW plan DAG.
+        self.assertIn("Goal: Add a GET /health endpoint", user_prompt)
+        self.assertIn(
+            "Capabilities to use: scaffold, bash, llm_synthesis", user_prompt
+        )
+        self.assertIn("Workspace: /home/seeker/freetalon-workspace", user_prompt)
+        self.assertTrue(user_prompt.rstrip().endswith("JSON Output:"))
+
+    def test_plan_repairs_echoed_intent_then_succeeds(self) -> None:
+        # The exact failure from the /health retry: the model returns the
+        # intent JSON verbatim instead of a plan DAG. The repair round
+        # must break the echo and produce a valid plan in one round.
+        echo = self.intent.model_dump_json(indent=2)
+        good = self._dag([self._good_node()])
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[echo, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(plan.nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(call_mock.call_count, 2)
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        # The failed output is described, never pasted back: the verbatim
+        # intent JSON must not appear in the repair prompt.
+        self.assertNotIn(echo, repair_prompt)
+        self.assertNotIn('"project_type": "bash"', repair_prompt)
+        self.assertIn("no 'nodes' array", repair_prompt)
+
+    def test_plan_gives_up_after_echo_budget(self) -> None:
+        echo = self.intent.model_dump_json(indent=2)
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=echo
+        ) as call_mock:
+            with self.assertRaisesRegex(LLMResponseError, "'nodes' array"):
+                plan_task_intent(self.intent, settings=self.settings)
+        # Initial attempt + 2 repair retries, then the last error is raised.
+        self.assertEqual(call_mock.call_count, 3)
+
+    def test_describe_failed_output_names_the_problem_without_quoting_it(
+        self,
+    ) -> None:
+        from freetalon.orchestrator.planner import _describe_failed_output
+
+        echo = self.intent.model_dump_json(indent=2)
+        description = _describe_failed_output(echo)
+        self.assertIn("no 'nodes' array", description)
+        self.assertIn("goal", description)
+        self.assertNotIn("Add a GET /health endpoint", description)
+        self.assertNotIn('"project_type"', description)
+
+        bad_dag = self._dag(
+            [{"id": "step_1", "assigned_claw": "script", "depends_on": []}]
+        )
+        self.assertIn("failed validation", _describe_failed_output(bad_dag))
+        self.assertNotIn("script", _describe_failed_output(bad_dag))
+
+        self.assertIn("not valid JSON", _describe_failed_output("hello there"))
+
+    def test_planner_prompt_states_anti_echo_rule(self) -> None:
+        self.assertIn(
+            "Do NOT repeat, quote, or echo the task description",
+            PLANNER_SYSTEM_PROMPT,
+        )
+        self.assertNotIn("TaskIntent JSON object", PLANNER_SYSTEM_PROMPT)
+
+    def test_replan_prompt_ends_with_new_plan_framing(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        good = self._dag(
+            [
+                {
+                    "id": "step_1",
+                    "objective": "Run the tests",
+                    "depends_on": [],
+                    "assigned_claw": "bash",
+                    "inputs": {"command": "python3 -m unittest discover -s tests"},
+                    "criteria": [{"type": "exit_code", "equals": 0}],
+                    "responds_to": "node-1",
+                    "differs_by": "run the suite to confirm the failure",
+                }
+            ]
+        )
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=good
+        ) as call_mock:
+            replan_from_brief({"goal": {}, "failed_nodes": []})
+        user_prompt = call_mock.call_args[0][1]
+        self.assertTrue(user_prompt.rstrip().endswith("JSON Output:"))
+        self.assertIn("Do NOT repeat, quote, or echo the brief", user_prompt)

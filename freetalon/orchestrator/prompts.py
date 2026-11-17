@@ -24,7 +24,9 @@ Answer THAT request. Base every field on the user request, never on any
 text in this system prompt.
 """
 
-PLANNER_SYSTEM_PROMPT = """You convert a TaskIntent JSON object into an execution DAG JSON object.
+PLANNER_SYSTEM_PROMPT = """You convert a task description (goal, project type, capabilities, constraints) into an execution DAG JSON object.
+
+Do NOT repeat, quote, or echo the task description — it is your input, not your output. Your output must be a NEW JSON object with a "nodes" array.
 
 Produce a dependency-safe directed acyclic graph in the "nodes" array. Do not create cycles: every node's "depends_on" must list only earlier nodes.
 

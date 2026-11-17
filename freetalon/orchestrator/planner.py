@@ -1,6 +1,7 @@
 """LLM-backed planner for producing validated execution DAGs."""
 
 from __future__ import annotations
+import json
 import re
 import shlex
 import hashlib
@@ -205,7 +206,6 @@ _CRITERION_TYPES = frozenset(
     }
 )
 _COMPARISON_OPS = frozenset({"<", "<=", "==", ">=", ">"})
-_REPAIR_TRUNCATION = 4000
 
 
 def _node_path_strings(node: PlanNode) -> list[str]:
@@ -483,6 +483,57 @@ def _collect_plan_errors(
     return errors
 
 
+def _format_intent_for_prompt(intent: TaskIntent) -> str:
+    """Render a TaskIntent as plain prose lines for the planner prompt.
+
+    The planner prompt must never end with a copyable JSON object: with
+    temperature 0 the model echoes whatever JSON it last saw in the prompt.
+    That is what happened in the /health retry — Gemma returned the
+    TaskIntent JSON verbatim 3/3 times instead of a plan DAG. Prose lines
+    carry the same facts with nothing to copy. (Same fix family as the
+    Nov 14 intake echo, where the few-shot JSON example was removed and
+    the request was reframed as a "User Request:" line followed by
+    "JSON Output:".)
+    """
+    lines = [
+        f"Goal: {intent.goal}",
+        f"Project type: {intent.project_type}",
+    ]
+    if intent.capabilities:
+        lines.append(f"Capabilities to use: {', '.join(intent.capabilities)}")
+    constraints = dict(intent.constraints or {})
+    workspace = constraints.pop("workspace", None)
+    if workspace:
+        lines.append(f"Workspace: {workspace}")
+    if constraints:
+        pairs = "; ".join(f"{key}={value}" for key, value in constraints.items())
+        lines.append(f"Other constraints: {pairs}")
+    if intent.missing_inputs:
+        lines.append(f"Missing inputs: {', '.join(intent.missing_inputs)}")
+    else:
+        lines.append("Missing inputs: none")
+    return "\n".join(lines)
+
+
+def _describe_failed_output(response_text: str) -> str:
+    """Summarize a rejected planner output WITHOUT quoting it back.
+
+    Pasting the failed output into the repair prompt reinforces the echo:
+    at temperature 0 the model copies the JSON it last saw, so a repair
+    round that re-presents the echoed TaskIntent JSON just produces the
+    same echo again. The repair prompt gets a classification instead —
+    enough to tell the model what went wrong, with nothing copyable.
+    """
+    try:
+        payload = parse_json_object(sanitize_llm_output(response_text))
+    except Exception:
+        return "text that is not valid JSON."
+    keys = ", ".join(sorted(str(key) for key in payload))
+    if "nodes" in payload:
+        return f"a JSON object with keys {keys} whose 'nodes' failed validation."
+    return f"a JSON object with keys {keys} and no 'nodes' array."
+
+
 def _call_llm_with_repair(
     system_prompt: str,
     user_prompt: str,
@@ -493,10 +544,11 @@ def _call_llm_with_repair(
     """Call the LLM and parse the plan, repairing rejected output.
 
     On LLMResponseError the model is re-prompted with the rejection reason
-    and its failed output, and asked for a corrected DAG only. Bounded:
-    at most ``max_repairs`` repair attempts, then the last error is raised.
-    Nothing is silently substituted — a plan the model cannot fix is an
-    honest failure.
+    and a short description of what was wrong with the failed output —
+    never the output itself, which at temperature 0 would just be copied
+    again. Bounded: at most ``max_repairs`` repair attempts, then the last
+    error is raised. Nothing is silently substituted — a plan the model
+    cannot fix is an honest failure.
     """
     prompt = user_prompt
     last_error: LLMResponseError | None = None
@@ -512,9 +564,10 @@ def _call_llm_with_repair(
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
                 f"Rejection reason: {exc}\n"
-                "Failed output (do not echo it back, fix it):\n"
-                f"{response_text[:_REPAIR_TRUNCATION]}\n\n"
-                "Return ONLY a corrected JSON object that fixes ALL of the rejection reasons listed above."
+                f"Previous output: {_describe_failed_output(response_text)}\n\n"
+                "Return ONLY a corrected JSON object with a \"nodes\" array that "
+                "fixes ALL of the rejection reasons listed above.\n"
+                "JSON Output:"
             )
     assert last_error is not None
     raise last_error
@@ -553,10 +606,14 @@ def plan_task_intent(
     the code that actually exists.
     """
     context = format_repo_context(build_repo_index(repo_root))
-    prompt_input = intent.model_dump_json(indent=2)
     nodes, metadata = _call_llm_with_repair(
         PLANNER_SYSTEM_PROMPT,
-        f"{context}\n\nTaskIntent JSON:\n{prompt_input}",
+        f"{context}\n\n"
+        f"{_format_intent_for_prompt(intent)}\n\n"
+        "Produce a NEW execution plan DAG for the goal above. Your output "
+        "must be a JSON object with a \"nodes\" array — do NOT repeat the "
+        "goal text or any JSON from this prompt.\n"
+        "JSON Output:",
         settings,
         max_repairs=max_repairs,
     )
@@ -582,7 +639,10 @@ def replan_from_brief(
     context = format_repo_context(build_repo_index(repo_root))
     nodes, _metadata = _call_llm_with_repair(
         REPLAN_SYSTEM_PROMPT,
-        f"{context}\n\nRe-plan brief JSON:\n{_json.dumps(brief, indent=2, default=str)}",
+        f"{context}\n\nRe-plan brief JSON:\n{_json.dumps(brief, indent=2, default=str)}\n\n"
+        "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
+        "quote, or echo the brief — it is your input, not your output.\n"
+        "JSON Output:",
         settings,
         max_repairs=max_repairs,
     )

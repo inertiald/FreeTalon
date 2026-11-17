@@ -374,3 +374,23 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   no live verification happened — planning never produced a DAG.
 - Still blocked: gh token invalid — this commit is local-only until
   Pat re-auths gh on seeker7 (classic PAT plan, 2026-11-17).
+
+## Update - 2026-11-16 21:05 (planner echo fix — CPU-only)
+
+- Planner echo fix DONE: the /health retry failed because Gemma echoed
+  the TaskIntent JSON verbatim 3/3 times. Root cause was the planner
+  prompt ending with the raw intent JSON at temperature 0, plus a repair
+  loop that pasted the failed output back in. Fix: intent is now rendered
+  as prose lines (no copyable JSON), prompts end with "Produce a NEW
+  plan DAG ... JSON Output:", the repair re-prompt describes the failure
+  instead of quoting it, and the planner system prompt states the
+  anti-echo rule (same family as the Nov 14 intake fix). Re-plan brief
+  got the same trailing framing. Temperature unchanged at 0.
+- Tests 402 -> 408/408 green (+6 in new TestPlannerEchoFix, incl. the
+  exact /health echo case now repairing to a valid plan in one round).
+  M5 smoke still passes. Log:
+  freetalon-workspace/logs/planner-echo-fix-2026-11-16.log.
+- /health retry is unblocked by this fix but NOT re-run: it needs GPU
+  load and Pat's go. No LLM calls were made for this fix.
+- Still blocked: gh token invalid — commits local-only until Pat
+  re-auths gh on seeker7 (classic PAT plan, 2026-11-17).
