@@ -205,6 +205,9 @@ Rules:
 - Return ONLY a JSON object with a "nodes" array and "metadata". Do NOT
   repeat, quote, or echo the brief — the brief is your input, not your
   output. If you output anything other than the new DAG, the plan is rejected.
+- Your output must be a NEW "nodes" array — never re-serialize the brief
+  as JSON (no "instruction", "delta_plan", or "steps" object). The brief
+  is your input, not your output.
 - "assigned_claw" MUST be one of: scaffold, file_writer, bash, shell_exec,
   llm_synthesis, summarize, research, web_search, fetch_dataset, data_fetch,
   sandbox_analyze, backtest, train_model, paper_trade, invest,

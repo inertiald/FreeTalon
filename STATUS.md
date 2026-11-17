@@ -543,3 +543,21 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
     grounded plan shape for route goals (modify the serving module, write
     tests via scaffold/heredoc, curl the real API port) instead of
     free-form probe/echo nodes.
+
+## Update - 2026-11-16 22:40
+
+- Planner route + replan fix DONE (CPU-only, no GPU/LLM): route
+  engagement now requires the serving-module mention or a call to the
+  route on the API's own port (8765) — the retry-#4 plan (curl
+  11434/health, never touching freetalon/api.py) is now rejected at
+  plan time naming the wrong service. Replan brief got the no-copy
+  treatment: memory params are described by kind, never quoted
+  ("command=a shell command"); a brief-echo-shaped reply is rejected
+  by name; the replan prompt carries a grounded ROUTE GOAL shape
+  (edit module -> tests -> curl API port). Tests 427 -> 437/437
+  green (new TestPlannerRouteEngagementFix, 10 tests), M5 smoke
+  passes (finance run-20261117T063750Z-21a835, ecu
+  run-20261117T063750Z-5e46df). Demo tools/demo-route-engagement.py
+  shows the exact retry-#4 plan rejected and a correct plan accepted.
+  Log: logs/planner-route-fix-2026-11-16.log.
+  - Next: /health retry #5 (live, GPU) - not run here by design.

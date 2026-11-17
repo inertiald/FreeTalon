@@ -1662,3 +1662,538 @@ class TestPlannerHeredocFix(unittest.TestCase):
 
         unterminated = "cat > /tmp/x.py <<'EOF'\nx = 1\n"
         self.assertEqual(_strip_heredoc_bodies(unterminated), unterminated)
+
+
+class TestPlannerRouteEngagementFix(unittest.TestCase):
+    """Tight route engagement + replan no-copy (retry #4).
+
+    Retry #4 (run-20261117T062659Z-bcd569) failed two ways. (1) The
+    accepted plan never engaged freetalon/api.py: node-1 curled
+    http://localhost:11434/health — the route literal on Ollama's port —
+    and the old engagement rule counted ANY "/health" string, so the plan
+    passed validation while curling a service with no /health endpoint.
+    (2) The replan echoed the brief's own delta-plan steps back verbatim
+    (instruction + delta_plan.steps, including retry #2's test.sh /
+    glued-unittest failures) because the brief's memory prose still
+    handed the model verbatim command strings. Three fixes: engagement
+    now requires the serving-module mention or a call to the route on
+    the API's own port; memory parameters are described by kind, never
+    quoted; a brief-echo-shaped reply is rejected by name, and the
+    replan prompt carries a grounded ROUTE GOAL shape for route goals.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The three nodes of the retry-#4 plan, verbatim from
+    # runs/run-20261117T062659Z-bcd569/plan-v001.json. Embedded (not read
+    # from the run directory) so the test stays hermetic in CI.
+    @staticmethod
+    def _retry4_plan_nodes() -> list[dict]:
+        ws = "/home/seeker/freetalon-workspace"
+        return [
+            {
+                "id": "node-1",
+                "objective": "Verify OLLAMA is reachable at localhost:11434 and return status.",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "curl -s http://localhost:11434/health | grep '{\"status\":\"running\"'"},
+                "outputs": ["ollama_reachable"],
+                "acceptance": ["OLLAMA reachable and status is running."],
+                "error": None,
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "reversible": True,
+                "timeout_s": 300.0,
+                "max_retries": 0,
+                "hypothesis": "",
+                "responds_to": "",
+                "differs_by": "",
+                "measurement": {},
+                "duration_s": None,
+                "exit_code": None,
+            },
+            {
+                "id": "node-2",
+                "objective": "Verify GPU temperature is available via nvidia-smi.",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "nvidia-smi"},
+                "outputs": ["gpu_temperature"],
+                "acceptance": ["GPU temperature information is available."],
+                "error": None,
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "reversible": True,
+                "timeout_s": 300.0,
+                "max_retries": 0,
+                "hypothesis": "",
+                "responds_to": "",
+                "differs_by": "",
+                "measurement": {},
+                "duration_s": None,
+                "exit_code": None,
+            },
+            {
+                "id": "node-3",
+                "objective": "Return JSON reporting service status, OLLAMA reachability and GPU temperature.",
+                "depends_on": ["node-1", "node-2"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "echo '{\"service_status\":\"running\", \"ollama_reachable\": true, \"gpu_temperature\": \"available\"}'"},
+                "outputs": ["health_json"],
+                "acceptance": ["JSON reporting service status, OLLAMA reachability and GPU temperature is returned."],
+                "error": None,
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "reversible": True,
+                "timeout_s": 300.0,
+                "max_retries": 0,
+                "hypothesis": "",
+                "responds_to": "",
+                "differs_by": "",
+                "measurement": {},
+                "duration_s": None,
+                "exit_code": None,
+            },
+        ]
+
+    # The exact first replan reply from retry #4 (log
+    # llm-end-to-end-health-retry4-2026-11-16.log): the brief re-serialized
+    # as {"instruction": ..., "delta_plan": {"steps": [...]}}.
+    @staticmethod
+    def _replan1_echo() -> dict:
+        return {
+            "instruction": "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, quote, or echo the brief — it is your input, not your output.",
+            "delta_plan": {
+                "replans_remaining": 1,
+                "wall_clock_s": 3599.9614646220007,
+                "max_attempts_per_hypothesis": 3,
+                "max_nodes": 50,
+                "max_money": 0.0,
+                "steps": [
+                    {
+                        "step_id": "1",
+                        "action": "REPLAN",
+                        "node": "node-1",
+                        "command": "curl -s http://localhost:11434/health | grep '{\"status\":\"running\"';",
+                        "exit_code": 1,
+                        "stderr": "",
+                        "stdout": "",
+                        "reason": "Failed to reach OLLAMA at localhost:11434 and return status.",
+                        "hypothesis": "Verify OLLAMA is reachable at localhost:11434 and return status.",
+                        "outcome": "VERDICT FAIL",
+                        "measurement_did_not_pass": True,
+                        "decision": "REPLAN",
+                    },
+                    {
+                        "step_id": "2",
+                        "action": "REPLAN",
+                        "node": "node-3",
+                        "command": "/home/seeker/freetalon-workspace/test.sh",
+                        "exit_code": 127,
+                        "stderr": "/home/seeker/freetalon-workspace/test.sh: 1: assert: not found",
+                        "stdout": "",
+                        "reason": "Failed to verify the endpoint live.",
+                        "hypothesis": "Verify the endpoint live.",
+                        "outcome": "VERDICT FAIL",
+                        "measurement_did_not_pass": True,
+                        "decision": "REPLAN",
+                    },
+                    {
+                        "step_id": "3",
+                        "action": "REPLAN",
+                        "node": "node-2",
+                        "command": "python3 -munittestdiscover -s/home/seeker/freetalon-workspace/api/health.py",
+                        "exit_code": 127,
+                        "stderr": "/bin/sh: 1: python3 -munittestdiscover -s/home/seeker/freetalon-workspace/api/heal",
+                        "stdout": "",
+                        "reason": "Failed to run API endpoint tests.",
+                        "hypothesis": "Run API endpoint tests.",
+                        "outcome": "VERDICT FAIL",
+                        "measurement_did_not_pass": True,
+                        "decision": "REPLAN",
+                    },
+                ],
+            },
+        }
+
+    # The retry-#4 node-1 failure as an experiment-memory record, in the
+    # shape ExperimentStore._row_to_record returns. Its approach carries
+    # the failed curl as a key_param — the copy source for the echo.
+    _MEMORY_RECORD_RETRY4 = {
+        "run_id": "run-20261117T062659Z-bcd569",
+        "goal_key": "07ab30f88fe6662b",
+        "domain": "bash",
+        "node_id": "node-1",
+        "ts": "2026-11-17T06:26:59.053190+00:00",
+        "hypothesis": "Verify OLLAMA is reachable at localhost:11434 and return status.",
+        "approach": {
+            "capability": "bash",
+            "key_params": {
+                "command": "curl -s http://localhost:11434/health | grep '{\"status\":\"running\"'"
+            },
+            "data_window": "",
+        },
+        "measurement": {
+            "verdict": "FAIL",
+            "exit_code": 1,
+            "duration_s": 0.008,
+            "results": [
+                {"passed": False, "measured": True, "detail": "exit_code 1 != 0"}
+            ],
+        },
+        "decision": "REPLAN",
+        "lesson": (
+            "bash (Verify OLLAMA is reachable at localhost:11434 and return "
+            "status.): verdict FAIL — failed criterion: exit_code 1 != 0; "
+            "exit 1; 0.008s; decision REPLAN."
+        ),
+    }
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _good_delta_nodes(self) -> list[dict]:
+        """A real delta plan: edit the module, then call the live route."""
+        return [
+            {
+                "id": "step_1",
+                "objective": "Extend the health endpoint in freetalon/api.py",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": self.api_path, "content": "# extended health"},
+                "outputs": [self.api_path],
+                "criteria": [{"type": "file_exists", "path": self.api_path}],
+                "responds_to": "node-1",
+                "differs_by": "edit the existing module instead of probing Ollama",
+            },
+            {
+                "id": "step_2",
+                "objective": "Verify the endpoint live on the API port",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -s http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "responds_to": "node-1",
+                "differs_by": "call the FreeTalon API on 8765, not Ollama on 11434",
+            },
+        ]
+
+    def _brief(self, memory: list[dict] | None = None) -> dict:
+        failed_measurement = {
+            "verdict": "FAIL",
+            "exit_code": 1,
+            "duration_s": 0.008,
+            "results": [
+                {"passed": False, "measured": True, "detail": "exit_code 1 != 0"}
+            ],
+        }
+        return {
+            "goal": {
+                "objective": self.HEALTH_GOAL,
+                "success_measures": [
+                    {"name": "endpoint live", "metric": "health_ok", "op": "==", "value": 1}
+                ],
+                "budget": {"max_wall_clock_s": 3600.0, "max_replans": 2},
+                "risk_class": "read_only",
+                "stop_conditions": [],
+                "irreversible_actions": [],
+            },
+            "plan_id": "plan-7885a4ef9d99",
+            "plan_version": 1,
+            "failed_nodes": [
+                {
+                    "id": "node-1",
+                    "objective": "Verify OLLAMA is reachable at localhost:11434 and return status.",
+                    "hypothesis": "Verify OLLAMA is reachable at localhost:11434 and return status.",
+                    "assigned_claw": "bash",
+                    "measurement": failed_measurement,
+                    "error": None,
+                }
+            ],
+            "measurements": [
+                dict({"node_id": "node-1"}, **failed_measurement),
+            ],
+            "memory": memory if memory is not None else [self._MEMORY_RECORD_RETRY4],
+            "remaining_budget": {
+                "replans": 1,
+                "wall_clock_s": 3000.0,
+                "max_attempts_per_hypothesis": 3,
+                "max_nodes": 10,
+                "max_money": 0.0,
+            },
+            "instruction": (
+                "Produce a delta plan: name which failed hypothesis each new "
+                "node responds to (responds_to) and what it does differently "
+                "(differs_by). Do not repeat a recorded failed approach "
+                "without a stated reason. Shrink scope before growing it."
+            ),
+        }
+
+    # --- Weakness 1: route engagement is port-aware ---
+
+    def test_parse_rejects_retry4_plan_wrong_service(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(self._retry4_plan_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+        message = str(caught.exception)
+        # Only the engagement rule fires: the curl is a known port, the
+        # echo goes to stdout (no file written), nvidia-smi is fine.
+        self.assertIn("1 error", message)
+        self.assertIn("freetalon/api.py", message)
+        self.assertIn("11434", message)
+        self.assertIn("8765", message)
+        self.assertIn("different service", message)
+
+    def test_api_port_call_engages_wrong_port_does_not(self) -> None:
+        curl_8765 = {
+            "id": "step_1",
+            "objective": "Verify the endpoint live",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "curl -s http://localhost:8765/health"},
+            "outputs": ["verification"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        # A live call on the API port engages the route on its own.
+        nodes, _ = parse_planner_response(
+            self._dag([curl_8765]), goal_text=self.HEALTH_GOAL
+        )
+        self.assertEqual(len(nodes), 1)
+        # With a module-engaging node alongside, same result.
+        nodes, _ = parse_planner_response(
+            self._dag(self._good_delta_nodes()), goal_text=self.HEALTH_GOAL
+        )
+        self.assertEqual(len(nodes), 2)
+        # Only curling /health on Ollama's port does not engage it.
+        curl_11434 = dict(
+            curl_8765,
+            inputs={"command": "curl -s http://localhost:11434/health"},
+        )
+        with self.assertRaisesRegex(LLMResponseError, "different service"):
+            parse_planner_response(
+                self._dag([curl_11434]), goal_text=self.HEALTH_GOAL
+            )
+
+    # --- Weakness 2: the replan brief cannot be copied back ---
+
+    def test_parse_names_brief_echo(self) -> None:
+        import json
+
+        echo = json.dumps(self._replan1_echo())
+        with self.assertRaisesRegex(
+            LLMResponseError, "copied the re-plan brief"
+        ):
+            parse_planner_response(echo, goal_text=self.HEALTH_GOAL)
+
+    def test_brief_never_quotes_failed_commands(self) -> None:
+        from freetalon.orchestrator.planner import _format_brief_for_prompt
+
+        memory = [
+            self._MEMORY_RECORD_RETRY4,
+            TestPlannerFakeAndMemoryFix._MEMORY_RECORD,
+        ]
+        text = _format_brief_for_prompt(self._brief(memory=memory))
+        # The failed curl is never handed over whole.
+        self.assertNotIn(
+            "curl -s http://localhost:11434/health", text
+        )
+        self.assertNotIn("test.sh", text)
+        self.assertIn("command=a shell command", text)
+        # A file path is described by kind, not quoted.
+        self.assertNotIn(
+            "/home/seeker/freetalon-workspace/api/health.py", text
+        )
+        self.assertIn("file_path=a file path", text)
+        # The facts are still there as prose.
+        self.assertIn("verdict FAIL", text)
+        self.assertIn("exit 1", text)
+        self.assertIn("Decision: REPLAN", text)
+
+    def test_describe_param_value_names_kinds_not_text(self) -> None:
+        from freetalon.orchestrator.planner import _describe_param_value
+
+        self.assertEqual(
+            _describe_param_value("command", "curl -s http://localhost:11434/health"),
+            "command=a shell command",
+        )
+        self.assertEqual(
+            _describe_param_value("file_path", "/home/seeker/x/api/health.py"),
+            "file_path=a file path",
+        )
+        self.assertEqual(
+            _describe_param_value("model", "llama3"), "model=llama3"
+        )
+        self.assertEqual(_describe_param_value("count", 3), "count=3")
+        self.assertEqual(_describe_param_value("flag", True), "flag=True")
+
+    def test_replan_repairs_brief_echo_in_one_round(self) -> None:
+        import json
+
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        echo = json.dumps(self._replan1_echo())
+        good = self._dag(self._good_delta_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[echo, good]
+        ) as call_mock:
+            nodes = replan_from_brief(self._brief())
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(call_mock.call_count, 2)
+        first_prompt = call_mock.call_args_list[0][0][1]
+        repair_prompt = call_mock.call_args[0][1]
+        # The first prompt hands the model a grounded shape, not copyable
+        # commands: the ROUTE GOAL block is present, the failed curl is not.
+        self.assertIn("ROUTE GOAL", first_prompt)
+        self.assertIn("curl http://localhost:8765/health", first_prompt)
+        self.assertIn("freetalon/api.py", first_prompt)
+        self.assertNotIn("curl -s http://localhost:11434/health", first_prompt)
+        self.assertNotIn("test.sh", first_prompt)
+        # The repair names the echo and never pastes the echoed output back.
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("copied the re-plan brief", repair_prompt)
+        self.assertNotIn(echo, repair_prompt)
+        # The repair names the echo shape ("delta_plan" in the rejection
+        # reason) — that naming is the fix — but carries none of the
+        # echoed step content: no failed commands, no test.sh.
+        self.assertNotIn("python3 -munittestdiscover", repair_prompt)
+        self.assertNotIn("test.sh", repair_prompt)
+        self.assertNotIn("curl -s http://localhost:11434/health", repair_prompt)
+
+    def test_replan_prompt_has_route_shape_only_for_route_goals(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        good = self._dag(self._good_delta_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=good
+        ) as call_mock:
+            replan_from_brief(self._brief())
+        self.assertIn("ROUTE GOAL", call_mock.call_args[0][1])
+
+        non_route_brief = {
+            "goal": {
+                "objective": "Run the test suite",
+                "success_measures": [],
+                "budget": {},
+                "risk_class": "read_only",
+                "stop_conditions": [],
+                "irreversible_actions": [],
+            },
+            "plan_id": "plan-x",
+            "plan_version": 1,
+            "failed_nodes": [],
+            "measurements": [],
+            "memory": [],
+            "remaining_budget": {"replans": 1},
+            "instruction": "Produce a delta plan.",
+        }
+        plain = self._dag(
+            [
+                {
+                    "id": "step_1",
+                    "objective": "Run the test suite",
+                    "depends_on": [],
+                    "assigned_claw": "bash",
+                    "inputs": {"command": "python3 -m unittest discover -s tests"},
+                    "outputs": ["test results"],
+                    "criteria": [{"type": "exit_code", "equals": 0}],
+                }
+            ]
+        )
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=plain
+        ) as call_mock:
+            nodes = replan_from_brief(non_route_brief)
+        self.assertEqual(len(nodes), 1)
+        self.assertNotIn("ROUTE GOAL", call_mock.call_args[0][1])
+
+    # --- Regression guards: the heredoc fix still holds ---
+
+    def test_parse_accepts_valid_heredoc_health_plan(self) -> None:
+        ws = self.WS
+        nodes_in = [
+            {
+                "id": "step_1",
+                "objective": "Extend the health endpoint in freetalon/api.py",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": self.api_path, "content": "# extended health"},
+                "outputs": [self.api_path],
+                "criteria": [{"type": "file_exists", "path": self.api_path}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Write the health endpoint test file",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": TestPlannerHeredocFix.HEREDOC_TEST},
+                "outputs": [f"{ws}/test_health.py"],
+                "criteria": [{"type": "file_exists", "path": f"{ws}/test_health.py"}],
+            },
+            {
+                "id": "step_3",
+                "objective": "Run the health endpoint tests",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": f"python3 {ws}/test_health.py"},
+                "outputs": ["test results"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_4",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_3"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -s http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+        nodes, _ = parse_planner_response(
+            self._dag(nodes_in), goal_text=self.HEALTH_GOAL
+        )
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+
+    def test_parse_still_rejects_retry3_glued_echo(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Write the health endpoint test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": TestPlannerHeredocFix.GLUED_ECHO},
+            "outputs": [f"{self.WS}/test_health.py"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        with self.assertRaisesRegex(LLMResponseError, "glued together") as ctx:
+            parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
+        self.assertIn("heredoc", str(ctx.exception))
+        self.assertIn("scaffold", str(ctx.exception))
+
+    def test_prompts_forbid_re_serializing_the_brief(self) -> None:
+        from freetalon.orchestrator.prompts import REPLAN_SYSTEM_PROMPT
+
+        self.assertIn("never re-serialize the brief", REPLAN_SYSTEM_PROMPT)
+        self.assertIn('"delta_plan"', REPLAN_SYSTEM_PROMPT)

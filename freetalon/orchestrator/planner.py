@@ -151,6 +151,20 @@ def parse_planner_response(
 
     nodes_raw = payload.get("nodes")
     if not isinstance(nodes_raw, list):
+        # Brief-echo shape (retry #4 replan 1): the model re-serialized the
+        # re-plan brief as {"instruction": ..., "delta_plan": {"steps": [...]}}.
+        # Name the echo explicitly — the repair prompt carries the rejection
+        # verbatim, so the model learns the brief is input, not output.
+        brief_keys = {"instruction", "delta_plan", "steps", "failed_nodes", "remaining_budget"}
+        if brief_keys & set(payload):
+            raise LLMResponseError(
+                "Planner output copied the re-plan brief instead of a plan DAG — "
+                "it has an 'instruction'/'delta_plan'/'steps' object and no 'nodes' "
+                "array. Output ONLY a JSON object with a NEW 'nodes' array of "
+                "PlanNodes (id, objective, depends_on, assigned_claw, inputs, "
+                "outputs, acceptance, criteria, error) — never re-serialize the "
+                "brief, its instruction, or its failed steps."
+            )
         raise LLMResponseError("Planner output must contain a 'nodes' array.")
 
     # Defensive normalization: coerce plain strings into single-element lists
@@ -714,40 +728,87 @@ def _route_engagement_errors(
     """Reject a plan that claims route work without touching the route.
 
     When the goal names an existing API route, at least one node must
-    engage it: mention the module that serves it, or call the live route.
-    (Retry #2: the goal asked for GET /health in freetalon/api.py, but no
-    node read, modified, or called anything in freetalon/api.py — the plan
-    wrote a static api.json instead.)
+    engage it: mention the module that serves it, or call the live route
+    on the API's own port. A route literal on any other host/port does
+    NOT count — it is a different service. (Retry #2: the goal asked for
+    GET /health in freetalon/api.py, but no node read, modified, or called
+    anything in freetalon/api.py — the plan wrote a static api.json
+    instead. Retry #4: node-1 curled http://localhost:11434/health — the
+    route literal on Ollama's port — and the plan passed while never
+    touching freetalon/api.py and curling a service with no /health
+    endpoint.)
     """
     if not goal_text:
         return []
     errors: list[str] = []
+    api_port = index.api_port
     for route, module in _routes_named_in_goal(goal_text, index):
         engaged = False
-        route_re = re.compile(rf"{re.escape(route)}(?![A-Za-z0-9_.\-])")
+        wrong_service: list[str] = []
+        # A call to the route on the API's own port, e.g.
+        # curl http://localhost:8765/health or
+        # requests.get("http://localhost:8765/health").
+        live_re = re.compile(
+            rf":{api_port}[^\s\"']*{re.escape(route)}(?![A-Za-z0-9_.\-])"
+        )
+        # The same route literal after any other port is a different
+        # service (Ollama on 11434 has no /health endpoint).
+        other_port_re = re.compile(
+            rf":(\d+)[^\s\"']*{re.escape(route)}(?![A-Za-z0-9_.\-])"
+        )
         for node in nodes:
             for text in _node_path_strings(node):
-                if module in text or route_re.search(text):
+                if module in text or live_re.search(text):
                     engaged = True
                     break
+                for match in other_port_re.finditer(text):
+                    if int(match.group(1)) != api_port:
+                        wrong_service.append(f"localhost:{match.group(1)}")
             if engaged:
                 break
         if not engaged:
-            errors.append(
-                f"Planner goal asks for the {route} endpoint, served by "
-                f"{module}, but no node reads, modifies, or calls it — "
-                f"extend {module} instead of writing a stand-in file."
-            )
+            if wrong_service:
+                ports = ", ".join(sorted(set(wrong_service)))
+                errors.append(
+                    f"Planner goal asks for the {route} endpoint, served by "
+                    f"{module} on port {api_port}, but no node reads, modifies, "
+                    f"or calls it — a node calls {route} on {ports} instead, "
+                    f"which is a different service, not the FreeTalon API. "
+                    f"Call {route} on port {api_port} or extend {module}."
+                )
+            else:
+                errors.append(
+                    f"Planner goal asks for the {route} endpoint, served by "
+                    f"{module}, but no node reads, modifies, or calls it — "
+                    f"extend {module} instead of writing a stand-in file."
+                )
     return errors
 
 
-def _short_value(value: Any, limit: int = 80) -> str:
-    """One-line rendering of a value, truncated so a long literal (a bash
-    command echoing a JSON answer, say) is never handed to the model whole."""
+def _describe_param_value(key: str, value: Any) -> str:
+    """One prose phrase for a past parameter — its kind, never its text.
+
+    A failed command or file path handed to the model verbatim is a node
+    waiting to be copied: at temperature 0 the model pastes what it last
+    saw. Retry #4's replan 1 copied the failed curl command out of the
+    memory prose, and the retry-#2 test.sh / glued-unittest commands the
+    same way (all under 80 chars, so truncation did not save them).
+    Short plain tokens — a model name, a flag, a number — carry no command
+    and are safe to name; anything shaped like a command, a path, or code
+    is described by kind only.
+    """
+    if isinstance(value, bool):
+        return f"{key}={value}"
+    if isinstance(value, (int, float)):
+        return f"{key}={value}"
     text = str(value)
-    if len(text) > limit:
-        return text[:limit] + "… (truncated)"
-    return text
+    if len(text) <= 40 and not any(ch in text for ch in " /|<>$\"'{}()[]"):
+        return f"{key}={text}"
+    if key == "command":
+        return f"{key}=a shell command"
+    if key in ("file_path", "path"):
+        return f"{key}=a file path"
+    return f"{key}=a longer value"
 
 
 def _describe_measurement(measurement: Any) -> str:
@@ -775,8 +836,8 @@ def _describe_memory_record(record: Any) -> str:
     copyable JSON object at temperature 0: in the /health retry #2 the
     replan returned one verbatim as the nodes array. Prose carries the
     same facts (what was tried, what happened, the lesson) with nothing
-    to copy. Long values are truncated so a literal the model could echo
-    is never handed over whole.
+    to copy. Parameter values are described by kind, never quoted: a
+    failed command handed over verbatim is copied back as a node (retry #4).
     """
     if not isinstance(record, dict):
         return str(record)
@@ -788,7 +849,7 @@ def _describe_memory_record(record: Any) -> str:
     param_text = ""
     if isinstance(params, dict) and params:
         param_text = "; ".join(
-            f"{key}={_short_value(value)}" for key, value in params.items()
+            _describe_param_value(key, value) for key, value in params.items()
         )
     data_window = approach.get("data_window", "")
     bits = [
@@ -890,6 +951,35 @@ def _goal_text_from_brief(brief: dict[str, Any]) -> str:
     if isinstance(goal, str):
         return goal
     return ""
+
+
+def _route_goal_shape(goal_text: str | None, repo_root: str | Path | None = None) -> str:
+    """A concrete node shape for a goal naming an existing API route.
+
+    When the goal names a route, the delta plan has a known shape — edit
+    the serving module, write tests, call the live route on the API port —
+    so the replan prompt hands the model a NEW structure to produce
+    instead of leaving it to re-serialize the brief's failed steps as
+    JSON (retry #4 replan 1 echoed the brief's delta steps verbatim).
+    Returns "" when the goal names no route.
+    """
+    if not goal_text:
+        return ""
+    index = build_repo_index(repo_root)
+    named = _routes_named_in_goal(goal_text, index)
+    if not named:
+        return ""
+    lines = ["ROUTE GOAL — the delta plan must follow this shape:"]
+    for route, module in named:
+        lines.append(
+            f"- {route} is served by {module} on port {index.api_port}: "
+            f"node 1 edits {module} (scaffold claw, or a bash heredoc) to "
+            f"implement the endpoint; node 2 writes the tests (scaffold or "
+            f"heredoc) and runs them; node 3 verifies live with "
+            f"curl http://localhost:{index.api_port}{route}. Do NOT probe "
+            f"another service's {route} path, and do NOT echo a JSON answer."
+        )
+    return "\n".join(lines)
 
 def _format_intent_for_prompt(intent: TaskIntent) -> str:
     """Render a TaskIntent as plain prose lines for the planner prompt.
@@ -1046,9 +1136,11 @@ def replan_from_brief(
     """
 
     context = format_repo_context(build_repo_index(repo_root))
+    shape = _route_goal_shape(_goal_text_from_brief(brief), repo_root)
+    shape_block = f"\n\n{shape}" if shape else ""
     nodes, _metadata = _call_llm_with_repair(
         REPLAN_SYSTEM_PROMPT,
-        f"{context}\n\n{_format_brief_for_prompt(brief)}\n\n"
+        f"{context}\n\n{_format_brief_for_prompt(brief)}{shape_block}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
         "quote, or echo the brief — it is your input, not your output.\n"
         "JSON Output:",
