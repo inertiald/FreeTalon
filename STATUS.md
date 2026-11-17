@@ -1086,3 +1086,65 @@ Deliberately left out:
   (verified byte-for-byte against a pristine b79ac6f worktree). Log:
   freetalon-workspace/logs/planner-framework-steer-fix-2026-11-16.log.
   Next: /health retry #14 (GPU load, separate step).
+
+## /health retry #14 (2026-11-17, run run-20261117T090107Z-c77c7a)
+
+  Goal FAIL in 54.7s -- escalated: node 'node-1' unmeasurable twice
+  in a row; the plan is underspecified. First retry where a plan was
+  ACCEPTED on the first attempt AND executed through the loop with
+  replans (v1 -> v2 -> v3). Intake succeeded cleanly (valid
+  TaskIntent, no echo). v1 plan plan-7885a4ef9d99 (3 bash nodes,
+  correct node-id depends_on, exit_code criteria) -- the
+  framework-steer fix IS working: node-1's command names the real
+  handler (HiveAPIServer, do_GET of the Handler class inside
+  HiveAPIServer.start, absolute repo path). But the "command" was
+  prose, not shell -- /bin/sh: Syntax error: "(" unexpected, exit 2
+  in 0.001s. Judge chose REPLAN. The v1->v2 replan: a scaffold of
+  '/health' with a JSON literal was rejected by the duplicate-route
+  rule (scaffolding '/health' duplicates the existing /health route
+  in freetalon/api.py -- extend it instead); v2 accepted: scaffold
+  freetalon/api.py with "# Scaffolded code for /health endpoint."
+  (39 bytes, status success) -- measurement UNMEASURABLE (no exit
+  code reported). Judge chose REPLAN. The v2->v3 replan: a single-node
+  object (prose re-serialization, rejected by name) and {"nodes":[]}
+  (rejected) before v3 accepted: one scaffold node, absolute
+  file_path /home/seeker/projects/FreeTalon/freetalon/api.py, content
+  "# Placeholder for health endpoint logic." (40 bytes, status
+  success) -- measurement UNMEASURABLE again. Judge ESCALATED:
+  node-1 unmeasurable twice in a row.
+  The v3 scaffold OVERWROTE the real freetalon/api.py with the
+  1-line placeholder comment (219 lines -> 1 line, 1 insertion /
+  219 deletions); the loop never noticed, because scaffold nodes
+  report no exit code. api.py was restored with git checkout --
+  freetalon/api.py (tracked, committed at 5a82b74); suite re-run
+  579/579 green after the restore; tree clean apart from this file.
+  Endpoint NOT extended, no new tests, no live curl (node-3 never
+  ran). No stray files (health.json, api.json, test.sh,
+  test_health.py, /health all absent). Log:
+  freetalon-workspace/logs/llm-end-to-end-health-retry14-2026-11-16.log
+  (259 lines); run dir
+  freetalon-workspace/runs/run-20261117T090107Z-c77c7a (plan-v001 /
+  v002 / v003.json, measurements.jsonl, memory.jsonl).
+  GPU survived: mid-run peak sampled 66C at 260.53W, post-run 61C at
+  fan restore (cooling), now idle, limit 300W holding, link x16,
+  zero Xid 79/154; fans manual 85% during, restored to auto after.
+  No thermal pause (never >=85C), no fall-off.
+  Next weakness (for the parent to decide): (1) scaffold nodes are
+  UNMEASURABLE -- the exit_code criterion cannot measure scaffold
+  work, so the loop escalates without learning anything; scaffold
+  should report an exit code / a file-written measurement. (2) The
+  scaffold claw overwrites an existing code file with placeholder
+  content and no guard -- a scaffold write to an existing module
+  should be refused unless the content is real code (or at least
+  not a comment-only placeholder), and an absolute file_path
+  reaching outside the run dir into the repo needs a guard. (3) The
+  v1 prose-command problem remains: the grounded move names the
+  handler, but the model still emits a description in the command
+  field instead of an executable edit (heredoc/scaffold with real
+  code) -- bash commands that are prose descriptions should be
+  rejected at plan time. Known gaps not exercised: file_matches
+  outputs-only hole; literal JSON to a new non-code file with only
+  an exit_code criterion still passes; comment-only commands not
+  validated as no-ops.
+  Next: planner fix for scaffold measurability + overwrite guard,
+  then /health retry #15.
