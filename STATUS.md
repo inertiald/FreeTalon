@@ -957,3 +957,40 @@ Deliberately left out:
   not fixed here): file_matches has the same outputs-only hole as
   file_exists had; comment-only commands are not validated as
   no-ops. Next: /health retry #12 (GPU load, separate step).
+
+## Update - 2026-11-17 (early, /health retry #12)
+
+  /health retry #12 FAILED at planning (DRIVER_EXIT:1, ~70s, no
+  run created). Pre-flight green (51C idle, 300W, x16, zero Xid,
+  head 7c11000, suite 531/531). Intake succeeded. Three planner
+  attempts, all rejected: (1) {"nodes":[]} -- empty plan;
+  (2) the stdout-echo fake in a new disguise -- echo of a JSON
+  answer redirected INTO freetalon/api.py itself (would have
+  overwritten the serving module with a JSON literal), node ids
+  as integers (1, 2) and depends_on [1] -- rejected with 3 errors
+  (id must be a valid string x2, depends_on.0 must be a valid
+  string); the stand-in rule did NOT fire (criteria is exit_code,
+  not file_exists), so only the int-id type error caught it --
+  had the ids been strings, the plan may have been accepted;
+  (3) a scaffold plan writing a Flask app to freetalon/api.py,
+  otherwise well-shaped (correct repo paths, string ids, correct
+  node-id depends_on, objective/assigned_claw/inputs/criteria
+  present -- the shape fixes ARE steering) -- rejected with 1
+  error by the framework rule, naming stdlib http.server.
+  Repair budget (max 2) was already spent on the first two junk
+  attempts, so the model never got a repair round for the Flask
+  error; driver raised at plan_task_intent (planner.py:1794).
+  Judge/replan never ran. Endpoint NOT extended, no new tests,
+  suite 531/531 green after, no stray files. GPU survived (65C
+  at fan restore, now 51C idle, 300W, x16, zero Xid; fans auto).
+  Log: freetalon-workspace/logs/llm-end-to-end-health-retry12-
+  2026-11-16.log. Next weakness: an echo of a literal answer
+  INTO a file with an exit_code criterion slips past the stand-in
+  rule (it only fires on a file_exists claim on the same file) --
+  the validator should reject writing a literal JSON answer into
+  any file, and/or reject overwriting the serving module with
+  non-code content. Second: the first two junk attempts burn the
+  repair budget before a real (single-error, repairable) rejection
+  arrives -- consider a repair round reserved for the last
+  rejection, or rejecting empty/echo plans without spending the
+  full budget.
