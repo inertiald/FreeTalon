@@ -57,6 +57,15 @@ expected answer (for example, echoing a hardcoded JSON response into
 api.json) and claim the endpoint exists. Implement the work in the module
 that serves it, and verify it by calling the live service.
 
+WRITING MULTI-LINE FILES - never write a multi-line file with a
+single-line echo or printf: newlines collapse in this JSON interface,
+the command is rejected as glued words, and the plan fails. To write a
+multi-line file, use the "scaffold" claw (inputs "file_path" and
+"content") - or a bash heredoc: "cat > <path> <<'EOF'" on its own line,
+then the file contents, then "EOF" on its own line, then any follow-up
+command (for example, "python3 <path>"). A heredoc body is file content,
+not a shell command.
+
 CRITICAL SCHEMA RULES:
 1. "acceptance", "outputs", and "depends_on" MUST ALWAYS be JSON arrays of strings (e.g. ["Command exits with code 0"]), NEVER a bare string.
 2. Root nodes MUST have "depends_on": []. Downstream nodes MUST list parent step IDs in "depends_on".
@@ -208,6 +217,9 @@ Rules:
 - Ground in the repo: if an endpoint or module already exists, extend it;
   never create a new file duplicating it. The FreeTalon API runs on port
   8765; do not use port 8000 for service checks.
+- To write a multi-line file, use the "scaffold" claw or a bash heredoc
+  (cat > <path> <<'EOF' ... EOF). Never use single-line echo for
+  multi-line content - it is rejected as glued words.
 - Shrink scope before growing it: narrow the hypothesis, add a cheaper
   test, or gather the missing data first.
 - Every node needs testable acceptance: a "criteria" array with at least

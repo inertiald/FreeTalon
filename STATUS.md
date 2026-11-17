@@ -495,3 +495,24 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
     write (heredoc or scaffold claw) and name it in the repair message
     when the glued-word rule fires; the validator is doing its job, the
     model just has no valid move.
+
+## Update - 2026-11-16 22:23
+
+- Planner heredoc fix (retry #3, CPU-only, no LLM/GPU calls): the model
+  had no valid move for writing a multi-line file - it tried 3 times to
+  echo a test file as one glued line and the validator correctly rejected
+  it every time. Now the planner prompt names the scaffold claw and the
+  bash heredoc as THE ways to write a multi-line file (both system
+  prompts), and a glued-word rejection names them as the alternative.
+  Validation accepts a heredoc write: heredoc bodies are file content,
+  not shell (a URL inside the file no longer trips the glued check or
+  the port check), and a multi-line test file is no longer flagged as a
+  static stand-in answer (the "assert" check now only fires on
+  single-line literals; a heredoc fake JSON answer is still rejected).
+  Demo: tools/demo-glued-echo-repair.py reads the verbatim retry-#3
+  command from the retry3 log - rejected with the guidance, heredoc
+  version accepted. Tests 419 -> 427/427 green (new
+  TestPlannerHeredocFix, 8 tests), M5 smoke OK
+  (finance run-20261117T062208Z-06cb8e, ecu run-20261117T062208Z-d6dc96).
+  Log: logs/planner-heredoc-fix-2026-11-16.log.
+  - Next: /health retry #4 (live, GPU) - not run here by design.

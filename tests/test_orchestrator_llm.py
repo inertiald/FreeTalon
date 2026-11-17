@@ -1423,3 +1423,242 @@ class TestPlannerFakeAndMemoryFix(unittest.TestCase):
         self.assertIn("live service", PLANNER_SYSTEM_PROMPT)
         self.assertIn("re-plan brief as prose", REPLAN_SYSTEM_PROMPT)
         self.assertNotIn("Re-plan brief JSON", REPLAN_SYSTEM_PROMPT)
+
+
+
+class TestPlannerHeredocFix(unittest.TestCase):
+    """A valid multi-line file write (retry #3).
+
+    Retry #3 (log llm-end-to-end-health-retry3-2026-11-16.log) failed at
+    the planning stage: the model tried 3 times (initial plan + 2
+    repairs) to write the test file as a single-line echo with all
+    newlines collapsed, and the validator correctly rejected it every
+    time as glued words. The model had no valid move: the repair prompt
+    never named an alternative. Two fixes: (1) the planner prompt names
+    the scaffold claw and the bash heredoc as THE ways to write a
+    multi-line file, and the glued-word rejection names them too; (2)
+    validation accepts a heredoc file write - heredoc bodies are file
+    content, not shell, so a URL inside the file is not flagged as
+    glued words, and a multi-line test file is not flagged as a static
+    stand-in answer.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+
+    # The exact node-1 command from the retry-#3 final rejection: a
+    # single-line echo with every newline collapsed.
+    GLUED_ECHO = (
+        "echo '#import unittest, requests, json from freetalon.api import api"
+        "class TestHealthEndpoint(unittest.TestCase): "
+        "def test_health_endpoint(self): "
+        'response = requests.get("http://localhost:8765/health") '
+        "self.assertEqual(response.status_code, 200) "
+        "data = json.loads(response.text) "
+        'self.assertEqual(data["service_status"], "running") '
+        'self.assertEqual(data["ollama_reachable"], True) '
+        'self.assertTrue(isinstance(data["gpu_temperature"], int)) '
+        'if __name__ == "__main__": unittest.main()\' '
+        "> /home/seeker/freetalon-workspace/test_health.py "
+        "&& python3 /home/seeker/freetalon-workspace/test_health.py"
+    )
+
+    # The same test file as a heredoc: the valid replacement.
+    HEREDOC_TEST = (
+        "cat > /home/seeker/freetalon-workspace/test_health.py <<'EOF'\n"
+        "import unittest, requests, json\n"
+        "from freetalon.api import api\n"
+        "class TestHealthEndpoint(unittest.TestCase):\n"
+        "    def test_health_endpoint(self):\n"
+        '        response = requests.get("http://localhost:8765/health")\n'
+        "        self.assertEqual(response.status_code, 200)\n"
+        "        data = json.loads(response.text)\n"
+        '        self.assertEqual(data["service_status"], "running")\n'
+        '        self.assertEqual(data["ollama_reachable"], True)\n'
+        '        self.assertTrue(isinstance(data["gpu_temperature"], int))\n'
+        "EOF"
+    )
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _bash_node(self, command: str, **overrides: object) -> dict:
+        node: dict = {
+            "id": "step_1",
+            "objective": "Write the health endpoint test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": command},
+            "outputs": ["/home/seeker/freetalon-workspace/test_health.py"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        node.update(overrides)
+        return node
+
+    def _heredoc_plan_nodes(self) -> list[dict]:
+        ws = "/home/seeker/freetalon-workspace"
+        return [
+            {
+                "id": "step_1",
+                "objective": "Write the health endpoint test file",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "inputs": {"command": self.HEREDOC_TEST},
+                "outputs": [f"{ws}/test_health.py"],
+                "criteria": [{"type": "file_exists", "path": f"{ws}/test_health.py"}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Run the health endpoint tests",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": f"python3 {ws}/test_health.py"},
+                "outputs": ["test results"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_3",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -s http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+
+    def test_parse_rejects_retry3_glued_echo_and_names_alternative(self) -> None:
+        node = self._bash_node(self.GLUED_ECHO)
+        with self.assertRaisesRegex(LLMResponseError, "glued together") as ctx:
+            parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
+        self.assertIn("heredoc", str(ctx.exception))
+        self.assertIn("scaffold", str(ctx.exception))
+
+    def test_glued_echo_repairs_to_heredoc_in_one_round(self) -> None:
+        bad = self._dag([self._bash_node(self.GLUED_ECHO)])
+        good = self._dag(self._heredoc_plan_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(plan.nodes[0].assigned_claw, "bash")
+        self.assertIn("<<'EOF'", plan.nodes[0].inputs["command"])
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("heredoc", repair_prompt)
+
+    def test_parse_accepts_heredoc_with_url_in_body(self) -> None:
+        node = self._bash_node(
+            self.HEREDOC_TEST,
+            criteria=[
+                {
+                    "type": "file_exists",
+                    "path": "/home/seeker/freetalon-workspace/test_health.py",
+                }
+            ],
+        )
+        nodes, _ = parse_planner_response(
+            self._dag([node]), goal_text=self.HEALTH_GOAL
+        )
+        self.assertEqual(nodes[0].assigned_claw, "bash")
+
+    def test_parse_still_rejects_heredoc_fake_json_answer(self) -> None:
+        fake = (
+            "cat > /home/seeker/freetalon-workspace/api.json <<'EOF'\n"
+            '{"health": "OK", "ollama_reachable": true, "gpu_temp": 60}\n'
+            "EOF"
+        )
+        node = self._bash_node(
+            fake,
+            outputs=["/home/seeker/freetalon-workspace/api.json"],
+            criteria=[
+                {
+                    "type": "file_exists",
+                    "path": "/home/seeker/freetalon-workspace/api.json",
+                }
+            ],
+        )
+        with self.assertRaisesRegex(LLMResponseError, "hardcoded answer"):
+            parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
+
+    def test_parse_accepts_scaffold_test_file(self) -> None:
+        # A scaffold node alone cannot engage the /health route, so the
+        # plan also needs a node that calls the live endpoint.
+        nodes_in = [
+            {
+                "id": "step_1",
+                "objective": "Write the health endpoint test file",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {
+                    "file_path": "/home/seeker/freetalon-workspace/test_health.py",
+                    "content": "import unittest\n\n\nclass TestHealth(unittest.TestCase):\n    pass\n",
+                },
+                "outputs": ["/home/seeker/freetalon-workspace/test_health.py"],
+                "criteria": [
+                    {
+                        "type": "file_exists",
+                        "path": "/home/seeker/freetalon-workspace/test_health.py",
+                    }
+                ],
+            },
+            {
+                "id": "step_2",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -s http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+        nodes, _ = parse_planner_response(
+            self._dag(nodes_in), goal_text=self.HEALTH_GOAL
+        )
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+
+    def test_prompts_name_heredoc_or_scaffold_for_multiline_files(self) -> None:
+        from freetalon.orchestrator.prompts import (
+            PLANNER_SYSTEM_PROMPT,
+            REPLAN_SYSTEM_PROMPT,
+        )
+
+        for prompt in (PLANNER_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT):
+            self.assertIn("heredoc", prompt)
+            self.assertIn("scaffold", prompt)
+        self.assertIn("single-line echo", PLANNER_SYSTEM_PROMPT)
+
+    def test_strip_heredoc_bodies_keeps_shell_around_it(self) -> None:
+        from freetalon.orchestrator.planner import _strip_heredoc_bodies
+
+        command = (
+            "cat > /tmp/x.py <<'EOF'\n"
+            "x = 1\n"
+            "EOF\n"
+            "python3 /tmp/x.py"
+        )
+        stripped = _strip_heredoc_bodies(command)
+        self.assertNotIn("x = 1", stripped)
+        self.assertIn("python3 /tmp/x.py", stripped)
+        self.assertIn("<<'EOF'", stripped)
+
+    def test_strip_heredoc_bodies_leaves_unterminated_alone(self) -> None:
+        from freetalon.orchestrator.planner import _strip_heredoc_bodies
+
+        unterminated = "cat > /tmp/x.py <<'EOF'\nx = 1\n"
+        self.assertEqual(_strip_heredoc_bodies(unterminated), unterminated)

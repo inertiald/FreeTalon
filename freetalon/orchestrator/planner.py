@@ -336,6 +336,13 @@ _PORT_RE = re.compile(r"(?:localhost|127\.0\.0\.1):(\d+)(/[^\s\"']*)?")
 _FLAG_PATH_RE = re.compile(r"^-[A-Za-z][^ ]*/")
 
 
+_GLUED_WORD_GUIDANCE = (
+    " To write a multi-line file, use a heredoc "
+    "(cat > <path> <<'EOF' ... EOF) or the scaffold claw \u2014 do not use "
+    "single-line echo for multi-line content"
+)
+
+
 def _validate_bash_command(node: PlanNode) -> list[str]:
     """Return every error in a bash/shell_exec node's command (fix 2).
 
@@ -353,9 +360,13 @@ def _validate_bash_command(node: PlanNode) -> list[str]:
     cmd = node.inputs.get("command") or node.inputs.get("cmd")
     if not isinstance(cmd, str) or not cmd.strip():
         return ["bash node needs a non-empty 'command' string"]
+    # A heredoc body is file content, not shell: strip it before the
+    # shlex / port checks, or a URL inside the file is flagged as glued
+    # words (retry #3). The shell around the heredoc is still validated.
+    shell = _strip_heredoc_bodies(cmd)
     tokens: list[str] = []
     try:
-        tokens = shlex.split(cmd)
+        tokens = shlex.split(shell)
     except ValueError as exc:
         errors.append(f"bash command does not parse as a shell command: {exc}")
     if tokens:
@@ -363,25 +374,25 @@ def _validate_bash_command(node: PlanNode) -> list[str]:
         if not first.startswith(("/", "./", "../")):
             if "://" in first and not first.startswith(("http://", "https://")):
                 errors.append(
-                    f"bash command looks like words glued together (missing spaces): {cmd!r}"
+                    f"bash command looks like words glued together (missing spaces): {shell!r}.{_GLUED_WORD_GUIDANCE}"
                 )
             elif "/" in first and first.split("/", 1)[0].count("-") >= 2:
                 errors.append(
-                    f"bash command looks like words glued together (missing spaces): {cmd!r}"
+                    f"bash command looks like words glued together (missing spaces): {shell!r}.{_GLUED_WORD_GUIDANCE}"
                 )
         for token in tokens[1:]:
             if _FLAG_PATH_RE.match(token):
                 errors.append(
                     f"bash command looks like a flag and a path glued together: "
-                    f"{token!r} in {cmd!r}"
+                    f"{token!r} in {shell!r}"
                 )
             if "://" in token and not token.startswith(("http://", "https://")):
                 errors.append(
-                    f"bash command looks like words glued together (missing spaces): {cmd!r}"
+                    f"bash command looks like words glued together (missing spaces): {shell!r}.{_GLUED_WORD_GUIDANCE}"
                 )
     elif not errors:
         errors.append("bash node needs a non-empty 'command' string")
-    for match in _PORT_RE.finditer(cmd):
+    for match in _PORT_RE.finditer(shell):
         port = int(match.group(1))
         if port in _KNOWN_SERVICE_PORTS:
             continue
@@ -509,6 +520,49 @@ _HEREDOC_RE = re.compile(
 )
 
 
+# Same heredoc shape without the line-start anchor, for stripping
+# bodies from commands where the heredoc follows `&&` or `;`.
+_STRIP_HEREDOC_RE = re.compile(
+    r"cat\s*>>?\s*(?P<target>\S+)\s*<<-?\s*['\"]?(?P<marker>[A-Za-z_][A-Za-z0-9_]*)['\"]?"
+)
+
+
+def _strip_heredoc_bodies(command: str) -> str:
+    """Remove heredoc bodies from a bash command, leaving the shell around them.
+
+    A heredoc body is file content, not shell: its lines must not be
+    tokenized by the glued-word checks or scanned for localhost ports.
+    (Retry #3: a heredoc test file containing
+    ``requests.get("http://localhost:8765/health")`` was rejected as
+    glued words, because shlex turns the body line into a token
+    containing "://" that does not start with "http://".) The head line
+    (``cat > path <<'MARKER'``), the closing marker line, and any
+    commands after the marker are kept and still validated.
+    """
+    out: list[str] = []
+    rest = command
+    while True:
+        match = _STRIP_HEREDOC_RE.search(rest)
+        if not match:
+            out.append(rest)
+            break
+        out.append(rest[: match.end()])
+        tail = rest[match.end() :]
+        lines = tail.splitlines(keepends=True)
+        marker = match.group("marker")
+        marker_idx = next(
+            (i for i, line in enumerate(lines) if line.strip() == marker), None
+        )
+        if marker_idx is None:
+            # Unterminated heredoc: leave the rest as-is for validation.
+            out.append(tail)
+            break
+        out.append(lines[0] if lines else "")
+        out.append(lines[marker_idx])
+        rest = "".join(lines[marker_idx + 1 :])
+    return "".join(out)
+
+
 def _quoted_segments(body: str) -> list[str]:
     """Quoted segments of a shell fragment, in order.
 
@@ -564,13 +618,19 @@ def _literal_write(command: str) -> tuple[str, str] | None:
 def _literal_is_answer(literal: str) -> bool:
     """True when a written literal is a hardcoded answer, not data.
 
-    A JSON object/array literal (``{"health": "OK", ...}``) or a string
-    containing ``assert`` is the expected answer written out by hand.
+    A JSON object/array literal (``{"health": "OK", ...}``) or a
+    single-line string containing ``assert`` is the expected answer
+    written out by hand.
     Plain text (``echo hello > out.txt``) is ordinary scratch output and
     is not flagged.
     """
     text = literal.strip()
-    if "assert" in text.lower():
+    # A single-line assert sentence is the expected answer written out
+    # by hand (retry #2: an assert sentence echoed into test.sh). A
+    # multi-line literal containing "assert" is real code (a test file),
+    # not an answer sentence - the JSON check below still catches a
+    # multi-line fake JSON answer.
+    if "assert" in text.lower() and "\n" not in text:
         return True
     try:
         parsed = json.loads(text)
