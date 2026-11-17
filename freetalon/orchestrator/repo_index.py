@@ -109,6 +109,14 @@ class RepoIndex:
     # rel-path -> web framework the module is built on ("stdlib http.server",
     # "Flask", ...), only when the module imports one.
     frameworks: dict[str, str] = field(default_factory=dict)
+    # HTTP route (same keys as ``routes``) -> the request handler that
+    # already serves it, e.g. "the do_GET method of the Handler class
+    # (defined inside HiveAPIServer.start)". Derived from the AST: the
+    # route literal's enclosing do_* method. Lets the grounded move name
+    # the real dispatch instead of guessing it (retry #13: the model
+    # wrote two Flask scaffolds because "extend the module" read as
+    # "write a new app"). Empty for a route with no recorded handler.
+    route_handlers: dict[str, str] = field(default_factory=dict)
 
     def route_names(self) -> set[str]:
         """First path segment of each route ("health", "tasks", ...)."""
@@ -129,6 +137,87 @@ def resolve_repo_root(explicit: str | Path | None = None) -> Path:
         return Path(env_root).expanduser().resolve()
     # This file is <root>/freetalon/orchestrator/repo_index.py.
     return Path(__file__).resolve().parent.parent.parent
+
+
+# A request-handler method: do_GET, do_POST, ... on a class built on a
+# request-handler base (http.server's BaseHTTPRequestHandler) or any class
+# that defines one.
+_HANDLER_METHOD_RE = re.compile(r"^do_(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)$")
+
+
+def _handler_spans(source: str) -> list[tuple[int, int, str, str, str]]:
+    """(start_line, end_line, class, method, enclosing) for handler methods.
+
+    ``enclosing`` is the dotted path of the scopes around the class
+    ("" for a top-level class, "HiveAPIServer.start" for a Handler
+    defined inside HiveAPIServer.start). A class counts as a handler
+    when a base class name ends in "RequestHandler" or it defines a
+    do_* method.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    spans: list[tuple[int, int, str, str, str]] = []
+
+    def _base_name(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return ""
+
+    def _visit(node: ast.AST, scope: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                methods = [
+                    item
+                    for item in child.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and _HANDLER_METHOD_RE.match(item.name)
+                ]
+                is_handler = any(
+                    _base_name(base).endswith("RequestHandler")
+                    for base in child.bases
+                ) or bool(methods)
+                if is_handler:
+                    enclosing = ".".join(scope)
+                    for method in methods:
+                        spans.append(
+                            (
+                                method.lineno,
+                                method.end_lineno or method.lineno,
+                                child.name,
+                                method.name,
+                                enclosing,
+                            )
+                        )
+                _visit(child, scope + [child.name])
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _visit(child, scope + [child.name])
+            else:
+                _visit(child, scope)
+
+    _visit(tree, [])
+    return spans
+
+
+def _handler_for_line(
+    spans: list[tuple[int, int, str, str, str]], source: str, pos: int
+) -> str | None:
+    """The handler description for a route literal at byte offset ``pos``.
+
+    The route's line must fall inside a handler method's span; otherwise
+    None (the route is not served by a recorded handler method).
+    """
+    line = source.count("\n", 0, pos) + 1
+    for start, end, class_name, method_name, enclosing in spans:
+        if start <= line <= end:
+            description = f"the {method_name} method of the {class_name} class"
+            if enclosing:
+                description += f" (defined inside {enclosing})"
+            return description
+    return None
 
 
 def _top_level_names(source: str) -> list[str]:
@@ -165,11 +254,20 @@ def build_repo_index(repo_root: str | Path | None = None) -> RepoIndex:
             index.frameworks[rel] = framework
         stem = path.stem
         index.modules.setdefault(stem, []).append(rel)
+        spans = _handler_spans(source)
         for match in _ROUTE_EQ_RE.finditer(source):
-            index.routes.setdefault(match.group(1), rel)
+            route = match.group(1)
+            index.routes.setdefault(route, rel)
+            handler = _handler_for_line(spans, source, match.start())
+            if handler is not None:
+                index.route_handlers.setdefault(route, handler)
         for match in _ROUTE_STARTSWITH_RE.finditer(source):
             prefix = match.group(1)
-            index.routes.setdefault(prefix.rstrip("/") + "/…", rel)
+            key = prefix.rstrip("/") + "/…"
+            index.routes.setdefault(key, rel)
+            handler = _handler_for_line(spans, source, match.start())
+            if handler is not None:
+                index.route_handlers.setdefault(key, handler)
         if rel == "freetalon/config.py":
             port_match = _API_PORT_RE.search(source)
             if port_match:
@@ -177,6 +275,29 @@ def build_repo_index(repo_root: str | Path | None = None) -> RepoIndex:
     for stem in index.modules:
         index.modules[stem] = sorted(index.modules[stem])
     return index
+
+
+def _handler_groups(index: RepoIndex, module: str) -> str:
+    """One module's routes grouped by the handler that serves them.
+
+    "the do_GET method of the Handler class (defined inside
+    HiveAPIServer.start) handles /health, /status, /metrics; the do_POST
+    method of the Handler class (defined inside HiveAPIServer.start)
+    handles /shutdown". Empty when no route of the module has a recorded
+    handler.
+    """
+    by_handler: dict[str, list[str]] = {}
+    for route in sorted(index.routes):
+        if index.routes[route] != module:
+            continue
+        handler = index.route_handlers.get(route)
+        if handler is None:
+            continue
+        by_handler.setdefault(handler, []).append(route)
+    return "; ".join(
+        f"{handler} handles {', '.join(routes)}"
+        for handler, routes in sorted(by_handler.items())
+    )
 
 
 def format_repo_context(index: RepoIndex, workspace: str | None = None) -> str:
@@ -213,10 +334,15 @@ def format_repo_context(index: RepoIndex, workspace: str | None = None) -> str:
     for module in serving:
         framework = index.frameworks.get(module)
         if framework:
-            lines.append(
+            line = (
                 f"- {module} serves the API routes and is built on {framework} — "
-                "extend it in place; do not rewrite it in a different web framework."
+                "extend it in place"
             )
+            handled = _handler_groups(index, module)
+            if handled:
+                line += f"; {handled}"
+            line += "; do not rewrite it in a different web framework."
+            lines.append(line)
     if index.files:
         shown = sorted(index.files)[:_MAX_CONTEXT_FILES]
         for rel in shown:

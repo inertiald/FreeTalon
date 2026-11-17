@@ -1049,3 +1049,40 @@ Deliberately left out:
   rejection names the grounded move. Secondary: the stand-in check
   should run even when schema errors are present, so the int-id echo
   fake is a cheap rejection instead of a repair-consuming one.
+
+## planner framework-steer + stand-in-despite-schema fix (retry #13)
+
+  Planner fix for the two weaknesses that killed /health retry #13.
+  (1) Framework rejection names the grounded move: the repo index now
+  records each route's request handler (for /health, the do_GET method
+  of the Handler class defined inside HiveAPIServer.start in
+  freetalon/api.py), and the framework rejection names the grounded move
+  concretely -- extend freetalon/api.py in place, add a /health branch
+  to that do_GET method -- the way the anti-fake rejection names the
+  grounded move; the ROUTE GOAL shape carries the same concrete move,
+  and the repo context names the handler per route. (2) Stand-in check
+  runs despite schema errors: _validate_raw_nodes runs it on lenient
+  views of the raw nodes, so a rejection containing a stand-in error is
+  cheap regardless of accompanying schema errors -- the int-id echo
+  fake is now a free re-prompt, not a repair round. Genuinely structural
+  errors (bad JSON, duplicate ids, dependency cycles, self-dependency)
+  still raise first.
+  Tests 555 -> 579/579 green (+24 new TestPlannerFrameworkSteerFix),
+  M5 smoke passes (finance run-20261117T085448Z-da9c48, ECU
+  run-20261117T085448Z-7eacd6), verbatim retry-#13 attempt-2 output now
+  a cheap rejection (4 errors: 1 stand-in + 3 schema) naming the fake
+  and the grounded move, attempt-4 Flask scaffold rejected with 1 error
+  naming the handler branch, mocked repair lands on a grounded plan in
+  one round, [empty, fake, Flask, grounded] repairs in 4 calls;
+  regression guards pass (retry-#12 code-overwrite, retry-#11 invented
+  schema 8 errors, retry-#10 unknown dependency, retry-#9 wrong
+  location, retry-#8 unwritten file, retry-#7 invented schema 11
+  errors, retry-#5 fake, retry-#4 wrong service, retry-#3 glued echo,
+  bare-dict criteria coercion; duplicate ids, cycles, self-dependency
+  still raise first). Demo:
+  freetalon-workspace/tools/demo-framework-steer.py, log
+  freetalon-workspace/logs/demo-framework-steer.log; apply script
+  freetalon-workspace/tools/apply-planner-framework-steer-fix.py
+  (verified byte-for-byte against a pristine b79ac6f worktree). Log:
+  freetalon-workspace/logs/planner-framework-steer-fix-2026-11-16.log.
+  Next: /health retry #14 (GPU load, separate step).

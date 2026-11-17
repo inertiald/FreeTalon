@@ -7,6 +7,7 @@ import shlex
 import hashlib
 import heapq
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from pydantic import ValidationError
@@ -117,7 +118,54 @@ class CheapRejectionError(LLMResponseError):
     """
 
 
-def _validate_raw_nodes(raw_nodes: list[Any]) -> list[PlanNode]:
+def _lenient_node_view(raw: Any, position: int) -> SimpleNamespace | None:
+    """A duck-typed view of a raw node dict for checks that only read
+    claw/inputs/criteria/id — usable before PlanNode validation passes.
+
+    Retry #13 attempt 2: the echo fake had integer ids, so
+    _validate_raw_nodes raised a schema error before the stand-in check
+    in _collect_plan_errors ever ran, and the fake spent a repair round
+    instead of a free re-prompt. The view exposes exactly what
+    _static_standin_errors reads (assigned_claw, inputs, criteria, id)
+    with defensive defaults, so the stand-in check can run on raw nodes
+    even when their shape is wrong. Non-dict entries have no view.
+    """
+    if not isinstance(raw, dict):
+        return None
+    raw_id = raw.get("id")
+    if isinstance(raw_id, str):
+        label = raw_id
+    elif raw_id is not None:
+        label = str(raw_id)
+    else:
+        label = f"position {position}"
+    inputs = raw.get("inputs")
+    if not isinstance(inputs, dict):
+        inputs = {}
+    criteria = raw.get("criteria")
+    if isinstance(criteria, dict):
+        criteria = [criteria]
+    elif not isinstance(criteria, list):
+        criteria = []
+    outputs = raw.get("outputs")
+    if isinstance(outputs, str):
+        outputs = [outputs]
+    elif not isinstance(outputs, list):
+        outputs = []
+    return SimpleNamespace(
+        id=label,
+        assigned_claw=raw.get("assigned_claw") or "",
+        inputs=inputs,
+        criteria=criteria,
+        outputs=outputs,
+    )
+
+
+def _validate_raw_nodes(
+    raw_nodes: list[Any],
+    repo_index: Any | None = None,
+    goal_text: str | None = None,
+) -> list[PlanNode]:
     """Validate raw node dicts, collecting per-node schema errors.
 
     Per-node schema errors (a missing required field, an unknown
@@ -131,6 +179,14 @@ def _validate_raw_nodes(raw_nodes: list[Any]) -> list[PlanNode]:
     name the problem.) Genuinely structural problems — bad JSON,
     duplicate ids, dependency cycles — still raise first in
     normalize_plan_nodes, as today.
+
+    When schema errors exist, the stand-in check also runs on lenient
+    views of the raw nodes (retry #13): a fake whose ids are the wrong
+    type must still be named as a fake, and the rejection is cheap —
+    the repair loop re-prompts for free instead of spending a repair
+    round on output that was never a plan. ``repo_index``/``goal_text``
+    are the repo index and goal for the grounded-move sentence; both
+    optional (hand-built plans pass neither).
     """
     nodes: list[PlanNode] = []
     errors: list[str] = []
@@ -144,21 +200,41 @@ def _validate_raw_nodes(raw_nodes: list[Any]) -> list[PlanNode]:
         except ValidationError as exc:
             errors.extend(_schema_error_text(label, err) for err in exc.errors())
     if errors:
-        noun = "error" if len(errors) == 1 else "errors"
-        lines = "\n".join(
-            f"{index}. {error}" for index, error in enumerate(errors, start=1)
+        standin_errors = _static_standin_errors(
+            [
+                view
+                for view in (
+                    _lenient_node_view(raw, position)
+                    for position, raw in enumerate(raw_nodes, start=1)
+                )
+                if view is not None
+            ],
+            index=repo_index,
+            goal_text=goal_text,
         )
-        raise LLMResponseError(
-            f"Planner output was rejected with {len(errors)} {noun} — "
+        all_errors = standin_errors + errors
+        noun = "error" if len(all_errors) == 1 else "errors"
+        lines = "\n".join(
+            f"{index}. {error}" for index, error in enumerate(all_errors, start=1)
+        )
+        message = (
+            f"Planner output was rejected with {len(all_errors)} {noun} — "
             f"fix ALL of them:\n{lines}\n{_NODE_SHAPE_EXAMPLE}"
         )
+        if standin_errors:
+            raise CheapRejectionError(message)
+        raise LLMResponseError(message)
     return nodes
 
 
-def _coerce_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[PlanNode]:
+def _coerce_nodes(
+    nodes: list[PlanNode] | list[dict[str, Any]],
+    repo_index: Any | None = None,
+    goal_text: str | None = None,
+) -> list[PlanNode]:
     if nodes and isinstance(nodes[0], PlanNode):
         return list(nodes)
-    return _validate_raw_nodes(list(nodes))
+    return _validate_raw_nodes(list(nodes), repo_index=repo_index, goal_text=goal_text)
 
 
 def _unknown_dependency_error(
@@ -192,9 +268,18 @@ def _unknown_dependency_error(
     )
 
 
-def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[PlanNode]:
-    """Validate a DAG, topologically order it, and assign deterministic node ids."""
-    nodes = _coerce_nodes(nodes)
+def normalize_plan_nodes(
+    nodes: list[PlanNode] | list[dict[str, Any]],
+    repo_index: Any | None = None,
+    goal_text: str | None = None,
+) -> list[PlanNode]:
+    """Validate a DAG, topologically order it, and assign deterministic node ids.
+
+    ``repo_index``/``goal_text`` are threaded to the schema check so a
+    fake with wrong-typed ids is named as a fake (retry #13); both
+    optional (hand-built plans pass neither).
+    """
+    nodes = _coerce_nodes(nodes, repo_index=repo_index, goal_text=goal_text)
     if not nodes:
         # Cheap rejection (retry #12): an empty plan is a degenerate
         # output, not a plan that needs a repair round to fix.
@@ -408,8 +493,13 @@ def parse_planner_response(
     # Normalize: topologically order the DAG and assign deterministic
     # node-1, node-2, ... ids, remapping depends_on. Without this the raw
     # LLM ids/order leak through and downstream code cannot rely on
-    # dependency order.
-    nodes = normalize_plan_nodes(nodes_raw)
+    # dependency order. The repo index is built once here and shared by
+    # the schema check (which needs it to name a stand-in fake on raw
+    # nodes, retry #13) and the collected validation errors below, so a
+    # fake with wrong-typed ids is named as a fake instead of only as a
+    # schema error — and the rejection is cheap, not repair-consuming.
+    index = build_repo_index(repo_root) if goal_text else None
+    nodes = normalize_plan_nodes(nodes_raw, repo_index=index, goal_text=goal_text)
 
     # Planner hardening: an invented claw name or an unmeasurable node is a
     # plan error here, where the repair retry can fix it — not at execution
@@ -418,7 +508,9 @@ def parse_planner_response(
     # All per-node errors are collected and reported in ONE rejection, so a
     # plan with several independent errors can be fixed in a single repair
     # round instead of burning the repair budget one error at a time.
-    errors, cheap = _collect_plan_errors(nodes, repo_root, goal_text, workspace)
+    errors, cheap = _collect_plan_errors(
+        nodes, repo_root, goal_text, workspace, index=index
+    )
     if errors:
         noun = "error" if len(errors) == 1 else "errors"
         lines = "\n".join(
@@ -819,6 +911,18 @@ def _framework_errors(
         serving_framework = index.frameworks.get(module)
         if not serving_framework:
             continue
+        # Retry #13: the rejection named http.server but the model
+        # treated "write a Flask app" as the grounded move and elaborated
+        # it across repair rounds. Name the grounded move concretely --
+        # extend the serving module in place, adding a branch to the
+        # handler that already serves the route -- the way the anti-fake
+        # rejection names the grounded move (retry #5).
+        grounded = _grounded_move_sentence(
+            route,
+            str(index.root / module),
+            index.api_port,
+            index.route_handlers.get(route),
+        )
         for node in nodes:
             written: list[str] = []
             if node.assigned_claw in ("scaffold", "file_writer"):
@@ -835,8 +939,8 @@ def _framework_errors(
                     errors.append(
                         f"Planner node '{node.id}' writes a {found} app — "
                         f"{route} is served by {module}, which is built on "
-                        f"{serving_framework}; extend that code instead of "
-                        f"introducing a different web framework."
+                        f"{serving_framework}. {grounded} Do not rewrite it "
+                        f"in a different web framework."
                     )
                     break
     return errors
@@ -1051,6 +1155,7 @@ def _collect_plan_errors(
     repo_root: str | Path | None = None,
     goal_text: str | None = None,
     workspace: str | None = None,
+    index: Any | None = None,
 ) -> tuple[list[str], bool]:
     """Collect EVERY plan validation error, grouped by node, plus plan-level rules.
 
@@ -1082,7 +1187,8 @@ def _collect_plan_errors(
     needs_index = any(
         node.assigned_claw in ("scaffold", "file_writer") for node in nodes
     ) or goal_text is not None
-    index = build_repo_index(repo_root) if needs_index else None
+    if index is None and needs_index:
+        index = build_repo_index(repo_root)
     for node in nodes:
         error = _claw_error(node)
         if error is not None:
@@ -1245,7 +1351,9 @@ def _same_path(left: str, right: str) -> bool:
     return left == right or left.endswith("/" + right) or right.endswith("/" + left)
 
 
-def _grounded_move_sentence(route: str, module: str, api_port: int) -> str:
+def _grounded_move_sentence(
+    route: str, module: str, api_port: int, handler: str | None = None
+) -> str:
     """One sentence naming the valid move for a route goal.
 
     The sentence is the concrete form of the ROUTE GOAL shape: extend
@@ -1254,7 +1362,22 @@ def _grounded_move_sentence(route: str, module: str, api_port: int) -> str:
     is pointed TOWARD the real work, not just away from the fake.
     ``module`` is the absolute repo path of the serving module, so the
     model is never left guessing which directory the code lives in.
+    ``handler`` is the repo index's description of the request handler
+    that already serves the route ("the do_GET method of the Handler
+    class (defined inside HiveAPIServer.start)"), when known: the move
+    is then named as a branch on that handler, not just "extend the
+    module" — the model otherwise reads "implement the endpoint" as
+    "write a new app" and elaborates the wrong framework instead
+    (retry #13: two Flask scaffolds, the second more elaborate than
+    the first, both rejected by the framework rule).
     """
+    if handler is not None:
+        return (
+            f"The grounded move is: extend {module} in place — add a "
+            f"{route} branch to {handler}; write the tests (scaffold or "
+            f"heredoc) and run them; verify live with "
+            f"curl http://localhost:{api_port}{route}."
+        )
     return (
         f"The grounded move is: extend {module} (scaffold claw, or a bash "
         f"heredoc) to implement {route}; write the tests (scaffold or "
@@ -1324,7 +1447,10 @@ def _static_standin_errors(
         if named:
             grounded = " " + " ".join(
                 _grounded_move_sentence(
-                    route, str(index.root / module), index.api_port
+                    route,
+                    str(index.root / module),
+                    index.api_port,
+                    index.route_handlers.get(route),
                 )
                 for route, module in named
             )
@@ -1661,10 +1787,20 @@ def _route_goal_shape(
         # must not have to guess which directory the code lives in
         # (retry #9 named the module under the workspace path instead).
         module_path = str(index.root / module)
+        edit = (
+            f"node 1 edits {module_path} (scaffold claw, or a bash heredoc) to "
+            f"implement the endpoint"
+        )
+        handler = index.route_handlers.get(route)
+        if handler is not None:
+            # Retry #13: the shape said "implement the endpoint" and the
+            # model read that as "write a new app" -- twice, in Flask.
+            # Name the edit as a branch on the handler that already serves
+            # the route, so the valid move is concrete.
+            edit += f" — add a {route} branch to {handler}"
         lines.append(
             f"- {route} is served by {module_path} on port {index.api_port}: "
-            f"node 1 edits {module_path} (scaffold claw, or a bash heredoc) to "
-            f"implement the endpoint; node 2 writes the tests (scaffold or "
+            f"{edit}; node 2 writes the tests (scaffold or "
             f"heredoc) and runs them; node 3 verifies live with "
             f"curl http://localhost:{index.api_port}{route}. Do NOT probe "
             f"another service's {route} path, and do NOT echo a JSON answer. "
