@@ -91,9 +91,60 @@ def _result(
 
 
 def _eval_exit_code(
-    criterion: dict[str, Any], envelope: dict[str, Any]
+    criterion: dict[str, Any], envelope: dict[str, Any], workdir: Path | None = None
 ) -> dict[str, Any]:
+    """Evaluate an exit_code criterion.
+
+    Retry #23: a criterion with a `command` measures THAT command —
+    the command runs here (shell, in the node workdir) and its return
+    code is compared to `equals`. The old code ignored the command
+    field entirely and compared the NODE's exit code, so v1 node-1
+    "passed" a `curl -sf` criterion because the scaffold write exited
+    0 — no live curl ever executed. A bare criterion (no command)
+    measures the node command's exit code — that is the explicit
+    default. A criterion command that times out or fails to start is
+    a measured failure, not unmeasurable: the measurement ran.
+    """
     expected = criterion.get("equals", 0)
+    command = criterion.get("command")
+    if isinstance(command, str) and command.strip():
+        timeout = _criterion_timeout_s(criterion, default=60.0)
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return _result(
+                criterion,
+                passed=False,
+                measured=True,
+                detail=f"criterion command timed out after {_fmt_timeout(timeout)}",
+            )
+        except OSError as exc:
+            return _result(
+                criterion,
+                passed=False,
+                measured=True,
+                detail=f"criterion command failed to start: {exc}",
+            )
+        if proc.returncode == expected:
+            return _result(
+                criterion,
+                passed=True,
+                measured=True,
+                detail=f"criterion command exit code {proc.returncode} == {expected}",
+            )
+        return _result(
+            criterion,
+            passed=False,
+            measured=True,
+            detail=f"criterion command exit code {proc.returncode} != {expected}",
+        )
     exit_code = envelope.get("exit_code")
     if exit_code is None:
         return _result(
@@ -109,6 +160,23 @@ def _eval_exit_code(
         measured=True,
         detail=f"exit_code {exit_code} != {expected}",
     )
+
+
+def _criterion_timeout_s(criterion: dict[str, Any], default: float) -> float:
+    """Timeout for a criterion command, coerced from timeout_s (default 60s)."""
+    timeout = criterion.get("timeout_s", default)
+    try:
+        timeout_f = float(timeout)
+    except (TypeError, ValueError):
+        return default
+    return timeout_f if timeout_f > 0 else default
+
+
+def _fmt_timeout(timeout: float) -> str:
+    """Render a timeout as seconds, e.g. 60s or 2.5s."""
+    if float(timeout).is_integer():
+        return f"{int(timeout)}s"
+    return f"{timeout}s"
 
 
 def _eval_file_exists(
@@ -299,7 +367,7 @@ def evaluate_criterion(
     """Evaluate one criterion deterministically against an envelope."""
     ctype = str(criterion.get("type", ""))
     if ctype == CRITERION_EXIT_CODE:
-        return _eval_exit_code(criterion, envelope)
+        return _eval_exit_code(criterion, envelope, workdir)
     if ctype == CRITERION_FILE_EXISTS:
         return _eval_file_exists(criterion, workdir)
     if ctype == CRITERION_FILE_MATCHES:

@@ -906,7 +906,9 @@ def _criterion_path_is_node_path(criterion_path: str, node: PlanNode) -> bool:
     return False
 
 
-def _usable_criterion_error(criterion: Any, node: PlanNode) -> str | None:
+def _usable_criterion_error(
+    criterion: Any, node: PlanNode, repo_root: str | Path | None = None
+) -> str | None:
     """Return an error string if the criterion is unusable, else None."""
     if not isinstance(criterion, dict):
         return f"criterion is not an object: {criterion!r}"
@@ -920,6 +922,19 @@ def _usable_criterion_error(criterion: Any, node: PlanNode) -> str | None:
             return f"criterion has no 'type': {_CRITERION_SHAPE_EXAMPLE}"
         return f"unknown criterion type: {ctype!r}"
     if ctype == CRITERION_EXIT_CODE:
+        # Retry #23: an exit_code criterion with a `command` measures
+        # that command (see measure._eval_exit_code) — the command is
+        # a bash command too, so its interpreter must exist. A bare
+        # criterion (no command) measures the node command's exit code
+        # — that is the explicit default, and it stays valid.
+        command = criterion.get("command")
+        if command is None:
+            return None
+        if not isinstance(command, str) or not command.strip():
+            return "exit_code criterion 'command' must be a non-empty string"
+        interpreter_errors = _bash_interpreter_errors(command, repo_root)
+        if interpreter_errors:
+            return "; ".join(interpreter_errors)
         return None
     if ctype == CRITERION_FILE_EXISTS:
         path = criterion.get("path")
@@ -1081,14 +1096,116 @@ def _prose_command_error(shell: str) -> str | None:
     return None
 
 
-def _validate_bash_command(node: PlanNode) -> list[str]:
+# Shell builtins and keywords: never an interpreter to validate.
+_SHELL_SKIP_TOKENS = frozenset({
+    "cd", "echo", "export", "source", ".", "test", "[", "[[", "true",
+    "false", "set", "unset", "eval", "exec", "exit", "return", "shift",
+    "trap", "umask", "alias", "unalias", "if", "then", "else", "elif",
+    "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "function", "select", "time", "coproc", "{", "}",
+})
+
+# Command separators for interpreter extraction: a new segment starts
+# after &&, ||, ;, |, or a newline. Redirections and ` - ` splits are
+# NOT separators here — they belong to the segment's command.
+_INTERPRETER_SEGMENT_RE = re.compile(r"(?:\n|&&|\|\||;|\|)")
+
+
+def _bash_interpreter_errors(
+    command: str, repo_root: str | Path | None
+) -> list[str]:
+    """Return errors for a bash command whose interpreter/binary does not exist.
+
+    Retry #23: v1 node-3 ran `./venv/bin/python` (no such path — the
+    venv is `.venv`), v2 node-3 ran bare `python` (does not resolve on
+    Ubuntu, only python3), and both failed with exit 127 at execution
+    time. Validate at plan time, one segment at a time: the first word
+    of each shell segment must be a real interpreter/binary. Bare
+    `python` is always an error on Ubuntu — the grounded form is
+    `./.venv/bin/python` (the repo venv). A path token is resolved
+    against the repo root (disk-independent, like the missing-directory
+    check) and must exist there; a path outside the repo (workspace,
+    /tmp, /usr/bin) is not judged. Other bare names are NOT checked:
+    PATH varies by machine, so a which() check would answer
+    differently on seeker7 and in CI. Heredoc bodies are stripped by
+    the caller — file content is not shell.
+    """
+    errors: list[str] = []
+    root = resolve_repo_root(repo_root) if repo_root is not None else None
+    for segment in _INTERPRETER_SEGMENT_RE.split(command):
+        tokens: list[str] = []
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        # Strip leading env assignments (VAR=1 python ...) — the
+        # command is the first token after them.
+        while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+            tokens.pop(0)
+        if not tokens:
+            continue
+        first = tokens[0]
+        if first in _SHELL_SKIP_TOKENS:
+            continue
+        if first == "python":
+            errors.append(
+                "bash command uses bare `python`, which does not resolve "
+                "on Ubuntu (only python3) — use ./.venv/bin/python (the "
+                "repo venv) or python3"
+            )
+            continue
+        if "/" not in first:
+            continue
+        # A path token: resolve against the repo root and require it
+        # to exist. Outside the repo it is not judged.
+        if root is None:
+            continue
+        if first.startswith("/"):
+            rel = _repo_relative_target(first, root)
+            if rel is None:
+                continue
+            candidate = root / rel
+        else:
+            stripped = first[2:] if first.startswith("./") else first
+            if stripped.startswith("../") or stripped.startswith("/"):
+                continue
+            # The repo venv is a machine fact, not a repo-tree fact:
+            # seeker7 has .venv, a CI checkout does not, so its
+            # presence cannot be judged from the checkout — and the
+            # grounded move names ./.venv/bin/python as the correct
+            # interpreter, so a plan that follows it must not be
+            # rejected for it. (The retry-#23 defect is ./venv, without
+            # the dot — that path IS judged, and does not exist.)
+            if stripped == ".venv" or stripped.startswith(".venv/"):
+                continue
+            candidate = root / stripped
+        if not candidate.exists():
+            if Path(first).name == "python":
+                errors.append(
+                    f"bash command uses {first!r}, which does not exist in "
+                    "the repo — the repo venv is ./.venv/bin/python, not "
+                    f"{first!r}"
+                )
+            else:
+                errors.append(
+                    f"bash command uses {first!r}, which does not exist in "
+                    f"the repo (repo root {root})"
+                )
+    return errors
+
+
+def _validate_bash_command(
+    node: PlanNode, repo_root: str | Path | None = None
+) -> list[str]:
     """Return every error in a bash/shell_exec node's command (fix 2).
 
     Checks: the command is a non-empty string; it tokenizes
     (shlex.split — unbalanced quotes fail); it is not words glued together
     (the failed /health run produced ``python3-munittestdiscover-s/...``
     and ``curl-shttp://localhost:8000/health``); any localhost port it
-    addresses is a known service (FreeTalon API, Ollama). All problems are
+    addresses is a known service (FreeTalon API, Ollama); its
+    interpreter/binary exists (retry #23: `./venv/bin/python` and bare
+    `python` both died with exit 127 at execution time). All problems are
     collected, not just the first, so one repair round can fix them all.
     The glued-word checks are heuristics for the observed failure shapes,
     not a shell parser: a single token jamming a program, flags, and a
@@ -1149,6 +1266,7 @@ def _validate_bash_command(node: PlanNode) -> list[str]:
                 f"bash command addresses unknown service port localhost:{port} — "
                 "known services are the FreeTalon API on 8765 and Ollama on 11434"
             )
+    errors.extend(_bash_interpreter_errors(shell, repo_root))
     return errors
 
 
@@ -1371,7 +1489,9 @@ def _claw_error(node: PlanNode) -> str | None:
     return None
 
 
-def _criteria_errors(node: PlanNode) -> list[str]:
+def _criteria_errors(
+    node: PlanNode, repo_root: str | Path | None = None
+) -> list[str]:
     """Return every unusable-criterion error for one node."""
     errors: list[str] = []
     criteria = list(node.criteria or [])
@@ -1382,7 +1502,7 @@ def _criteria_errors(node: PlanNode) -> list[str]:
             f"file_matches, metric, or tests_pass). {_CRITERION_SHAPE_EXAMPLE}."
         ]
     for criterion in criteria:
-        error = _usable_criterion_error(criterion, node)
+        error = _usable_criterion_error(criterion, node, repo_root)
         if error is not None:
             errors.append(
                 f"Planner node '{node.id}' has an unusable criterion: {error}."
@@ -1390,13 +1510,15 @@ def _criteria_errors(node: PlanNode) -> list[str]:
     return errors
 
 
-def _command_errors(node: PlanNode) -> list[str]:
+def _command_errors(
+    node: PlanNode, repo_root: str | Path | None = None
+) -> list[str]:
     """Return every malformed-command error for a bash/shell_exec node."""
     if node.assigned_claw not in ("bash", "shell_exec"):
         return []
     return [
         f"Planner node '{node.id}' has an invalid bash command: {error}."
-        for error in _validate_bash_command(node)
+        for error in _validate_bash_command(node, repo_root)
     ]
 
 
@@ -1811,6 +1933,45 @@ def _unwritten_file_errors(
     return errors
 
 
+# A comment that labels its own content as a placeholder to be replaced
+# ("# This is a placeholder, replace with actual implementation.").
+_PLACEHOLDER_MARKER_RE = re.compile(r"placeholder", re.IGNORECASE)
+_PLACEHOLDER_REPLACE_RE = re.compile(
+    r"replace|todo|implement|fill in|actual implementation", re.IGNORECASE
+)
+
+
+def _is_placeholder_stub(content: str) -> bool:
+    """True when content is a placeholder marker plus a trivial code stub.
+
+    Retry #23 replan output 3 step-1 scaffolded api.py with a
+    "placeholder, replace with actual implementation" comment plus a
+    two-line `def health(): return {...}` stub. The placeholder guard
+    only fires on comment/docstring-only content, so a stub the model
+    itself labels as a placeholder sailed through. A write that (a)
+    carries a comment saying it is a placeholder to be replaced and
+    (b) contains at most three lines of real code is the same defect:
+    the author admits the implementation is not there. A real
+    implementation that merely mentions "placeholder" in a comment is
+    not flagged — it has more than three lines of code.
+    """
+    has_placeholder_word = False
+    has_replace_word = False
+    code_lines = 0
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("#", "//")):
+            if _PLACEHOLDER_MARKER_RE.search(stripped):
+                has_placeholder_word = True
+            if _PLACEHOLDER_REPLACE_RE.search(stripped):
+                has_replace_word = True
+            continue
+        code_lines += 1
+    return has_placeholder_word and has_replace_word and code_lines <= 3
+
+
 def _placeholder_scaffold_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None,
@@ -1863,9 +2024,27 @@ def _placeholder_scaffold_errors(
             continue
         if not is_code_path(target):
             continue
+        stub = False
         if not is_placeholder_content(content):
-            continue
+            # Retry #23: a stub the model itself labels as a placeholder
+            # (marker comment + a trivial function) is the same defect
+            # as a comment-only stub — the implementation is not there.
+            if not _is_placeholder_stub(content):
+                continue
+            stub = True
         if not _path_exists_on_disk(target, repo_root):
+            continue
+        if stub:
+            errors.append(
+                f"Planner node '{node.id}' scaffolds {target!r} with a "
+                "placeholder stub (a 'placeholder' comment saying to "
+                "replace it, plus only a trivial stub function — no real "
+                "implementation) — that would overwrite the existing "
+                "module with a stub instead of implementing it. Write "
+                "real code in the module (scaffold claw with real code, "
+                "or a bash heredoc) and verify it by running the tests "
+                f"and curling the live service.{grounded}"
+            )
             continue
         errors.append(
             f"Planner node '{node.id}' scaffolds {target!r} with placeholder "
@@ -2103,10 +2282,9 @@ def _code_append_errors(
     stand-in rule owns that defect (retry #12: a JSON literal echoed
     over api.py). Skipped when the existing file itself no longer parses
     — it is already broken, and this rule cannot judge the write. A
-    scaffold write is NOT parse-checked here: the placeholder guard
-    covers the observed scaffold hole, and a scaffold whose content is
-    real code but syntactically invalid (retry #13 attempt 4's Flask app)
-    is a separate, unobserved hole.
+    scaffold write is NOT parse-checked here — that is
+    `_scaffold_parse_errors`' job (retry #23: v1's accepted scaffold
+    content did not parse, and the loop executed it).
     """
     errors: list[str] = []
     grounded = _grounded_move_text(index, goal_text)
@@ -2178,6 +2356,64 @@ def _code_append_errors(
     return errors
 
 
+def _scaffold_parse_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    goal_text: str | None = None,
+    index: Any | None = None,
+) -> list[str]:
+    """Reject scaffold writes of unparseable Python to a code file.
+
+    Retry #23: v1's accepted plan scaffolded freetalon/api.py with a
+    whole new BaseHTTPRequestHandler module whose content does not
+    parse (IndentationError — `def handle_health(self):` followed by
+    a top-level `try:` with no body), and the loop executed it: the
+    module broke, and the framework guard then disarmed itself on the
+    clobbered file. The code-append parse check covers bash heredoc
+    writes only — a scaffold write was never parse-checked (retry #13
+    attempt 4's unparseable Flask scaffold was a known unobserved
+    hole). A scaffold overwrites the whole file, so its content must
+    parse as Python on its own — for an existing file and for a new
+    one. Skipped when the content is already a hardcoded answer: the
+    stand-in rule owns that defect. Non-Python code files are not
+    parse-checked (no parser available), like the bash rule.
+    """
+    errors: list[str] = []
+    grounded = _grounded_move_text(index, goal_text)
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("scaffold", "file_writer"):
+            continue
+        target = (
+            node.inputs.get("file_path")
+            or node.inputs.get("path")
+            or (node.outputs[0] if node.outputs else "")
+        )
+        content = node.inputs.get("content")
+        if not isinstance(target, str) or not target:
+            continue
+        if not isinstance(content, str):
+            continue
+        if not is_code_path(target):
+            continue
+        if Path(target).suffix.lower() != ".py":
+            continue
+        if _literal_is_answer(content):
+            continue
+        try:
+            ast.parse(content)
+        except SyntaxError as exc:
+            errors.append(
+                f"Planner node '{node.id}' scaffolds {target!r} with code "
+                "that does not parse as Python "
+                f"({_syntax_error_detail(exc)}) — a scaffold overwrites "
+                "the whole file, so unparseable content would break the "
+                "module. Write valid code (extend the module in place "
+                "with real code) and verify it parses (python -m "
+                f"py_compile {target}) and the tests pass.{grounded}"
+            )
+    return errors
+
+
 def _plan_runs_path_as_test(nodes: list[PlanNode], target: str) -> bool:
     """True when some node runs the target path as a test.
 
@@ -2244,8 +2480,14 @@ def _placeholder_bash_errors(
         for target, content, _is_append in _bash_code_writes(command):
             if not is_code_path(target):
                 continue
+            stub = False
             if not is_placeholder_content(content):
-                continue
+                # Retry #23: the scaffold stub rule applies to heredocs
+                # too — a marker comment plus a trivial stub is the same
+                # fake deliverable as a comment-only heredoc.
+                if not _is_placeholder_stub(content):
+                    continue
+                stub = True
             claimed = target in file_exists_claims
             run_as_test = _plan_runs_path_as_test(nodes, target)
             if not claimed and not run_as_test:
@@ -2255,6 +2497,19 @@ def _placeholder_bash_errors(
                 if claimed
                 else "run as a test"
             )
+            if stub:
+                errors.append(
+                    f"Planner node '{node.id}' writes {target!r} with a "
+                    "placeholder stub (a 'placeholder' comment saying to "
+                    "replace it, plus only a trivial stub function — no "
+                    f"real implementation) via a bash heredoc/echo, {why} "
+                    "— the file has only a stub, so the plan fakes the "
+                    "deliverable. Write real code (a heredoc with the "
+                    "real implementation, or the scaffold claw with real "
+                    "code) and verify it by running the tests and curling "
+                    f"the live service.{grounded}"
+                )
+                continue
             errors.append(
                 f"Planner node '{node.id}' writes {target!r} with placeholder "
                 "content only (comments and/or a docstring, no code) via a "
@@ -2311,8 +2566,8 @@ def _collect_plan_errors(
         error = _claw_error(node)
         if error is not None:
             errors.append(error)
-        errors.extend(_criteria_errors(node))
-        errors.extend(_command_errors(node))
+        errors.extend(_criteria_errors(node, repo_root))
+        errors.extend(_command_errors(node, repo_root))
         if index is not None:
             error = _grounding_error(node, index)
             if error is not None:
@@ -2334,6 +2589,7 @@ def _collect_plan_errors(
         )
     errors.extend(placeholder_errors)
     errors.extend(_code_append_errors(nodes, repo_root, goal_text, index))
+    errors.extend(_scaffold_parse_errors(nodes, repo_root, goal_text, index))
     errors.extend(_sed_noop_errors(nodes, repo_root, goal_text, index))
     standin_errors = _static_standin_errors(nodes, index=index, goal_text=goal_text)
     errors.extend(standin_errors)
@@ -3419,6 +3675,63 @@ def _forbidden_block(
     )
 
 
+def _repo_forbidden_approaches(
+    goal_text: str | None, index: Any | None
+) -> list[str]:
+    """Approaches known-bad for this repo, regardless of this call's history.
+
+    Retry #23: the replan branch ran twice (first time since the
+    seeded-replan fix) but the seed was EMPTY both times — initial
+    planning had zero rejections, so nothing was carried in, and the
+    replan's first attempt was the Flask plan. The Flask prohibition
+    and the placeholder prohibition are not call history: they are
+    repo facts. When the goal names an existing route, the serving
+    module is built on stdlib http.server, so writing a Flask app over
+    it is always wrong, and a placeholder stub over an existing module
+    is always a fake deliverable. Those two labels are seeded into
+    every replan prompt for a route goal from the start, seeded or not.
+    """
+    if not goal_text or index is None:
+        return []
+    if not _routes_named_in_goal(goal_text, index):
+        return []
+    markers = {"Flask", "placeholder"}
+    return [label for marker, label in _APPROACH_MARKERS if marker in markers]
+
+
+def _seed_forbidden_block(
+    seed: list[str], goal_text: str | None, repo_root: str | Path | None
+) -> str:
+    """The DO NOT use block for a replan's FIRST prompt, with replacements.
+
+    The seed previously only reached repair prompts (inside
+    _call_llm_with_repair): a replan whose first attempt was the Flask
+    plan was ACCEPTED before the seed was ever shown. Retry #23's
+    replan 1 was exactly that — Flask, accepted, executed, failed at
+    runtime. The seed block goes into the initial prompt too, with
+    first-attempt wording: these approaches were already rejected for
+    this goal (or are known-bad for this repo), and a plan that uses
+    one will be rejected again. The labels carry their concrete
+    replacements, like the repair-prompt block, and the Flask entry is
+    followed by the goal's grounded move when one exists.
+    """
+    if not seed:
+        return ""
+    items = "\n".join(f"- {approach}" for approach in seed)
+    grounded = ""
+    if any("Flask app" in approach for approach in seed):
+        move = _grounded_move_for_goal(goal_text, repo_root).strip()
+        if move:
+            grounded = f"\n{move}\n"
+    return (
+        "\nDO NOT use these approaches — they were already rejected for "
+        "this goal (or are known-bad for this repo):\n"
+        f"{items}\n"
+        f"{grounded}"
+        "A plan that uses a forbidden approach will be rejected again.\n"
+    )
+
+
 # Context window for planner/replan LLM calls (Ollama num_ctx).
 # Retry #22: the planner prompts do not fit in the 4096-token
 # default, so the model never received the skeleton and could not
@@ -3746,9 +4059,8 @@ def replan_from_brief(
     replan's seed.
     """
 
-    context = format_repo_context(
-        build_repo_index(repo_root), workspace=brief.get("workspace")
-    )
+    index = build_repo_index(repo_root)
+    context = format_repo_context(index, workspace=brief.get("workspace"))
     shape = _route_goal_shape(_goal_text_from_brief(brief), repo_root)
     shape_block = f"\n\n{shape}" if shape else ""
     # The replan needs the node shape in front of it, not just as a
@@ -3760,13 +4072,30 @@ def replan_from_brief(
     seed = seed_forbidden if seed_forbidden is not None else brief.get("seed_forbidden")
     if not isinstance(seed, list):
         seed = None
+    # Retry #23: the seed was empty in both replan calls because initial
+    # planning had zero rejections — so the replan's first attempt was
+    # the Flask plan, accepted before the seed was ever shown. Merge the
+    # call-history seed with the repo-level known-bad approaches (Flask
+    # + placeholder for a route goal), and put the merged seed in the
+    # FIRST replan prompt too, not just in repair prompts.
+    merged_seed = list(
+        dict.fromkeys(
+            list(seed or [])
+            + _repo_forbidden_approaches(_goal_text_from_brief(brief), index)
+        )
+    )
+    seed_block = _seed_forbidden_block(
+        merged_seed, _goal_text_from_brief(brief), repo_root
+    )
     # Retry #22: as in plan_task_intent, the ROUTE GOAL shape goes
     # last (after the node shape and the instruction), immediately
-    # before "JSON Output:" — it is the decision, not preamble.
+    # before "JSON Output:" — it is the decision, not preamble. The
+    # seed block goes BEFORE the shape, so the shape stays last.
     user_prompt = (
         f"{context}\n\n{_format_brief_for_prompt(brief)}{node_shape_block}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
         "quote, or echo the brief — it is your input, not your output.\n"
+        f"{seed_block}"
         f"{shape_block}\n\n"
         "JSON Output:"
     )
@@ -3778,7 +4107,7 @@ def replan_from_brief(
         goal_text=_goal_text_from_brief(brief),
         workspace=brief.get("workspace"),
         repo_root=repo_root,
-        seed_forbidden=seed,
+        seed_forbidden=merged_seed or None,
     )
     brief["rejected_approaches"] = metadata.get("rejected_approaches", seed or [])
     return nodes

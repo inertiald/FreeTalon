@@ -5241,7 +5241,11 @@ class TestPlannerFrameworkSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only).
+        # Now 3 — the same rejection also names the unparseable Flask
+        # scaffold (def health(): followed by a top-level try:) and
+        # node-2's bare `python` (does not resolve on Ubuntu).
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("stdlib http.server", message)
         self.assertIn("different web framework", message)
@@ -5758,7 +5762,12 @@ class TestPlannerScaffoldGuardFix(unittest.TestCase):
         message = str(caught.exception)
         # Node-1: placeholder scaffold to the existing freetalon/api.py.
         # Node-2: a comment alone, which does nothing.
-        self.assertIn("was rejected with 2 errors", message)
+        # Node-3: ./test.sh, which does not exist in the repo.
+        # Framework-guard fix (retry #23): the interpreter check names
+        # the missing ./test.sh the old rejection missed.
+        self.assertIn("was rejected with 3 errors", message)
+        self.assertIn("./test.sh", message)
+        self.assertIn("does not exist in the repo", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("placeholder", message)
         self.assertIn("only a comment", message)
@@ -5844,7 +5853,10 @@ class TestPlannerScaffoldGuardFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only).
+        # Now 3 — the rejection also names the unparseable Flask
+        # scaffold and node-2's bare `python`.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_rejected_as_code_overwrite(self) -> None:
@@ -6288,7 +6300,10 @@ class TestPlannerDuplicateKeysFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only).
+        # Now 3 — the rejection also names the unparseable Flask
+        # scaffold and node-2's bare `python`.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_code_overwrite(self) -> None:
@@ -6833,7 +6848,10 @@ class TestPlannerCodeAppendFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only).
+        # Now 3 — the rejection also names the unparseable Flask
+        # scaffold and node-2's bare `python`.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_code_overwrite(self) -> None:
@@ -7416,7 +7434,10 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only).
+        # Now 3 — the rejection also names the unparseable Flask
+        # scaffold and node-2's bare `python`.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_code_overwrite(self) -> None:
@@ -7802,7 +7823,7 @@ class TestPlannerSignalLossFix(unittest.TestCase):
 
     # --- (a) Verbatim retry-#18 attempt-2: parse + framework + missing dir + /tmp ---
 
-    def test_retry18_attempt2_names_all_four_defects(self) -> None:
+    def test_retry18_attempt2_names_all_five_defects(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag(self._retry18_attempt2_nodes()),
@@ -7810,11 +7831,14 @@ class TestPlannerSignalLossFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 4 = step-2 parse error + step-1 framework error (Flask use,
+        # 5 = step-2 parse error + step-1 framework error (Flask use,
         # no import) + step-2 missing-directory error (freetalon/tests/)
-        # + step-3 /tmp redirect in a compound command. Before this fix
-        # the rejection carried only the parse error.
-        self.assertIn("was rejected with 4 errors", message)
+        # + step-3 /tmp redirect in a compound command + step-3 bare
+        # `python` (no bare `python` on Ubuntu). Framework-guard fix
+        # (retry #23): the interpreter check names the bare `python`
+        # the old rejection missed.
+        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
@@ -7832,10 +7856,13 @@ class TestPlannerSignalLossFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 5 = the 3 errors the retry saw (invented response_content
+        # 6 = the 3 errors the retry saw (invented response_content
         # criterion, step-2 parse error, step-2 Flask app) + the sed
-        # no-op on step-1 + the missing-directory error on step-2.
-        self.assertIn("was rejected with 5 errors", message)
+        # no-op on step-1 + the missing-directory error on step-2
+        # + step-3 bare `python`. Framework-guard fix (retry #23):
+        # the interpreter check names the bare `python`.
+        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("bare `python`", message)
         self.assertIn("response_content", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -8184,7 +8211,10 @@ class TestPlannerSignalLossFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only).
+        # Now 3 — the rejection also names the unparseable Flask
+        # scaffold and node-2's bare `python`.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_code_overwrite(self) -> None:
@@ -8683,7 +8713,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
 
     # --- (b) Verbatim retry-#19 rejections ---
 
-    def test_retry19_attempt2_rejected_with_4_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self.RETRY19_ATTEMPT2_RAW,
@@ -8691,7 +8721,9 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do NOT write a Flask app", message)
@@ -8700,7 +8732,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         self.assertIn("/tmp/health_response.json", message)
         self.assertIn("not a /tmp scratch file", message)
 
-    def test_retry19_attempt3_rejected_with_1_error(self) -> None:
+    def test_retry19_attempt3_rejected_with_3_errors(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self.RETRY19_ATTEMPT3_RAW,
@@ -8708,7 +8740,10 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("was rejected with 3 errors", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
+        self.assertIn("does not parse as Python", message)
+        self.assertIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do NOT write a Flask app", message)
         self.assertIn("The grounded move is:", message)
@@ -8853,7 +8888,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
 
     # --- (e) Regression guards: retry #18 still holds, then every earlier fix ---
 
-    def test_retry18_attempt2_names_all_four_defects(self) -> None:
+    def test_retry18_attempt2_names_all_five_defects(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag(self._retry18_attempt2_nodes()),
@@ -8861,11 +8896,14 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 4 = step-2 parse error + step-1 framework error (Flask use,
+        # 5 = step-2 parse error + step-1 framework error (Flask use,
         # no import) + step-2 missing-directory error (freetalon/tests/)
-        # + step-3 /tmp redirect in a compound command. Before this fix
-        # the rejection carried only the parse error.
-        self.assertIn("was rejected with 4 errors", message)
+        # + step-3 /tmp redirect in a compound command + step-3 bare
+        # `python` (no bare `python` on Ubuntu). Framework-guard fix
+        # (retry #23): the interpreter check names the bare `python`
+        # the old rejection missed.
+        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
@@ -8883,10 +8921,13 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 5 = the 3 errors the retry saw (invented response_content
+        # 6 = the 3 errors the retry saw (invented response_content
         # criterion, step-2 parse error, step-2 Flask app) + the sed
-        # no-op on step-1 + the missing-directory error on step-2.
-        self.assertIn("was rejected with 5 errors", message)
+        # no-op on step-1 + the missing-directory error on step-2
+        # + step-3 bare `python`. Framework-guard fix (retry #23):
+        # the interpreter check names the bare `python`.
+        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("bare `python`", message)
         self.assertIn("response_content", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -9019,7 +9060,10 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only).
+        # Now 3 — the rejection also names the unparseable Flask
+        # scaffold and node-2's bare `python`.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("add a /health branch to the do_GET method", message)
 
     def test_retry12_string_ids_code_overwrite(self) -> None:
@@ -9687,7 +9731,7 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
 
     # --- (f) Regression guards: every earlier fix still holds ---
 
-    def test_retry19_attempt2_rejected_with_4_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -9697,13 +9741,15 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry19_attempt3_rejected_with_1_error(self) -> None:
+    def test_retry19_attempt3_rejected_with_3_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -9713,12 +9759,15 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("was rejected with 3 errors", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
+        self.assertIn("does not parse as Python", message)
+        self.assertIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("The grounded move is:", message)
         self.assertIn("do_GET method of the Handler class", message)
 
-    def test_retry18_attempt2_rejected_with_4_errors(self) -> None:
+    def test_retry18_attempt2_rejected_with_5_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -9727,13 +9776,15 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry18_attempt3_rejected_with_5_errors(self) -> None:
+    def test_retry18_attempt3_rejected_with_6_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt3_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -9742,7 +9793,9 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 6 errors", message)
+        # Framework-guard fix (retry #23): was 5 errors. Now 6 — the rejection also names step-3's bare `python`.
+        self.assertIn("bare `python`", message)
         self.assertIn("response_content", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("sed -i", message)
@@ -9860,7 +9913,10 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only).
+        # Now 3 — the rejection also names the unparseable Flask
+        # scaffold and node-2's bare `python`.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET", message)
 
@@ -10452,7 +10508,7 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         self.assertIn("health.py", message)
         self.assertIn("test_health.py", message)
 
-    def test_retry19_attempt2_rejected_with_4_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -10462,13 +10518,15 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry19_attempt3_rejected_with_1_error_naming_flask(self) -> None:
+    def test_retry19_attempt3_rejected_with_3_errors_naming_flask(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -10478,11 +10536,14 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("was rejected with 3 errors", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
+        self.assertIn("does not parse as Python", message)
+        self.assertIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET method", message)
 
-    def test_retry18_attempt2_rejected_with_4_errors(self) -> None:
+    def test_retry18_attempt2_rejected_with_5_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -10491,13 +10552,15 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry18_attempt3_rejected_with_5_errors(self) -> None:
+    def test_retry18_attempt3_rejected_with_6_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt3_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -10506,7 +10569,9 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 6 errors", message)
+        # Framework-guard fix (retry #23): was 5 errors. Now 6 — the rejection also names step-3's bare `python`.
+        self.assertIn("bare `python`", message)
         self.assertIn("response_content", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -10618,7 +10683,10 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only).
+        # Now 3 — the rejection also names the unparseable Flask
+        # scaffold and node-2's bare `python`.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET method", message)
 
@@ -11221,7 +11289,7 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         self.assertIn("health.py", message)
         self.assertIn("test_health.py", message)
 
-    def test_retry19_attempt2_rejected_with_4_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -11231,13 +11299,15 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry19_attempt3_rejected_with_1_error_naming_flask(self) -> None:
+    def test_retry19_attempt3_rejected_with_3_errors_naming_flask(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -11247,11 +11317,14 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("was rejected with 3 errors", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
+        self.assertIn("does not parse as Python", message)
+        self.assertIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET method", message)
 
-    def test_retry18_attempt2_rejected_with_4_errors(self) -> None:
+    def test_retry18_attempt2_rejected_with_5_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -11260,13 +11333,15 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry18_attempt3_rejected_with_5_errors(self) -> None:
+    def test_retry18_attempt3_rejected_with_6_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt3_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -11275,7 +11350,9 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 6 errors", message)
+        # Framework-guard fix (retry #23): was 5 errors. Now 6 — the rejection also names step-3's bare `python`.
+        self.assertIn("bare `python`", message)
         self.assertIn("response_content", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -11387,7 +11464,10 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        # Framework-guard fix (retry #23): was 1 error (Flask only).
+        # Now 3 — the rejection also names the unparseable Flask
+        # scaffold and node-2's bare `python`.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET method", message)
 
@@ -11531,3 +11611,844 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
             )
         with self.assertRaisesRegex(LLMResponseError, "cannot depend on itself"):
             normalize_plan_nodes([dict(base, id="a", depends_on=["a"])])
+
+
+class TestPlannerFrameworkGuardFix(unittest.TestCase):
+    """The framework guard disarms itself after a bad scaffold write (retry #23).
+
+    Retry #23 (log llm-end-to-end-health-retry23-2026-11-16.log, run
+    run-20261117T150407Z-a461f2, plan plan-7885a4ef9d99) FAILED in 208s,
+    escalated: re-planner failed, DRIVER_EXIT:0. First plan accepted since
+    retry #20. Initial planning: (1) a stdlib http.server scaffold plan —
+    ACCEPTED, became v1; (2) replan 1, a Flask plan — ACCEPTED, became v2;
+    (3)(4)(5) replan 2 calls REJECTED with exactly 1 error each (unknown
+    criterion type string_matches; the placeholder stub in step-1 was NOT
+    named). Execution: v1 node-3 FAIL (exit 127, ./venv/bin/python not
+    found), v2 node-3 FAIL (exit 127, python: not found). Two measured
+    mechanisms: (a) the framework guard disarms itself after the first
+    bad write — _framework_errors reads index.frameworks, built from
+    _imported_modules, which returns an empty set on SyntaxError, so
+    once v1 overwrote api.py with unparseable scaffold the index
+    recorded NO framework and the Flask check skipped every later plan
+    (proven by re-probe with api.py restored: output 2 then REJECTED
+    with 2 errors, outputs 4/5 with 2); (b) exit_code criteria never
+    run their command — _eval_exit_code compares the NODE's exit code
+    and ignores the criterion's command field, so v1 node-1 "passed"
+    its curl -sf criterion because the scaffold write exited 0.
+
+    Fixes, in priority order: (1) the serving-framework lookup reads
+    the committed module (git HEAD) and falls back to the working tree
+    only when HEAD names no framework; scaffold writes of unparseable
+    Python to a code file are rejected at plan time, like bash heredoc
+    writes; a placeholder comment plus a trivial stub is rejected as a
+    placeholder stub. (2) An exit_code criterion with a command runs
+    that command as the measurement; a bare criterion still measures
+    the node command. (3) Full signal in replan: the constituent checks
+    above now name every defect, so one rejection carries framework +
+    placeholder + interpreter + unusable-criterion together — verified
+    by replaying the retry-#23 probe outputs against the restored
+    repo. (4) A bash command's interpreter/binary must exist in the
+    repo (bare `python` never resolves on Ubuntu — the grounded form
+    is ./.venv/bin/python). (5) The replan is seeded with the
+    repo-level known-bad approaches (Flask, placeholder) from the
+    start, in the FIRST prompt — not only in repair prompts.
+
+    Fixtures below are the retry-#23 probe outputs (restored-log
+    numbering), rebuilt as node dicts with the real scaffold contents,
+    commands, and criteria from logs/probe-retry23-rejections-
+    restored.log. Expected counts were verified by parsing each
+    scaffold content with ast.parse: every Flask scaffold in retry #23
+    is unparseable too (def/class bodies at column 0), so the
+    scaffold-parse error fires alongside the framework error.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+    API_PATH = "/home/seeker/projects/FreeTalon/freetalon/api.py"
+    TEST_API_PATH = "/home/seeker/projects/FreeTalon/tests/test_api.py"
+
+    # Output 1 (v1, ACCEPTED live): the http.server scaffold. Step-1
+    # content is the real scaffold's head — `def handle_health(self):`
+    # followed by a top-level `try:` does not parse. Step-2's test
+    # scaffold is the real content's head — the class body is at
+    # column 0 and does not parse either.
+    RETRY23_OUTPUT1_STEP1_CONTENT = (
+        "import json\n"
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "\n"
+        "def handle_health(self):\n"
+        "try:\n"
+        "import subprocess\n"
+    )
+    RETRY23_OUTPUT1_STEP2_CONTENT = (
+        "import unittest\n"
+        "from freetalon.api import HiveAPIServer\n"
+        "\n"
+        "class TestHealthEndpoint(unittest.TestCase):\n"
+        "def test_health_endpoint(self):\n"
+        "# Assuming the server is running on localhost:8765\n"
+        "response = requests.get('http://localhost:8765/health')\n"
+    )
+
+    # Output 3 step-1 content, verbatim: the placeholder stub the
+    # live rejection never named.
+    RETRY23_OUTPUT3_STEP1_CONTENT = (
+        "# Add health check logic to api.py\n"
+        "# This is a placeholder, replace with actual implementation.\n"
+        "def health():\n"
+        " return {'status': 'OK'}\n"
+    )
+    # Output 3 step-2 content, verbatim: the method body is at the
+    # same indent as the def, so it does not parse (line 6).
+    RETRY23_OUTPUT3_STEP2_CONTENT = (
+        "import unittest\n"
+        "from freetalon.api import health\n"
+        "\n"
+        "class TestHealthEndpoint(unittest.TestCase):\n"
+        " def test_health_endpoint(self):\n"
+        " response = health()\n"
+        " self.assertEqual(response, {'status': 'OK'})\n"
+    )
+
+    # Output 4 step-1 content, verbatim: Flask + unparseable.
+    RETRY23_OUTPUT4_STEP1_CONTENT = (
+        "# Add health check logic here\n"
+        "def health():\n"
+        "return {'status': 'OK'}\n"
+        "\n"
+        "@app.route('/health')\n"
+        "def health_endpoint():\n"
+        "return jsonify(health())"
+    )
+    # Output 4 step-2 content, verbatim: unparseable, no Flask.
+    RETRY23_OUTPUT4_STEP2_CONTENT = (
+        "import unittest\n"
+        "from freetalon.api import health_endpoint\n"
+        "\n"
+        "class TestHealthEndpoint(unittest.TestCase):\n"
+        "def test_health(self):\n"
+        "response = health_endpoint()\n"
+        "self.assertEqual(response.status_code, 200)\n"
+        "self.assertEqual(response.json(), {'status': 'OK'})"
+    )
+
+    # Output 2 step-1 content, verbatim: Flask + unparseable.
+    RETRY23_OUTPUT2_STEP1_CONTENT = (
+        "# Add health check logic to api.py\n"
+        "from flask import Flask, jsonify\n"
+        "\n"
+        "app = Flask(__name__)\n"
+        "\n"
+        "@app.route('/health')\n"
+        "def health_check():\n"
+        "return jsonify({\n"
+        "'status': 'OK',\n"
+        "'ollama_reachable': True,\n"
+        "'gpu_temperature': 'N/A'\n"
+        "})\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "app.run(debug=True)"
+    )
+    # Output 2 step-2 content, verbatim: Flask + unparseable.
+    RETRY23_OUTPUT2_STEP2_CONTENT = (
+        "import unittest\n"
+        "from flask import Flask\n"
+        "from freetalon.api import app\n"
+        "\n"
+        "class TestHealthEndpoint(unittest.TestCase):\n"
+        "def test_health_endpoint(self):\n"
+        "response = app.get('/health')\n"
+        "self.assertEqual(response.status_code, 200)\n"
+        "data = response.get_json()\n"
+        "self.assertEqual(data['status'], 'OK')\n"
+        "self.assertTrue(data['ollama_reachable'])\n"
+        "self.assertEqual(data['gpu_temperature'], 'N/A')\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "unittest.main()"
+    )
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _brief(self) -> dict:
+        """A fresh re-plan brief, carrying no seed (the retry-#23 condition)."""
+        fake = TestPlannerFakeAndMemoryFix()
+        fake.setUp()
+        return fake._brief()
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        grounded = TestPlannerGroundedShapeFix()
+        grounded.setUp()
+        return grounded._grounded_health_nodes()
+
+    def _retry23_output1_nodes(self) -> list[dict]:
+        api = self.API_PATH
+        ws = self.WS
+        return [
+            {
+                "id": "step_1",
+                "objective": "Modify freetalon/api.py to implement the /health endpoint",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": api, "content": self.RETRY23_OUTPUT1_STEP1_CONTENT},
+                "outputs": [api],
+                "acceptance": ["File exists", "API responds to /health"],
+                "criteria": [
+                    {"type": "file_exists", "path": api},
+                    {"type": "exit_code", "equals": 0, "command": "curl -sf http://localhost:8765/health"},
+                ],
+            },
+            {
+                "id": "step_2",
+                "objective": "Write and run unit tests for the /health endpoint",
+                "depends_on": ["step_1"],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": f"{ws}/test_api.py", "content": self.RETRY23_OUTPUT1_STEP2_CONTENT},
+                "outputs": [f"{ws}/test_api.py"],
+                "acceptance": ["Tests pass"],
+                "criteria": [
+                    {"type": "exit_code", "equals": 0, "command": f"python {ws}/test_api.py"},
+                ],
+            },
+            {
+                "id": "step_3",
+                "objective": "Start the FreeTalon API server and verify it's live",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli start"},
+                "outputs": ["server running"],
+                "acceptance": ["Server is live and responding to requests"],
+                "criteria": [
+                    {"type": "exit_code", "equals": 0, "command": "curl -sf http://localhost:8765/health"},
+                ],
+            },
+        ]
+
+    def _retry23_output3_nodes(self) -> list[dict]:
+        api = self.API_PATH
+        test_api = self.TEST_API_PATH
+        return [
+            {
+                "id": "step_1",
+                "objective": "Modify freetalon/api.py to implement the /health endpoint.",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": api, "content": self.RETRY23_OUTPUT3_STEP1_CONTENT},
+                "outputs": [api],
+                "acceptance": ["The /health endpoint returns JSON with status OK."],
+                "criteria": [{"type": "file_exists", "path": api}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Write unit tests for the /health endpoint.",
+                "depends_on": ["step_1"],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": test_api, "content": self.RETRY23_OUTPUT3_STEP2_CONTENT},
+                "outputs": [test_api],
+                "acceptance": ["Unit tests pass for the /health endpoint."],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_3",
+                "objective": "Start the FreeTalon API server and verify it's live.",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "/home/seeker/projects/FreeTalon/.venv/bin/python -m freetalon.cli start"},
+                "outputs": ["server running"],
+                "acceptance": ["The API server is running and accessible."],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_4",
+                "objective": "Verify the /health endpoint returns OK.",
+                "depends_on": ["step_3"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -sf http://localhost:8765/health"},
+                "outputs": ["response from curl"],
+                "acceptance": ["The /health endpoint returns JSON with status OK."],
+                "criteria": [
+                    {"type": "string_matches", "pattern": "'status': 'OK'", "input": "curl -sf http://localhost:8765/health"}
+                ],
+            },
+        ]
+
+    def _retry23_output4_nodes(self) -> list[dict]:
+        api = self.API_PATH
+        test_api = self.TEST_API_PATH
+        return [
+            {
+                "id": "step_1",
+                "objective": "Modify freetalon/api.py to implement the /health endpoint",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": api, "content": self.RETRY23_OUTPUT4_STEP1_CONTENT},
+                "outputs": [api],
+                "acceptance": ["The /health endpoint is implemented in api.py"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Write unit tests for the /health endpoint",
+                "depends_on": ["step_1"],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": test_api, "content": self.RETRY23_OUTPUT4_STEP2_CONTENT},
+                "outputs": [test_api],
+                "acceptance": ["Unit tests for the /health endpoint are written"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_3",
+                "objective": "Run unit tests for the /health endpoint",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "python -m unittest discover"},
+                "outputs": ["test results"],
+                "acceptance": ["Unit tests pass"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_4",
+                "objective": "Verify the API is live and returns OK",
+                "depends_on": ["step_3"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -sf http://localhost:8765/health"},
+                "outputs": ["API response"],
+                "acceptance": ["The /health endpoint returns a 200 status code with JSON body {'status': 'OK'}"],
+                "criteria": [{"type": "string_matches", "equals": ".*{\"status\": \"OK\"}.*", "field": "stdout"}],
+            },
+        ]
+
+    def _retry23_output2_nodes(self) -> list[dict]:
+        api = self.API_PATH
+        test_api = self.TEST_API_PATH
+        return [
+            {
+                "id": "step_1",
+                "objective": "Modify freetalon/api.py to implement the /health endpoint.",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": api, "content": self.RETRY23_OUTPUT2_STEP1_CONTENT},
+                "outputs": [api],
+                "acceptance": ["The /health endpoint is implemented in api.py."],
+                "criteria": [{"type": "file_exists", "path": api}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Write unit tests for the /health endpoint.",
+                "depends_on": ["step_1"],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": test_api, "content": self.RETRY23_OUTPUT2_STEP2_CONTENT},
+                "outputs": [test_api],
+                "acceptance": ["Unit tests for the /health endpoint are written."],
+                "criteria": [{"type": "file_exists", "path": test_api}],
+            },
+            {
+                "id": "step_3",
+                "objective": "Run the unit tests for /health.",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "python /home/seeker/projects/FreeTalon/tests/test_api.py"},
+                "outputs": [],
+                "acceptance": ["The unit tests pass."],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_4",
+                "objective": "Start the FreeTalon API server and verify it's live.",
+                "depends_on": ["step_3"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "cd /home/seeker/projects && ./freetalon/api.py start"},
+                "outputs": [],
+                "acceptance": ["The API server is running and accessible."],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_5",
+                "objective": "Verify the /health endpoint returns OK.",
+                "depends_on": ["step_4"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -sf http://localhost:8765/health"},
+                "outputs": [],
+                "acceptance": ["The /health endpoint returns a JSON response with status OK."],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+
+    def _reject(self, nodes: list[dict]) -> str:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=self.repo_root,
+            )
+        return str(caught.exception)
+
+    # --- (1a) HEAD framework lookup survives a clobbered working tree ---
+
+    def _init_git_repo_with_api(self, root: Path) -> Path:
+        """A temp git repo whose committed api.py serves /health on stdlib http.server."""
+        import subprocess
+
+        api = root / "freetalon" / "api.py"
+        api.parent.mkdir(parents=True, exist_ok=True)
+        api.write_text(
+            "from http.server import BaseHTTPRequestHandler\n"
+            "\n"
+            "class Handler(BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        if self.path == '/health':\n"
+            "            self.send_response(200)\n",
+            encoding="utf-8",
+        )
+        env = dict(
+            os.environ,
+            GIT_AUTHOR_NAME="test",
+            GIT_AUTHOR_EMAIL="test@test",
+            GIT_COMMITTER_NAME="test",
+            GIT_COMMITTER_EMAIL="test@test",
+        )
+        subprocess.run(["git", "init", "-q", str(root)], check=True, env=env)
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True, env=env)
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-q", "-m", "api"], check=True, env=env
+        )
+        return api
+
+    def test_head_framework_survives_unparseable_working_tree(self) -> None:
+        import shutil
+        import tempfile
+
+        from freetalon.orchestrator.repo_index import build_repo_index
+
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._init_git_repo_with_api(Path(tmp))
+            # (a) Unparseable scaffold overwrite: the working-tree import
+            # scan returns nothing, but HEAD still names http.server.
+            api.write_text("def health():\ntry:\n", encoding="utf-8")
+            index = build_repo_index(Path(tmp))
+            self.assertEqual(
+                index.frameworks.get("freetalon/api.py"), "stdlib http.server"
+            )
+            # (b) Parseable overwrite in a different framework: the
+            # working tree now says Flask, but HEAD still wins.
+            api.write_text(
+                "from flask import Flask\napp = Flask(__name__)\n", encoding="utf-8"
+            )
+            index = build_repo_index(Path(tmp))
+            self.assertEqual(
+                index.frameworks.get("freetalon/api.py"), "stdlib http.server"
+            )
+
+    def test_head_source_returns_none_outside_git(self) -> None:
+        import tempfile
+
+        from freetalon.orchestrator.repo_index import _head_source, build_repo_index
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "freetalon").mkdir()
+            (root / "freetalon" / "api.py").write_text(
+                "from http.server import BaseHTTPRequestHandler\n", encoding="utf-8"
+            )
+            # Fail-soft: not a git checkout, so no HEAD source — and the
+            # working-tree framework is still recorded.
+            self.assertIsNone(_head_source(root, "freetalon/api.py"))
+            index = build_repo_index(root)
+            self.assertEqual(
+                index.frameworks.get("freetalon/api.py"), "stdlib http.server"
+            )
+
+    def test_flask_plan_rejected_when_working_tree_clobbered(self) -> None:
+        import shutil
+        import tempfile
+
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._init_git_repo_with_api(Path(tmp))
+            api.write_text("def health():\ntry:\n", encoding="utf-8")
+            flask_node = {
+                "id": "step_1",
+                "objective": "Write a Flask app for /health",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {
+                    "file_path": "freetalon/api.py",
+                    "content": "from flask import Flask\napp = Flask(__name__)\n",
+                },
+                "outputs": ["freetalon/api.py"],
+                "acceptance": ["Flask app serves /health"],
+                "criteria": [{"type": "file_exists", "path": "freetalon/api.py"}],
+            }
+            # Judged against the temp repo, not the real repo root.
+            with self.assertRaises(LLMResponseError) as caught:
+                parse_planner_response(
+                    self._dag([flask_node]),
+                    goal_text=self.HEALTH_GOAL,
+                    workspace=self.WS,
+                    repo_root=Path(tmp),
+                )
+            self.assertIn("writes a Flask app", str(caught.exception))
+
+    # --- (1b) Scaffold parse check + placeholder-stub rule ---
+
+    def test_retry23_output1_rejected_with_four_errors(self) -> None:
+        # Was ACCEPTED live (v1). Now: scaffold-parse on step-1 and
+        # step-2, bare `python` in step-2's criterion command, and the
+        # missing ./venv/bin/python in step-3's command.
+        message = self._reject(self._retry23_output1_nodes())
+        self.assertIn("was rejected with 4 errors", message)
+        self.assertEqual(message.count("does not parse as Python"), 2)
+        self.assertIn("bare `python`", message)
+        self.assertIn("./venv/bin/python", message)
+        self.assertIn("./.venv/bin/python", message)
+
+    def test_retry23_output3_rejected_with_three_errors(self) -> None:
+        # Was REJECTED live with exactly 1 error (string_matches only).
+        # Now the placeholder stub in step-1 and the unparseable test
+        # scaffold in step-2 are named too. Step-3's command is the
+        # correct .venv path, so no interpreter error fires there.
+        message = self._reject(self._retry23_output3_nodes())
+        self.assertIn("was rejected with 3 errors", message)
+        self.assertIn("placeholder stub", message)
+        self.assertEqual(message.count("does not parse as Python"), 1)
+        self.assertIn("string_matches", message)
+
+    def test_retry23_output4_rejected_with_five_errors(self) -> None:
+        # Was REJECTED live (restored probe) with 2 errors
+        # (string_matches + step-1 Flask). Now: Flask step-1,
+        # scaffold-parse step-1 and step-2, bare `python` step-3,
+        # string_matches step-4.
+        message = self._reject(self._retry23_output4_nodes())
+        self.assertIn("was rejected with 5 errors", message)
+        self.assertEqual(message.count("writes a Flask app"), 1)
+        self.assertEqual(message.count("does not parse as Python"), 2)
+        self.assertIn("bare `python`", message)
+        self.assertIn("string_matches", message)
+
+    def test_retry23_output2_rejected_with_five_errors(self) -> None:
+        # Was REJECTED live (restored probe) with 2 errors (Flask
+        # step-1 + step-2). Now the unparseable scaffolds and the bare
+        # `python` in step-3 are named too. Step-4's ./freetalon/api.py
+        # exists in the repo, so no interpreter error fires there.
+        message = self._reject(self._retry23_output2_nodes())
+        self.assertIn("was rejected with 5 errors", message)
+        self.assertEqual(message.count("writes a Flask app"), 2)
+        self.assertEqual(message.count("does not parse as Python"), 2)
+        self.assertIn("bare `python`", message)
+
+    def test_is_placeholder_stub(self) -> None:
+        from freetalon.orchestrator.planner import _is_placeholder_stub
+
+        # The retry-#23 output-3 step-1 stub: marker comment + 2 lines.
+        self.assertTrue(_is_placeholder_stub(self.RETRY23_OUTPUT3_STEP1_CONTENT))
+        # A real implementation that merely mentions "placeholder" in a
+        # comment is not a stub — more than three lines of code.
+        real = (
+            "# placeholder note, replace later if needed\n"
+            "def health():\n"
+            "    a = 1\n"
+            "    b = 2\n"
+            "    c = 3\n"
+            "    d = 4\n"
+            "    return {'status': 'OK'}\n"
+        )
+        self.assertFalse(_is_placeholder_stub(real))
+        # No placeholder word at all — not a stub either.
+        self.assertFalse(
+            _is_placeholder_stub(
+                "# Add health check logic here\n"
+                "def health():\n"
+                "    return {'status': 'OK'}\n"
+            )
+        )
+        # // comments count too.
+        self.assertTrue(
+            _is_placeholder_stub(
+                "// placeholder, TODO: implement this\nint main() { return 0; }\n"
+            )
+        )
+
+    def test_placeholder_stub_heredoc_rejected_when_claimed(self) -> None:
+        # The stub rule applies to heredocs too: a marker comment plus
+        # a trivial stub, claimed by file_exists, is a fake deliverable.
+        stub = self.RETRY23_OUTPUT3_STEP1_CONTENT
+        node = {
+            "id": "step_1",
+            "objective": "Write the health endpoint",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": f"cat > tests/test_api.py <<'EOF'\n{stub}EOF"
+            },
+            "outputs": ["tests/test_api.py"],
+            "acceptance": ["The health endpoint is implemented"],
+            "criteria": [{"type": "file_exists", "path": "tests/test_api.py"}],
+        }
+        message = self._reject([node])
+        self.assertIn("placeholder stub", message)
+
+    def test_scaffold_parse_skips_literal_answer(self) -> None:
+        # A scaffold whose content is already a hardcoded answer is
+        # the stand-in rule's defect, not a parse error.
+        node = {
+            "id": "step_1",
+            "objective": "Answer /health",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": self.api_path,
+                "content": '{"ok": true, "status": "ready"}',
+            },
+            "outputs": [self.api_path],
+            "acceptance": ["The endpoint answers"],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+        }
+        message = self._reject([node])
+        self.assertNotIn("does not parse as Python", message)
+
+    # --- (2) exit_code criteria run their command ---
+
+    def test_exit_code_criterion_runs_its_command(self) -> None:
+        import tempfile
+
+        from freetalon.orchestrator.measure import evaluate_criterion
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            env = {
+                "node_id": "n1",
+                "status": "completed",
+                "exit_code": 0,
+                "duration_s": 0.1,
+                "stdout": "",
+                "stderr": "",
+                "artifacts": [],
+                "metrics": {},
+                "error": None,
+            }
+            # The command is the measurement: `false` fails even
+            # though the node exited 0 (the retry-#23 shape — v1
+            # node-1 "passed" its curl criterion on the write's exit).
+            failed = evaluate_criterion(
+                {"type": "exit_code", "equals": 0, "command": "false"},
+                dict(env, exit_code=0),
+                workdir,
+            )
+            self.assertFalse(failed["passed"])
+            self.assertTrue(failed["measured"])
+            self.assertIn("criterion command exit code 1", failed["detail"])
+            # And a command whose exit matches `equals` passes even
+            # when the node itself failed.
+            passed = evaluate_criterion(
+                {"type": "exit_code", "equals": 1, "command": "false"},
+                dict(env, exit_code=0),
+                workdir,
+            )
+            self.assertTrue(passed["passed"])
+            self.assertTrue(passed["measured"])
+            # A bare criterion still measures the node command's exit
+            # code — the explicit default.
+            bare = evaluate_criterion(
+                {"type": "exit_code", "equals": 0}, dict(env, exit_code=1), workdir
+            )
+            self.assertFalse(bare["passed"])
+            self.assertTrue(bare["measured"])
+            # An unknown command is a measured failure (shell exit
+            # 127), not a silent pass.
+            missing = evaluate_criterion(
+                {"type": "exit_code", "equals": 0, "command": "definitely-not-a-real-command-xyz"},
+                env,
+                workdir,
+            )
+            self.assertFalse(missing["passed"])
+            self.assertTrue(missing["measured"])
+            # A command that times out is a measured failure too.
+            timed_out = evaluate_criterion(
+                {"type": "exit_code", "equals": 0, "command": "sleep 2", "timeout_s": 0.05},
+                env,
+                workdir,
+            )
+            self.assertFalse(timed_out["passed"])
+            self.assertTrue(timed_out["measured"])
+            self.assertIn("timed out", timed_out["detail"])
+
+    # --- (4) Bash interpreter existence ---
+
+    def test_bash_interpreter_errors(self) -> None:
+        from freetalon.orchestrator.planner import _bash_interpreter_errors
+
+        root = self.repo_root
+        bare = _bash_interpreter_errors("python -m unittest discover", root)
+        self.assertEqual(len(bare), 1)
+        self.assertIn("bare `python`", bare[0])
+        self.assertIn("./.venv/bin/python", bare[0])
+        wrong_venv = _bash_interpreter_errors(
+            "cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli start",
+            root,
+        )
+        self.assertEqual(len(wrong_venv), 1)
+        self.assertIn("./venv/bin/python", wrong_venv[0])
+        # The grounded form is allowed: the repo venv is a machine
+        # fact, not a repo-tree fact (CI has no .venv).
+        self.assertEqual(
+            _bash_interpreter_errors("./.venv/bin/python -m freetalon.cli start", root),
+            [],
+        )
+        self.assertEqual(
+            _bash_interpreter_errors("python3 tests/test_api.py", root), []
+        )
+        self.assertEqual(
+            _bash_interpreter_errors("curl -sf http://localhost:8765/health", root),
+            [],
+        )
+        self.assertEqual(
+            _bash_interpreter_errors(
+                "cd /home/seeker/projects && ./freetalon/api.py start", root
+            ),
+            [],
+        )
+        # Env assignments are stripped before the command is read.
+        self.assertEqual(
+            len(_bash_interpreter_errors("FOO=1 python foo.py", root)), 1
+        )
+        # Builtins and multi-segment commands: only real interpreters
+        # are judged.
+        self.assertEqual(
+            _bash_interpreter_errors(
+                "echo hi && python3 -m unittest discover -s tests", root
+            ),
+            [],
+        )
+
+    def test_exit_code_criterion_command_validated_at_plan_time(self) -> None:
+        # A criterion command with bare `python` is rejected at plan
+        # time, naming the grounded form.
+        node = {
+            "id": "step_1",
+            "objective": "Run the tests",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "python3 tests/test_api.py"},
+            "outputs": ["test results"],
+            "acceptance": ["Tests pass"],
+            "criteria": [
+                {"type": "exit_code", "equals": 0, "command": "python tests/test_api.py"},
+            ],
+        }
+        message = self._reject([node])
+        self.assertIn("bare `python`", message)
+        # A criterion command that resolves is fine — and a bare
+        # exit_code criterion on a bash node stays valid (it measures
+        # the node command). Both plans carry the scaffold step that
+        # engages the route, so the route-engagement check is not the
+        # thing under test here.
+        scaffold = {
+            "id": "step_1",
+            "objective": "Extend the health endpoint in freetalon/api.py",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+            "outputs": [self.api_path],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+        }
+        good = {
+            "id": "step_2",
+            "objective": "Run the tests",
+            "depends_on": ["step_1"],
+            "assigned_claw": "bash",
+            "inputs": {"command": "python3 tests/test_api.py"},
+            "outputs": ["test results"],
+            "acceptance": ["Tests pass"],
+            "criteria": [
+                {"type": "exit_code", "equals": 0, "command": "curl -sf http://localhost:8765/health"},
+            ],
+        }
+        nodes, _meta = parse_planner_response(
+            self._dag([scaffold, good]),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=self.repo_root,
+        )
+        self.assertEqual(len(nodes), 2)
+        bare = dict(good)
+        bare["criteria"] = [{"type": "exit_code", "equals": 0}]
+        nodes, _meta = parse_planner_response(
+            self._dag([scaffold, bare]),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=self.repo_root,
+        )
+        self.assertEqual(len(nodes), 2)
+
+    # --- (5) Seeded forbidden list carries the repo-level known-bad approaches ---
+
+    def test_repo_forbidden_approaches(self) -> None:
+        from freetalon.orchestrator.planner import _repo_forbidden_approaches
+        from freetalon.orchestrator.repo_index import build_repo_index
+
+        index = build_repo_index(self.repo_root)
+        seed = _repo_forbidden_approaches(self.HEALTH_GOAL, index)
+        self.assertTrue(any("Flask app" in a for a in seed))
+        self.assertTrue(any("placeholder" in a for a in seed))
+        # A goal naming no existing route seeds nothing.
+        self.assertEqual(
+            _repo_forbidden_approaches("Do something unrelated", index), []
+        )
+        self.assertEqual(_repo_forbidden_approaches(None, index), [])
+
+    def test_replan_first_prompt_carries_repo_forbidden_seed(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        brief = self._brief()
+        brief.pop("seed_forbidden", None)
+        flask_raw = self._dag(self._retry23_output4_nodes())
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[flask_raw, good]
+        ) as call_mock:
+            nodes = replan_from_brief(brief, repo_root=self.repo_root)
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(len(nodes), 4)
+        first_prompt = call_mock.call_args_list[0][0][1]
+        self.assertIn("DO NOT use these approaches", first_prompt)
+        self.assertIn("Do NOT write a Flask app", first_prompt)
+        self.assertIn("The grounded move is:", first_prompt)
+        self.assertIn("do_GET method of the Handler class", first_prompt)
+        # The ROUTE GOAL shape stays last (retry #22): the seed block
+        # goes before it, and only "JSON Output:" follows it.
+        self.assertLess(
+            first_prompt.index("DO NOT use these approaches"),
+            first_prompt.index("ROUTE GOAL"),
+        )
+        self.assertTrue(first_prompt.rstrip().endswith("JSON Output:"))
+        # The repair prompt still names Flask as forbidden too.
+        repair_prompt = call_mock.call_args_list[1][0][1]
+        self.assertIn("Do NOT write a Flask app", repair_prompt)
+        # The accumulated list is written back into the brief for the
+        # loop to carry into the next replan's seed.
+        self.assertTrue(
+            any("Flask app" in a for a in brief.get("rejected_approaches", []))
+        )

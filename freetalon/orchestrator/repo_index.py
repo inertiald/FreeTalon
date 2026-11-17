@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import subprocess
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -79,6 +80,41 @@ def _framework_of_imports(names: set[str]) -> str | None:
         if key in candidates:
             return label
     return None
+
+
+# git-HEAD sources, cached per process: build_repo_index runs on every
+# plan parse, and a git show per file would dominate the suite. HEAD
+# does not change inside a process (commits happen between runs), so a
+# process-level cache is safe; None (untracked / not a git checkout)
+# is cached too.
+_HEAD_SOURCE_CACHE: dict[tuple[str, str], str | None] = {}
+
+
+def _head_source(root: Path, rel: str) -> str | None:
+    """Source of ``rel`` at git HEAD, or None when unavailable.
+
+    Fail-soft by design: not a git checkout, git missing, or the file
+    untracked at HEAD all return None, and the caller falls back to
+    the working-tree source — so synthetic test trees and non-git
+    checkouts behave exactly as before.
+    """
+    key = (str(root), rel)
+    if key in _HEAD_SOURCE_CACHE:
+        return _HEAD_SOURCE_CACHE[key]
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "show", f"HEAD:{rel}"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _HEAD_SOURCE_CACHE[key] = None
+        return None
+    result = proc.stdout if proc.returncode == 0 else None
+    _HEAD_SOURCE_CACHE[key] = result
+    return result
 
 
 def framework_in_text(text: str) -> str | None:
@@ -346,8 +382,40 @@ def build_repo_index(repo_root: str | Path | None = None) -> RepoIndex:
             source = path.read_text(encoding="utf-8")
         except OSError:
             continue
+        # Retry #23: when the working-tree copy does not parse, fall
+        # back to the committed file for the whole per-file analysis
+        # (routes, handlers, branches, top-level names, framework).
+        # The framework check gates on the goal naming a route in the
+        # index, so a clobbered module that no longer contains any
+        # route string would disarm the guard through the route gate
+        # even with the framework restored — the committed file is the
+        # pristine truth for everything derived from this file. When
+        # the file is untracked at HEAD (or this is not a git
+        # checkout) there is no committed copy, and the working-tree
+        # source is used as before.
+        try:
+            ast.parse(source)
+        except SyntaxError:
+            committed = _head_source(root, rel)
+            if committed is not None:
+                source = committed
         index.files[rel] = _top_level_names(source)
+        # Retry #23: the serving framework comes from the committed
+        # module, not the working tree. A bad scaffold write disarms
+        # the guard two ways: an unparseable overwrite leaves no
+        # framework recorded (the import scan returns nothing on a
+        # SyntaxError), and a parseable overwrite in a different
+        # framework re-labels the serving stack as the wrong one. The
+        # committed module is the pristine truth — read it from HEAD
+        # when it names a framework there, and fall back to the
+        # working-tree source when HEAD names none (or the file is
+        # untracked / this is not a git checkout).
         framework = _framework_of_imports(_imported_modules(source))
+        head_source = _head_source(root, rel)
+        if head_source is not None:
+            head_framework = _framework_of_imports(_imported_modules(head_source))
+            if head_framework is not None:
+                framework = head_framework
         if framework is not None:
             index.frameworks[rel] = framework
         stem = path.stem
