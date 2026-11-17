@@ -994,3 +994,22 @@ Deliberately left out:
   arrives -- consider a repair round reserved for the last
   rejection, or rejecting empty/echo plans without spending the
   full budget.
+
+## planner stand-in-overwrite + free-reprompt fix (retry #12)
+
+  Done 2026-11-16 evening (commit pending): the stand-in rule is
+  widened -- a literal JSON answer written into a CODE file (.py and
+  friends) is rejected by name as overwriting code with a hardcoded
+  answer, regardless of criteria, for bash and scaffold writes alike
+  (data/generated files exempt: a JSON config to a new file is
+  legitimate). Cheap rejections -- an empty plan, or a rejection
+  whose only errors are stand-in fakes -- are re-prompted for free,
+  up to 2 free re-prompts (CheapRejectionError); the max-2 repair
+  budget is NOT raised. Tests 531 -> 555/555 green (+24
+  TestPlannerStandinOverwriteFix), M5 smoke passes, retry-#12
+  attempt-2 string-ids version now rejected with 1 error naming the
+  code-overwrite, mocked [empty, fake, Flask] sequence repairs to a
+  grounded plan in 4 calls. Demo: tools/demo-standin-overwrite.py.
+  Known remaining gap: a literal JSON answer to a NEW non-code file
+  with only an exit_code criterion still passes validation.
+  Next: /health retry #13.

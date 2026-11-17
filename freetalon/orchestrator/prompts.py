@@ -54,8 +54,11 @@ service to curl or verify.
 
 Never fake a deliverable: do not write a static file containing the
 expected answer (for example, echoing a hardcoded JSON response into
-api.json) and claim the endpoint exists. Implement the work in the module
-that serves it, and verify it by calling the live service.
+api.json) and claim the endpoint exists. Never write the expected answer
+over a code file either: a JSON literal is not code, and echoing one into
+freetalon/api.py would destroy the module — write real code in the module
+instead. Implement the work in the module that serves it, and verify it by
+calling the live service.
 
 WRITING MULTI-LINE FILES - never write a multi-line file with a
 single-line echo or printf: newlines collapse in this JSON interface,

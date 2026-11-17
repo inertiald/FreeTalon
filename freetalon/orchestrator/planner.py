@@ -101,6 +101,22 @@ def _schema_error_text(label: str, err: dict[str, Any]) -> str:
     )
 
 
+class CheapRejectionError(LLMResponseError):
+    """A planner rejection cheap enough to re-prompt without spending the repair budget.
+
+    Retry #12: the first two planner attempts were an empty plan
+    (``{"nodes": []}``) and an echo fake, and they spent the whole
+    repair budget (max 2) before the third attempt's single-error,
+    repairable Flask rejection ever arrived — so the model never got a
+    repair round for it. A rejection is cheap when the output is
+    degenerate (no plan at all) or its only errors are stand-in /
+    code-overwrite fakes: re-prompting costs the model nothing to fix,
+    so the repair loop re-prompts for free, up to a small cap, instead
+    of burning a repair round. A subclass of LLMResponseError, so
+    callers that catch LLMResponseError are unaffected.
+    """
+
+
 def _validate_raw_nodes(raw_nodes: list[Any]) -> list[PlanNode]:
     """Validate raw node dicts, collecting per-node schema errors.
 
@@ -180,7 +196,9 @@ def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[P
     """Validate a DAG, topologically order it, and assign deterministic node ids."""
     nodes = _coerce_nodes(nodes)
     if not nodes:
-        raise LLMResponseError("Planner response must include at least one plan node.")
+        # Cheap rejection (retry #12): an empty plan is a degenerate
+        # output, not a plan that needs a repair round to fix.
+        raise CheapRejectionError("Planner response must include at least one plan node.")
 
     node_map = {node.id: node for node in nodes}
     if len(node_map) != len(nodes):
@@ -400,16 +418,19 @@ def parse_planner_response(
     # All per-node errors are collected and reported in ONE rejection, so a
     # plan with several independent errors can be fixed in a single repair
     # round instead of burning the repair budget one error at a time.
-    errors = _collect_plan_errors(nodes, repo_root, goal_text, workspace)
+    errors, cheap = _collect_plan_errors(nodes, repo_root, goal_text, workspace)
     if errors:
         noun = "error" if len(errors) == 1 else "errors"
         lines = "\n".join(
             f"{index}. {error}" for index, error in enumerate(errors, start=1)
         )
-        raise LLMResponseError(
+        message = (
             f"Planner output was rejected with {len(errors)} {noun} — "
             f"fix ALL of them:\n{lines}"
         )
+        if cheap:
+            raise CheapRejectionError(message)
+        raise LLMResponseError(message)
 
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
@@ -1030,7 +1051,7 @@ def _collect_plan_errors(
     repo_root: str | Path | None = None,
     goal_text: str | None = None,
     workspace: str | None = None,
-) -> list[str]:
+) -> tuple[list[str], bool]:
     """Collect EVERY plan validation error, grouped by node, plus plan-level rules.
 
     Each node is checked against every rule (claw allowlist, structured
@@ -1052,6 +1073,10 @@ def _collect_plan_errors(
     the exception: normalize_plan_nodes collects them as a numbered
     rejection (retry #10), so the repair loop can fix them instead of
     the driver dying on a bare raise.
+
+    Returns (errors, cheap): ``cheap`` is True when every error is a
+    stand-in / code-overwrite fake (retry #12) — a rejection the repair
+    loop may re-prompt for free, without spending the repair budget.
     """
     errors: list[str] = []
     needs_index = any(
@@ -1069,13 +1094,19 @@ def _collect_plan_errors(
             if error is not None:
                 errors.append(error)
     errors.extend(_unwritten_file_errors(nodes, repo_root))
-    errors.extend(_static_standin_errors(nodes, index=index, goal_text=goal_text))
+    standin_errors = _static_standin_errors(nodes, index=index, goal_text=goal_text)
+    errors.extend(standin_errors)
     if index is not None:
         errors.extend(_route_engagement_errors(nodes, index, goal_text))
         errors.extend(_tmp_write_errors(nodes, index, goal_text))
         errors.extend(_framework_errors(nodes, index, goal_text))
         errors.extend(_wrong_location_errors(nodes, index, workspace))
-    return errors
+    # Cheap rejection (retry #12): the only errors are stand-in /
+    # code-overwrite fakes, so re-prompting costs the model nothing to
+    # fix and must not spend the repair budget. Any other error mixed
+    # in makes it a real rejection.
+    cheap = bool(errors) and len(standin_errors) == len(errors)
+    return errors, cheap
 
 
 # --- Anti-fake validation (retry #2, run-20261117T054715Z-698173) ---
@@ -1232,6 +1263,24 @@ def _grounded_move_sentence(route: str, module: str, api_port: int) -> str:
     )
 
 
+# File suffixes that mark a path as a code file. A JSON literal is never
+# valid code in any of these languages, so writing one over such a path
+# destroys an implementation instead of producing it (retry #12: the
+# model echoed a JSON answer over freetalon/api.py). Data files are
+# exempt on purpose: writing a JSON config to a new file is legitimate
+# file production, so only code paths are guarded.
+_CODE_FILE_SUFFIXES = frozenset({
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".c",
+    ".cc", ".cpp", ".h", ".hpp", ".rb", ".sh", ".pl", ".php", ".swift",
+    ".kt", ".scala", ".cs",
+})
+
+
+def _is_code_path(path: str) -> bool:
+    """True when a path names a code file — by suffix."""
+    return Path(path).suffix.lower() in _CODE_FILE_SUFFIXES
+
+
 def _static_standin_errors(
     nodes: list[PlanNode],
     index: Any | None = None,
@@ -1239,19 +1288,34 @@ def _static_standin_errors(
 ) -> list[str]:
     """Flag nodes that manufacture their own evidence.
 
-    A bash node that echo-writes a hardcoded answer (a JSON literal or an
-    assert string) into a file and then claims file_exists on that same
-    file never ran any code or service: the file's contents were asserted,
-    not produced. (Retry #2: node-1 echoed a hardcoded api.json; node-2
-    echoed an assert sentence into test.sh.) The escape hatch is the
-    scaffold claw for real files, or a node that runs the real code and
-    checks ITS output. When the goal names an existing route, the
-    rejection also names the grounded move (extend the serving module,
-    write real tests, curl the live API port): the rule used to steer
-    AWAY from the fake without pointing TOWARD the real work, so the
-    model burned repair rounds re-discovering it (retry #5: two fakes,
-    then a wrong-service probe, budget spent before the engagement
-    error fired).
+    Two shapes, both general:
+    1. A bash node that echo-writes a hardcoded answer (a JSON literal
+       or an assert string) into a file and then claims file_exists on
+       that same file never ran any code or service: the file's contents
+       were asserted, not produced. (Retry #2: node-1 echoed a hardcoded
+       api.json; node-2 echoed an assert sentence into test.sh.)
+    2. A node that writes a hardcoded answer into a CODE file — a bash
+       redirect/heredoc, or a scaffold write whose content is a JSON
+       literal. A JSON literal is not code, so this overwrites the
+       implementation instead of producing it. (Retry #12 attempt 2
+       echoed a JSON answer over freetalon/api.py with an exit_code
+       criterion, so shape 1 never fired — only the int-id type error
+       caught it, and string ids would have let the plan through and
+       destroyed api.py.) Shape 2 fires regardless of the node's
+       criteria: the criterion type must not be the escape hatch.
+       Data/generated files are exempt: writing a JSON config to a new
+       file is legitimate file production, so only code paths (.py and
+       friends) are guarded. The scaffold claw's normal pattern —
+       writing real code and claiming file_exists on it — is untouched:
+       real code is not a JSON literal.
+    The escape hatch is the scaffold claw for real files, or a node that
+    runs the real code and checks ITS output. When the goal names an
+    existing route, the rejection also names the grounded move (extend
+    the serving module, write real tests, curl the live API port): the
+    rule used to steer AWAY from the fake without pointing TOWARD the
+    real work, so the model burned repair rounds re-discovering it
+    (retry #5: two fakes, then a wrong-service probe, budget spent
+    before the engagement error fired).
     """
     errors: list[str] = []
     grounded = ""
@@ -1265,33 +1329,50 @@ def _static_standin_errors(
                 for route, module in named
             )
     for node in nodes:
-        if node.assigned_claw not in ("bash", "shell_exec"):
-            continue
-        command = node.inputs.get("command") or node.inputs.get("cmd")
-        if not isinstance(command, str):
-            continue
-        written = _literal_write(command)
-        if written is None:
-            continue
-        target, literal = written
-        if not _literal_is_answer(literal):
-            continue
-        for criterion in node.criteria or []:
-            if (
-                isinstance(criterion, dict)
-                and criterion.get("type") == CRITERION_FILE_EXISTS
-                and isinstance(criterion.get("path"), str)
-                and _same_path(criterion["path"], target)
-            ):
+        claw = node.assigned_claw or ""
+        writes: list[tuple[str, str]] = []
+        if claw in ("bash", "shell_exec"):
+            command = node.inputs.get("command") or node.inputs.get("cmd")
+            if isinstance(command, str):
+                written = _literal_write(command)
+                if written is not None:
+                    writes.append(written)
+        elif claw in ("scaffold", "file_writer"):
+            target = node.inputs.get("file_path") or node.inputs.get("path")
+            content = node.inputs.get("content")
+            if isinstance(target, str) and target and isinstance(content, str):
+                writes.append((target, content))
+        for target, literal in writes:
+            if not _literal_is_answer(literal):
+                continue
+            if _is_code_path(target):
                 errors.append(
-                    f"Planner node '{node.id}' writes a static file {target!r} "
-                    "containing a hardcoded answer and then claims it exists — "
-                    "that manufactures the deliverable instead of producing it. "
-                    "Run the real code or service and check ITS output instead "
-                    "(implement the endpoint in its module, run the tests, "
-                    f"curl the live service).{grounded}"
+                    f"Planner node '{node.id}' writes a hardcoded answer into "
+                    f"{target!r} — a JSON literal is not code, and {target!r} "
+                    f"is a code file. That overwrites code with a hardcoded "
+                    f"answer instead of implementing it. Write real code in "
+                    f"the module (scaffold claw, or a bash heredoc) and verify "
+                    f"it by running the tests and curling the live service.{grounded}"
                 )
-                break
+                continue
+            if claw not in ("bash", "shell_exec"):
+                continue
+            for criterion in node.criteria or []:
+                if (
+                    isinstance(criterion, dict)
+                    and criterion.get("type") == CRITERION_FILE_EXISTS
+                    and isinstance(criterion.get("path"), str)
+                    and _same_path(criterion["path"], target)
+                ):
+                    errors.append(
+                        f"Planner node '{node.id}' writes a static file {target!r} "
+                        "containing a hardcoded answer and then claims it exists — "
+                        "that manufactures the deliverable instead of producing it. "
+                        "Run the real code or service and check ITS output instead "
+                        "(implement the endpoint in its module, run the tests, "
+                        f"curl the live service).{grounded}"
+                    )
+                    break
     return errors
 
 
@@ -1699,6 +1780,7 @@ def _call_llm_with_repair(
     settings: LLMSettings | None,
     *,
     max_repairs: int = 2,
+    max_free_reprompts: int = 2,
     goal_text: str | None = None,
     workspace: str | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
@@ -1718,11 +1800,21 @@ def _call_llm_with_repair(
     description/output nodes instead). When the new output drops a
     required field the previous attempt had, the prompt names the
     dropped fields.
+
+    Cheap rejections do not spend the repair budget (retry #12): an
+    empty plan, or a rejection whose only errors are stand-in /
+    code-overwrite fakes, is re-prompted for free, up to
+    ``max_free_reprompts`` times. The budget is not raised — junk that
+    keeps coming eventually spends repairs and the loop still ends
+    (at most 1 + max_free_reprompts + max_repairs calls). A cheap
+    rejection past the free cap falls through to the repair budget.
     """
     prompt = user_prompt
     last_error: LLMResponseError | None = None
     prev_response_text: str | None = None
-    for attempt in range(max_repairs + 1):
+    repairs_used = 0
+    free_used = 0
+    while True:
         response_text = call_llm(system_prompt, prompt, settings=settings)
         try:
             return parse_planner_response(
@@ -1730,7 +1822,11 @@ def _call_llm_with_repair(
             )
         except LLMResponseError as exc:
             last_error = exc
-            if attempt >= max_repairs:
+            if isinstance(exc, CheapRejectionError) and free_used < max_free_reprompts:
+                free_used += 1
+            elif repairs_used < max_repairs:
+                repairs_used += 1
+            else:
                 break
             prompt = (
                 f"{user_prompt}\n\n"
