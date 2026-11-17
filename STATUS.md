@@ -681,3 +681,31 @@ Deliberately left out:
     Tool: freetalon-workspace/tools/demo-criteria-shape.py, log
     freetalon-workspace/logs/demo-criteria-shape.log.
   - Next: /health retry #7 (GPU load, separate step).
+## Update - 2026-11-16 (evening, /health retry #7 — GPU load)
+
+  Retry #7 FAILED at the planning stage (~112s, DRIVER_EXIT:1, no run
+  created). Intake succeeded cleanly. The three planner attempts:
+  (1) the fake shape again (echo a hardcoded JSON answer, echo "curl
+  ..." as the test) — rejected; (2) real progress in shape — a heredoc
+  plan curling :8765/health — but it wrote a hallucinated Flask app to
+  /tmp/freetalon/api.py (wrong path AND wrong framework; the real API
+  is http.server-based) with a broken test.sh, and all three nodes had
+  NO criteria — rejected by the /tmp rule and the no-criteria rule;
+  (3) the model abandoned the PlanNode schema entirely and invented
+  node types {"type": "write_file", "path": ..., "content": ...} /
+  {"type": "execute_command", ...} with no "objective" and no
+  "assigned_claw" — a structural PlanNode schema error (4 validation
+  errors: objective missing; type/path/content extra-forbidden) raised
+  before validation, repair budget exhausted. The criteria-shape fix
+  DID steer attempt 2 (no-criteria rejection named the shape; /tmp
+  write rejected by name), but a schema invention is not a repairable
+  validation error yet. Endpoint NOT extended, no new tests, suite
+  455/455 green, no stray files. GPU survived (55C, 300W, x16, zero
+  Xid). Log: freetalon-workspace/logs/llm-end-to-end-health-retry7-2026-11-16.log.
+  Next weakness: structural schema errors (missing objective, invented
+  node fields like type/path/content) raise instead of becoming a
+  numbered, repairable rejection — and the node shape itself
+  (id/objective/assigned_claw/inputs/criteria/depends_on) is never
+  shown to the model as an example. Also worth grounding: the API is
+  not Flask; the serving module's framework should be visible to the
+  planner so it stops writing Flask apps.
