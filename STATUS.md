@@ -516,3 +516,30 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   (finance run-20261117T062208Z-06cb8e, ecu run-20261117T062208Z-d6dc96).
   Log: logs/planner-heredoc-fix-2026-11-16.log.
   - Next: /health retry #4 (live, GPU) - not run here by design.
+
+## Update - 2026-11-16 22:26
+
+- /health retry #4 (live, GPU, fans 85%): FAILED in 50.0s, run
+  run-20261117T062659Z-bcd569, plan plan-7885a4ef9d99. Intake clean.
+  Initial planning took 3 attempts: two fake api.json/test.sh plans
+  rejected, third accepted - but it never engaged freetalon/api.py:
+  node-1 curled Ollama's /health (no such endpoint) -> FAIL exit 1,
+  node-2 nvidia-smi PASS, node-3 echoed a hardcoded JSON to stdout.
+  Judge chose REPLAN. Replan 1 echoed the brief's own delta steps
+  back (incl. retry-#2's test.sh / glued unittest failures); replan 2
+  faked again (echo api/health.py + glued unittest); replan 3 returned
+  {"nodes":[]} -> re-planner failed ("must include at least one plan
+  node") -> escalated FAIL. Endpoint NOT extended, no new tests, no
+  live curl. Suite 427/427 green after; no stray files. GPU survived,
+  zero Xid, limit 300W held, x16; 70C at fan restore (peak not sampled
+  mid-run; 85% fans ran cooler than retry #3's 83C at 65%).
+  Log: logs/llm-end-to-end-health-retry4-2026-11-16.log.
+  - Next fix (same family): route engagement is too loose - it counts
+    any "/health" string as engagement, so node-1 curling Ollama's
+    /health (port 11434) satisfied it without touching freetalon/api.py.
+    Tighten it (module mention, or a call to the route on the API's own
+    port), and give the replan path the same no-copy treatment: replan 1
+    echoed the brief's structured steps verbatim. The model also needs a
+    grounded plan shape for route goals (modify the serving module, write
+    tests via scaffold/heredoc, curl the real API port) instead of
+    free-form probe/echo nodes.
