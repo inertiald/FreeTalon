@@ -760,3 +760,29 @@ Deliberately left out:
   path the node never writes is unmeasurable by construction and
   should be rejected at plan time; the replan also needs a guard
   against re-serializing prompt prose as JSON.
+
+## Update - 2026-11-16 (evening, planner unwritten-file + prose fix — CPU-only)
+
+  Both retry-#8 weaknesses fixed. (1) A file_exists criterion on a
+  path no node in the plan writes is now rejected at plan time: the
+  check looks at the whole plan's writes (scaffold file_path, bash
+  redirect, heredoc target), any node's bash command (the node runs or
+  reads the file), or disk existence — listing the path in "outputs"
+  alone does not count, which was the hole (node-1 echoed to stdout
+  and listed health.json in outputs). Nodes with an unknown claw are
+  skipped (the claw error already rejects them). (2) A payload with no
+  "nodes" array whose keys read like prompt prose tokenized into JSON
+  is rejected by name as a prose re-serialization; the ROUTE GOAL
+  shape now forbids re-serializing the instructions as JSON, and the
+  replan prompt rule covers any instruction text, not just the brief.
+  Prompt text updated to match (outputs alone does not count; a later
+  node may check a file an earlier node wrote). Tests 470 -> 484/484
+  green (+14 new TestPlannerUnwrittenFileFix), M5 smoke passes,
+  verbatim retry-#8 v1 plan now rejected with 1 error naming
+  health.json and a mocked stdout-echo fake repairs to a grounded
+  plan in one round; verbatim tokenized prose rejected by name.
+  Regression guards pass (retry-#7 invented schema 11 errors,
+  retry-#5 fake, retry-#4 wrong service, retry-#3 glued echo,
+  bare-dict criteria coercion). Log:
+  freetalon-workspace/logs/planner-unwritten-file-fix-2026-11-16.log.
+  Next: /health retry #9 (GPU load, separate step).

@@ -3071,3 +3071,320 @@ class TestPlannerNodeShapeFix(unittest.TestCase):
         )
         self.assertEqual(len(nodes), 4)
         self.assertEqual(nodes[0].assigned_claw, "scaffold")
+
+
+class TestPlannerUnwrittenFileFix(unittest.TestCase):
+    """Reject file_exists on a path the plan never writes; name prose re-serialization (retry #8).
+
+    Retry #8 (log llm-end-to-end-health-retry8-2026-11-16.log, run
+    run-20261117T071848Z-640cb5) failed in 22.0s: the v1 plan was ACCEPTED
+    on the first attempt but was the fake in a new disguise — node-1 echoed
+    a JSON answer to STDOUT (no redirect, so the static stand-in rule did
+    not fire) while claiming file_exists on health.json, a file the command
+    never writes; node-2 was a curl probe mislabeled as a test. Execution
+    caught it (node-1 UNMEASURABLE: health.json does not exist) and the
+    judge chose REPLAN. The replan then failed 3x: (1) it re-serialized
+    the ROUTE GOAL shape prose as a tokenized JSON object (no nodes
+    array), (2) {"nodes": []}, (3) invented node/action/target/port
+    fields. Two fixes: (1) a file_exists criterion on a path no node in
+    the plan writes and that does not exist on disk is rejected at plan
+    time — listing the path in "outputs" alone does not count; (2) a
+    payload with no 'nodes' array whose keys read like prompt prose
+    tokenized into JSON is rejected by name as a prose re-serialization,
+    and the ROUTE GOAL shape now forbids re-serializing the instructions
+    as JSON.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#8 v1 nodes, verbatim from
+    # runs/run-20261117T071848Z-640cb5/plan-v001.json. Embedded (not read
+    # from the run directory) so the test stays hermetic in CI. The node-1
+    # command is the JSON-parsed value: echo with backslash-escaped quotes,
+    # no redirect, claiming file_exists on a file it never writes.
+    @staticmethod
+    def _retry8_v1_nodes() -> list[dict]:
+        ws = "/home/seeker/freetalon-workspace"
+        return [
+            {
+                "id": "node-1",
+                "objective": "Implement the /health endpoint in freetalon/api.py and save its output",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "echo \"{\\\"status\\\": \\\"OK\\\", \\\"ollama_reachable\\\": true, \\\"gpu_temp\\\": 25}\""},
+                "outputs": [f"{ws}/health.json"],
+                "acceptance": ["Output file exists"],
+                "criteria": [{"type": "file_exists", "path": f"{ws}/health.json"}],
+                "error": None,
+            },
+            {
+                "id": "node-2",
+                "objective": "Write unit tests for the /health endpoint and run them",
+                "depends_on": ["node-1"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "curl http://localhost:8765/health | jq '.status' -r"},
+                "outputs": ["test_result"],
+                "acceptance": ["Test result is OK"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "error": None,
+            },
+            {
+                "id": "node-3",
+                "objective": "Verify live with curl http://localhost:8765/health",
+                "depends_on": ["node-2"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "curl http://localhost:8765/health"},
+                "outputs": ["live_result"],
+                "acceptance": ["Live result is OK"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "error": None,
+            },
+        ]
+
+    # The exact retry-#8 replan attempt-1 output, verbatim from the second
+    # RAW PLANNER OUTPUT block of
+    # logs/llm-end-to-end-health-retry8-2026-11-16.log: the ROUTE GOAL
+    # shape prose re-serialized as a tokenized JSON object (no nodes
+    # array). Embedded so the test stays hermetic in CI. Duplicate "node"
+    # keys collapse on parse, as in the live run.
+    RETRY8_REPLAN1_PROSE = """{"health":true,"served":false,"freetalon":"/api.py","on":"port",
+"8765":true,"node":"1","edits":"freetalon/api.py",
+"(scaffold":"claw,or","a":"bash","heredoc)":"to implement the endpoint;",
+"node":"2","writes":"the tests",
+"(scaffold":"or","a":"bash","heredoc)":"and runs them;",
+"node":"3","verifies":"live with curl http://localhost:8765/health.",
+"Do":true,"NOT":true,
+"probe":"another service's /health path,",
+"and":"do NOT echo a JSON answer."}"""
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        """The grounded plan, from the previous fix's test class."""
+        grounded = TestPlannerGroundedShapeFix()
+        grounded.setUp()
+        return grounded._grounded_health_nodes()
+
+    # --- Fix 1: file_exists on a path the plan never writes ---
+
+    def test_parse_rejects_retry8_stdout_echo_fake(self) -> None:
+        # The exact retry-#8 v1 plan: node-1 echoes to stdout and claims
+        # file_exists on health.json, which no node writes and which does
+        # not exist on disk. The stand-in rule cannot see it (no redirect);
+        # the unwritten-file rule must catch it at plan time.
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(self._retry8_v1_nodes()), goal_text=self.HEALTH_GOAL
+            )
+        message = str(caught.exception)
+        self.assertIn("1 error", message)
+        self.assertIn("health.json", message)
+        self.assertIn("no node in the plan writes", message)
+        self.assertIn("does not exist on disk", message)
+
+    def test_stdout_echo_fake_repairs_to_grounded_plan_in_one_round(self) -> None:
+        bad = self._dag(self._retry8_v1_nodes())
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        nodes = plan.nodes
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(nodes[0].inputs["file_path"], self.api_path)
+        self.assertIn("curl -s http://localhost:8765/health", nodes[-1].inputs["command"])
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("health.json", repair_prompt)
+        self.assertIn("does not exist on disk", repair_prompt)
+        # The first attempt already carried the ROUTE GOAL shape with the
+        # no-serialization rule, so the repair is not the model's first
+        # sight of it.
+        first_prompt = call_mock.call_args_list[0][0][1]
+        self.assertIn("ROUTE GOAL", first_prompt)
+        self.assertIn("Do NOT re-serialize these instructions as JSON", first_prompt)
+
+    def test_cross_node_file_exists_passes(self) -> None:
+        # A later node may check a file an earlier node wrote: the check
+        # looks at the whole plan's writes, not just the claiming node.
+        shared = f"{self.WS}/shared.txt"
+        nodes = [
+            {
+                "id": "step_1",
+                "objective": "Write the shared file",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "inputs": {"command": f"cat > {shared} <<'EOF'\nhello\nEOF"},
+                "outputs": [shared],
+                "criteria": [{"type": "file_exists", "path": shared}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Check the shared file",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": f"ls {shared}"},
+                "outputs": ["check"],
+                "criteria": [{"type": "file_exists", "path": shared}],
+            },
+        ]
+        parsed, _ = parse_planner_response(self._dag(nodes))
+        self.assertEqual(len(parsed), 2)
+
+    def test_file_exists_on_preexisting_file_passes(self) -> None:
+        # A file_exists criterion on a file that already exists on disk
+        # passes even when no node writes it: the serving module is the
+        # canonical case.
+        node = {
+            "id": "step_1",
+            "objective": "Check the API module exists",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": f"grep -n 'health' {self.api_path}"},
+            "outputs": ["check"],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+        }
+        parsed, _ = parse_planner_response(self._dag([node]))
+        self.assertEqual(len(parsed), 1)
+        # The disk escape hatch on its own: the path is listed in outputs
+        # but named in no command and written by no node — it still passes
+        # because the file exists on disk.
+        node2 = {
+            "id": "step_1",
+            "objective": "Verify the endpoint live",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "curl -s http://localhost:8765/health"},
+            "outputs": [self.api_path],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+        }
+        parsed, _ = parse_planner_response(
+            self._dag([node2]), goal_text=self.HEALTH_GOAL
+        )
+        self.assertEqual(len(parsed), 1)
+
+    def test_parse_accepts_valid_heredoc_health_plan(self) -> None:
+        nodes, _ = parse_planner_response(
+            self._dag(self._grounded_health_nodes()), goal_text=self.HEALTH_GOAL
+        )
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+
+    def test_planner_prompt_says_outputs_alone_do_not_count(self) -> None:
+        self.assertIn(
+            'Listing a path in "outputs" alone does NOT count',
+            PLANNER_SYSTEM_PROMPT,
+        )
+
+    # --- Fix 2: prompt prose re-serialized as JSON ---
+
+    def test_parse_rejects_tokenized_route_goal_prose_by_name(self) -> None:
+        # The exact retry-#8 replan attempt-1 output: the ROUTE GOAL shape
+        # tokenized into a JSON object with no 'nodes' array. This must be
+        # a named prose re-serialization rejection — not an acceptance and
+        # not the generic "must contain a 'nodes' array" raise.
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(self.RETRY8_REPLAN1_PROSE)
+        message = str(caught.exception)
+        self.assertIn("re-serialized", message)
+        self.assertIn("no 'nodes' array", message)
+        self.assertNotIn("copied the re-plan brief", message)
+        self.assertNotIn("must contain a 'nodes' array", message)
+
+    def test_route_goal_shape_forbids_reserialization(self) -> None:
+        from freetalon.orchestrator.planner import _route_goal_shape
+
+        shape = _route_goal_shape(self.HEALTH_GOAL)
+        self.assertIn("ROUTE GOAL", shape)
+        self.assertIn("Do NOT re-serialize these instructions as JSON", shape)
+        first = _route_goal_shape(self.HEALTH_GOAL, delta=False)
+        self.assertIn("Do NOT re-serialize these instructions as JSON", first)
+        self.assertIn("the plan must follow this shape", first)
+
+    def test_replan_prompt_forbids_reserializing_guidance(self) -> None:
+        from freetalon.orchestrator.prompts import (
+            REPLAN_SYSTEM_PROMPT as REPLAN,
+        )
+
+        self.assertIn("never re-serialize", REPLAN)
+        self.assertIn("ROUTE", REPLAN)
+        self.assertIn("GOAL shape", REPLAN)
+
+    # --- Regression guards: the earlier fixes still hold ---
+
+    def test_parse_still_rejects_retry7_invented_schema(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerNodeShapeFix._retry7_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+        message = str(caught.exception)
+        self.assertNotIn("did not match PlanNode schema", message)
+        self.assertIn("was rejected with 11 errors", message)
+        self.assertIn("missing required field 'objective'", message)
+
+    def test_parse_still_rejects_retry5_fake(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerGroundedShapeFix._retry5_fake_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+        self.assertIn("grounded move", str(caught.exception))
+
+    def test_parse_still_rejects_retry4_plan_wrong_service(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "different service"):
+            parse_planner_response(
+                self._dag(TestPlannerRouteEngagementFix._retry4_plan_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+
+    def test_parse_still_rejects_retry3_glued_echo(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Write the health endpoint test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": TestPlannerHeredocFix.GLUED_ECHO},
+            "outputs": [f"{self.WS}/test_health.py"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        with self.assertRaisesRegex(LLMResponseError, "glued together") as ctx:
+            parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
+        self.assertIn("heredoc", str(ctx.exception))
+        self.assertIn("scaffold", str(ctx.exception))
+
+    def test_bare_dict_criteria_still_coerces(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerCriteriaShapeFix._retry6_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+        message = str(caught.exception)
+        self.assertNotIn("did not match PlanNode schema", message)
+        self.assertIn("criteria MUST be a JSON array", message)
+        self.assertIn("has no 'type'", message)

@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from .intake import LLMResponseError, LLMSettings, call_llm, parse_json_object
 from .repo_index import (
     build_repo_index,
+    resolve_repo_root,
     duplicate_scaffold_error,
     format_repo_context,
     framework_in_text,
@@ -203,6 +204,40 @@ def sanitize_llm_output(raw_text: str) -> str:
     cleaned = cleaned.replace("\xe2\x96\x81", " ").replace("▁", "")
     return cleaned
 
+# Top-level keys a real planner response may carry. Anything else with
+# no "nodes" array is not a plan shape.
+_PLAN_PAYLOAD_KEYS = frozenset(
+    {"nodes", "metadata", "plan_id", "intent", "status", "created_at", "updated_at"}
+)
+
+
+def _looks_like_prose_reserialization(payload: dict[str, Any]) -> bool:
+    """True when a JSON object with no 'nodes' array reads like prompt prose turned into JSON.
+
+    Retry #8 replan 1 re-serialized the ROUTE GOAL shape as a tokenized
+    object ({"health": true, "served": false, "freetalon": "/api.py",
+    "on": "port", "8765": true, "node": "1", ...}) — keys are single
+    words or fragments of the prompt's sentences, values are booleans or
+    sentence fragments, and there is no "nodes" array. A real plan
+    payload carries recognized top-level keys (nodes, metadata, plan_id,
+    intent); prose carries none of those, and its keys are mostly short
+    tokens. This is general: any prompt prose, not just the ROUTE GOAL
+    block, tokenizes the same way.
+    """
+    keys = [str(key) for key in payload]
+    if len(keys) < 3:
+        return False
+    if _PLAN_PAYLOAD_KEYS & set(keys):
+        return False
+    prose_like = 0
+    for key in keys:
+        if re.fullmatch(r"[A-Za-z0-9]{1,16}", key):
+            prose_like += 1
+        elif any(ch in key for ch in " ()\"'.,;:"):
+            prose_like += 1
+    return prose_like * 2 >= len(keys)
+
+
 def parse_planner_response(
     raw_text: str,
     *,
@@ -238,6 +273,18 @@ def parse_planner_response(
                 "PlanNodes (id, objective, depends_on, assigned_claw, inputs, "
                 "outputs, acceptance, criteria, error) — never re-serialize the "
                 "brief, its instruction, or its failed steps."
+            )
+        if _looks_like_prose_reserialization(payload):
+            raise LLMResponseError(
+                "Planner output re-serialized the prompt's instructions as JSON "
+                "instead of a plan DAG — it turned guidance prose (for example "
+                "the ROUTE GOAL shape) into a JSON object whose keys are words "
+                "from the prompt and which has no 'nodes' array. The prompt's "
+                "instructions are input, not output: return ONLY a JSON object "
+                "with a NEW 'nodes' array of PlanNodes (id, objective, "
+                "depends_on, assigned_claw, inputs, outputs, acceptance, "
+                "criteria, error) — never turn any sentence from the prompt "
+                "into JSON keys or values."
             )
         raise LLMResponseError("Planner output must contain a 'nodes' array.")
 
@@ -703,6 +750,126 @@ def _framework_errors(
     return errors
 
 
+# A shell redirect that writes a file: `> path`, `>> path`, `2> path`.
+# Heredoc targets are caught by _STRIP_HEREDOC_RE separately; a `>` inside
+# a quoted string is not a redirect, so callers strip quoted segments first.
+_REDIRECT_RE = re.compile(r"(?:^|[\s;&|])(?:\d+)?>>?\s*(?P<target>[^\s;&|]+)")
+
+
+def _node_written_paths(node: PlanNode) -> set[str]:
+    """Paths a node writes: scaffold target, bash redirect/heredoc targets.
+
+    A node's "outputs" list is NOT evidence — it is a claim about what
+    the node produces, and a fake plan lists a file there without ever
+    creating it (retry #8: node-1 listed health.json in outputs while
+    echoing its answer to stdout). Only a real write counts: the scaffold
+    claw's file_path, a redirect, or a heredoc target.
+    """
+    written: set[str] = set()
+    claw = node.assigned_claw or ""
+    if claw in ("scaffold", "file_writer"):
+        target = (
+            node.inputs.get("file_path")
+            or node.inputs.get("path")
+            or (node.outputs[0] if node.outputs else "")
+        )
+        if isinstance(target, str) and target:
+            written.add(target)
+    elif claw in ("bash", "shell_exec"):
+        command = node.inputs.get("command") or node.inputs.get("cmd")
+        if isinstance(command, str) and command:
+            for match in _STRIP_HEREDOC_RE.finditer(command):
+                written.add(match.group("target"))
+            stripped = _strip_heredoc_bodies(command)
+            unquoted = re.sub(r"'[^']*'|\"[^\"]*\"", "", stripped)
+            for match in _REDIRECT_RE.finditer(unquoted):
+                target = match.group("target")
+                if target and not target.startswith("/dev/"):
+                    written.add(target)
+    return written
+
+
+def _node_command_mentions_path(node: PlanNode, path: str) -> bool:
+    """True if a bash node's command names the path — it runs or reads the file.
+
+    Heredoc bodies are stripped first: a path inside file content the node
+    is writing is data, not a file the node runs.
+    """
+    if node.assigned_claw not in ("bash", "shell_exec"):
+        return False
+    command = node.inputs.get("command") or node.inputs.get("cmd")
+    if not isinstance(command, str):
+        return False
+    shell = _strip_heredoc_bodies(command)
+    return path in shell or shell.endswith("/" + path)
+
+
+def _path_exists_on_disk(path: str, repo_root: str | Path | None) -> bool:
+    """True if the path already exists on disk at plan time.
+
+    Absolute paths are checked as-is; relative paths resolve against the
+    repo root (the checkout holding this package when repo_root is None).
+    """
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate.exists()
+    return (resolve_repo_root(repo_root) / candidate).exists() or candidate.exists()
+
+
+def _unwritten_file_errors(
+    nodes: list[PlanNode], repo_root: str | Path | None
+) -> list[str]:
+    """Reject file_exists criteria on paths the plan never produces.
+
+    A file_exists criterion on a path no node writes is unmeasurable by
+    construction — the measurement can only ever report "does not exist".
+    (Retry #8: node-1 echoed a JSON answer to STDOUT and claimed
+    file_exists on health.json, a file the command never writes; the
+    static stand-in rule did not fire because there was no redirect, and
+    only execution caught it as UNMEASURABLE.) The criterion path must be
+    written by some node in the plan (scaffold file_path, bash redirect,
+    or heredoc target — the check looks at the whole plan's writes, so a
+    later node may check a file an earlier node wrote), named in a node's
+    bash command (the node runs or reads the file), or already exist on
+    disk at plan time. Listing the path in a node's "outputs" alone does
+    not count — outputs is a claim, not a write. Nodes with an unknown
+    claw are skipped: the claw error already rejects them, and they
+    cannot write anything.
+    """
+    written: set[str] = set()
+    for node in nodes:
+        written.update(_node_written_paths(node))
+    errors: list[str] = []
+    for node in nodes:
+        if (node.assigned_claw or "") not in KNOWN_CLAW_NAMES:
+            continue
+        for criterion in node.criteria or []:
+            if not isinstance(criterion, dict):
+                continue
+            if criterion.get("type") != CRITERION_FILE_EXISTS:
+                continue
+            path = criterion.get("path")
+            if not isinstance(path, str) or not path:
+                continue  # _usable_criterion_error already flags this
+            if any(_same_path(path, target) for target in written):
+                continue
+            if any(_node_command_mentions_path(other, path) for other in nodes):
+                continue
+            if _path_exists_on_disk(path, repo_root):
+                continue
+            errors.append(
+                f"Planner node '{node.id}' has a file_exists criterion on "
+                f"{path!r}, but no node in the plan writes that file and it "
+                "does not exist on disk — the file would be unmeasurable. A "
+                "file_exists criterion must point at a file the plan writes "
+                "(scaffold file_path, a bash redirect, or a heredoc target), "
+                "a file a node runs or reads in its command, or a file that "
+                "already exists. Listing the path in 'outputs' does not "
+                "count: echoing an answer to stdout does not create the file."
+            )
+    return errors
+
+
 def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
@@ -713,10 +880,12 @@ def _collect_plan_errors(
     Each node is checked against every rule (claw allowlist, structured
     criteria, command/port validation, repo grounding) and every failure is
     reported, so a single rejection can drive one repair round that fixes
-    them all. Two plan-level rules run after the per-node checks: static
+    them all. Plan-level rules run after the per-node checks: static
     stand-in files (a node that echo-writes a hardcoded answer and then
-    claims it exists) and route engagement (a goal naming an existing API
-    route must have a node that reads, modifies, or calls it). Per-node
+    claims it exists), unwritten files (a file_exists criterion on a
+    path no node writes and that does not exist on disk), and route
+    engagement (a goal naming an existing API route must have a node
+    that reads, modifies, or calls it). Per-node
     schema errors (missing fields, invented fields) are collected the
     same way in _validate_raw_nodes, before this runs. DAG-level
     structural errors (bad JSON, duplicate ids, dependency cycles) are
@@ -739,6 +908,7 @@ def _collect_plan_errors(
             error = _grounding_error(node, index)
             if error is not None:
                 errors.append(error)
+    errors.extend(_unwritten_file_errors(nodes, repo_root))
     errors.extend(_static_standin_errors(nodes, index=index, goal_text=goal_text))
     if index is not None:
         errors.extend(_route_engagement_errors(nodes, index, goal_text))
@@ -1247,7 +1417,9 @@ def _route_goal_shape(
             f"implement the endpoint; node 2 writes the tests (scaffold or "
             f"heredoc) and runs them; node 3 verifies live with "
             f"curl http://localhost:{index.api_port}{route}. Do NOT probe "
-            f"another service's {route} path, and do NOT echo a JSON answer."
+            f"another service's {route} path, and do NOT echo a JSON answer. "
+            f"Do NOT re-serialize these instructions as JSON — they are "
+            f"guidance, not output; your output is a NEW 'nodes' array."
         )
     return "\n".join(lines)
 

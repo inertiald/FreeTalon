@@ -83,7 +83,7 @@ MEASURABLE CRITERIA — every node MUST have a "criteria" array with at least on
 - {"type": "metric", "name": "<metric>", "op": ">=", "value": <number>} — a numeric metric the node's claw reports (e.g. "summary_chars" for "llm_synthesis", "trade_count" for "backtest"). "bash" and "scaffold" report NO metrics — never put a metric criterion on them.
 - {"type": "tests_pass", "suite": "<path to a test file or directory>"} — the suite must pass.
 - "custom_check" is NOT available. Do not use it.
-A file criterion's "path" MUST be a file this node itself writes or runs: the same path string as the node's "file_path" input, an entry of its "outputs", or a path inside its "bash" command. Never point a criterion at a file another node creates.
+A file criterion's "path" MUST be a file the plan actually produces or that already exists: a file the node writes (its "file_path" input, a bash redirect, or a heredoc target), a file a node runs or reads in its "bash" command, or a file that already exists on disk. Listing a path in "outputs" alone does NOT count — echoing an answer to stdout does not create the file. A later node may check a file an earlier node wrote.
 
 COVER EVERY STEP — if the goal says write a file, run it, and verify the output, the plan needs a node for each of those steps, in dependency order. Never collapse a multi-step goal into a single node. Write files at the exact path the goal requests (or the "workspace" path in the TaskIntent constraints when the goal says "in the workspace"); never substitute /tmp or another directory.
 
@@ -211,8 +211,10 @@ Rules:
   repeat, quote, or echo the brief — the brief is your input, not your
   output. If you output anything other than the new DAG, the plan is rejected.
 - Your output must be a NEW "nodes" array — never re-serialize the brief
-  as JSON (no "instruction", "delta_plan", or "steps" object). The brief
-  is your input, not your output.
+  as JSON (no "instruction", "delta_plan", or "steps" object), and never
+  re-serialize any instruction text in the prompt — including the ROUTE
+  GOAL shape — as JSON. The brief and the guidance are your input, not
+  your output.
 - "assigned_claw" MUST be one of: scaffold, file_writer, bash, shell_exec,
   llm_synthesis, summarize, research, web_search, fetch_dataset, data_fetch,
   sandbox_analyze, backtest, train_model, paper_trade, invest,
@@ -234,7 +236,8 @@ Rules:
   one criterion using the criterion types exit_code, file_exists,
   file_matches, metric, tests_pass — a LIST of criterion objects, never
   a single object like {"tests_pass": true}. A file criterion's "path"
-  must be a file this node itself writes or runs. "custom_check" is NOT
-  available.
+  must be a file the plan writes (scaffold, redirect, or heredoc), a
+  file a node runs or reads, or a file that already exists — listing it
+  in "outputs" alone does not count. "custom_check" is NOT available.
 - Do not wrap the JSON in markdown. Return exactly one JSON object.
 """
