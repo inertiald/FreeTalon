@@ -734,3 +734,29 @@ Deliberately left out:
   framework errors on the same Flask heredoc node. Log:
   freetalon-workspace/logs/planner-node-shape-fix-2026-11-16.log.
   Next: /health retry #8 (GPU load, separate step).
+
+## Update - 2026-11-16 (evening, /health retry #8 — GPU load)
+
+  FAILED in 22.0s, run run-20261117T071848Z-640cb5 (plan
+  plan-7885a4ef9d99), goal verdict FAIL — escalated: re-planner
+  failed. v1 was accepted on the first attempt but was a fake in a new
+  disguise: node-1 echoed a JSON answer to stdout (no file write, so
+  the stand-in rule did not fire) while claiming file_exists on
+  /home/seeker/freetalon-workspace/health.json, which the command never
+  writes; node-2 "write unit tests" was just a curl probe. Execution
+  caught it — node-1 UNMEASURABLE (exit 0, 0.001s, health.json does not
+  exist) — and the judge chose REPLAN. The replan then failed 3x: (1)
+  it re-serialized the ROUTE GOAL shape prose as a tokenized JSON
+  object (no nodes), (2) {"nodes": []}, (3) invented node/action/
+  target/port fields with no id/objective. The node-shape fix (091ebfd)
+  worked as designed — attempt 3 became a 16-error numbered rejection
+  instead of a budget-burning raise — but the model never repaired it
+  within the replan budget. Endpoint NOT extended, no new tests, suite
+  470/470 green, no stray files. GPU survived (51C idle after, 300W,
+  x16, zero Xid; peak temp not sampled mid-run — the parent runtime
+  restarted during the run and polling was interrupted; fans restored
+  to auto). Log: freetalon-workspace/logs/llm-end-to-end-health-
+  retry8-2026-11-16.log. Next weakness: a file_exists criterion on a
+  path the node never writes is unmeasurable by construction and
+  should be rejected at plan time; the replan also needs a guard
+  against re-serializing prompt prose as JSON.
