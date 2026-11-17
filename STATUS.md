@@ -1200,3 +1200,56 @@ Deliberately left out:
   exit_code criterion still passes validation; repair budget (max 2)
   not raised.
   Next: /health retry #15.
+
+## /health retry #15 (2026-11-17, DRIVER_EXIT:1, no run created)
+
+  Verdict: FAIL at planning (~2 min, 3 planner calls, no run created).
+  Pre-flight green: GPU 46C, 43.00W, limit 300.00W, link x16, zero Xid
+  79/154; Ollama reachable with gemma-3-abliterated:latest; git head
+  174d7ec, tree clean; suite 605/605 green. Fans manual 85% during
+  the run, restored to auto after. Log:
+  logs/llm-end-to-end-health-retry15-2026-11-16.log (181 lines).
+  Intake succeeded cleanly (valid TaskIntent, no echo).
+  Attempt 1: the prose-command plan again -- step_1/2/3 commands are
+  handler-citation prose ("/home/seeker/projects/FreeTalon/freetalon/
+  api.py:HiveAPIServer, _ThreadingHTTPServer - Add a /health branch to
+  the do_GET method..."). Rejected with exactly 3 errors by the new
+  prose rule (174d7ec working as designed), each naming the grounded
+  move (heredoc or scaffold with real code).
+  Attempt 2: a Flask heredoc plan (cat > /tmp/freetalon_api.py with a
+  Flask app + psutil, test file, curl checks) -- but MALFORMED: the
+  three nodes' fields are concatenated into a single object (the
+  "},{" separators between nodes are missing, and outputs/acceptance/
+  criteria are nested inside inputs). Duplicate-key last-wins
+  collapsed it to a 1-node plan (node-3, depends_on ["node-2"]) ->
+  rejected with 1 error, unknown dependency -- which names NOTHING
+  about the real defect (no Flask, no /tmp, no missing separators).
+  The framework and /tmp rules never fired because normalize raised
+  the dependency error before _collect_plan_errors ran.
+  Attempt 3: the echo fake to /tmp (echo JSON > /tmp/health.json;
+  glued echo test into /tmp/test.sh; /bin/bash /tmp/test.sh && curl).
+  Rejected with 4 errors (glued words on node-2, code-overwrite
+  stand-in naming the grounded move, /tmp write x2). Budget exhausted
+  (initial + 2 repairs = 3 calls; no free re-prompts used -- no empty
+  plan, no stand-in-only rejection) -> driver raised at
+  plan_task_intent (planner.py:2150 via _call_llm_with_repair line
+  2106 raising last_error). Judge/replan never ran.
+  Endpoint NOT extended. freetalon/api.py untouched (219 lines,
+  0-line diff vs HEAD) -- the minimal /health at api.py:44-45
+  ({"ok": True, "status": "ready"}) is still the only one. No new
+  tests written. Full suite re-run after the failure: 605/605 OK.
+  No live curl happened -- no plan was ever accepted, so nothing ran.
+  No stray files: health.json, api.json, test.sh, test_health.py,
+  health.py all absent from the workspace; /tmp/health.json,
+  /tmp/test.sh, /tmp/freetalon_api.py absent too.
+  GPU survived: mid-run peak sampled 62C at 258.11W; post-run 40C
+  idle, 42.60W, limit 300W holding, link x16, zero Xid 79/154. No
+  thermal pause triggered (never >=85C), no fall-off. Fans confirmed
+  auto.
+  Next: planner fix for duplicate-key / merged-node collapse (a node
+  object, or the nodes array, with repeated keys must be rejected by
+  name, naming the duplicated keys and the likely cause -- missing
+  "},{" between nodes, outputs/acceptance/criteria nested inside
+  inputs -- instead of collapsing silently and surfacing only a
+  downstream dependency error), and for the framework//tmp signal
+  being lost when normalize raises before _collect_plan_errors runs.
