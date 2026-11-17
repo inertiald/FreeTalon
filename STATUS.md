@@ -1605,3 +1605,26 @@ Deliberately left out:
   fragment overwriting a whole module; echo regex misses a '>'
   inside a quoted echo body.
 - Next: fix weakness (1), then /health retry #19.
+
+## Update - 2026-11-17 (CI fix: retry-#16 line number is disk-dependent)
+
+- CI on the ff299a2 push: Tests 44078864370 FAILED (3m8s), GPU tests
+  44078864446 SUCCESS (2m28s) -- exactly 1 failure:
+  test_retry16_v1_rejected_by_name asserts "line 221" but CI got
+  "line 2". Same family as the 49a6a38 disk-dependent fix.
+- Root cause: the code-append parse check simulates existing file +
+  appended lines on seeker7 (real api.py, 219 lines -> IndentationError
+  on line 221) but falls back to parsing the appended content alone in
+  CI (fixture path does not exist there -> line 2). The validator is
+  correct; the test was fragile.
+- Fix (tests only): new _expected_retry16_error_line() helper -- 221
+  where the fixture path exists, 2 where it does not -- mirroring
+  _expected_retry10_error_count(). No validator or fixture changes.
+- Verified: suite 679/679 green, M5 smoke passes. The fixed test passes
+  unpatched on seeker7 (line 221) and under a simulated-CI stub (line 2,
+  message identical to the real CI log). Both classes unpatched: 53/53.
+  Under the stub 5 placeholder tests fail, all known false positives of
+  the stub: their fixtures are retargeted to this checkout's api.py via
+  __file__, which exists in real CI under /home/runner (and all 5 passed
+  in the real CI 679 run).
+- Next: signal-loss fix (retry #18 weakness 1), then /health retry #19.

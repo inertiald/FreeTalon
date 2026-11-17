@@ -49,6 +49,21 @@ def _expected_retry10_error_count() -> int:
     """7 on a checkout where the fixture's api.py exists, 9 elsewhere."""
     return 7 if os.path.exists(RETRY10_API_PATH) else 9
 
+# The retry-#16 v1 fixture appends to the same absolute seeker7 path
+# (RETRY10_API_PATH). The code-append parse check simulates the write
+# against the file on disk when it exists and against the appended
+# content alone when it does not, so the reported line of the
+# IndentationError is disk-dependent too: on seeker7 the existing
+# api.py has 219 lines, the appended def lands on line 220 and the
+# missing indented block is reported on line 221; in CI the path
+# does not exist, the content alone is parsed (def on line 1, return
+# on line 2) and the error is reported on line 2. Tests asserting
+# the line must use _expected_retry16_error_line() instead of a
+# hard-coded number.
+def _expected_retry16_error_line() -> int:
+    """221 on a checkout where the fixture's api.py exists, 2 elsewhere."""
+    return 221 if os.path.exists(RETRY10_API_PATH) else 2
+
 
 def _assert_code_append_parse_error(
     testcase: unittest.TestCase, message: str
@@ -7308,7 +7323,10 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
         self.assertIn("node-2", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("expected an indented block", message)
-        self.assertIn("line 221", message)
+        # The reported line is disk-dependent: 221 where the fixture
+        # path exists, 2 where it does not (see
+        # _expected_retry16_error_line).
+        self.assertIn(f"line {_expected_retry16_error_line()}", message)
         _assert_code_append_parse_error(self, message)
 
     def test_retry15_attempt2_names_duplicate_keys_and_flask_tmp(self) -> None:
