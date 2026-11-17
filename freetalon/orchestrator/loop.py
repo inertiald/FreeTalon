@@ -295,6 +295,15 @@ class LoopRunner:
                     memory=self._memory_store.experiments_for_goal(goal_key, domain),
                     plan_version=version,
                 )
+                # Retry #20: the replan phase starts with a fresh forbidden
+                # list, so an approach rejected in initial planning (Flask)
+                # came back in the replan. Carry the initial planning's
+                # rejected approaches through the plan metadata into the
+                # replan brief; replan_from_brief seeds its repair prompts
+                # from it and writes the accumulated list back.
+                seed = plan.metadata.get("rejected_approaches") or []
+                if seed:
+                    brief["seed_forbidden"] = list(seed)
                 replan = replan_fn or (lambda b: replan_from_brief(b))
                 try:
                     new_nodes = replan(brief)
@@ -312,8 +321,13 @@ class LoopRunner:
                     escalation = f"delta plan rejected: {rejection}"
                     break
                 version += 1
+                metadata = dict(plan.metadata or {})
+                if brief.get("rejected_approaches"):
+                    metadata["rejected_approaches"] = list(
+                        brief["rejected_approaches"]
+                    )
                 plan = build_execution_plan(
-                    plan.intent, new_nodes, plan_id=plan.plan_id
+                    plan.intent, new_nodes, plan_id=plan.plan_id, metadata=metadata
                 )
                 self._store.save(plan)
                 continue

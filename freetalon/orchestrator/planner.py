@@ -2138,6 +2138,95 @@ def _code_append_errors(
     return errors
 
 
+def _plan_runs_path_as_test(nodes: list[PlanNode], target: str) -> bool:
+    """True when some node runs the target path as a test.
+
+    A bash command that names the target and matches the test-run pattern
+    (python3 <test file>, pytest, unittest) executes the file — so a
+    comment-only file passed off as a test is a fake the loop would
+    measure PASS (a comment-only file exits 0). Heredoc bodies are
+    stripped first: a path inside file content being written is data,
+    not a file being run.
+    """
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("bash", "shell_exec"):
+            continue
+        command = node.inputs.get("command") or node.inputs.get("cmd")
+        if not isinstance(command, str) or not command:
+            continue
+        shell = _strip_heredoc_bodies(command)
+        if target in shell and _TEST_RUN_RE.search(shell):
+            return True
+    return False
+
+
+def _placeholder_bash_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    index: Any | None = None,
+    goal_text: str | None = None,
+) -> list[str]:
+    """Reject bash heredoc/echo writes of placeholder content that fake a deliverable.
+
+    Retry #20: the accepted v1 plan wrote ``#TODO: replace this comment
+    with the real code for /health`` into health.py and test_health.py via
+    ``cat>`` heredocs, claimed file_exists on both, and ran the comment-only
+    test file — all three nodes measured PASS (a comment-only file exists
+    and exits 0) while nothing was implemented. The scaffold placeholder
+    guard covers scaffold writes to existing code files only, and the
+    code-append check only rejects writes that break parsing — a comment
+    parses fine — so the heredoc fake sailed through.
+
+    The rule fires when a bash write (heredoc or echo) of comment-only /
+    TODO-only content to a code file is claimed by a file_exists criterion
+    anywhere in the plan, or run as a test by some node. A placeholder
+    heredoc nobody claims and nobody runs is not a fake deliverable, so
+    it is left alone; a heredoc with real code passes untouched. The
+    error names the placeholder approach (so the repair prompt forbids
+    it) and the grounded move for route goals.
+    """
+    errors: list[str] = []
+    grounded = _grounded_move_text(index, goal_text)
+    file_exists_claims = {
+        criterion.get("path")
+        for node in nodes
+        for criterion in node.criteria or []
+        if isinstance(criterion, dict)
+        and criterion.get("type") == CRITERION_FILE_EXISTS
+        and isinstance(criterion.get("path"), str)
+    }
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("bash", "shell_exec"):
+            continue
+        command = node.inputs.get("command") or node.inputs.get("cmd")
+        if not isinstance(command, str) or not command:
+            continue
+        for target, content, _is_append in _bash_code_writes(command):
+            if not is_code_path(target):
+                continue
+            if not is_placeholder_content(content):
+                continue
+            claimed = target in file_exists_claims
+            run_as_test = _plan_runs_path_as_test(nodes, target)
+            if not claimed and not run_as_test:
+                continue
+            why = (
+                "claimed by a file_exists criterion"
+                if claimed
+                else "run as a test"
+            )
+            errors.append(
+                f"Planner node '{node.id}' writes {target!r} with placeholder "
+                "content only (comments and/or a docstring, no code) via a "
+                f"bash heredoc/echo, {why} — the file exists but implements "
+                "nothing, so the plan fakes the deliverable. Write real code "
+                "(a heredoc with the real implementation, or the scaffold "
+                "claw with real code) and verify it by running the tests "
+                f"and curling the live service.{grounded}"
+            )
+    return errors
+
+
 def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
@@ -2192,6 +2281,17 @@ def _collect_plan_errors(
     placeholder_errors = _placeholder_scaffold_errors(
         nodes, repo_root, index=index, goal_text=goal_text
     )
+    if not placeholder_errors:
+        # Retry #20: a plan whose only placeholder defect is a bash
+        # heredoc (no scaffold placeholder) is the same failed approach,
+        # named once. When a scaffold placeholder already names it, the
+        # heredoc placeholder is the same defect in the same plan, not a
+        # new one — listing it too only inflates the count (retry #17
+        # attempt-4 stays 1 error) while the cheap free re-prompt lets
+        # the model iterate one placeholder defect at a time.
+        placeholder_errors.extend(
+            _placeholder_bash_errors(nodes, repo_root, index=index, goal_text=goal_text)
+        )
     errors.extend(placeholder_errors)
     errors.extend(_code_append_errors(nodes, repo_root, goal_text, index))
     errors.extend(_sed_noop_errors(nodes, repo_root, goal_text, index))
@@ -2207,8 +2307,10 @@ def _collect_plan_errors(
     # code-overwrite fakes, so re-prompting costs the model nothing to
     # fix and must not spend the repair budget. A rejection whose only
     # errors are placeholder scaffolds is cheap too (retry #17): a
-    # comment stub costs the model nothing to replace with real code.
-    # Any other error mixed in makes it a real rejection.
+    # comment stub costs the model nothing to replace with real code —
+    # and so is a rejection whose only errors are placeholder bash
+    # heredocs (retry #20). Any other error mixed in makes it a real
+    # rejection.
     cheap = (
         bool(errors)
         and len(standin_errors) + len(placeholder_errors) == len(errors)
@@ -2377,13 +2479,15 @@ def _grounded_move_sentence(
         return (
             f"The grounded move is: extend {module} in place — add a "
             f"{route} branch to {handler}; write the tests (scaffold or "
-            f"heredoc) and run them; verify live with "
+            f"heredoc) and run them; start the API server and wait for it "
+            f"to answer; verify live with "
             f"curl http://localhost:{api_port}{route}."
         )
     return (
         f"The grounded move is: extend {module} (scaffold claw, or a bash "
         f"heredoc) to implement {route}; write the tests (scaffold or "
-        f"heredoc) and run them; verify live with "
+        f"heredoc) and run them; start the API server and wait for it to "
+        f"answer; verify live with "
         f"curl http://localhost:{api_port}{route}."
     )
 
@@ -2753,14 +2857,14 @@ def _route_goal_shape(
     """A concrete node shape for a goal naming an existing API route.
 
     When the goal names a route, the plan has a known shape — edit the
-    serving module, write tests, call the live route on the API port —
-    so the prompt hands the model a NEW structure to produce instead of
-    leaving it to discover the shape by trial and error inside a
-    3-attempt budget (retry #5 burned attempts 1-2 on the fake before
-    the engagement error fired) or to re-serialize the brief's failed
-    steps as JSON (retry #4 replan 1 echoed the brief's delta steps
-    verbatim). ``delta`` says whether the plan is a re-plan delta
-    ("the delta plan must follow this shape") or a first attempt
+    serving module, write tests, start the server, call the live route
+    on the API port — so the prompt hands the model a NEW structure to
+    produce instead of leaving it to discover the shape by trial and
+    error inside a 3-attempt budget (retry #5 burned attempts 1-2 on
+    the fake before the engagement error fired) or to re-serialize the
+    brief's failed steps as JSON (retry #4 replan 1 echoed the brief's
+    delta steps verbatim). ``delta`` says whether the plan is a re-plan
+    delta ("the delta plan must follow this shape") or a first attempt
     ("the plan must follow this shape"). Returns "" when the goal
     names no route.
     """
@@ -2791,8 +2895,15 @@ def _route_goal_shape(
         lines.append(
             f"- {route} is served by {module_path} on port {index.api_port}: "
             f"{edit}; node 2 writes the tests (scaffold or "
-            f"heredoc) and runs them; node 3 verifies live with "
-            f"curl http://localhost:{index.api_port}{route}. Do NOT probe "
+            f"heredoc) and runs them; node 3 starts the API server — from "
+            f"the repo root run cd {index.root} && ./.venv/bin/python -m "
+            f"freetalon.cli start (it daemonizes itself; stop a stale "
+            f"server first with ./.venv/bin/python -m freetalon.cli stop) "
+            f"and wait until curl -sf http://localhost:{index.api_port}"
+            f"{route} answers; node 4 verifies live with "
+            f"curl http://localhost:{index.api_port}{route}. The live curl "
+            f"cannot pass unless a node starts the server first — nothing "
+            f"serves port {index.api_port} until then. Do NOT probe "
             f"another service's {route} path, and do NOT echo a JSON answer. "
             f"Do NOT re-serialize these instructions as JSON — they are "
             f"guidance, not output; your output is a NEW 'nodes' array."
@@ -2929,7 +3040,8 @@ def _grounded_skeleton(
     not enough to get it writing again. A skeleton lowers the generation
     burden to filling in the code: the node ids, claws, file paths, and
     criteria are already there, mirroring the grounded plan shape (edit
-    the serving module, write + run the tests, curl the live route).
+    the serving module, write + run the tests, start the server, curl
+    the live route).
     The skeleton is a SHAPE to complete, not a plan to copy verbatim:
     every "# TODO" line must be replaced with real code, and a TODO
     comment copied into a scaffold is rejected by the placeholder guard
@@ -3026,8 +3138,27 @@ def _grounded_skeleton(
         },
         {
             "id": "step-4",
-            "objective": f"Verify {route} live",
+            "objective": f"Start the API server for {route}",
             "depends_on": ["step-3"],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": (
+                    f"cd {index.root} && ./.venv/bin/python -m freetalon.cli "
+                    f"stop; ./.venv/bin/python -m freetalon.cli start && "
+                    f"for i in $(seq 1 30); do curl -sf "
+                    f"http://localhost:{index.api_port}{route} && break; "
+                    f"sleep 1; done; curl -sf "
+                    f"http://localhost:{index.api_port}{route}"
+                )
+            },
+            "outputs": ["API server running"],
+            "acceptance": [f"The API server answers {route}."],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        },
+        {
+            "id": "step-5",
+            "objective": f"Verify {route} live",
+            "depends_on": ["step-4"],
             "assigned_claw": "bash",
             "inputs": {"command": f"curl -s http://localhost:{index.api_port}{route}"},
             "outputs": ["verification"],
@@ -3162,6 +3293,7 @@ def _call_llm_with_repair(
     goal_text: str | None = None,
     workspace: str | None = None,
     repo_root: str | Path | None = None,
+    seed_forbidden: list[str] | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
 
@@ -3193,7 +3325,15 @@ def _call_llm_with_repair(
     tried and had rejected in this planning call (retry #17: the Flask
     heredoc came back verbatim after a rejection that named the fix),
     so the model is told not to repeat them instead of re-discovering
-    the same rejection.
+    the same rejection. ``seed_forbidden`` carries approaches rejected
+    in an EARLIER planning call into this one (retry #20: the replan
+    phase starts with a fresh forbidden list, so Flask — rejected in
+    initial planning — came back as the replan's third attempt). Seeded
+    approaches are named in the first repair prompt of this call, with
+    their replacements and the consequence, exactly like approaches
+    rejected inside this call. The accumulated list is returned in the
+    metadata under "rejected_approaches" so the caller can carry it
+    into the next planning call.
 
     A run of empty plans is answered with a concrete grounded skeleton
     (retry #16): after any empty reply the next repair prompt carries a
@@ -3208,17 +3348,26 @@ def _call_llm_with_repair(
     repairs_used = 0
     free_used = 0
     empty_streak = 0
+    # Seed with approaches rejected in an earlier planning call, in
+    # order, deduplicated — the first repair prompt of this call already
+    # names them (retry #20).
     rejected_approaches: list[str] = []
+    for seeded in seed_forbidden or []:
+        if isinstance(seeded, str) and seeded and seeded not in rejected_approaches:
+            rejected_approaches.append(seeded)
     spent_repair = False
     while True:
         response_text = call_llm(system_prompt, prompt, settings=settings)
         try:
-            return parse_planner_response(
+            nodes, metadata = parse_planner_response(
                 response_text,
                 goal_text=goal_text,
                 workspace=workspace,
                 repo_root=repo_root,
             )
+            metadata = dict(metadata)
+            metadata["rejected_approaches"] = list(rejected_approaches)
+            return nodes, metadata
         except LLMResponseError as exc:
             last_error = exc
             for approach in _rejected_approaches(str(exc)):
@@ -3345,6 +3494,7 @@ def replan_from_brief(
     *,
     max_repairs: int = 2,
     repo_root: str | Path | None = None,
+    seed_forbidden: list[str] | None = None,
 ) -> list[PlanNode]:
     """Produce delta-plan nodes from a judge's re-plan brief (M1).
 
@@ -3352,6 +3502,15 @@ def replan_from_brief(
     relevant memory, and the remaining budget. The LLM's response is parsed
     and normalized exactly like an initial plan; the caller (the loop) runs
     the judge's duplicate-approach validation before accepting it.
+
+    ``seed_forbidden`` (or the brief's "seed_forbidden" key, which the loop
+    fills from the initial plan's metadata) carries the approaches rejected
+    in initial planning into this replan call — retry #20: without it the
+    replan starts with a fresh forbidden list and Flask, rejected in
+    initial planning, came back as the replan's third attempt. The
+    accumulated rejected-approaches list is written back into the brief
+    under "rejected_approaches" so the loop can carry it into the next
+    replan's seed.
     """
 
     context = format_repo_context(
@@ -3365,7 +3524,10 @@ def replan_from_brief(
     # named. The ROUTE GOAL shape is route-scoped; the node shape is
     # general, so it rides along on every replan.
     node_shape_block = f"\n\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}"
-    nodes, _metadata = _call_llm_with_repair(
+    seed = seed_forbidden if seed_forbidden is not None else brief.get("seed_forbidden")
+    if not isinstance(seed, list):
+        seed = None
+    nodes, metadata = _call_llm_with_repair(
         REPLAN_SYSTEM_PROMPT,
         f"{context}\n\n{_format_brief_for_prompt(brief)}{shape_block}{node_shape_block}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
@@ -3376,5 +3538,7 @@ def replan_from_brief(
         goal_text=_goal_text_from_brief(brief),
         workspace=brief.get("workspace"),
         repo_root=repo_root,
+        seed_forbidden=seed,
     )
+    brief["rejected_approaches"] = metadata.get("rejected_approaches", seed or [])
     return nodes
