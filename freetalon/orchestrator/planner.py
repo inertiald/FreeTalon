@@ -1643,6 +1643,56 @@ def _describe_failed_output(response_text: str) -> str:
     return f"a JSON object with keys {keys} and no 'nodes' array."
 
 
+# PlanNode fields the planner shape demands on every node. Retry #11:
+# attempt 2 (the stdout-echo fake) had objective/assigned_claw/inputs on
+# its nodes and attempt 3 dropped all three while inventing
+# description/output fields, so the shape error was named only after the
+# repair budget was spent. The repair prompt names any such regression.
+_REQUIRED_NODE_FIELDS = ("objective", "assigned_claw", "inputs", "criteria")
+
+
+def _node_field_names(response_text: str) -> set[str]:
+    """Field names present on the nodes of a planner reply, best-effort."""
+    try:
+        payload = parse_json_object(sanitize_llm_output(response_text))
+    except Exception:
+        return set()
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, list):
+        return set()
+    fields: set[str] = set()
+    for node in nodes:
+        if isinstance(node, dict):
+            fields.update(str(key) for key in node)
+    return fields
+
+
+def _dropped_fields_note(prev_text: str | None, cur_text: str) -> str:
+    """Name required fields the previous attempt had and this one dropped.
+
+    Returns "" when there is no previous attempt, when either reply is
+    not parseable JSON, or when nothing was dropped. Field names only --
+    no quoted content -- so the note cannot feed an echo the way pasting
+    the failed output would.
+    """
+    if not prev_text:
+        return ""
+    dropped = [
+        field
+        for field in _REQUIRED_NODE_FIELDS
+        if field in _node_field_names(prev_text)
+        and field not in _node_field_names(cur_text)
+    ]
+    if not dropped:
+        return ""
+    quoted = ", ".join(f"'{field}'" for field in dropped)
+    return (
+        f"Your previous attempt had {quoted} on its nodes; do not drop "
+        f"them — every node needs all of: id, objective, depends_on, "
+        f"assigned_claw, inputs, outputs, acceptance, criteria.\n"
+    )
+
+
 def _call_llm_with_repair(
     system_prompt: str,
     user_prompt: str,
@@ -1660,9 +1710,18 @@ def _call_llm_with_repair(
     again. Bounded: at most ``max_repairs`` repair attempts, then the last
     error is raised. Nothing is silently substituted — a plan the model
     cannot fix is an honest failure.
+
+    The repair prompt also carries the full NODE SHAPE block, so the
+    model has the valid node in front of it while fixing the named
+    error instead of having to remember it from the system prompt
+    (retry #11: the model fixed depends_on and invented
+    description/output nodes instead). When the new output drops a
+    required field the previous attempt had, the prompt names the
+    dropped fields.
     """
     prompt = user_prompt
     last_error: LLMResponseError | None = None
+    prev_response_text: str | None = None
     for attempt in range(max_repairs + 1):
         response_text = call_llm(system_prompt, prompt, settings=settings)
         try:
@@ -1677,11 +1736,16 @@ def _call_llm_with_repair(
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
                 f"Rejection reason: {exc}\n"
-                f"Previous output: {_describe_failed_output(response_text)}\n\n"
+                f"Previous output: {_describe_failed_output(response_text)}\n"
+                f"{_dropped_fields_note(prev_response_text, response_text)}"
+                f"\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n\n"
                 "Return ONLY a corrected JSON object with a \"nodes\" array that "
-                "fixes ALL of the rejection reasons listed above.\n"
+                "fixes ALL of the rejection reasons listed above. Every node "
+                "must match the NODE SHAPE above — do not drop a field from it "
+                "and do not invent a field outside it.\n"
                 "JSON Output:"
             )
+            prev_response_text = response_text
     assert last_error is not None
     raise last_error
 

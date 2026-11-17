@@ -4081,3 +4081,359 @@ class TestPlannerDependsOnFix(unittest.TestCase):
             normalize_plan_nodes(
                 [{"id": "a", "objective": "First", "depends_on": ["a"]}]
             )
+
+class TestPlannerShapeSurvivesRepair(unittest.TestCase):
+    """The repair prompt carries the full node shape; dropped fields are named (retry #11).
+
+    Retry #11 (log llm-end-to-end-health-retry11-2026-11-16.log) failed
+    at planning (~50s, DRIVER_EXIT:1, no run created). Intake succeeded.
+    Planner attempts: (1) {"nodes": []} -- empty; (2) the stdout-echo
+    fake again, no criteria on any node, depends_on with output names
+    again -- rejected; (3) a NEW invented schema: nodes with
+    description/output fields and no objective, no assigned_claw, no
+    inputs, no criteria -- but depends_on now uses correct node ids
+    (["step_1"] / ["step_2"]). The depends_on fix IS steering. The
+    node-shape fix worked as designed: attempt 3 was an 8-error numbered
+    rejection with the node shape appended, NOT a structural raise -- but
+    the repair budget was already spent. The model fixes the named error
+    but drops the rest of the PlanNode shape. Fix: the repair prompt
+    itself (in _call_llm_with_repair, used by both plan_task_intent and
+    replan_from_brief) carries the full minimal valid node, and when a
+    repair round's output drops a required field the previous attempt
+    had, the prompt names the dropped fields.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#11 attempt-3 nodes, verbatim from the third RAW
+    # PLANNER OUTPUT block of
+    # logs/llm-end-to-end-health-retry11-2026-11-16.log. Embedded (not
+    # read from the log) so the test stays hermetic in CI.
+    @staticmethod
+    def _retry11_attempt3_nodes() -> list[dict]:
+        return [
+            {
+                "id": "step_1",
+                "description": "Implement /health endpoint in /home/seeker/projects/FreeTalon/freetalon/api.py on port 8765",
+                "depends_on": [],
+                "output": "endpoint_implemented",
+            },
+            {
+                "id": "step_2",
+                "description": "Add tests for the endpoint",
+                "depends_on": ["step_1"],
+                "output": "tests_added",
+            },
+            {
+                "id": "step_3",
+                "description": "Verify live with curl http://localhost:8765/health",
+                "depends_on": ["step_2"],
+            },
+        ]
+
+    # The exact retry-#11 attempt-2 nodes (the stdout-echo fake), verbatim
+    # from the second RAW PLANNER OUTPUT block of the same log. It has
+    # objective/assigned_claw/inputs on every node but no criteria, and
+    # depends_on with output names -- the fields attempt 3 then dropped.
+    @staticmethod
+    def _retry11_attempt2_nodes() -> list[dict]:
+        return [
+            {
+                "id": "step_1",
+                "objective": "Implement /health endpoint in freetalon/api.py to return JSON reporting service status, OLLAMA reachability and GPU temperature.",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "echo \"{\\\"status\\\": \\\"OK\\\", \\\"ollama_reachable\\\": true, \\\"gpu_temp\\\": 25}\""},
+                "outputs": ["endpoint_implemented"],
+                "acceptance": ["Endpoint returns JSON with status, OLLAMA reachability and GPU temperature."],
+            },
+            {
+                "id": "step_2",
+                "objective": "Add unit tests for the /health endpoint.",
+                "depends_on": ["endpoint_implemented"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "echo \"# Unit tests for /health endpoint\""},
+                "outputs": ["tests_added"],
+                "acceptance": ["Unit tests are added for the /health endpoint."],
+            },
+            {
+                "id": "step_3",
+                "objective": "Verify live with curl http://localhost:8765/health.",
+                "depends_on": ["tests_added"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "curl http://localhost:8765/health"},
+                "outputs": ["endpoint_live"],
+                "acceptance": ["Endpoint is live and returns JSON."],
+            },
+        ]
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
+        )
+        self.repo_root = str(Path(__file__).resolve().parent.parent)
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        """The grounded plan, from the previous fix's test class."""
+        grounded = TestPlannerGroundedShapeFix()
+        grounded.setUp()
+        return grounded._grounded_health_nodes()
+
+    # --- Fix: the repair prompt carries the node shape ---
+
+    def test_parse_rejects_retry11_attempt3_numbered_with_shape(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(self._retry11_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 8 errors", message)
+        self.assertIn("fix ALL of them", message)
+        self.assertIn("missing required field 'objective'", message)
+        self.assertIn("has an unknown field 'description'", message)
+        self.assertIn("has an unknown field 'output'", message)
+        self.assertIn("every node MUST be a PlanNode object", message)
+        self.assertNotIn("did not match PlanNode schema", message)
+
+    def test_retry11_attempt3_repairs_to_grounded_plan_in_one_round(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        bad = self._dag(self._retry11_attempt3_nodes())
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        nodes = plan.nodes
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(nodes[0].inputs["file_path"], self.api_path)
+        self.assertEqual(nodes[1].depends_on, ["node-1"])
+        self.assertIn("curl -s http://localhost:8765/health", nodes[-1].inputs["command"])
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("missing required field 'objective'", repair_prompt)
+        # The repair prompt itself carries the full minimal valid node.
+        self.assertIn("NODE SHAPE", repair_prompt)
+        self.assertIn('"objective": "<what the node delivers>"', repair_prompt)
+        self.assertIn("Every node must match the NODE SHAPE above", repair_prompt)
+        self.assertIn("do not invent a field outside it", repair_prompt)
+        # No previous attempt on this round, so no dropped-fields note.
+        # (The "do not drop a field" instruction is in every repair
+        # prompt now; the note itself starts "Your previous attempt".)
+        self.assertNotIn("Your previous attempt had", repair_prompt)
+
+    def test_shape_survives_repair_rounds_fake_then_invention(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        fake = self._dag(self._retry11_attempt2_nodes())
+        invented = self._dag(self._retry11_attempt3_nodes())
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm",
+            side_effect=[fake, invented, good],
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 3)
+        self.assertEqual(len(plan.nodes), 4)
+        self.assertEqual(plan.nodes[0].assigned_claw, "scaffold")
+        first_repair = call_mock.call_args_list[1][0][1]
+        second_repair = call_mock.call_args_list[2][0][1]
+        # Both repair rounds carry the node shape in front of the model.
+        for repair_prompt in (first_repair, second_repair):
+            self.assertIn("NODE SHAPE", repair_prompt)
+            self.assertIn("Every node must match the NODE SHAPE above", repair_prompt)
+        # The first repair round has no previous attempt, so no note.
+        self.assertNotIn("Your previous attempt had", first_repair)
+        # The second names the fields the fake had and the invention dropped.
+        self.assertIn("do not drop", second_repair)
+        self.assertIn("Your previous attempt had", second_repair)
+        self.assertIn("'objective'", second_repair)
+        self.assertIn("'assigned_claw'", second_repair)
+        self.assertIn("'inputs'", second_repair)
+
+    def test_dropped_fields_note(self) -> None:
+        from freetalon.orchestrator.planner import _dropped_fields_note
+
+        fake = self._dag(self._retry11_attempt2_nodes())
+        invented = self._dag(self._retry11_attempt3_nodes())
+        self.assertEqual(_dropped_fields_note(None, fake), "")
+        self.assertEqual(_dropped_fields_note("not json", fake), "")
+        self.assertEqual(_dropped_fields_note(fake, fake), "")
+        self.assertEqual(_dropped_fields_note(invented, fake), "")
+        note = _dropped_fields_note(fake, invented)
+        self.assertIn("Your previous attempt had", note)
+        self.assertIn("'objective'", note)
+        self.assertIn("'assigned_claw'", note)
+        self.assertIn("'inputs'", note)
+        self.assertIn("do not drop", note)
+
+    def test_replan_repair_prompt_carries_node_shape(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        route = TestPlannerRouteEngagementFix()
+        route.setUp()
+        bad = self._dag(self._retry11_attempt3_nodes())
+        good = self._dag(route._good_delta_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            nodes = replan_from_brief(route._brief())
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(len(nodes), 2)
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("NODE SHAPE", repair_prompt)
+        self.assertIn("Every node must match the NODE SHAPE above", repair_prompt)
+        self.assertIn('"objective": "<what the node delivers>"', repair_prompt)
+
+    # --- Valid plans still pass untouched ---
+
+    def test_parse_accepts_grounded_plan(self) -> None:
+        nodes, _ = parse_planner_response(
+            self._dag(self._grounded_health_nodes()),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+        )
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(nodes[1].depends_on, ["node-1"])
+
+    # --- Regression guards: the earlier fixes still hold ---
+
+    def test_parse_rejects_retry10_attempt3_numbered(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerDependsOnFix._retry10_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 2 errors", message)
+        self.assertIn("depends on unknown node 'endpoint_implemented'", message)
+        self.assertIn("depend on 'step_1' (the node id)", message)
+        self.assertIn('"depends_on" lists NODE IDS only', message)
+
+    def test_parse_rejects_retry9_plan_wrong_location(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerRepoRootFix._retry9_v1_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("2 errors", message)
+        self.assertIn("repo root", message)
+
+    def test_parse_rejects_retry8_stdout_echo_fake(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerUnwrittenFileFix._retry8_v1_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        self.assertIn("unmeasurable", str(caught.exception))
+
+    def test_parse_rejects_retry7_invented_schema_numbered(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerNodeShapeFix._retry7_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 11 errors", message)
+        self.assertIn("every node MUST be a PlanNode object", message)
+        self.assertIn('There is NO "type" field', message)
+
+    def test_parse_still_rejects_retry5_fake(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "grounded move"):
+            parse_planner_response(
+                self._dag(TestPlannerGroundedShapeFix._retry5_fake_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+
+    def test_parse_still_rejects_retry4_plan_wrong_service(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "different service"):
+            parse_planner_response(
+                self._dag(TestPlannerRouteEngagementFix._retry4_plan_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+
+    def test_parse_still_rejects_retry3_glued_echo(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Write the health endpoint test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": TestPlannerHeredocFix.GLUED_ECHO},
+            "outputs": [f"{self.WS}/test_health.py"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        with self.assertRaisesRegex(LLMResponseError, "glued together") as ctx:
+            parse_planner_response(
+                self._dag([node]), goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        self.assertIn("heredoc", str(ctx.exception))
+        self.assertIn("scaffold", str(ctx.exception))
+
+    def test_bare_dict_criteria_still_coerces(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerCriteriaShapeFix._retry6_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertNotIn("did not match PlanNode schema", message)
+        self.assertIn("criteria MUST be a JSON array", message)
+
+    # --- Structural errors still raise first, unchanged ---
+
+    def test_normalize_still_raises_duplicate_ids_first(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "duplicate node ids"):
+            normalize_plan_nodes(
+                [
+                    {"id": "a", "objective": "First", "depends_on": []},
+                    {"id": "a", "objective": "Second", "depends_on": []},
+                ]
+            )
+
+    def test_normalize_still_raises_dependency_cycles_first(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "dependency cycle"):
+            normalize_plan_nodes(
+                [
+                    {"id": "a", "objective": "First", "depends_on": ["b"]},
+                    {"id": "b", "objective": "Second", "depends_on": ["a"]},
+                ]
+            )
+
+    def test_normalize_still_raises_self_dependency_first(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "cannot depend on itself"):
+            normalize_plan_nodes(
+                [{"id": "a", "objective": "First", "depends_on": ["a"]}]
+            )

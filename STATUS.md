@@ -928,3 +928,32 @@ Deliberately left out:
   repair prompt itself, so a repair that drops required fields
   (objective, assigned_claw, inputs, criteria) is corrected
   rather than invented around.
+
+## Update - 2026-11-17 (early, planner shape-survives-repair fix)
+
+  Planner shape-survives-repair fix DONE (retry #11 weakness): the
+  repair prompt itself -- in _call_llm_with_repair, used by both
+  plan_task_intent and replan_from_brief -- now carries the full
+  NODE SHAPE block in every repair round, and tells the model every
+  node must match it (do not drop a field from it, do not invent a
+  field outside it). New _dropped_fields_note: when a repair round's
+  output drops a required field the previous attempt had (objective,
+  assigned_claw, inputs, criteria), the repair prompt names the
+  dropped fields explicitly ("Your previous attempt had 'objective',
+  'assigned_claw', 'inputs' on its nodes; do not drop them").
+  Field names only, no quoted content. Tests 514 -> 531/531 green
+  (+17 TestPlannerShapeSurvivesRepair); M5 smoke OK (finance
+  run-20261117T081628Z-11da5e, ECU run-20261117T081628Z-e6cb04).
+  Demo: retry-#11 attempt-3 output rejected with 8 errors naming
+  the shape, mocked repair lands on a grounded plan in one round,
+  and a [fake, invention, grounded] sequence repairs within the
+  2-repair budget with the dropped fields named on the second round.
+  Demo: freetalon-workspace/tools/demo-shape-survives-repair.py, log
+  freetalon-workspace/logs/demo-shape-survives-repair.log; apply
+  script freetalon-workspace/tools/apply-planner-shape-survives-
+  repair-fix.py (verified byte-for-byte against a pristine 0758177
+  worktree). Log: freetalon-workspace/logs/planner-shape-survives-
+  repair-fix-2026-11-16.log. Known remaining gaps (pre-existing,
+  not fixed here): file_matches has the same outputs-only hole as
+  file_exists had; comment-only commands are not validated as
+  no-ops. Next: /health retry #12 (GPU load, separate step).
