@@ -709,3 +709,28 @@ Deliberately left out:
   shown to the model as an example. Also worth grounding: the API is
   not Flask; the serving module's framework should be visible to the
   planner so it stops writing Flask apps.
+
+## Update - 2026-11-16 (evening, planner node-shape fix — CPU-only)
+
+  Structural PlanNode schema errors are now collected, numbered
+  validation errors instead of a raise: _validate_raw_nodes names the
+  missing fields (objective) and the extra-forbidden fields (type/path/
+  content/command) per node and shows the required node shape, so a
+  schema invention becomes a repair-round fix instead of burning the
+  whole budget (retry #7 attempt 3: invented write_file/execute_command
+  node types). The planner prompt now shows the PlanNode shape as an
+  example (NODE SHAPE rule). Secondary: the repo index records each
+  module's web framework from its imports and the REPO CONTEXT names
+  it — freetalon/api.py is built on stdlib http.server — and a
+  route-goal plan that writes a different framework (Flask) is
+  rejected by name. Tests 455 -> 470/470 green (+15 new
+  TestPlannerNodeShapeFix), M5 smoke passes, verbatim retry-#7
+  attempt-3 output is now a numbered rejection (11 errors) and a mocked
+  first reply with invented node types repairs to a grounded plan in one
+  round. Regression guards pass (retry-#5 fake, retry-#4 wrong service,
+  retry-#3 glued echo, bare-dict criteria coercion). One older test
+  updated: the memory-echo budget test now expects the numbered
+  rejection, and the /tmp-write test now expects both the /tmp and the
+  framework errors on the same Flask heredoc node. Log:
+  freetalon-workspace/logs/planner-node-shape-fix-2026-11-16.log.
+  Next: /health retry #8 (GPU load, separate step).

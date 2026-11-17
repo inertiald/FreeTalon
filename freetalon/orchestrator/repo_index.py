@@ -30,6 +30,64 @@ _ROUTE_EQ_RE = re.compile(r"""path\s*==\s*["'](/[^"']*)["']""")
 _ROUTE_STARTSWITH_RE = re.compile(r"""path\.startswith\(\s*["'](/[^"']*)["']""")
 _API_PORT_RE = re.compile(r"""port:\s*int\s*=\s*Field\(default=(\d+)""")
 
+# Web frameworks, by the import name that identifies them. A module
+# that imports one of these is built on that framework; a module that
+# imports none of them has no framework label. Used to ground the
+# planner: freetalon/api.py imports stdlib http.server, so a plan that
+# writes a Flask app for the /health route is inventing a stack the
+# repo does not use (retry #7 attempts 2-3).
+_WEB_FRAMEWORKS = {
+    "http.server": "stdlib http.server",
+    "flask": "Flask",
+    "fastapi": "FastAPI",
+    "django": "Django",
+    "tornado": "Tornado",
+    "aiohttp": "aiohttp",
+    "starlette": "Starlette",
+    "bottle": "Bottle",
+    "sanic": "Sanic",
+    "falcon": "Falcon",
+}
+
+_IMPORT_LINE_RE = re.compile(
+    r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", re.MULTILINE
+)
+
+
+def _imported_modules(source: str) -> set[str]:
+    """Module names a source file imports (``import x`` / ``from x import``)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+    return names
+
+
+def _framework_of_imports(names: set[str]) -> str | None:
+    """The web framework a set of imported module names implies, if any."""
+    candidates = set(names)
+    for name in names:
+        candidates.add(name.split(".")[0])
+    for key, label in _WEB_FRAMEWORKS.items():
+        if key in candidates:
+            return label
+    return None
+
+
+def framework_in_text(text: str) -> str | None:
+    """The web framework a blob of Python source imports, if any."""
+    names: set[str] = set()
+    for match in _IMPORT_LINE_RE.finditer(text):
+        names.add(match.group(1) or match.group(2))
+    return _framework_of_imports(names)
+
+
 # How much of the module inventory the prompt context carries. The index
 # itself is complete; only the rendered text is truncated.
 _MAX_CONTEXT_FILES = 14
@@ -48,6 +106,9 @@ class RepoIndex:
     modules: dict[str, list[str]] = field(default_factory=dict)
     # FreeTalon API port from freetalon/config.py (HiveConfig.port default).
     api_port: int = 8765
+    # rel-path -> web framework the module is built on ("stdlib http.server",
+    # "Flask", ...), only when the module imports one.
+    frameworks: dict[str, str] = field(default_factory=dict)
 
     def route_names(self) -> set[str]:
         """First path segment of each route ("health", "tasks", ...)."""
@@ -99,6 +160,9 @@ def build_repo_index(repo_root: str | Path | None = None) -> RepoIndex:
         except OSError:
             continue
         index.files[rel] = _top_level_names(source)
+        framework = _framework_of_imports(_imported_modules(source))
+        if framework is not None:
+            index.frameworks[rel] = framework
         stem = path.stem
         index.modules.setdefault(stem, []).append(rel)
         for match in _ROUTE_EQ_RE.finditer(source):
@@ -128,6 +192,14 @@ def format_repo_context(index: RepoIndex) -> str:
         "HiveConfig.port). Ollama is on 11434. Port 8000 is the "
         "OpenAI-compatible LLM backend, not a service to curl or verify."
     )
+    serving = sorted({index.routes[route] for route in index.routes})
+    for module in serving:
+        framework = index.frameworks.get(module)
+        if framework:
+            lines.append(
+                f"- {module} serves the API routes and is built on {framework} — "
+                "extend it in place; do not rewrite it in a different web framework."
+            )
     if index.files:
         shown = sorted(index.files)[:_MAX_CONTEXT_FILES]
         for rel in shown:

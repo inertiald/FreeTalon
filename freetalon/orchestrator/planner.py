@@ -16,6 +16,7 @@ from .repo_index import (
     build_repo_index,
     duplicate_scaffold_error,
     format_repo_context,
+    framework_in_text,
 )
 from .measure import (
     CRITERION_CUSTOM_CHECK,
@@ -41,11 +42,84 @@ def _normalized_node_sort_key(node_id: str) -> int:
     return int(node_id.split("-")[1])
 
 
+# The PlanNode shape, spelled out wherever a node-schema error is
+# reported. Retry #7: the model invented write_file/execute_command
+# node types with no objective and no assigned_claw, and the structural
+# raise never showed it the shape it was supposed to use. Short on
+# purpose: it rides along in every schema rejection and in the planner
+# prompt's schema rules.
+_NODE_SHAPE_EXAMPLE = (
+    'every node MUST be a PlanNode object: {"id": "step_1", "objective": '
+    '"<what the node delivers>", "depends_on": [], "assigned_claw": '
+    '"scaffold" | "bash", "inputs": {"file_path": "<path>", "content": '
+    '"<file contents>"} | {"command": "<shell command>"}, "outputs": '
+    '["<path or result>"], "acceptance": ["<human-readable check>"], '
+    '"criteria": [{"type": "exit_code", "equals": 0}]}. There is NO '
+    '"type" field and NO "write_file" / "execute_command" node kind — '
+    'to write a file use the "scaffold" claw, to run a command use the '
+    '"bash" claw.'
+)
+
+
+def _schema_error_text(label: str, err: dict[str, Any]) -> str:
+    """One pydantic validation error as a plain sentence naming the field."""
+    loc = err.get("loc", ())
+    field = ".".join(str(part) for part in loc) if loc else ""
+    err_type = err.get("type", "")
+    if err_type == "missing":
+        return f"Planner node {label} is missing required field '{field}'."
+    if err_type == "extra_forbidden":
+        return (
+            f"Planner node {label} has an unknown field '{field}' — "
+            f"PlanNodes have no '{field}' field."
+        )
+    if field:
+        return (
+            f"Planner node {label} has an invalid value for '{field}': "
+            f"{err.get('msg', '')}."
+        )
+    return (
+        f"Planner node {label} is not a valid node object: "
+        f"{err.get('msg', '')}."
+    )
+
+
 def _validate_raw_nodes(raw_nodes: list[Any]) -> list[PlanNode]:
-    try:
-        return [PlanNode.model_validate(node) for node in raw_nodes]
-    except ValidationError as exc:
-        raise LLMResponseError(f"Planner response did not match PlanNode schema: {exc}") from exc
+    """Validate raw node dicts, collecting per-node schema errors.
+
+    Per-node schema errors (a missing required field, an unknown
+    extra-forbidden field, a wrong field type) are collected into ONE
+    numbered LLMResponseError in the same format as the collected
+    validation errors in _collect_plan_errors, so the repair loop can
+    fix them in one round. (Retry #7: the model invented write_file /
+    execute_command node types with no objective and no assigned_claw;
+    the old code raised a structural "did not match PlanNode schema"
+    error that burned the whole repair budget before validation could
+    name the problem.) Genuinely structural problems — bad JSON,
+    duplicate ids, dependency cycles — still raise first in
+    normalize_plan_nodes, as today.
+    """
+    nodes: list[PlanNode] = []
+    errors: list[str] = []
+    for position, raw in enumerate(raw_nodes, start=1):
+        if isinstance(raw, dict) and isinstance(raw.get("id"), str):
+            label = f"'{raw['id']}'"
+        else:
+            label = f"at position {position}"
+        try:
+            nodes.append(PlanNode.model_validate(raw))
+        except ValidationError as exc:
+            errors.extend(_schema_error_text(label, err) for err in exc.errors())
+    if errors:
+        noun = "error" if len(errors) == 1 else "errors"
+        lines = "\n".join(
+            f"{index}. {error}" for index, error in enumerate(errors, start=1)
+        )
+        raise LLMResponseError(
+            f"Planner output was rejected with {len(errors)} {noun} — "
+            f"fix ALL of them:\n{lines}\n{_NODE_SHAPE_EXAMPLE}"
+        )
+    return nodes
 
 
 def _coerce_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[PlanNode]:
@@ -560,6 +634,75 @@ def _tmp_write_errors(
     return errors
 
 
+def _heredoc_bodies(command: str) -> list[str]:
+    """The bodies of every heredoc in a bash command (file content, not shell)."""
+    bodies: list[str] = []
+    rest = command
+    while True:
+        match = _STRIP_HEREDOC_RE.search(rest)
+        if not match:
+            return bodies
+        tail = rest[match.end() :]
+        lines = tail.splitlines(keepends=True)
+        marker = match.group("marker")
+        marker_idx = next(
+            (i for i, line in enumerate(lines) if line.strip() == marker), None
+        )
+        if marker_idx is None:
+            return bodies
+        bodies.append("".join(lines[1:marker_idx]))
+        rest = "".join(lines[marker_idx + 1 :])
+
+
+def _framework_errors(
+    nodes: list[PlanNode], index: Any, goal_text: str | None
+) -> list[str]:
+    """Reject route-goal plans that write a different web framework.
+
+    When the goal names an existing API route, the serving module's
+    framework is the stack: a node that writes a Flask app for a route
+    served by an http.server module is inventing a stack the repo does
+    not use (retry #7 attempts 2-3 wrote a Flask app for /health,
+    which freetalon/api.py serves with stdlib http.server). General:
+    any written content (scaffold content, or a heredoc body) that
+    imports a web framework different from the serving module's.
+    """
+    if not goal_text:
+        return []
+    named = _routes_named_in_goal(goal_text, index)
+    if not named:
+        return []
+    serving: dict[str, str] = {}
+    for route, module in named:
+        serving.setdefault(module, route)
+    errors: list[str] = []
+    for module, route in sorted(serving.items()):
+        serving_framework = index.frameworks.get(module)
+        if not serving_framework:
+            continue
+        for node in nodes:
+            written: list[str] = []
+            if node.assigned_claw in ("scaffold", "file_writer"):
+                content = node.inputs.get("content")
+                if isinstance(content, str):
+                    written.append(content)
+            elif node.assigned_claw in ("bash", "shell_exec"):
+                command = node.inputs.get("command") or node.inputs.get("cmd")
+                if isinstance(command, str):
+                    written.extend(_heredoc_bodies(command))
+            for content in written:
+                found = framework_in_text(content)
+                if found is not None and found != serving_framework:
+                    errors.append(
+                        f"Planner node '{node.id}' writes a {found} app — "
+                        f"{route} is served by {module}, which is built on "
+                        f"{serving_framework}; extend that code instead of "
+                        f"introducing a different web framework."
+                    )
+                    break
+    return errors
+
+
 def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
@@ -573,10 +716,13 @@ def _collect_plan_errors(
     them all. Two plan-level rules run after the per-node checks: static
     stand-in files (a node that echo-writes a hardcoded answer and then
     claims it exists) and route engagement (a goal naming an existing API
-    route must have a node that reads, modifies, or calls it). Structural
-    errors (bad JSON, duplicate ids, dependency cycles) are not collected
-    here — they are raised first by normalize_plan_nodes, since the node
-    list cannot be interpreted at all until the DAG is structurally valid.
+    route must have a node that reads, modifies, or calls it). Per-node
+    schema errors (missing fields, invented fields) are collected the
+    same way in _validate_raw_nodes, before this runs. DAG-level
+    structural errors (bad JSON, duplicate ids, dependency cycles) are
+    not collected — they are raised first by normalize_plan_nodes, since
+    the node list cannot be interpreted at all until the DAG is
+    structurally valid.
     """
     errors: list[str] = []
     needs_index = any(
@@ -597,6 +743,7 @@ def _collect_plan_errors(
     if index is not None:
         errors.extend(_route_engagement_errors(nodes, index, goal_text))
         errors.extend(_tmp_write_errors(nodes, index, goal_text))
+        errors.extend(_framework_errors(nodes, index, goal_text))
     return errors
 
 

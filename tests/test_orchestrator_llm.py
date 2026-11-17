@@ -1406,10 +1406,15 @@ class TestPlannerFakeAndMemoryFix(unittest.TestCase):
         with patch(
             "freetalon.orchestrator.planner.call_llm", return_value=echo
         ) as call_mock:
+            # Retry #7: a schema invention is now a numbered, repairable
+            # rejection (naming the missing objective and the invented
+            # fields) instead of a structural "did not match PlanNode
+            # schema" raise — the budget is still exhausted after 3 calls.
             with self.assertRaisesRegex(
-                LLMResponseError, "did not match PlanNode schema"
-            ):
+                LLMResponseError, "was rejected with"
+            ) as caught:
                 replan_from_brief(self._brief())
+        self.assertIn("missing required field 'objective'", str(caught.exception))
         # Initial attempt + 2 repair retries, then the last error is raised.
         self.assertEqual(call_mock.call_count, 3)
 
@@ -2661,9 +2666,12 @@ class TestPlannerCriteriaShapeFix(unittest.TestCase):
     # --- Secondary: a route-goal write to /tmp is rejected ---
 
     def test_tmp_write_for_route_goal_is_rejected(self) -> None:
-        # Retry #6 attempt 2, reduced to one node with valid criteria so
-        # the /tmp error is isolated: the heredoc writes a Flask app to
-        # /tmp/freetalon/api.py instead of extending freetalon/api.py.
+        # Retry #6 attempt 2, reduced to one node with valid criteria:
+        # the heredoc writes a Flask app to /tmp/freetalon/api.py
+        # instead of extending freetalon/api.py. Two rules fire on the
+        # same node — the /tmp rule and (retry #7) the framework rule,
+        # since the heredoc body imports Flask while the serving module
+        # is http.server-based.
         node = {
             "id": "node-1",
             "objective": "Implement the /health endpoint in freetalon/api.py on port 8765",
@@ -2678,10 +2686,12 @@ class TestPlannerCriteriaShapeFix(unittest.TestCase):
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
         message = str(caught.exception)
-        self.assertIn("1 error", message)
+        self.assertIn("2 errors", message)
         self.assertIn("/tmp/freetalon/api.py", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("not a /tmp scratch file", message)
+        self.assertIn("writes a Flask app", message)
+        self.assertIn("stdlib http.server", message)
 
     def test_tmp_write_for_non_route_goal_is_not_flagged(self) -> None:
         # The /tmp rule is scoped to route goals: a scratch write for an
@@ -2699,6 +2709,330 @@ class TestPlannerCriteriaShapeFix(unittest.TestCase):
             self._dag([node]), goal_text="Write a python script at /tmp/app.py"
         )
         self.assertEqual(len(nodes), 1)
+
+    # --- Regression guards: the earlier fixes still hold ---
+
+    def test_parse_still_rejects_retry5_fake_with_grounded_move(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "grounded move"):
+            parse_planner_response(
+                self._dag(TestPlannerGroundedShapeFix._retry5_fake_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+
+    def test_parse_still_rejects_retry4_plan_wrong_service(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "different service"):
+            parse_planner_response(
+                self._dag(TestPlannerRouteEngagementFix._retry4_plan_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+
+    def test_parse_still_rejects_retry3_glued_echo(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Write the health endpoint test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": TestPlannerHeredocFix.GLUED_ECHO},
+            "outputs": [f"{self.WS}/test_health.py"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        with self.assertRaisesRegex(LLMResponseError, "glued together") as ctx:
+            parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
+        self.assertIn("heredoc", str(ctx.exception))
+        self.assertIn("scaffold", str(ctx.exception))
+
+    def test_parse_accepts_valid_heredoc_health_plan(self) -> None:
+        nodes, _ = parse_planner_response(
+            self._dag(self._grounded_health_nodes()), goal_text=self.HEALTH_GOAL
+        )
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+
+
+class TestPlannerNodeShapeFix(unittest.TestCase):
+    """Schema inventions become numbered rejections; the node shape is shown (retry #7).
+
+    Retry #7 (log llm-end-to-end-health-retry7-2026-11-16.log) failed at
+    the planning stage: attempt 3 abandoned the PlanNode schema entirely
+    and invented node types {"type": "write_file", "path": ..., "content":
+    ...} / {"type": "execute_command", ...} with no objective and no
+    assigned_claw. The old _validate_raw_nodes raised a structural
+    "did not match PlanNode schema" error, which the repair loop could
+    not turn into a fix — the budget burned on an error that never named
+    the problem. Two fixes: (1) per-node schema errors are collected
+    into ONE numbered rejection naming the missing fields and the
+    extra-forbidden fields, plus the required node shape; (2) the
+    planner prompt now shows the PlanNode shape as an example (NODE
+    SHAPE rule), so the model stops drifting off the schema. Secondary:
+    the repo index records each module's web framework from its imports
+    and the REPO CONTEXT names it, and a route-goal plan that writes a
+    different framework than the serving module's is rejected by name —
+    freetalon/api.py is stdlib http.server, not Flask (retry #7 attempts
+    2-3 wrote a Flask app for /health).
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#7 attempt-3 nodes, verbatim from the third RAW
+    # PLANNER OUTPUT block of
+    # logs/llm-end-to-end-health-retry7-2026-11-16.log. Embedded (not
+    # read from the log) so the test stays hermetic in CI. Values are
+    # the JSON-parsed values (plain double quotes), not the log's
+    # backslash-escaped spellings.
+    @staticmethod
+    def _retry7_attempt3_nodes() -> list[dict]:
+        return [
+            {
+                "id": "node-1",
+                "type": "write_file",
+                "path": "freetalon/api.py",
+                "content": "import json\nfrom flask import Flask, jsonify\n\napp = Flask(__name__)\n\n@app.route('/health')\ndef health():\nstatus = {'status': 'ok', 'version': '1.0'}\nreturn jsonify(status)\n\nif __name__ == '__main__':\napp.run(host='0.0.0.0', port=8765)",
+                "criteria": [{"type": "file_exists", "path": "freetalon/api.py"}],
+            },
+            {
+                "id": "node-2",
+                "type": "write_file",
+                "path": "freetalon/test.sh",
+                "content": "#!/bin/bash\ncurl http://localhost:8765/health | jq -r '.status' | grep 'ok'",
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "node-3",
+                "type": "execute_command",
+                "command": "freetalon/test.sh",
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        """The grounded plan, from the previous fix's test class."""
+        grounded = TestPlannerGroundedShapeFix()
+        grounded.setUp()
+        return grounded._grounded_health_nodes()
+
+    # --- Fix 1: schema inventions are collected, numbered rejections ---
+
+    def test_invented_node_types_are_numbered_rejection_not_raise(self) -> None:
+        # The exact retry-#7 attempt-3 output: before the fix this raised
+        # a structural "did not match PlanNode schema" error, burning the
+        # repair budget. Now it is a collected rejection naming the missing
+        # objective and every invented field, plus the required node shape.
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(self._retry7_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+        message = str(caught.exception)
+        self.assertNotIn("did not match PlanNode schema", message)
+        self.assertIn("was rejected with 11 errors", message)
+        self.assertIn("missing required field 'objective'", message)
+        self.assertIn("unknown field 'type'", message)
+        self.assertIn("unknown field 'path'", message)
+        self.assertIn("unknown field 'content'", message)
+        self.assertIn("unknown field 'command'", message)
+        # The rejection shows the required shape, not just the complaint.
+        self.assertIn("PlanNode object", message)
+        self.assertIn('"assigned_claw"', message)
+        self.assertIn("write_file", message)
+        self.assertIn("execute_command", message)
+
+    def test_non_object_node_entry_is_numbered_rejection(self) -> None:
+        # A nodes entry that is not an object at all is per-entry, not
+        # DAG-level: it is collected the same way, never a structural raise.
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(["not a node"]), goal_text=self.HEALTH_GOAL
+            )
+        message = str(caught.exception)
+        self.assertNotIn("did not match PlanNode schema", message)
+        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("not a valid node object", message)
+
+    def test_invented_node_types_repair_to_grounded_plan_in_one_round(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        bad = self._dag(self._retry7_attempt3_nodes())
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        nodes = plan.nodes
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(nodes[0].inputs["file_path"], self.api_path)
+        self.assertIn("curl -s http://localhost:8765/health", nodes[-1].inputs["command"])
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        # The repair prompt carries the schema rejection and the shape.
+        self.assertIn("missing required field 'objective'", repair_prompt)
+        self.assertIn("PlanNode object", repair_prompt)
+        self.assertIn("write_file", repair_prompt)
+
+    # --- Fix 2: the node shape is shown in the prompt ---
+
+    def test_planner_prompt_shows_node_shape(self) -> None:
+        from freetalon.orchestrator.prompts import (
+            PLANNER_SYSTEM_PROMPT as PLANNER,
+        )
+
+        self.assertIn("NODE SHAPE", PLANNER)
+        self.assertIn('"id": "step_1"', PLANNER)
+        self.assertIn('"assigned_claw"', PLANNER)
+        self.assertIn('"criteria": [{"type": "exit_code", "equals": 0}]', PLANNER)
+        self.assertIn("write_file", PLANNER)
+        self.assertIn("execute_command", PLANNER)
+        self.assertIn("never a node \"type\"", PLANNER)
+
+    def test_first_prompt_carries_node_shape(self) -> None:
+        # The shape rides in the system prompt, so the first attempt (and
+        # every repair) sees it — no LLM call is needed to check this.
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=good
+        ) as call_mock:
+            plan_task_intent(self.intent, settings=self.settings)
+        system_prompt = call_mock.call_args[0][0]
+        self.assertIn("NODE SHAPE", system_prompt)
+        self.assertIn('"assigned_claw"', system_prompt)
+
+    # --- Fix 1 regression: bare-dict criteria still coerces (798a116) ---
+
+    def test_bare_dict_criteria_still_coerces(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerCriteriaShapeFix._retry6_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+        message = str(caught.exception)
+        self.assertNotIn("did not match PlanNode schema", message)
+        self.assertIn("criteria MUST be a JSON array", message)
+        self.assertIn("has no 'type'", message)
+
+    def test_no_criteria_node_still_rejected_with_shape_example(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Verify the endpoint live",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "curl -s http://localhost:8765/health"},
+            "outputs": ["verification"],
+        }
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
+        message = str(caught.exception)
+        self.assertIn("1 error", message)
+        self.assertIn("has no 'criteria'", message)
+        self.assertIn("criteria MUST be a JSON array", message)
+        self.assertIn('[{"type": "exit_code", "equals": 0}]', message)
+
+    # --- Secondary: the serving module's framework is grounded ---
+
+    def test_flask_app_for_http_server_route_is_rejected(self) -> None:
+        # Retry #7 attempt 2, reduced to one schema-valid node so the
+        # framework error is isolated: a scaffold that writes a Flask app
+        # into freetalon/api.py, which serves /health with http.server.
+        node = {
+            "id": "step_1",
+            "objective": "Extend the health endpoint in freetalon/api.py",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": self.api_path,
+                "content": "from flask import Flask\napp = Flask(__name__)\n\n@app.route('/health')\ndef health():\n    return {'ok': True}\n",
+            },
+            "outputs": [self.api_path],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+        }
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
+        message = str(caught.exception)
+        self.assertIn("1 error", message)
+        self.assertIn("Flask", message)
+        self.assertIn("stdlib http.server", message)
+        self.assertIn("freetalon/api.py", message)
+        self.assertIn("different web framework", message)
+
+    def test_http_server_write_for_http_server_route_is_not_flagged(self) -> None:
+        # The same shape in the serving module's own framework passes.
+        node = {
+            "id": "step_1",
+            "objective": "Extend the health endpoint in freetalon/api.py",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": self.api_path,
+                "content": "from http.server import BaseHTTPRequestHandler\n\nclass Handler(BaseHTTPRequestHandler):\n    pass\n",
+            },
+            "outputs": [self.api_path],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+        }
+        nodes, _ = parse_planner_response(
+            self._dag([node]), goal_text=self.HEALTH_GOAL
+        )
+        self.assertEqual(len(nodes), 1)
+
+    def test_repo_context_names_serving_module_framework(self) -> None:
+        from freetalon.orchestrator.repo_index import (
+            build_repo_index,
+            format_repo_context,
+        )
+
+        context = format_repo_context(build_repo_index())
+        self.assertIn("freetalon/api.py", context)
+        self.assertIn("stdlib http.server", context)
+        self.assertIn("do not rewrite it in a different web framework", context)
+
+    def test_flask_heredoc_body_is_flagged_by_framework_rule(self) -> None:
+        # Retry #7 attempt 2's heredoc, schema-valid and on the real path
+        # so only the framework rule fires: the Flask import lives in the
+        # heredoc body, which is file content, not shell.
+        node = {
+            "id": "node-1",
+            "objective": "Implement the /health endpoint in freetalon/api.py on port 8765",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": "cat > /home/seeker/projects/FreeTalon/freetalon/api.py <<'EOF'\nfrom flask import Flask\napp = Flask(__name__)\nEOF"
+            },
+            "outputs": ["/home/seeker/projects/FreeTalon/freetalon/api.py"],
+            "criteria": [
+                {
+                    "type": "file_exists",
+                    "path": "/home/seeker/projects/FreeTalon/freetalon/api.py",
+                }
+            ],
+        }
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
+        message = str(caught.exception)
+        self.assertIn("Flask", message)
+        self.assertIn("stdlib http.server", message)
 
     # --- Regression guards: the earlier fixes still hold ---
 
