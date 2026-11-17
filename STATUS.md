@@ -786,3 +786,28 @@ Deliberately left out:
   bare-dict criteria coercion). Log:
   freetalon-workspace/logs/planner-unwritten-file-fix-2026-11-16.log.
   Next: /health retry #9 (GPU load, separate step).
+
+## Update - 2026-11-16 (evening, /health retry #9 — GPU load)
+
+  Retry #9 FAILED (run run-20261117T073452Z-2e7e88, 30.5s, escalated:
+  re-planner failed — Planner response must include at least one plan
+  node). The v1 plan was ACCEPTED on the first attempt, but node-1
+  was a nonsense probe: it grepped for "def health(self)" on line 1
+  of /home/seeker/freetalon-workspace/freetalon/api.py — a path that
+  does not exist (the repo is /home/seeker/projects/FreeTalon, the
+  workspace is /home/seeker/freetalon-workspace, and the model used
+  the workspace path for the module). head failed, exit 1, node-1
+  FAIL; node-2 (same probe shape against a nonexistent
+  freetalon/tests/test_api.py) and node-3 (curl :8765/health) never
+  ran. Judge chose REPLAN. Replan failed 3x: (1) invented
+  node/action schema with no objective/assigned_claw, (2) a scaffold
+  plan writing /health.py at the filesystem root (not
+  freetalon/api.py), (3) {"nodes": []} — escalated FAIL. Endpoint NOT
+  extended, no new tests, suite 484/484 green, no stray files. GPU
+  survived (67C at fan restore, now 51C, 300W, x16, zero Xid; fans
+  85% during, auto after). Log: freetalon-workspace/logs/llm-end-
+  to-end-health-retry9-2026-11-16.log. Next weakness: the planner
+  confuses the workspace path with the repo root when naming module
+  paths — repo grounding should name the repo root explicitly, and
+  the replan still burns its budget on invented schemas instead of
+  repairing toward the grounded shape.
