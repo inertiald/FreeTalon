@@ -190,6 +190,7 @@ def _validate_raw_nodes(
     raw_nodes: list[Any],
     repo_index: Any | None = None,
     goal_text: str | None = None,
+    repo_root: str | Path | None = None,
 ) -> list[PlanNode]:
     """Validate raw node dicts, collecting per-node schema errors.
 
@@ -209,9 +210,15 @@ def _validate_raw_nodes(
     views of the raw nodes (retry #13): a fake whose ids are the wrong
     type must still be named as a fake, and the rejection is cheap —
     the repair loop re-prompts for free instead of spending a repair
-    round on output that was never a plan. ``repo_index``/``goal_text``
-    are the repo index and goal for the grounded-move sentence; both
-    optional (hand-built plans pass neither).
+    round on output that was never a plan. The placeholder checks run
+    on the lenient views too (retry #21): attempt 2 carried BOTH a
+    placeholder heredoc and a typo ("assigned_claws"), and the
+    placeholder defect never reached the repair prompt, so the model
+    fixed the typo and returned the same placeholder plan. ``repo_index``/
+    ``goal_text`` are the repo index and goal for the grounded-move
+    sentence; ``repo_root`` is the repo root for the placeholder
+    scaffold's exists-on-disk check. All three are optional
+    (hand-built plans pass none of them).
     """
     nodes: list[PlanNode] = []
     errors: list[str] = []
@@ -225,19 +232,45 @@ def _validate_raw_nodes(
         except ValidationError as exc:
             errors.extend(_schema_error_text(label, err) for err in exc.errors())
     if errors:
+        views = [
+            view
+            for view in (
+                _lenient_node_view(raw, position)
+                for position, raw in enumerate(raw_nodes, start=1)
+            )
+            if view is not None
+        ]
         standin_errors = _static_standin_errors(
-            [
-                view
-                for view in (
-                    _lenient_node_view(raw, position)
-                    for position, raw in enumerate(raw_nodes, start=1)
-                )
-                if view is not None
-            ],
+            views,
             index=repo_index,
             goal_text=goal_text,
         )
-        all_errors = standin_errors + errors
+        # Retry #21: the same masking as the stand-in check, one fix
+        # later — attempt 2 carried BOTH a placeholder heredoc (step-1)
+        # and a typo (step-4 "assigned_claws"), and the schema-error path
+        # ran only the stand-in check, so the placeholder defect never
+        # reached the repair prompt; the model fixed the typo and returned
+        # the same placeholder plan, burning another round. Run the
+        # placeholder checks on the lenient views too, with the same
+        # dedup as _collect_plan_errors (a scaffold placeholder already
+        # names the defect; the heredoc one is the same defect, not a new
+        # one). The full _collect_plan_errors is deliberately NOT run
+        # here: several of its errors duplicate the schema errors (an
+        # unknown claw for a missing assigned_claw, a no-criteria error
+        # for a missing criteria field), which would change the pinned
+        # counts for the retry-#7/#11 invented-schema fixtures — the
+        # placeholder/stand-in checks are the fake-naming checks that
+        # belong in the schema path.
+        placeholder_errors = _placeholder_scaffold_errors(
+            views, repo_root, index=repo_index, goal_text=goal_text
+        )
+        if not placeholder_errors:
+            placeholder_errors.extend(
+                _placeholder_bash_errors(
+                    views, repo_root, index=repo_index, goal_text=goal_text
+                )
+            )
+        all_errors = placeholder_errors + standin_errors + errors
         noun = "error" if len(all_errors) == 1 else "errors"
         lines = "\n".join(
             f"{index}. {error}" for index, error in enumerate(all_errors, start=1)
@@ -246,7 +279,7 @@ def _validate_raw_nodes(
             f"Planner output was rejected with {len(all_errors)} {noun} — "
             f"fix ALL of them:\n{lines}\n{_NODE_SHAPE_EXAMPLE}"
         )
-        if standin_errors:
+        if standin_errors or placeholder_errors:
             raise CheapRejectionError(message)
         raise LLMResponseError(message)
     return nodes
@@ -256,10 +289,13 @@ def _coerce_nodes(
     nodes: list[PlanNode] | list[dict[str, Any]],
     repo_index: Any | None = None,
     goal_text: str | None = None,
+    repo_root: str | Path | None = None,
 ) -> list[PlanNode]:
     if nodes and isinstance(nodes[0], PlanNode):
         return list(nodes)
-    return _validate_raw_nodes(list(nodes), repo_index=repo_index, goal_text=goal_text)
+    return _validate_raw_nodes(
+        list(nodes), repo_index=repo_index, goal_text=goal_text, repo_root=repo_root
+    )
 
 
 def _unknown_dependency_error(
@@ -308,13 +344,16 @@ def normalize_plan_nodes(
     optional (hand-built plans pass neither). ``repo_root``/``workspace``
     are threaded to the dependency check so the unknown-dependency
     rejection can also name the other validation errors (retry #15);
-    both optional. ``id_labels`` is an optional out-parameter: when
+    both optional. ``repo_root`` is also threaded to the schema check so
+    a placeholder defect is named alongside a schema error (retry #21). ``id_labels`` is an optional out-parameter: when
     given, it is filled with {normalized_id: original_id} so a caller
     can name the model's own ids in a rejection (retry #17: the
     placeholder error named 'node-1' while the plan's id was
     'step-1').
     """
-    nodes = _coerce_nodes(nodes, repo_index=repo_index, goal_text=goal_text)
+    nodes = _coerce_nodes(
+        nodes, repo_index=repo_index, goal_text=goal_text, repo_root=repo_root
+    )
     if not nodes:
         # Cheap rejection (retry #12): an empty plan is a degenerate
         # output, not a plan that needs a repair round to fix.
@@ -2479,15 +2518,19 @@ def _grounded_move_sentence(
         return (
             f"The grounded move is: extend {module} in place — add a "
             f"{route} branch to {handler}; write the tests (scaffold or "
-            f"heredoc) and run them; start the API server and wait for it "
-            f"to answer; verify live with "
+            f"heredoc) and run them; start the API server from the repo "
+            f"root with ./.venv/bin/python -m freetalon.cli start (stop a "
+            f"stale server first with ./.venv/bin/python -m freetalon.cli "
+            f"stop) and wait for it to answer; verify live with "
             f"curl http://localhost:{api_port}{route}."
         )
     return (
         f"The grounded move is: extend {module} (scaffold claw, or a bash "
         f"heredoc) to implement {route}; write the tests (scaffold or "
-        f"heredoc) and run them; start the API server and wait for it to "
-        f"answer; verify live with "
+        f"heredoc) and run them; start the API server from the repo root "
+        f"with ./.venv/bin/python -m freetalon.cli start (stop a stale "
+        f"server first with ./.venv/bin/python -m freetalon.cli stop) and "
+        f"wait for it to answer; verify live with "
         f"curl http://localhost:{api_port}{route}."
     )
 
@@ -3032,6 +3075,8 @@ def _grounded_skeleton(
     goal_text: str | None,
     repo_root: str | Path | None = None,
     workspace: str | None = None,
+    *,
+    after: str = "empty",
 ) -> str:
     """A concrete fill-in-the-blanks plan skeleton for a route goal, or "".
 
@@ -3053,6 +3098,17 @@ def _grounded_skeleton(
     model followed the skeleton shape but filled it with placeholder
     comments). A verbatim copy of the sketch is still placeholder-only
     (all comment lines), so the guard rejects it, cheaply.
+    Step-2's test is runnable real code, not a stub (retry #21): the old
+    skeleton showed a "# TODO: replace this comment with the real test
+    code" heredoc, and the model copied the TODO verbatim into its plan
+    — twice in one call. The test starts the API server in-process on an
+    ephemeral port (the pattern in tests/test_api.py), so it runs with
+    plain `python3 <file>` and no live server, and it asserts the fields
+    the goal asks the endpoint to report, so it fails on the unextended
+    endpoint and passes once the endpoint is extended. ``after`` names
+    what the previous reply was ("empty" or "placeholder") so the
+    lead-in never tells the model its reply was empty when it was a
+    placeholder stub, or vice versa.
     Returns "" when the goal names no existing route.
     """
     if not goal_text:
@@ -3096,6 +3152,75 @@ def _grounded_skeleton(
         )
     else:
         content = f"# TODO: replace this comment with the real code — {edit.lower()}"
+    # Step-2's test is runnable real code (see the docstring): the old
+    # skeleton's TODO heredoc was copied verbatim into the model's plan
+    # twice in retry #21. For /health the field assertions follow the
+    # goal's three reported items (service status, Ollama reachable, GPU
+    # temperature) and the established HEREDOC_TEST fixture's key names;
+    # any other route gets the generic ok/status assertions, so the test
+    # stays correct for routes whose fields the goal does not name.
+    if route == "/health":
+        field_assertions = (
+            '        self.assertIn("service_status", data)\n'
+            '        self.assertIn("ollama_reachable", data)\n'
+            '        self.assertIsInstance(data["ollama_reachable"], bool)\n'
+            '        self.assertIn("gpu_temperature", data)\n'
+            '        self.assertIsInstance(data["gpu_temperature"], (int, float))\n'
+        )
+    else:
+        field_assertions = ""
+    test_code = (
+        "import json\n"
+        "import sys\n"
+        "import tempfile\n"
+        "import unittest\n"
+        "import urllib.request\n"
+        "from pathlib import Path\n"
+        "\n"
+        f'sys.path.insert(0, "{index.root}")\n'
+        "\n"
+        "from freetalon.api import HiveAPIServer\n"
+        "from freetalon.config import HiveConfig\n"
+        "from freetalon.hive import HiveController\n"
+        "\n"
+        "\n"
+        "class RouteEndpointTests(unittest.TestCase):\n"
+        "    def setUp(self):\n"
+        "        self.tmpdir = tempfile.TemporaryDirectory()\n"
+        "        base = Path(self.tmpdir.name)\n"
+        "        config = HiveConfig(\n"
+        "            workspace=base,\n"
+        '            state_path=base / "state.json",\n'
+        '            audit_log_path=base / "audit.log",\n'
+        "            worker_cap=2,\n"
+        "            queue_multiplier=3,\n"
+        "            poll_interval_seconds=0.02,\n"
+        "        )\n"
+        "        self.controller = HiveController(config)\n"
+        "        self.controller.start()\n"
+        '        self.server = HiveAPIServer(self.controller, "test-token")\n'
+        '        self.server.start("127.0.0.1", 0)\n'
+        "        port = self.server._httpd.server_address[1]\n"
+        '        self.base = f"http://127.0.0.1:{port}"\n'
+        "\n"
+        "    def tearDown(self):\n"
+        "        self.server.stop()\n"
+        "        self.controller.stop()\n"
+        "        self.tmpdir.cleanup()\n"
+        "\n"
+        "    def test_route_answers(self):\n"
+        f'        with urllib.request.urlopen(f"{{self.base}}{route}", timeout=3) as resp:\n'
+        "            status = resp.status\n"
+        "            data = json.loads(resp.read())\n"
+        "        self.assertEqual(status, 200)\n"
+        '        self.assertTrue(data["ok"])\n'
+        '        self.assertIn("status", data)\n'
+        + field_assertions
+        + "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    unittest.main()\n"
+    )
     nodes: list[dict[str, Any]] = [
         {
             "id": "step-1",
@@ -3116,11 +3241,7 @@ def _grounded_skeleton(
             "depends_on": ["step-1"],
             "assigned_claw": "bash",
             "inputs": {
-                "command": (
-                    f"cat > {test_path} <<'EOF'\n"
-                    f"# TODO: replace this comment with the real test code for {route}\n"
-                    "EOF"
-                )
+                "command": f"cat > {test_path} <<'EOF'\n{test_code}EOF"
             },
             "outputs": [test_path],
             "acceptance": [f"The tests for {route} exist."],
@@ -3167,18 +3288,32 @@ def _grounded_skeleton(
         },
     ]
     skeleton = json.dumps({"nodes": nodes}, indent=2)
+    if after == "placeholder":
+        lead = (
+            "CONCRETE PLAN SKELETON — your previous reply was rejected as a "
+            "placeholder stub (comment-only code that implements nothing). Do "
+            "not return another placeholder. Complete the skeleton below with "
+            "REAL code and REAL tests, then return the completed JSON as your "
+            "output."
+        )
+    else:
+        lead = (
+            "CONCRETE PLAN SKELETON — your previous reply was an empty plan "
+            "({\"nodes\": []}). Do not return an empty plan again. Complete the "
+            "skeleton below with REAL code and REAL tests, then return the "
+            "completed JSON as your output."
+        )
     return (
-        "CONCRETE PLAN SKELETON — your previous reply was an empty plan "
-        "({\"nodes\": []}). Do not return an empty plan again. Complete the "
-        "skeleton below with REAL code and REAL tests, then return the "
-        "completed JSON as your output. The skeleton is the SHAPE of your "
-        "output, not instruction text to re-serialize: every \"# TODO\" line "
-        "must be replaced with real code. Step-1 shows the existing branch "
-        "as a commented sketch — extend it with the fields the goal asks "
-        "for and write the FULL module; do not copy the sketch's comment "
-        "lines into the scaffold. Copying a TODO comment into a scaffold "
-        "will be rejected — the scaffold must contain the real "
-        f"implementation.\n{skeleton}"
+        f"{lead} The skeleton is the SHAPE of your output, not instruction "
+        "text to re-serialize: every \"# TODO\" line must be replaced with "
+        "real code. Step-1 shows the existing branch as a commented sketch "
+        "— extend it with the fields the goal asks for and write the FULL "
+        "module; do not copy the sketch's comment lines into the scaffold. "
+        "Step-2's test is runnable real code, not a stub — extend its "
+        "assertions with the fields the goal asks the endpoint to report; "
+        "do not replace it with a TODO comment. Copying a TODO comment "
+        "into a scaffold will be rejected — the scaffold must contain the "
+        f"real implementation.\n{skeleton}"
     )
 
 
@@ -3340,7 +3475,15 @@ def _call_llm_with_repair(
     fill-in-the-blanks plan skeleton for the route goal, so the model has
     structure to complete instead of giving up again. And when the budget
     is exhausted on empty plans, the raised error names the grounded move
-    instead of failing silently on an empty reply.
+    instead of failing silently on an empty reply. A second empty plan in
+    the same call gets the skeleton again but with the count and the
+    consequence named (retry #21): the model returned an empty plan twice
+    despite the skeleton, so the repeat names how many empties there have
+    been and that the free re-prompts are used up — the budget itself is
+    unchanged. A placeholder rejection gets the skeleton too (retry #21):
+    the repair round after a placeholder stub carries the fill-in-the-
+    blanks with the actual branch code and a runnable test, not just the
+    prohibition.
     """
     prompt = user_prompt
     last_error: LLMResponseError | None = None
@@ -3348,6 +3491,7 @@ def _call_llm_with_repair(
     repairs_used = 0
     free_used = 0
     empty_streak = 0
+    empty_count = 0
     # Seed with approaches rejected in an earlier planning call, in
     # order, deduplicated — the first repair prompt of this call already
     # names them (retry #20).
@@ -3375,6 +3519,7 @@ def _call_llm_with_repair(
                     rejected_approaches.append(approach)
             if isinstance(exc, EmptyPlanError):
                 empty_streak += 1
+                empty_count += 1
             else:
                 empty_streak = 0
             if isinstance(exc, CheapRejectionError) and free_used < max_free_reprompts:
@@ -3388,6 +3533,46 @@ def _call_llm_with_repair(
             skeleton_block = ""
             if empty_streak >= 1:
                 skeleton = _grounded_skeleton(goal_text, repo_root, workspace)
+                if skeleton:
+                    skeleton_block = f"\n{skeleton}\n"
+                    if empty_count >= 2:
+                        # Retry #21: the model returned an empty plan twice
+                        # in one call despite the skeleton being in the
+                        # prompt after the first one — the same skeleton,
+                        # shown unchanged, is easy to ignore. Name the
+                        # count and the consequence (free re-prompts are
+                        # capped, so the next empty spends a repair)
+                        # instead of showing the same block again. The
+                        # budget itself is NOT changed: a second empty
+                        # still gets its free re-prompt.
+                        forceful = (
+                            f"\nYou have already returned an empty plan "
+                            f"{empty_count} times in this planning call. Do "
+                            "NOT return another empty plan — complete the "
+                            "skeleton below with real code and return it as "
+                            "your output.\n"
+                        )
+                        if free_used >= max_free_reprompts:
+                            forceful += (
+                                "Your free re-prompts are used up — another "
+                                "empty plan will spend one of your remaining "
+                                "repairs.\n"
+                            )
+                        skeleton_block = f"{forceful}{skeleton_block}"
+            elif "placeholder content only" in str(exc):
+                # Retry #21: after a placeholder rejection the model needs
+                # the concrete shape again, not just the prohibition — the
+                # skeleton is the fill-in-the-blanks with the actual branch
+                # code and a runnable test, so the repair round has
+                # something real to complete instead of another TODO to
+                # copy. The lead-in names the placeholder rejection, so
+                # the model is never told its reply was empty when it was
+                # a stub. Only the placeholder phrase is matched: it
+                # appears in exactly the two placeholder errors, never in
+                # the node-shape block or any other rejection.
+                skeleton = _grounded_skeleton(
+                    goal_text, repo_root, workspace, after="placeholder"
+                )
                 if skeleton:
                     skeleton_block = f"\n{skeleton}\n"
             forbidden_block = _forbidden_block(
