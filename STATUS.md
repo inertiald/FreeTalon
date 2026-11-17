@@ -1253,3 +1253,58 @@ Deliberately left out:
   inputs -- instead of collapsing silently and surfacing only a
   downstream dependency error), and for the framework//tmp signal
   being lost when normalize raises before _collect_plan_errors runs.
+
+## Planner duplicate-keys fix (2026-11-17, retry #15 weaknesses)
+
+  Two fixes for the two weaknesses that killed retry #15 (merged-node
+  collapse, framework//tmp signal lost).
+  (1) Duplicate-key detection: the raw planner output is scanned for
+  duplicate JSON keys (object_pairs_hook) before the normal parse
+  collapses it; a node object (or the top-level object) with repeated
+  keys is rejected by name, naming the duplicated keys and the likely
+  cause (missing `},{` separators between nodes; outputs/acceptance/
+  criteria nested inside `inputs`). Scoped to node-shaped objects only,
+  so a flat prose object whose keys are repeated words (retry #8
+  tokenized prose) is still rejected as a prose re-serialization, not
+  shadowed by a duplicate-key error; and nested fields only count
+  inside an actual `inputs` dict, so a node that merely has command
+  and criteria at the same level (retry #7 invented schema) is still a
+  schema error, not a nesting.
+  (2) Dependency rejection carries the validation errors: when
+  normalize raises an unknown-dependency error, the rejection also
+  names the plan's other validation errors (framework, /tmp, prose,
+  stand-in, route engagement, unwritten file) found in the lenient
+  node views, so the repair round sees the real defects in the same
+  rejection. Duplicate ids, dependency cycles, and self-dependency
+  still raise first, as before.
+  Retry-#10 count changed by design: the attempt-3 rejection is now 7
+  errors (2 unknown-dependency + 2 unwritten file_exists + 2
+  comment-only commands + 1 bad criterion type) instead of 2; the two
+  count assertions were updated with a comment explaining the 7.
+  Tests 605 -> 626/626 green: new TestPlannerDuplicateKeysFix (21
+  tests: verbatim retry-#15 attempt-2 rejected by name as a
+  duplicate-key collapse, naming the duplicated keys and the likely
+  cause, not only as an unknown dependency; mocked merged-node repair
+  lands on the grounded plan in one round; unknown dependency AND
+  framework//tmp named in the same rejection; valid grounded plan
+  passes; 16 regression guards covering retries #3-#14, bare-dict
+  criteria, duplicate ids / cycles / self-dependency) and the two
+  retry-#10 count assertions updated to 7 errors.
+  M5 smoke passes (finance run-20261117T101828Z-503d07, ecu
+  run-20261117T101828Z-f455ae). New demo tools/demo-duplicate-keys.py
+  passes (attempt-2 rejected by name as a duplicate-key collapse;
+  dependency + framework//tmp in one rejection; mocked repair lands
+  in one round); log logs/demo-duplicate-keys.log.
+  freetalon/api.py untouched (0-line diff vs HEAD). No LLM calls, no
+  GPU, no e2e driver, no reboot, no power-limit change.
+  Known gaps deliberately left out: file_matches outputs-only hole;
+  a literal JSON answer written to a NEW non-code file with only an
+  exit_code criterion still passes validation; repair budget (max 2)
+  not raised.
+  Transport note: heredoc delivery strips single-quote characters
+  from the transported text (the first helper draft lost its quotes
+  and had obj['id'] mangled to obj[id]); the fix and the tests were
+  written locally and transferred with scp, which preserves bytes
+  exactly. The helper now avoids literal single quotes in source
+  (uses repr() / !r for quoted output).
+  Next: /health retry #16.

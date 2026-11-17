@@ -278,12 +278,17 @@ def normalize_plan_nodes(
     nodes: list[PlanNode] | list[dict[str, Any]],
     repo_index: Any | None = None,
     goal_text: str | None = None,
+    repo_root: str | Path | None = None,
+    workspace: str | None = None,
 ) -> list[PlanNode]:
     """Validate a DAG, topologically order it, and assign deterministic node ids.
 
     ``repo_index``/``goal_text`` are threaded to the schema check so a
     fake with wrong-typed ids is named as a fake (retry #13); both
-    optional (hand-built plans pass neither).
+    optional (hand-built plans pass neither). ``repo_root``/``workspace``
+    are threaded to the dependency check so the unknown-dependency
+    rejection can also name the other validation errors (retry #15);
+    both optional.
     """
     nodes = _coerce_nodes(nodes, repo_index=repo_index, goal_text=goal_text)
     if not nodes:
@@ -313,12 +318,24 @@ def normalize_plan_nodes(
                     _unknown_dependency_error(node, node_map, dependency)
                 )
     if unknown_dep_errors:
-        noun = "error" if len(unknown_dep_errors) == 1 else "errors"
+        # Retry #15 attempt 2: the dependency error was the ONLY error the
+        # model saw, so the repair round fixed the dependency and kept the
+        # Flask heredoc to /tmp -- the framework and /tmp signals were lost
+        # because normalize raises before _collect_plan_errors runs. Append
+        # the other validation errors of the plan (framework, /tmp, prose,
+        # stand-in, ...) so the repair round sees the real defects in the
+        # same rejection. Duplicate ids, cycles, and self-dependency still
+        # raise first, as before.
+        extra_errors, _cheap = _collect_plan_errors(
+            nodes, repo_root, goal_text, workspace, index=repo_index
+        )
+        all_errors = unknown_dep_errors + extra_errors
+        noun = "error" if len(all_errors) == 1 else "errors"
         lines = "\n".join(
-            f"{index}. {error}" for index, error in enumerate(unknown_dep_errors, start=1)
+            f"{index}. {error}" for index, error in enumerate(all_errors, start=1)
         )
         raise LLMResponseError(
-            f"Planner output was rejected with {len(unknown_dep_errors)} {noun} — "
+            f"Planner output was rejected with {len(all_errors)} {noun} — "
             f"fix ALL of them:\n{lines}\n{_DEPENDS_ON_SHAPE}"
         )
 
@@ -415,6 +432,112 @@ def _looks_like_prose_reserialization(payload: dict[str, Any]) -> bool:
     return prose_like * 2 >= len(keys)
 
 
+def _duplicate_key_errors(raw_text: str) -> list[str]:
+    """Duplicate JSON keys in the raw planner output, as named rejections.
+
+    Retry #15 attempt 2: the three nodes were concatenated into a single
+    object (the separators between nodes were missing, and
+    outputs/acceptance/criteria were nested inside inputs), so the
+    last-wins collapse turned three nodes into one node-3 depending on
+    the nonexistent node-2 -- and the only error the model saw was the
+    unknown dependency, nothing about the real defect (a Flask heredoc
+    to /tmp). Runs on the RAW text before the normal parse collapses it;
+    returns [] when the text is not parseable JSON (the normal parse
+    raises "not valid JSON" then) or has no duplicates.
+
+    Only node-shaped objects count: a flat prose object whose keys are
+    repeated words (retry #8 tokenized prose) is a prose re-serialization,
+    not a node collapse -- the prose check names it, so duplicate keys
+    must not shadow it. Nested fields only count inside an actual inputs
+    dict: a node that merely has command and criteria at the same level
+    (retry #7 invented schema) is a schema error, not a nesting.
+    """
+    stripped = raw_text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 3 and lines[-1].strip() == "```":
+            stripped = "\n".join(lines[1:-1]).strip()
+    attempts = [stripped]
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        attempts.append(stripped[start : end + 1])
+    for attempt in attempts:
+        found: list[tuple[str, list[str], list[int]]] = []
+        nested_fields: set[str] = set()
+
+        def hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            obj: dict[str, Any] = {}
+            counts: dict[str, int] = {}
+            for key, value in pairs:
+                counts[key] = counts.get(key, 0) + 1
+                obj[key] = value
+            dups = [key for key, count in counts.items() if count > 1]
+            is_top = "nodes" in obj
+            is_node = isinstance(obj.get("id"), str) and any(
+                key in obj
+                for key in (
+                    "objective",
+                    "depends_on",
+                    "assigned_claw",
+                    "inputs",
+                    "outputs",
+                    "acceptance",
+                    "criteria",
+                )
+            )
+            if dups and (is_top or is_node):
+                if is_top:
+                    label = "the top-level object"
+                else:
+                    label = "node object (id " + repr(obj.get("id")) + ")"
+                found.append((label, dups, [counts[key] for key in dups]))
+            inputs = obj.get("inputs")
+            if isinstance(inputs, dict):
+                nested_fields.update(
+                    field
+                    for field in ("outputs", "acceptance", "criteria")
+                    if field in inputs
+                )
+            return obj
+
+        try:
+            parsed = json.loads(attempt, object_pairs_hook=hook)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if not found and not nested_fields:
+            return []
+        errors: list[str] = []
+        sep = "},{"
+        for label, dups, dup_counts in found:
+            keys = ", ".join(
+                f"{key!r} ({count} times)"
+                for key, count in zip(dups, dup_counts)
+            )
+            errors.append(
+                f"Planner output has duplicate JSON keys in {label}: {keys} — "
+                "the JSON parser kept only the last value of each, so "
+                "several nodes collapsed into one. The nodes were probably "
+                "concatenated into a single object: separate each node with "
+                f"{sep!r} (close the node object, comma, open the next one) so "
+                "the \"nodes\" array has one object per node, each with its "
+                "own id, objective, depends_on, assigned_claw, inputs, "
+                "outputs, acceptance and criteria."
+            )
+        if nested_fields:
+            nested = ", ".join(f"{field!r}" for field in sorted(nested_fields))
+            errors.append(
+                f"Planner output nests {nested} inside \"inputs\" — they belong "
+                "beside \"inputs\" at the node level, not inside it. Move them "
+                "out of the \"inputs\" object so each node has its own outputs, "
+                "acceptance and criteria."
+            )
+        return errors
+    return []
+
+
 def parse_planner_response(
     raw_text: str,
     *,
@@ -434,6 +557,16 @@ def parse_planner_response(
     raw_text = sanitize_llm_output(raw_text)
     print(f"\n--- RAW PLANNER OUTPUT ---\n{raw_text}\n--------------------------\n")
     
+    dup_errors = _duplicate_key_errors(raw_text)
+    if dup_errors:
+        noun = "error" if len(dup_errors) == 1 else "errors"
+        lines = "\n".join(
+            f"{index}. {error}" for index, error in enumerate(dup_errors, start=1)
+        )
+        raise LLMResponseError(
+            f"Planner output was rejected with {len(dup_errors)} {noun} — "
+            f"fix ALL of them:\n{lines}\n{_NODE_SHAPE_EXAMPLE}"
+        )
     payload = parse_json_object(raw_text)
     if not isinstance(payload, dict):
         raise LLMResponseError("Planner response must be a JSON object.")
@@ -505,7 +638,13 @@ def parse_planner_response(
     # fake with wrong-typed ids is named as a fake instead of only as a
     # schema error — and the rejection is cheap, not repair-consuming.
     index = build_repo_index(repo_root) if goal_text else None
-    nodes = normalize_plan_nodes(nodes_raw, repo_index=index, goal_text=goal_text)
+    nodes = normalize_plan_nodes(
+        nodes_raw,
+        repo_index=index,
+        goal_text=goal_text,
+        repo_root=repo_root,
+        workspace=workspace,
+    )
 
     # Planner hardening: an invented claw name or an unmeasurable node is a
     # plan error here, where the repair retry can fix it — not at execution
