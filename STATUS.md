@@ -1308,3 +1308,76 @@ Deliberately left out:
   exactly. The helper now avoids literal single quotes in source
   (uses repr() / !r for quoted output).
   Next: /health retry #16.
+
+## /health retry #16 (2026-11-17, DRIVER_EXIT:0, goal FAIL, run run-20261117T102447Z-e8bfa4)
+
+  Verdict: FAIL -- escalated: re-planner failed: "Planner response must
+  include at least one plan node." First retry since #8 where a plan was
+  accepted AND executed. Elapsed: ~2 min planning + 9.1s execution.
+  Pre-flight green: GPU 47C, 43.19W, limit 300.00W, link x16, zero Xid
+  79/154; Ollama reachable with gemma-3-abliterated:latest; git head
+  b66c5ac, tree clean; suite 626/626 green. Fans manual 85% during
+  the run, restored to auto after. Log:
+  logs/llm-end-to-end-health-retry16-2026-11-16.log (321 lines).
+  Intake succeeded cleanly (valid TaskIntent, no echo).
+  Attempt 1: the prose-command plan again -- step_1/2/3 commands are
+  handler-citation prose (api.py:HiveAPIServer, _ThreadingHTTPServer -
+  Add a /health branch to the do_GET method...). Rejected with exactly
+  3 errors by the prose rule (174d7ec working as designed), each naming
+  the grounded move (heredoc or scaffold with real code).
+  Attempt 2: the retry-#15 Flask heredoc plan again (cat >
+  /tmp/freetalon_api.py, Flask + psutil, test file, curl checks) --
+  still malformed, nodes concatenated into a single object (missing
+  "},{" separators, outputs/acceptance/criteria nested inside inputs).
+  Rejected with exactly 2 errors by the NEW duplicate-keys fix
+  (b66c5ac working as designed): duplicate JSON keys in node object
+  (id 'node-3'): 'id'/'objective'/'depends_on'/'assigned_claw'/
+  'inputs' each 3 times, naming the missing "},{" separators, plus the
+  nesting error. NOT named in this rejection: the Flask content and
+  the /tmp paths -- the duplicate-key check raises before
+  _collect_plan_errors runs, so the framework//tmp signal is still
+  lost on this path (b66c5ac weakness-2 fix covers only the
+  unknown-dependency raise, not the duplicate-key raise).
+  Attempt 3: ACCEPTED -- plan-7885a4ef9d99, 3 bash nodes, exit_code
+  criteria. node-1: echo '# /health endpoint' >> freetalon/api.py.
+  node-2: echo 'def health():\nreturn "OK"' >> freetalon/api.py.
+  node-3: curl http://localhost:8765/health | grep "OK".
+  Execution: node-1 PASS (exit 0, 0.001s), node-2 PASS (exit 0,
+  0.001s), node-3 FAIL (exit 1, 0.006s). Judge chose REPLAN
+  (informative failure: node-3 failed criterion exit_code 1 != 0).
+  Replan: 5 x {"nodes":[]} -- the re-planner returned empty plans 5
+  times in a row (initial + 2 free cheap re-prompts + 2 repairs) ->
+  escalated FAIL. The model gave up entirely after the informative
+  failure.
+  The v1 plan CORRUPTED freetalon/api.py while "passing": node-1 +
+  node-2 appended 3 lines (# /health endpoint, def health():, return
+  "OK" at column 0) -- an IndentationError (expected an indented block
+  after function definition on line 221). exit_code criteria passed
+  while the module broke: suite run against the corrupted file was
+  608 tests, 18 failures + 2 errors (vs 626/626 before). The loop
+  never noticed, because no node measured the file's validity. The
+  file was restored with git checkout -- freetalon/api.py (tracked,
+  committed at b66c5ac); suite re-run 626/626 green after the restore.
+  Node-3 failed because nothing serves :8765 -- the plan never starts
+  the API server, so curl has nothing to hit and grep finds no "OK".
+  Endpoint NOT extended (the minimal /health at api.py:44-45 is still
+  the only one). No new tests written. No live curl succeeded. No
+  stray files: health.json, api.json, test.sh, test_health.py,
+  health.py absent from the workspace; /tmp/health.json, /tmp/test.sh,
+  /tmp/freetalon_api.py absent too.
+  GPU survived: post-run 60C cooling at first check, then 51C idle,
+  43.12W, limit 300W holding, link x16, zero Xid 79/154. No thermal
+  pause triggered (never >=85C), no fall-off. Mid-run peak not
+  sampled (execution phase only 9.1s). Fans confirmed auto.
+  Next: planner fix for (1) bash appends/redirects that write code
+  into an EXISTING code file -- the placeholder guard covers scaffold
+  only, and the stand-in rule fires only on JSON literals, so an
+  echo-append of broken code with only an exit_code criterion is
+  accepted and measured PASS while corrupting the module; a node that
+  modifies a code file should have to measure the file still parsing
+  (or the suite still green); (2) the re-planner returning empty plans
+  5 times -- the model gives up after an informative failure and the
+  escalation carries no grounded guidance; (3) the duplicate-key
+  rejection not naming Flask//tmp (secondary -- the structural defect
+  IS named, but the framework//tmp defects never reach the repair
+  round on this path).
