@@ -8,8 +8,10 @@ Handlers can be:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
+import re
 import subprocess
 import warnings
 from collections.abc import Callable, Coroutine
@@ -27,6 +29,52 @@ class UnknownCapabilityError(KeyError):
     def __init__(self, capability: str) -> None:
         super().__init__(f"No handler registered for capability: {capability!r}")
         self.capability = capability
+
+
+CODE_FILE_SUFFIXES = frozenset({
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".c",
+    ".cc", ".cpp", ".h", ".hpp", ".rb", ".sh", ".pl", ".php", ".swift",
+    ".kt", ".scala", ".cs",
+})
+
+
+def is_code_path(path: str | Path) -> bool:
+    """True when a path names a code file — by suffix."""
+    return Path(path).suffix.lower() in CODE_FILE_SUFFIXES
+
+
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/|<!--.*?-->", re.DOTALL)
+
+
+def is_placeholder_content(content: str) -> bool:
+    """True when file content is placeholder-only: comments and/or a docstring, no code.
+
+    Retry #14: the v3 replan scaffolded freetalon/api.py with the single
+    comment "# Placeholder for health endpoint logic." — 219 lines of the
+    real module replaced by one comment, and the loop never noticed,
+    because scaffold nodes reported no exit code. A comment-only or
+    docstring-only body is not an implementation: it may only ever create
+    a new file, never overwrite an existing code file. Block comments
+    (/* ... */, <!-- ... -->) and line comments (#, //) are stripped
+    first; what is left must be real code. A lone string literal is a
+    docstring, not code.
+    """
+    text = _BLOCK_COMMENT_RE.sub("", content)
+    remaining: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("#", "//")):
+            continue
+        remaining.append(stripped)
+    if not remaining:
+        return True
+    joined = "\n".join(remaining).strip()
+    try:
+        return isinstance(ast.literal_eval(joined), str)
+    except (ValueError, SyntaxError):
+        return False
 
 
 def _wrap_sync(fn: Callable[[dict[str, Any]], dict[str, Any]]) -> AsyncHandler:
@@ -238,10 +286,38 @@ class ToolRegistry:
             if workdir and not target_path.is_absolute():
                 # Loop (M0): relative paths resolve under the node's run dir.
                 target_path = Path(workdir) / target_path
+            # Retry #14: the v3 replan scaffolded freetalon/api.py with a
+            # one-line placeholder comment (219 lines -> 1 line) and the
+            # loop never noticed, because scaffold nodes reported no exit
+            # code. A placeholder may only ever create a new file — it must
+            # never truncate an existing code file. Refuse loudly so the
+            # executor records a measured FAIL instead of a silent success.
+            if (
+                isinstance(content, str)
+                and target_path.exists()
+                and is_code_path(target_path)
+                and is_placeholder_content(content)
+            ):
+                raise ValueError(
+                    f"scaffold claw refuses to overwrite existing code file "
+                    f"{target_path} with placeholder content (comments and/or "
+                    "a docstring, no code) — write real code instead."
+                )
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(content, encoding="utf-8")
 
-            return {"status": "success", "path": str(target_path), "bytes_written": len(content)}
+            # Retry #14: scaffold nodes were UNMEASURABLE — the handler
+            # returned no exit code, so an exit_code criterion could only
+            # ever report "no exit code reported" and the loop escalated
+            # on "unmeasurable twice in a row". A successful write is
+            # exit 0; a failed write raises and the executor records a
+            # measured FAIL.
+            return {
+                "status": "success",
+                "path": str(target_path),
+                "bytes_written": len(content),
+                "exit_code": 0,
+            }
 
         @self.register("bash")
         @self.register("shell_exec")

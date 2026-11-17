@@ -69,6 +69,12 @@ then the file contents, then "EOF" on its own line, then any follow-up
 command (for example, "python3 <path>"). A heredoc body is file content,
 not a shell command.
 
+A bash "command" must be an executable shell command, never a prose
+description of the work ("Add a /health branch to the do_GET method")
+and never a comment alone ("# Define a test command ..."). A scaffold
+"content" that overwrites an existing code file must be real code, never
+a comment-only placeholder ("# Placeholder ...").
+
 CRITICAL SCHEMA RULES:
 1. "acceptance", "outputs", and "depends_on" MUST ALWAYS be JSON arrays of strings (e.g. ["Command exits with code 0"]), NEVER a bare string.
 2. Root nodes MUST have "depends_on": []. Downstream nodes MUST list parent step IDs in "depends_on".
@@ -236,6 +242,9 @@ Rules:
 - To write a multi-line file, use the "scaffold" claw or a bash heredoc
   (cat > <path> <<'EOF' ... EOF). Never use single-line echo for
   multi-line content - it is rejected as glued words.
+- A bash "command" must be executable shell, never prose or a comment
+  alone; a scaffold "content" overwriting an existing code file must be
+  real code, never a comment-only placeholder.
 - Shrink scope before growing it: narrow the hypothesis, add a cheaper
   test, or gather the missing data first.
 - Every node needs testable acceptance: a "criteria" array with at least

@@ -1148,3 +1148,55 @@ Deliberately left out:
   validated as no-ops.
   Next: planner fix for scaffold measurability + overwrite guard,
   then /health retry #15.
+
+## Planner scaffold-guard fix (2026-11-17, retry #14 weaknesses)
+
+  Three fixes for the three weaknesses that killed retry #14 (v1 prose
+  command, v2/v3 placeholder scaffolds, unmeasurable scaffold nodes).
+  (1) The scaffold claw now returns exit_code 0 on a successful write,
+  so an exit_code or file_exists criterion on a scaffold node measures
+  PASS instead of UNMEASURABLE. (2) Placeholder guard, both ends: at
+  plan time a scaffold whose content is comment-only / docstring-only
+  is rejected when its target is an EXISTING code file (new files may
+  still start as a comment stub); at execution time the scaffold claw
+  refuses to overwrite an existing code file with placeholder content
+  -- the refusal surfaces as a measured FAIL and the file is unchanged.
+  Absolute repo paths are NOT banned (repo edits are the point); the
+  content guard applies regardless of path. (3) At plan time a bash
+  command that is prose, not shell, is rejected by name -- comment-only
+  commands, and segments that read as sentences (code citation first
+  token, or capitalised first word with sentence markers) -- naming the
+  grounded move (heredoc or scaffold with real code). Legit commands
+  (curl, python3, nvidia-smi, heredocs, assignments) still pass.
+  Helpers moved: CODE_FILE_SUFFIXES / is_code_path /
+  is_placeholder_content now live in tool_registry.py (planner imports
+  them); prompts gain a prose + placeholder rule. The grounded-plan
+  fixtures now carry real code (a do_GET-branch fragment) instead of
+  the "# extended health" comment stub, and the 10 demo tools' grounded
+  fixtures were updated the same way.
+  Tests 579 -> 605/605 green: new TestPlannerScaffoldGuardFix (20
+  tests: verbatim retry-#14 v1 rejected with exactly 3 prose errors,
+  v2 with 2 errors, v3 with 1 error naming freetalon/api.py; mocked
+  prose and placeholder repairs land on the grounded plan in one
+  round; 15 regression guards covering retries #3-#13, bare-dict
+  criteria, duplicate ids / cycles / self-dependency) and
+  TestScaffoldGuardExecutor (6 tests: scaffold measures PASS on
+  exit_code + file_exists, placeholder overwrite refused at handler
+  and at executor as a measured FAIL with the file unchanged, real
+  code overwrite succeeds, comment stub to a new file succeeds).
+  M5 smoke passes. New demo tools/demo-scaffold-guard.py passes (v1
+  3 prose errors, v3 1 placeholder error, scaffold measures PASS);
+  all 12 existing demos re-run and pass. One pre-existing demo
+  failure found and fixed along the way: demo-standin-overwrite.py
+  asserted "3 errors" for the int-id attempt-2, stale since the
+  framework-steer fix made it a 4-error cheap rejection (1 stand-in
+  + 3 schema) -- assertion corrected to 4 errors; it failed the same
+  way on pristine 2ee4744, so not caused by this fix.
+  freetalon/api.py untouched (0-line diff vs HEAD). No LLM calls, no
+  GPU, no e2e driver, no reboot, no power-limit change. GPU baseline
+  after the fix: 46C, 42.91W, limit 300W, link x16, zero Xid.
+  Known gaps deliberately left out: file_matches outputs-only hole;
+  a literal JSON answer written to a NEW non-code file with only an
+  exit_code criterion still passes validation; repair budget (max 2)
+  not raised.
+  Next: /health retry #15.

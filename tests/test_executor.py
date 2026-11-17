@@ -27,9 +27,12 @@ from freetalon.orchestrator.models import (
     TaskIntent,
 )
 from freetalon.orchestrator.state_store import ExecutionPlanStateStore
+from freetalon.orchestrator.measure import VERDICT_FAIL, VERDICT_PASS
+from freetalon.orchestrator.run_store import RunStore
 from freetalon.orchestrator.tool_registry import (
     ToolRegistry,
     UnknownCapabilityError,
+    register_default_claws,
 )
 
 
@@ -643,3 +646,120 @@ class TestSubDagInjectionExecutor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Scaffold guard (retry #14) ───────────────────────────────────────────────
+
+
+class TestScaffoldGuardExecutor(unittest.TestCase):
+    """Scaffold nodes are measurable; placeholder overwrites are refused (retry #14).
+
+    Retry #14 (run run-20261117T090107Z-c77c7a): the v2 scaffold wrote 39
+    bytes and measured UNMEASURABLE ("no exit code reported"), and the v3
+    scaffold clobbered freetalon/api.py with a 1-line placeholder comment
+    (219 lines -> 1 line) without the loop noticing. Two fixes: the
+    scaffold claw returns exit_code 0 on a successful write, so an
+    exit_code or file_exists criterion measures PASS; and the claw refuses
+    to overwrite an existing code file with placeholder content — the
+    refusal surfaces as a measured FAIL and the file is unchanged.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.store = _make_store(self.tmpdir.name)
+        self.registry = ToolRegistry()
+        register_default_claws(self.registry)
+        # A run store under tmp: without one, Executor._node_workdir
+        # falls back to Path.cwd() and a scaffold would write into the
+        # repo root. The run dir is where the node writes and measures.
+        self.run_store = RunStore(Path(self.tmpdir.name) / "runs")
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    def _run_scaffold_plan(self, plan_id: str, node: PlanNode) -> ExecutionPlan:
+        plan = _make_plan(plan_id, [node])
+        self.store.save(plan)
+        executor = Executor(
+            store=self.store,
+            registry=self.registry,
+            run_store=self.run_store,
+            run_id="test-run",
+        )
+        return _run(executor.run(plan_id))
+
+    def test_scaffold_node_measures_pass(self) -> None:
+        node = PlanNode(
+            id="s1",
+            objective="Scaffold the health module",
+            assigned_claw="scaffold",
+            inputs={"file_path": "health.py", "content": "STATUS = \"ready\"\n"},
+            outputs=["health.py"],
+            criteria=[
+                {"type": "exit_code", "equals": 0},
+                {"type": "file_exists", "path": "health.py"},
+            ],
+        )
+        result = self._run_scaffold_plan("scaffold-pass", node)
+        self.assertEqual(result.status, PlanStatus.COMPLETED)
+        self.assertEqual(result.nodes[0].status, PlanStatus.COMPLETED)
+        self.assertEqual(result.nodes[0].measurement["verdict"], VERDICT_PASS)
+        written = (
+            Path(self.tmpdir.name) / "runs" / "test-run" / "nodes" / "s1" / "health.py"
+        )
+        self.assertTrue(written.exists())
+        self.assertEqual(written.read_text(encoding="utf-8"), "STATUS = \"ready\"\n")
+
+    def test_placeholder_overwrite_refused_at_handler(self) -> None:
+        target = Path(self.tmpdir.name) / "mod.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        handler = self.registry.resolve("scaffold")
+        with self.assertRaises(ValueError):
+            _run(handler({"file_path": str(target), "content": "# Placeholder.\n"}))
+        self.assertEqual(target.read_text(encoding="utf-8"), "x = 1\n")
+
+    def test_docstring_only_overwrite_refused_at_handler(self) -> None:
+        target = Path(self.tmpdir.name) / "mod.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        handler = self.registry.resolve("scaffold")
+        with self.assertRaises(ValueError):
+            _run(
+                handler(
+                    {"file_path": str(target), "content": '"""Health endpoint."""\n'}
+                )
+            )
+        self.assertEqual(target.read_text(encoding="utf-8"), "x = 1\n")
+
+    def test_real_code_overwrite_succeeds_at_handler(self) -> None:
+        target = Path(self.tmpdir.name) / "mod.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        handler = self.registry.resolve("scaffold")
+        envelope = _run(handler({"file_path": str(target), "content": "x = 2\n"}))
+        self.assertEqual(envelope["exit_code"], 0)
+        self.assertEqual(target.read_text(encoding="utf-8"), "x = 2\n")
+
+    def test_comment_stub_to_new_file_succeeds_at_handler(self) -> None:
+        target = Path(self.tmpdir.name) / "new_mod.py"
+        handler = self.registry.resolve("scaffold")
+        envelope = _run(handler({"file_path": str(target), "content": "# Stub.\n"}))
+        self.assertEqual(envelope["exit_code"], 0)
+        self.assertEqual(target.read_text(encoding="utf-8"), "# Stub.\n")
+
+    def test_placeholder_overwrite_fails_measured_at_executor(self) -> None:
+        target = Path(self.tmpdir.name) / "mod.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        node = PlanNode(
+            id="s1",
+            objective="Scaffold the health endpoint",
+            assigned_claw="scaffold",
+            inputs={
+                "file_path": str(target),
+                "content": "# Placeholder for health endpoint logic.\n",
+            },
+            outputs=[str(target)],
+            criteria=[{"type": "exit_code", "equals": 0}],
+        )
+        result = self._run_scaffold_plan("scaffold-placeholder", node)
+        self.assertEqual(result.nodes[0].status, PlanStatus.FAILED)
+        self.assertEqual(result.nodes[0].measurement["verdict"], VERDICT_FAIL)
+        self.assertEqual(target.read_text(encoding="utf-8"), "x = 1\n")

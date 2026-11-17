@@ -32,7 +32,13 @@ from .measure import (
 )
 from .models import ExecutionPlan, PlanNode, PlanStatus, TaskIntent
 from .prompts import PLANNER_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT
-from .tool_registry import KNOWN_CLAW_NAMES, metrics_reported_by
+from .tool_registry import (
+    CODE_FILE_SUFFIXES,
+    KNOWN_CLAW_NAMES,
+    is_code_path,
+    is_placeholder_content,
+    metrics_reported_by,
+)
 
 
 def _plan_id_for_intent(intent: TaskIntent) -> str:
@@ -691,6 +697,86 @@ _GLUED_WORD_GUIDANCE = (
 )
 
 
+# A bash "command" that is prose, not shell (retry #14): the v1 plan's
+# node-1 command was a description of the edit — "/home/seeker/...
+# /freetalon/api.py:HiveAPIServer, _ThreadingHTTPServer - Add a /health
+# branch to the do_GET method ..." — and /bin/sh failed on "(" in 0.001s.
+# The model keeps emitting descriptions where an executable edit belongs.
+_PROSE_MARKERS = (
+    " the ", " a ", " an ", " to ", " of ", " for ", " that ", " which ",
+    " and ", " with ", " in ", " on ", " is ", " are ", " returns ",
+    " reports ", " verify ", " check ",
+)
+_CODE_CITATION_RE = re.compile(
+    r"^[^:\s]*\.(?:"
+    + "|".join(sorted(s.lstrip(".") for s in CODE_FILE_SUFFIXES))
+    + r"):"
+)
+_SEGMENT_SPLIT_RE = re.compile(r"(?:\n|&&|\|\||;|\||>|<| - )")
+
+
+def _segment_is_prose(segment: str) -> bool:
+    """True when one shell segment is a prose description, not a command.
+
+    A segment is prose when it reads as a sentence: at least four words,
+    no shell verb, and either a code citation as its first token
+    ("freetalon/api.py:Handler," — a file reference, not an executable)
+    or a capitalised first word with sentence markers ("Add a /health
+    branch to the do_GET method ..."). Real commands start with a
+    lowercase command name (curl, python3, nvidia-smi), a path to an
+    executable, or a shell keyword — never with a capitalised English
+    word. An assignment first token (VAR=1 ...) is not prose.
+    """
+    words = segment.split()
+    if len(words) < 4:
+        return False
+    first = words[0]
+    if _CODE_CITATION_RE.match(first):
+        return True
+    if not first[0].isupper() or "=" in first:
+        return False
+    lowered = f" {segment.lower()} "
+    return any(marker in lowered for marker in _PROSE_MARKERS)
+
+
+def _prose_command_error(shell: str) -> str | None:
+    """Return an error if a bash command is prose, not shell — else None.
+
+    Two shapes, both general: a command that is only comments (retry #14
+    v2 node-2: "# Define a test command to verify the /health
+    endpoint." — a comment does nothing), and a command with a prose
+    segment (retry #14 v1 node-1: a description of the edit, node-3: a
+    real curl with a " - Verify ..." prose tail). The rejection names
+    the grounded move — a heredoc or the scaffold claw with real code —
+    the way the anti-fake rejection does. Heredoc bodies are already
+    stripped from ``shell`` by the caller, so file content is never
+    mistaken for prose.
+    """
+    stripped = shell.strip()
+    if not stripped:
+        return None
+    content_lines = [
+        line.strip()
+        for line in stripped.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not content_lines:
+        return (
+            "bash command is only a comment — it does nothing. Write the "
+            "edit as a heredoc (cat > <path> <<'EOF' ... EOF) or use the "
+            "scaffold claw with real code, and run the result."
+        )
+    for segment in _SEGMENT_SPLIT_RE.split(shell):
+        if _segment_is_prose(segment):
+            return (
+                f"bash command is prose, not a shell command: "
+                f"{segment.strip()!r} — describe nothing; write the edit "
+                "as a heredoc (cat > <path> <<'EOF' ... EOF) or use the "
+                "scaffold claw with real code, and run the result."
+            )
+    return None
+
+
 def _validate_bash_command(node: PlanNode) -> list[str]:
     """Return every error in a bash/shell_exec node's command (fix 2).
 
@@ -712,6 +798,9 @@ def _validate_bash_command(node: PlanNode) -> list[str]:
     # shlex / port checks, or a URL inside the file is flagged as glued
     # words (retry #3). The shell around the heredoc is still validated.
     shell = _strip_heredoc_bodies(cmd)
+    prose_error = _prose_command_error(shell)
+    if prose_error is not None:
+        errors.append(prose_error)
     tokens: list[str] = []
     try:
         tokens = shlex.split(shell)
@@ -1150,6 +1239,52 @@ def _unwritten_file_errors(
     return errors
 
 
+def _placeholder_scaffold_errors(
+    nodes: list[PlanNode], repo_root: str | Path | None
+) -> list[str]:
+    """Reject scaffolds that overwrite an existing code file with placeholder content.
+
+    A scaffold whose content is comments and/or a docstring — no code —
+    must never overwrite a module that already exists: retry #14's v3
+    replan scaffolded freetalon/api.py with "# Placeholder for health
+    endpoint logic." (219 lines -> 1 line) and the loop never noticed,
+    because scaffold nodes reported no exit code. The error names the
+    file and the fact that the content is a placeholder. A scaffold
+    creating a NEW file with a comment stub is still allowed — that is
+    how scaffolding starts — so the rule fires only when the target
+    already exists on disk. General: any code file, any route goal.
+    """
+    errors: list[str] = []
+    for node in nodes:
+        if node.assigned_claw not in ("scaffold", "file_writer"):
+            continue
+        target = (
+            node.inputs.get("file_path")
+            or node.inputs.get("path")
+            or (node.outputs[0] if node.outputs else "")
+        )
+        content = node.inputs.get("content")
+        if not isinstance(target, str) or not target:
+            continue
+        if not isinstance(content, str):
+            continue
+        if not is_code_path(target):
+            continue
+        if not is_placeholder_content(content):
+            continue
+        if not _path_exists_on_disk(target, repo_root):
+            continue
+        errors.append(
+            f"Planner node '{node.id}' scaffolds {target!r} with placeholder "
+            "content only (comments and/or a docstring, no code) — that would "
+            "overwrite the existing module with a comment stub instead of "
+            "implementing it. Write real code in the module (scaffold claw "
+            "with real code, or a bash heredoc) and verify it by running the "
+            "tests and curling the live service."
+        )
+    return errors
+
+
 def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
@@ -1200,6 +1335,7 @@ def _collect_plan_errors(
             if error is not None:
                 errors.append(error)
     errors.extend(_unwritten_file_errors(nodes, repo_root))
+    errors.extend(_placeholder_scaffold_errors(nodes, repo_root))
     standin_errors = _static_standin_errors(nodes, index=index, goal_text=goal_text)
     errors.extend(standin_errors)
     if index is not None:
@@ -1392,18 +1528,6 @@ def _grounded_move_sentence(
 # model echoed a JSON answer over freetalon/api.py). Data files are
 # exempt on purpose: writing a JSON config to a new file is legitimate
 # file production, so only code paths are guarded.
-_CODE_FILE_SUFFIXES = frozenset({
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".c",
-    ".cc", ".cpp", ".h", ".hpp", ".rb", ".sh", ".pl", ".php", ".swift",
-    ".kt", ".scala", ".cs",
-})
-
-
-def _is_code_path(path: str) -> bool:
-    """True when a path names a code file — by suffix."""
-    return Path(path).suffix.lower() in _CODE_FILE_SUFFIXES
-
-
 def _static_standin_errors(
     nodes: list[PlanNode],
     index: Any | None = None,
@@ -1471,7 +1595,7 @@ def _static_standin_errors(
         for target, literal in writes:
             if not _literal_is_answer(literal):
                 continue
-            if _is_code_path(target):
+            if is_code_path(target):
                 errors.append(
                     f"Planner node '{node.id}' writes a hardcoded answer into "
                     f"{target!r} — a JSON literal is not code, and {target!r} "
