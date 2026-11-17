@@ -1334,6 +1334,48 @@ def _sed_script_patterns(script: str) -> list[str]:
     return patterns
 
 
+def _sed_script_replacements(script: str) -> list[str]:
+    """The replacement texts of a sed script's s/// commands.
+
+    Same script shapes as _sed_script_patterns: an optional address
+    (/pattern/ or a line range) in front of one s command, any
+    delimiter. Returns [] when the script has no parseable
+    substitution — the command would fail at runtime, not silently,
+    so there is nothing to judge here.
+    """
+    text = script.strip()
+    if text.startswith("/"):
+        _pattern, after = _sed_scan_delimited(text, 0)
+        if _pattern is None:
+            return []
+        text = text[after:]
+    else:
+        match = re.match(r"\d+(?:,\d+)?", text)
+        if match:
+            text = text[match.end():]
+    if not (text.startswith("s") and len(text) >= 2):
+        return []
+    pattern, after = _sed_scan_delimited(text, 1)
+    if pattern is None:
+        return []
+    replacement, _end = _sed_scan_delimited(text, after - 1)
+    if replacement is None:
+        return []
+    results = [replacement]
+    # The replacement itself may contain the delimiter inside a
+    # quoted string (retry #25 attempt 3: "gpu_temp": "N/A" — the /
+    # in "N/A" closes the strict scan early, truncating the payload
+    # before the fabricated values). The text the model wrote still
+    # carries the full payload, so also offer the tolerant remainder:
+    # everything after the search pattern, minus a trailing delimiter
+    # and flags.
+    remainder = text[after:]
+    trimmed = re.sub(re.escape(text[1]) + r"[a-zA-Z0-9]*$", "", remainder)
+    if trimmed != replacement and trimmed.strip():
+        results.append(trimmed)
+    return results
+
+
 def _sed_pattern_matches(pattern: str, text: str) -> bool:
     """True when sed would find the pattern: literal text or a regex match.
 
@@ -2774,6 +2816,60 @@ def _same_path(left: str, right: str) -> bool:
     return left == right or left.endswith("/" + right) or right.endswith("/" + left)
 
 
+# A dict-literal binding of a key to a constant: "key": value with a
+# literal value (bool, None, number, or quoted string). A value that is
+# a name, a call, or any other expression is NOT matched — a computed
+# value is the real implementation; only a constant is a stand-in.
+_DICT_BINDING_RE = re.compile(
+    r"[\"'](?P<key>[A-Za-z_][A-Za-z0-9_]*)[\"']\s*:\s*"
+    r"(?P<value>true|false|null|True|False|None|-?\d+(?:\.\d+)?"
+    r"|\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')"
+)
+# Flat {...} spans — the observed fake shape. A nested dict's inner
+# spans are found on their own; the outer span is skipped.
+_DICT_SPAN_RE = re.compile(r"\{[^{}]*\}")
+
+
+def _is_measured_key(key: str) -> bool:
+    """True for keys that name a measured value, not static metadata.
+
+    The /health contract reports whether Ollama is reachable and the
+    GPU temperature — values that exist only by probing the service /
+    reading the sensor. A status or a service name is static metadata
+    the code may legitimately state as a constant; reachability and
+    temperature cannot be stated, only measured.
+    """
+    lowered = key.lower()
+    return (
+        "reachable" in lowered
+        or "temperature" in lowered
+        or lowered == "temp"
+        or lowered.endswith("_temp")
+    )
+
+
+def _hardcoded_measured_bindings(text: str) -> list[str]:
+    """Constant bindings of measured keys inside dict literals in text.
+
+    Scans flat {...} spans for key: constant pairs whose key names a
+    measured value (see _is_measured_key) and returns them in the
+    canonical '"key": value' spelling, so the rejection can name the
+    exact fabricated values. A dict whose measured values are computed
+    (a variable, a call) yields nothing — only constants are
+    stand-ins. This is a heuristic for the observed fake shape
+    (retry #25 attempt 3), not a Python parser.
+    """
+    bindings: list[str] = []
+    for span in _DICT_SPAN_RE.findall(text):
+        for match in _DICT_BINDING_RE.finditer(span):
+            if not _is_measured_key(match.group("key")):
+                continue
+            rendered = f'"{match.group("key")}": {match.group("value")}'
+            if rendered not in bindings:
+                bindings.append(rendered)
+    return bindings
+
+
 def _grounded_move_sentence(
     route: str, module: str, api_port: int, handler: str | None = None
 ) -> str:
@@ -2815,6 +2911,59 @@ def _grounded_move_sentence(
     )
 
 
+def _bash_payload_standin_errors(
+    node: PlanNode, command: str, grounded: str
+) -> list[str]:
+    """Stand-in shape 3: measured values hardcoded inside a bash payload.
+
+    Retry #25 attempt 3 edited api.py with a sed -i whose replacement
+    text inserted a status dict binding "ollama_reachable": True and
+    "gpu_temp": "N/A" — the endpoint's measured values, asserted as
+    constants inside a bash string. Shapes 1-2 never see it: the
+    command is not a literal write, and the scaffold checks do not
+    scan bash payloads. The payloads that write Python files — heredoc
+    bodies and echo/printf contents (_bash_code_writes), and sed -i
+    replacement texts (_sed_script_replacements) — are scanned for
+    dict literals binding measured keys to constants
+    (_hardcoded_measured_bindings). A payload that computes the values
+    (a probe call, a variable) is untouched, and a payload that is
+    itself a JSON literal is skipped: shapes 1-2 own that defect.
+    """
+    payloads: list[tuple[str, str]] = []
+    for target, content, _is_append in _bash_code_writes(command):
+        if Path(target).suffix.lower() != ".py":
+            continue
+        if _literal_is_answer(content):
+            continue
+        payloads.append((target, content))
+    shell = _strip_heredoc_bodies(command)
+    for script, target in _sed_in_place_edits(shell):
+        if Path(target).suffix.lower() != ".py":
+            continue
+        for replacement in _sed_script_replacements(script):
+            payloads.append((target, replacement))
+    errors: list[str] = []
+    seen: set[str] = set()
+    for target, payload in payloads:
+        if target in seen:
+            continue
+        bindings = _hardcoded_measured_bindings(payload)
+        if not bindings:
+            continue
+        seen.add(target)
+        errors.append(
+            f"Planner node '{node.id}' writes a hardcoded answer into "
+            f"{target!r}: the payload binds measured fields to "
+            f"constants ({', '.join(bindings)}) instead of measuring "
+            f"them — whether a service is reachable and what a sensor "
+            f"reads exist only by probing (call the service, run "
+            f"nvidia-smi), so a constant is a fabricated measurement. "
+            f"Write real code that measures the values it reports "
+            f"(scaffold claw, or a bash heredoc).{grounded}"
+        )
+    return errors
+
+
 # File suffixes that mark a path as a code file. A JSON literal is never
 # valid code in any of these languages, so writing one over such a path
 # destroys an implementation instead of producing it (retry #12: the
@@ -2828,7 +2977,7 @@ def _static_standin_errors(
 ) -> list[str]:
     """Flag nodes that manufacture their own evidence.
 
-    Two shapes, both general:
+    Three shapes, all general:
     1. A bash node that echo-writes a hardcoded answer (a JSON literal
        or an assert string) into a file and then claims file_exists on
        that same file never ran any code or service: the file's contents
@@ -2848,6 +2997,13 @@ def _static_standin_errors(
        friends) are guarded. The scaffold claw's normal pattern —
        writing real code and claiming file_exists on it — is untouched:
        real code is not a JSON literal.
+    3. A bash payload that writes a Python file — a heredoc body, an
+       echo/printf body, or a sed -i replacement text — containing a
+       dict literal that binds measured fields (reachability,
+       temperature) to constants: the surrounding code is real, but
+       the values it reports are fabricated, because those fields
+       exist only by probing. See _bash_payload_standin_errors
+       (retry #25 attempt 3).
     The escape hatch is the scaffold claw for real files, or a node that
     runs the real code and checks ITS output. When the goal names an
     existing route, the rejection also names the grounded move (extend
@@ -2916,6 +3072,12 @@ def _static_standin_errors(
                         f"curl the live service).{grounded}"
                     )
                     break
+        if claw in ("bash", "shell_exec"):
+            command = node.inputs.get("command") or node.inputs.get("cmd")
+            if isinstance(command, str):
+                errors.extend(
+                    _bash_payload_standin_errors(node, command, grounded)
+                )
     return errors
 
 
@@ -3231,6 +3393,29 @@ def _route_goal_shape(
             f"Do NOT re-serialize these instructions as JSON — they are "
             f"guidance, not output; your output is a NEW 'nodes' array."
         )
+    # Retry #25: attempt 1's scaffold plan was good code and failed
+    # ONLY on two interpreter strings the model composed from prose —
+    # a bare `python` in a step-2 criterion command and
+    # `./venv/bin/python` (missing the dot) in the step-3 start
+    # command — even though the route line above and every rejection
+    # named ./.venv/bin/python. The model copies shapes reliably and
+    # composes strings unreliably, so the exact commands also ride in
+    # the shape as quoted, copyable slots: the test run as a bash
+    # command, the same string as an exit_code criterion's command,
+    # and the server start as a bash command.
+    lines.append(
+        "COMMANDS — copy these character-for-character; do not retype "
+        "the interpreter path. The repo venv interpreter is "
+        "./.venv/bin/python (with the dot): bare `python` does not "
+        "exist on Ubuntu, and ./venv/bin/python is not a real path — "
+        "both are rejected. Run the tests with the bash command "
+        f"\"cd {index.root} && ./.venv/bin/python -m unittest "
+        "discover -s tests\" — and when an exit_code criterion carries "
+        "a \"command\", use that same string as the criterion's "
+        "command. Start the server with the bash command "
+        f"\"cd {index.root} && ./.venv/bin/python -m freetalon.cli "
+        "start\"."
+    )
     return "\n".join(lines)
 
 def _format_intent_for_prompt(intent: TaskIntent) -> str:
@@ -3331,6 +3516,68 @@ def _dropped_fields_note(prev_text: str | None, cur_text: str) -> str:
         f"Your previous attempt had {quoted} on its nodes; do not drop "
         f"them — every node needs all of: id, objective, depends_on, "
         f"assigned_claw, inputs, outputs, acceptance, criteria.\n"
+    )
+
+
+# Rejection-message markers for defects in a plan's CONTENT (the code
+# itself), as opposed to defects in its command/criterion strings.
+# Retry #25: attempt 1's scaffold plan failed only on two interpreter
+# strings (bare `python` in a criterion command, ./venv/bin/python in
+# a bash command) — no content marker appears in that rejection — and
+# attempts 2/3 then abandoned the scaffold shape for sed one-liners.
+# When a scaffold plan's rejection names no content defect, the repair
+# prompt says the shape was right, so the model fixes the named
+# strings instead of switching mechanism.
+_CONTENT_DEFECT_MARKERS = (
+    "does not parse as Python",
+    "no longer parses as Python",
+    "placeholder",
+    "hardcoded answer",
+    "Flask",
+    "FastAPI",
+)
+
+
+def _previous_plan_used_scaffold(response_text: str) -> bool:
+    """True when the failed planner output edited a file via the scaffold claw."""
+    try:
+        payload = parse_json_object(sanitize_llm_output(response_text))
+    except Exception:
+        return False
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, list):
+        return False
+    return any(
+        isinstance(node, dict)
+        and node.get("assigned_claw") in ("scaffold", "file_writer")
+        for node in nodes
+    )
+
+
+def _shape_steering_block(response_text: str, error_text: str) -> str:
+    """Steer a repair back to a scaffold shape that was one fix away.
+
+    Returns "" unless the previous output used the scaffold claw AND
+    its rejection names no content defect (see _CONTENT_DEFECT_MARKERS):
+    only then was the plan's shape right, with its defects confined to
+    command/criterion strings. Retry #25: without this, the repair
+    after the interpreter-only rejection abandoned the scaffold for
+    sed -i one-liners that failed shell quoting and pattern grounding.
+    """
+    if not _previous_plan_used_scaffold(response_text):
+        return ""
+    if any(marker in error_text for marker in _CONTENT_DEFECT_MARKERS):
+        return ""
+    return (
+        "\nYour previous plan's SHAPE was right: it made the code "
+        "edit with the scaffold claw, and none of its code was "
+        "rejected — the only defects are the command/criterion "
+        "strings named above. Keep the same plan shape and the same "
+        "code; fix ONLY the named strings, copying the corrected "
+        "commands character-for-character (the interpreter is "
+        "./.venv/bin/python). Do NOT abandon the scaffold edit for a "
+        "different mechanism (such as a sed -i text substitution) to "
+        "work around a command-string defect.\n"
     )
 
 
@@ -3646,6 +3893,22 @@ _APPROACH_MARKERS: tuple[tuple[str, str], ...] = (
         "service and check ITS output. Instead, run the service and curl "
         "its live endpoint, and check the real response.",
     ),
+    (
+        # Retry #25: after the scaffold plan fell only on interpreter
+        # paths, attempts 2/3 abandoned the scaffold for sed -i
+        # one-liners editing api.py — the sed attractor. The marker is
+        # the sed no-op rejection's own wording ("runs sed -i on ..."),
+        # so a sed rejection anywhere in a call forbids the approach in
+        # later repair prompts, and _repo_forbidden_approaches seeds it
+        # for route goals from the start.
+        "sed -i",
+        "Do NOT edit a Python file with sed -i (or another in-place "
+        "text substitution such as perl -pi) — a one-line substitution "
+        "cannot write a real endpoint, and a pattern that does not "
+        "match changes nothing while reporting success. Instead, write "
+        "the edit with the scaffold claw (the full file with the real "
+        "code) or a bash heredoc containing the real code.",
+    ),
 )
 
 
@@ -3713,12 +3976,20 @@ def _repo_forbidden_approaches(
     it is always wrong, and a placeholder stub over an existing module
     is always a fake deliverable. Those two labels are seeded into
     every replan prompt for a route goal from the start, seeded or not.
+
+    Retry #25 adds a third: editing the serving module with sed -i.
+    When the scaffold plan fell only on interpreter paths, the repairs
+    abandoned the scaffold for sed one-liners that failed shell quoting
+    and pattern grounding — the sed attractor. A route goal's edit has
+    a known-good mechanism (the scaffold claw with the full module, or
+    a heredoc), so the in-place text substitution is seeded as
+    known-bad for route goals too.
     """
     if not goal_text or index is None:
         return []
     if not _routes_named_in_goal(goal_text, index):
         return []
-    markers = {"Flask", "placeholder"}
+    markers = {"Flask", "placeholder", "sed -i"}
     return [label for marker, label in _APPROACH_MARKERS if marker in markers]
 
 
@@ -3839,6 +4110,14 @@ def _call_llm_with_repair(
     blanks with the actual branch code and a runnable test, not just the
     prohibition.
 
+    The repair prompt also steers back to the scaffold shape when the
+    previous plan used it and failed only on command/criterion strings
+    (retry #25): attempt 1's scaffold plan was good code rejected for
+    two interpreter paths, and attempts 2/3 abandoned the shape for
+    sed -i one-liners. When the rejection names no content defect, the
+    prompt says the shape was right and to fix only the named strings
+    (_shape_steering_block).
+
     The repair prompt only steers if the model receives it (retry
     #22): the prompts exceed Ollama's 4096-token context window,
     so planner/replan calls use _PLANNER_NUM_CTX instead. The
@@ -3958,6 +4237,7 @@ def _call_llm_with_repair(
                 max_repairs,
                 spent_repair,
             )
+            steering_block = _shape_steering_block(response_text, str(exc))
             prompt = (
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
@@ -3965,6 +4245,7 @@ def _call_llm_with_repair(
                 f"Previous output: {_describe_failed_output(response_text)}\n"
                 f"{_dropped_fields_note(prev_response_text, response_text)}"
                 f"{forbidden_block}"
+                f"{steering_block}"
                 f"\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n"
                 f"{skeleton_block}\n"
                 "Return ONLY a corrected JSON object with a \"nodes\" array that "

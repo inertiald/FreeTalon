@@ -7824,7 +7824,7 @@ class TestPlannerSignalLossFix(unittest.TestCase):
 
     # --- (a) Verbatim retry-#18 attempt-2: parse + framework + missing dir + /tmp ---
 
-    def test_retry18_attempt2_names_all_five_defects(self) -> None:
+    def test_retry18_attempt2_names_all_six_defects(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag(self._retry18_attempt2_nodes()),
@@ -7832,13 +7832,17 @@ class TestPlannerSignalLossFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 5 = step-2 parse error + step-1 framework error (Flask use,
+        # 6 = step-2 parse error + step-1 framework error (Flask use,
         # no import) + step-2 missing-directory error (freetalon/tests/)
         # + step-3 /tmp redirect in a compound command + step-3 bare
         # `python` (no bare `python` on Ubuntu). Framework-guard fix
         # (retry #23): the interpreter check names the bare `python`
         # the old rejection missed.
-        self.assertIn("was rejected with 5 errors", message)
+        # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
+        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("hardcoded answer", message)
+        self.assertIn('"ollama_reachable": True', message)
+        self.assertIn('"gpu_temperature": 0', message)
         self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -8714,7 +8718,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
 
     # --- (b) Verbatim retry-#19 rejections ---
 
-    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_6_errors(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self.RETRY19_ATTEMPT2_RAW,
@@ -8722,8 +8726,9 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 6 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -8889,7 +8894,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
 
     # --- (e) Regression guards: retry #18 still holds, then every earlier fix ---
 
-    def test_retry18_attempt2_names_all_five_defects(self) -> None:
+    def test_retry18_attempt2_names_all_six_defects(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag(self._retry18_attempt2_nodes()),
@@ -8897,13 +8902,17 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        # 5 = step-2 parse error + step-1 framework error (Flask use,
+        # 6 = step-2 parse error + step-1 framework error (Flask use,
         # no import) + step-2 missing-directory error (freetalon/tests/)
         # + step-3 /tmp redirect in a compound command + step-3 bare
         # `python` (no bare `python` on Ubuntu). Framework-guard fix
         # (retry #23): the interpreter check names the bare `python`
         # the old rejection missed.
-        self.assertIn("was rejected with 5 errors", message)
+        # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
+        self.assertIn("was rejected with 6 errors", message)
+        self.assertIn("hardcoded answer", message)
+        self.assertIn('"ollama_reachable": True', message)
+        self.assertIn('"gpu_temperature": 0', message)
         self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -9732,7 +9741,7 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
 
     # --- (f) Regression guards: every earlier fix still holds ---
 
-    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_6_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -9742,8 +9751,9 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 6 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -9768,7 +9778,7 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
         self.assertIn("The grounded move is:", message)
         self.assertIn("do_GET method of the Handler class", message)
 
-    def test_retry18_attempt2_rejected_with_5_errors(self) -> None:
+    def test_retry18_attempt2_rejected_with_6_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -9777,8 +9787,9 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 6 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -10509,7 +10520,7 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         self.assertIn("health.py", message)
         self.assertIn("test_health.py", message)
 
-    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_6_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -10519,8 +10530,9 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 6 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -10544,7 +10556,7 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET method", message)
 
-    def test_retry18_attempt2_rejected_with_5_errors(self) -> None:
+    def test_retry18_attempt2_rejected_with_6_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -10553,8 +10565,9 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 6 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -11290,7 +11303,7 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         self.assertIn("health.py", message)
         self.assertIn("test_health.py", message)
 
-    def test_retry19_attempt2_rejected_with_5_errors(self) -> None:
+    def test_retry19_attempt2_rejected_with_6_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -11300,8 +11313,9 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 6 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -11325,7 +11339,7 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         self.assertIn("writes a Flask app", message)
         self.assertIn("do_GET method", message)
 
-    def test_retry18_attempt2_rejected_with_5_errors(self) -> None:
+    def test_retry18_attempt2_rejected_with_6_errors(self) -> None:
         nodes = TestPlannerSignalLossFix._retry18_attempt2_nodes()
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
@@ -11334,8 +11348,9 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 6 errors", message)
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
+        # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         self.assertIn("bare `python`", message)
         self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
@@ -12677,3 +12692,475 @@ class TestIntakeSanitizeFix(unittest.TestCase):
             intent.constraints["verify"],
             "handler:\n    return {'ok': True}",
         )
+
+
+class TestPlannerInterpreterGroundingFix(unittest.TestCase):
+    """Interpreter paths + the sed attractor block every attempt (retry #25).
+
+    Retry #25 (log llm-end-to-end-health-retry25-2026-11-17.log,
+    DRIVER_EXIT:1, no run created) was the first live run with the
+    sanitize fix confirmed: attempt 1's scaffold plan was GOOD code --
+    indented, parsing, real subprocess nvidia-smi + requests probes --
+    and failed ONLY on two interpreter strings the model composed from
+    prose: a bare `python` in step_2's criterion command and
+    `./venv/bin/python` (missing the dot) in step_3's start command,
+    even though the rejections named ./.venv/bin/python explicitly.
+    Attempts 2/3 then abandoned the scaffold shape for sed -i
+    one-liners editing api.py (the sed attractor): attempt 2's sed did
+    not parse as shell, attempt 3's pattern did not occur in api.py,
+    and attempt 3's sed payload hardcoded "ollama_reachable": True /
+    "gpu_temp": "N/A" inside a bash string, which no check named --
+    stand-in detection covered scaffold content and literal writes,
+    not bash payloads.
+
+    Three fixes, repair budget NOT raised: (1) the ROUTE GOAL shape
+    carries the exact interpreter string in copyable command /
+    criterion slots (the model copies shapes reliably and composes
+    strings unreliably); (2) sed -i edits of Python files join the
+    seeded forbidden approaches for route goals, and the repair prompt
+    steers back to the scaffold shape when a scaffold plan failed only
+    on command/criterion strings; (3) stand-in detection extends to
+    bash payloads that write Python files (heredoc/echo bodies and
+    sed -i replacement texts) binding measured fields to constants.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+    GENERIC_GOAL = "Add a logging helper to the app and verify it works."
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        """The grounded plan, from the grounded-shape fix's test class."""
+        grounded = TestPlannerGroundedShapeFix()
+        grounded.setUp()
+        return grounded._grounded_health_nodes()
+
+    # The exact retry-#25 attempt-1 raw output, verbatim from the first
+    # RAW PLANNER OUTPUT block of the retry-#25 driver section of
+    # logs/llm-end-to-end-health-retry25-2026-11-17.log. Embedded (not
+    # read from the log) so the test stays hermetic in CI.
+    RETRY25_ATTEMPT1_RAW = r'''{
+"nodes":[
+{"id":"step_1","objective":"Modify /home/seeker/projects/FreeTalon/freetalon/api.py to implement the /health endpoint","depends_on":[],"assigned_claw":"scaffold","status":"draft","inputs":{"file_path":"/home/seeker/projects/FreeTalon/freetalon/api.py","content":"import json\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\ndef handle_health(self):\n    try:\n        import subprocess\n        gpu_temp = subprocess.check_output(['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader'], universal_newlines=True).strip()\n    except FileNotFoundError:\n        gpu_temp = 'N/A'\n\n    try:\n        import requests\n        ollama_status = requests.get('http://localhost:11434', timeout=2).status_code == 200\n    except requests.exceptions.RequestException:\n        ollama_status = False\n\n    response = {'service': 'FreeTalon API', 'status': 'OK', 'gpu_temperature': gpu_temp, 'ollama_reachable': ollama_status}\n    self.send_response(200)\n    self.send_header('Content-type', 'application/json')\n    self.end_headers()\n    self.wfile.write(json.dumps(response).encode())\n\nclass HiveAPIServer(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if self.path == '/health':\n            handle_health(self)\n        else:\n            super().do_GET()\n\nif __name__ == '__main__':\n    server_address = ('', 8765)\n    httpd = HTTPServer(server_address, HiveAPIServer)\n    print('Starting FreeTalon API server...')\n    httpd.serve_forever()"},"outputs":["/home/seeker/projects/FreeTalon/freetalon/api.py"],"acceptance":["File exists","API responds to /health"],
+"criteria":[{"type":"file_exists","path":"/home/seeker/projects/FreeTalon/freetalon/api.py"},{"type":"exit_code","equals":0,"command":"curl -sf http://localhost:8765/health"}],
+"error":null},
+{"id":"step_2","objective":"Write and run unit tests for the /health endpoint","depends_on":["step_1"],"assigned_claw":"scaffold","status":"draft",
+"inputs":{"file_path":"/home/seeker/freetalon-workspace/test_api.py","content":"import unittest\nfrom freetalon.api import HiveAPIServer\n\nclass TestHealthEndpoint(unittest.TestCase):\n    def test_health_endpoint(self):\n        # Assuming the server is running on localhost:8765\n        response = requests.get('http://localhost:8765/health')\n        self.assertEqual(response.status_code, 200)\n        data = response.json()\n        self.assertIn('service', data)\n        self.assertIn('status', data)\n        self.assertIn('gpu_temperature', data)\n        self.assertIn('ollama_reachable', data)\n\nif __name__ == '__main__':\n    unittest.main()"},"outputs":["/home/seeker/freetalon-workspace/test_api.py"],"acceptance":["Tests pass"],
+"criteria":[{"type":"exit_code","equals":0,"command":"python /home/seeker/freetalon-workspace/test_api.py"}],
+"error":null},
+{"id":"step_3","objective":"Start the FreeTalon API server and verify it's live","depends_on":["step_2"],"assigned_claw":"bash","status":"draft",
+"inputs":{"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli start"},"outputs":["server running"],
+"acceptance":["Server is live and responding to requests"],
+"criteria":[{"type":"exit_code","equals":0,"command":"curl -sf http://localhost:8765/health"}],
+"error":null}
+]
+}'''
+
+    # The exact retry-#25 attempt-3 raw output, verbatim from the third
+    # RAW PLANNER OUTPUT block of the same driver section.
+    RETRY25_ATTEMPT3_RAW = r'''{
+"nodes":
+[
+{
+"id":
+"step_1",
+"objective":
+"Edit /home/seeker/projects/FreeTalon/freetalon/api.py to implement the /health endpoint",
+"depends_on":
+[],
+"assigned_claw":
+"bash",
+"inputs":
+{
+"command":
+"sed -i 's/def do_GET(self):/def do_GET(self):\n        import json\n        status = { \"service\": \"FreeTalon\", \"ollama_reachable\": True, \"gpu_temp\": \"N/A\"}\n        return json.dumps(status)/' /home/seeker/projects/FreeTalon/freetalon/api.py"
+},
+"outputs":
+[
+"/home/seeker/projects/FreeTalon/freetalon/api.py"
+],
+"acceptance":
+"The /health endpoint is implemented",
+"criteria":
+[
+{
+"type":
+"file_exists",
+"path":
+"/home/seeker/projects/FreeTalon/freetalon/api.py"
+}
+],
+"error":
+null
+},
+{
+"id":
+"step_2",
+"objective":
+"Run unit tests for the /health endpoint",
+"depends_on":
+[
+"step_1"
+],
+"assigned_claw":
+"bash",
+"inputs":
+{
+"command":
+"python -m unittest discover -s /home/seeker/projects/FreeTalon/tests"
+},
+"outputs":
+[
+"unit test results"
+],
+"acceptance":
+"All unit tests pass",
+"criteria":
+[
+{
+"type":
+"exit_code",
+"equals":
+0
+}
+],
+"error":
+null
+},
+{
+"id":
+"step_3",
+"objective":
+"Start the FreeTalon API server and verify /health endpoint is live",
+"depends_on":
+[
+"step_2"
+],
+"assigned_claw":
+"bash",
+"inputs":
+{
+"command":
+"./.venv/bin/python -m freetalon.cli start"
+},
+"outputs":
+[
+"/health endpoint is live"
+],
+"acceptance":
+"The /health endpoint returns a 200 OK status and valid JSON",
+"criteria":
+[
+{
+"type":
+"exit_code",
+"equals":
+0
+}
+],
+"error":
+null
+}
+],
+"metadata":
+{
+"estimated_steps":
+3
+}
+}'''
+
+    # --- (1) Interpreter grounding: the exact string in copyable slots ---
+
+    def test_route_goal_shape_carries_verbatim_interpreter_commands(self) -> None:
+        from freetalon.orchestrator.planner import _route_goal_shape
+
+        shape = _route_goal_shape(self.HEALTH_GOAL, self.repo_root, delta=False)
+        root = str(self.repo_root)
+        # The test run as a quoted bash-command slot...
+        self.assertIn(
+            f'"cd {root} && ./.venv/bin/python -m unittest discover -s tests"',
+            shape,
+        )
+        # ...and the same string named as an exit_code criterion's
+        # command (retry #25 attempt 1 put a bare `python` there).
+        self.assertIn("exit_code criterion", shape)
+        self.assertIn("criterion's", shape)
+        # The server start as a quoted bash-command slot.
+        self.assertIn(
+            f'"cd {root} && ./.venv/bin/python -m freetalon.cli start"', shape
+        )
+        # The two wrong spellings are named as rejected.
+        self.assertIn("bare `python` does not exist on Ubuntu", shape)
+        self.assertIn("./venv/bin/python is not a real path", shape)
+
+    def test_initial_prompt_carries_verbatim_interpreter_commands(self) -> None:
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[good]
+        ) as call_mock:
+            plan_task_intent(self.intent, settings=self.settings)
+        first_prompt = call_mock.call_args_list[0][0][1]
+        self.assertIn(
+            "./.venv/bin/python -m unittest discover -s tests", first_prompt
+        )
+        self.assertIn("./.venv/bin/python -m freetalon.cli start", first_prompt)
+
+    # --- (2a) The sed edit joins the seeded forbidden approaches ---
+
+    def test_repo_forbidden_seed_includes_sed_edit(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _repo_forbidden_approaches,
+            _seed_forbidden_block,
+        )
+        from freetalon.orchestrator.repo_index import build_repo_index
+
+        index = build_repo_index(self.repo_root)
+        seed = _repo_forbidden_approaches(self.HEALTH_GOAL, index)
+        self.assertTrue(any("sed -i" in a for a in seed))
+        self.assertTrue(any("scaffold claw" in a for a in seed))
+        # The earlier seeds are unchanged.
+        self.assertTrue(any("Flask app" in a for a in seed))
+        self.assertTrue(any("placeholder" in a for a in seed))
+        block = _seed_forbidden_block(seed, self.HEALTH_GOAL, self.repo_root)
+        self.assertIn("sed -i", block)
+        # A goal naming no existing route seeds nothing.
+        self.assertEqual(
+            _repo_forbidden_approaches(self.GENERIC_GOAL, index), []
+        )
+
+    def test_sed_noop_rejection_forbids_sed_in_repair_prompt(self) -> None:
+        # A sed -i edit whose pattern does not occur in api.py is
+        # rejected naming sed; the repair prompt then forbids the
+        # approach (with the scaffold replacement), and the grounded
+        # plan is accepted on the next call.
+        bad = self._dag(
+            [
+                {
+                    "id": "step_1",
+                    "objective": "Edit the /health endpoint in api.py",
+                    "depends_on": [],
+                    "assigned_claw": "bash",
+                    "inputs": {
+                        "command": (
+                            "sed -i 's/def nope():/def nope():\\npass/' "
+                            f"{self.api_path}"
+                        )
+                    },
+                    "outputs": [self.api_path],
+                    "acceptance": ["Edited."],
+                    "criteria": [{"type": "exit_code", "equals": 0}],
+                }
+            ]
+        )
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(len(plan.nodes), 4)
+        repair_prompt = call_mock.call_args_list[1][0][1]
+        self.assertIn("DO NOT repeat approaches", repair_prompt)
+        self.assertIn("Do NOT edit a Python file with sed -i", repair_prompt)
+        self.assertIn("scaffold claw", repair_prompt)
+
+    # --- (2b) Shape steering: a scaffold plan one fix away keeps its shape ---
+
+    def test_repair_prompt_steers_back_to_scaffold_shape(self) -> None:
+        # Retry #25 attempt 1 verbatim: a scaffold plan rejected ONLY
+        # for interpreter strings. The repair prompt must say the shape
+        # was right; the grounded plan is then accepted.
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm",
+            side_effect=[self.RETRY25_ATTEMPT1_RAW, good],
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(len(plan.nodes), 4)
+        repair_prompt = call_mock.call_args_list[1][0][1]
+        self.assertIn("SHAPE was right", repair_prompt)
+        self.assertIn("scaffold claw", repair_prompt)
+        self.assertIn("./.venv/bin/python", repair_prompt)
+
+    def test_repair_prompt_no_steering_when_code_was_rejected(self) -> None:
+        # A scaffold plan whose CODE does not parse was not one fix
+        # away, so the repair prompt must not claim the shape was right.
+        bad = self._dag(
+            [
+                {
+                    "id": "step_1",
+                    "objective": "Extend the /health endpoint in api.py",
+                    "depends_on": [],
+                    "assigned_claw": "scaffold",
+                    "inputs": {
+                        "file_path": self.api_path,
+                        "content": "def broken(:\n    pass\n",
+                    },
+                    "outputs": [self.api_path],
+                    "acceptance": ["Extended."],
+                    "criteria": [
+                        {"type": "file_exists", "path": self.api_path}
+                    ],
+                }
+            ]
+        )
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(len(plan.nodes), 4)
+        repair_prompt = call_mock.call_args_list[1][0][1]
+        self.assertIn("does not parse as Python", repair_prompt)
+        self.assertNotIn("SHAPE was right", repair_prompt)
+
+    # --- (3) Stand-in detection inside bash payloads ---
+
+    def test_retry25_attempt3_gains_standin_error(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self.RETRY25_ATTEMPT3_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=self.repo_root,
+            )
+        message = str(caught.exception)
+        # 3 = bare `python` (step_2) + the sed no-op (step_1) + the NEW
+        # stand-in error naming the values attempt 3 hardcoded in its
+        # sed payload, which retry #25's live rejection (2 errors)
+        # never named.
+        self.assertIn("was rejected with 3 errors", message)
+        self.assertIn("hardcoded answer", message)
+        self.assertIn('"ollama_reachable": True', message)
+        self.assertIn('"gpu_temp": "N/A"', message)
+
+    def test_standin_fires_on_heredoc_payload_with_hardcoded_values(self) -> None:
+        target = f"{self.WS}/health_impl.py"
+        node = {
+            "id": "step_1",
+            "objective": "Write the health implementation",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": (
+                    f"cat > {target} <<'EOF'\n"
+                    "import json\n\n\n"
+                    "def health():\n"
+                    "    return json.dumps({\"service\": \"FreeTalon\", "
+                    "\"ollama_reachable\": True, \"gpu_temp\": \"N/A\"})\n"
+                    "EOF"
+                )
+            },
+            "outputs": [target],
+            "acceptance": ["The implementation exists."],
+            "criteria": [{"type": "file_exists", "path": target}],
+        }
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag([node]), goal_text=self.GENERIC_GOAL, workspace=self.WS
+            )
+        message = str(caught.exception)
+        self.assertIn("hardcoded answer", message)
+        self.assertIn('"ollama_reachable": True', message)
+        self.assertIn('"gpu_temp": "N/A"', message)
+
+    def test_standin_ignores_payload_that_computes_values(self) -> None:
+        # The same heredoc shape with probes instead of constants: the
+        # dict binds variables, so nothing is fabricated and the plan
+        # is accepted untouched.
+        target = f"{self.WS}/health_impl.py"
+        node = {
+            "id": "step_1",
+            "objective": "Write the health implementation",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": (
+                    f"cat > {target} <<'EOF'\n"
+                    "import subprocess\n"
+                    "import requests\n\n\n"
+                    "def health():\n"
+                    "    try:\n"
+                    "        gpu_temp = subprocess.check_output("
+                    "[\"nvidia-smi\", \"--query-gpu=temperature.gpu\", "
+                    "\"--format=csv,noheader\"], universal_newlines=True).strip()\n"
+                    "    except Exception:\n"
+                    "        gpu_temp = \"unavailable\"\n"
+                    "    ollama_reachable = requests.get("
+                    "\"http://localhost:11434\", timeout=2).status_code == 200\n"
+                    "    return {\"service\": \"FreeTalon\", "
+                    "\"ollama_reachable\": ollama_reachable, "
+                    "\"gpu_temp\": gpu_temp}\n"
+                    "EOF"
+                )
+            },
+            "outputs": [target],
+            "acceptance": ["The implementation exists."],
+            "criteria": [{"type": "file_exists", "path": target}],
+        }
+        nodes, _metadata = parse_planner_response(
+            self._dag([node]), goal_text=self.GENERIC_GOAL, workspace=self.WS
+        )
+        self.assertEqual(len(nodes), 1)
+
+    def test_sed_replacements_survive_delimiter_inside_string(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _hardcoded_measured_bindings,
+            _sed_script_replacements,
+        )
+
+        # Retry #25 attempt 3's script shape: the / inside "N/A"
+        # closes the strict replacement scan early; the tolerant
+        # remainder still carries the fabricated values.
+        script = (
+            "s/def do_GET(self):/def do_GET(self):\\n"
+            "        status = { \"ollama_reachable\": True, "
+            "\"gpu_temp\": \"N/A\" }/"
+        )
+        bindings = [
+            binding
+            for replacement in _sed_script_replacements(script)
+            for binding in _hardcoded_measured_bindings(replacement)
+        ]
+        self.assertIn('"ollama_reachable": True', bindings)
+        self.assertIn('"gpu_temp": "N/A"', bindings)
+        # A plain substitution still parses strictly, with no remainder.
+        self.assertEqual(_sed_script_replacements("s/a/b/"), ["b"])
+        # Computed values are not bindings.
+        self.assertEqual(
+            _hardcoded_measured_bindings(
+                '{"ollama_reachable": reachable, "gpu_temp": temp}'
+            ),
+            [],
+        )
+
+    # --- Regression guard: legitimate bash steps are untouched ---
+
+    def test_grounded_plan_with_bash_steps_passes_untouched(self) -> None:
+        nodes, _metadata = parse_planner_response(
+            self._dag(self._grounded_health_nodes()),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+        )
+        self.assertEqual(len(nodes), 4)
