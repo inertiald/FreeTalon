@@ -621,9 +621,17 @@ class TestPlannerGroundingFixes(unittest.TestCase):
     # --- Prompt wiring ---
 
     def test_plan_prompt_includes_repo_context(self) -> None:
-        response = TestPlannerHardening._dag(
-            [TestPlannerHardening()._scaffold_node()]
+        # The mocked plan must engage the /health route (anti-fake rule):
+        # scaffold the existing API module itself, not an unrelated file.
+        api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
         )
+        node = TestPlannerHardening()._scaffold_node(
+            inputs={"file_path": api_path, "content": "# extended health"},
+            outputs=[api_path],
+            criteria=[{"type": "file_exists", "path": api_path}],
+        )
+        response = TestPlannerHardening._dag([node])
         with patch(
             "freetalon.orchestrator.planner.call_llm", return_value=response
         ) as call_mock:
@@ -975,3 +983,443 @@ class TestPlannerEchoFix(unittest.TestCase):
         user_prompt = call_mock.call_args[0][1]
         self.assertTrue(user_prompt.rstrip().endswith("JSON Output:"))
         self.assertIn("Do NOT repeat, quote, or echo the brief", user_prompt)
+
+
+class TestPlannerFakeAndMemoryFix(unittest.TestCase):
+    """Anti-fake validation and prose re-plan briefs (retry #2).
+
+    Retry #2 (run-20261117T054715Z-698173) produced a real plan DAG first
+    try, but the plan faked the deliverable: node-1 echoed a hardcoded
+    api.json instead of extending freetalon/api.py, node-2 echoed an
+    assert sentence into test.sh, and the replan then echoed an
+    experiment-memory record verbatim as the nodes array. Two fixes:
+    (1) plan validation rejects static stand-in files and plans that
+    claim route work without touching the route module; (2) the re-plan
+    brief renders memory as prose, never as JSON.
+    """
+
+    HEALTH_GOAL = (
+        "Add a GET /health endpoint to FreeTalon's API that returns JSON "
+        "reporting the service status, whether Ollama at localhost:11434 is "
+        "reachable, and the GPU temperature when nvidia-smi is available. "
+        "Add unit tests for the endpoint, keep the full test suite green, "
+        "and verify the endpoint live."
+    )
+
+    # The experiment-memory record the retry-#2 replan echoed verbatim as
+    # its nodes array (run-20261116T013052Z-917367, node-1), in the shape
+    # ExperimentStore._row_to_record returns.
+    _MEMORY_RECORD = {
+        "run_id": "run-20261116T013052Z-917367",
+        "goal_key": "07ab30f88fe6662b",
+        "domain": "bash",
+        "node_id": "node-1",
+        "ts": "2026-11-16T01:30:52.241891+00:00",
+        "hypothesis": "ScaffoldAPIendpoint",
+        "approach": {
+            "capability": "scaffold",
+            "key_params": {
+                "file_path": "/home/seeker/freetalon-workspace/api/health.py"
+            },
+            "data_window": "",
+        },
+        "measurement": {
+            "verdict": "FAIL",
+            "exit_code": 127,
+            "duration_s": 0.5,
+            "results": [
+                {"passed": False, "measured": True, "detail": "exit_code 127 != 0"}
+            ],
+        },
+        "decision": "ESCALATE",
+        "lesson": (
+            "scaffold (ScaffoldAPIendpoint): verdict FAIL — failed criterion: "
+            "exit_code 127 != 0; exit 127; 0.5s; decision ESCALATE."
+        ),
+    }
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    @staticmethod
+    def _fake_health_plan_nodes() -> list[dict]:
+        """The three nodes of the retry-#2 plan, verbatim from plan-v001.json.
+
+        Embedded (not read from the run directory) so the test stays
+        hermetic in CI: the run directory is not part of the repo.
+        """
+        ws = "/home/seeker/freetalon-workspace"
+        return [
+            {
+                "id": "node-1",
+                "objective": "Add health endpoint to FreeTalon's API",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {
+                    "command": "echo '{\"health\": \"OK\", \"ollama_reachable\": true, \"gpu_temp\": 60}' > /home/seeker/freetalon-workspace/api.json"
+                },
+                "outputs": [f"{ws}/api.json"],
+                "acceptance": ["File exists"],
+                "error": None,
+                "criteria": [
+                    {"type": "file_exists", "path": f"{ws}/api.json"},
+                ],
+                "reversible": True,
+                "timeout_s": 300.0,
+                "max_retries": 0,
+                "hypothesis": "",
+                "responds_to": "",
+                "differs_by": "",
+                "measurement": {},
+                "duration_s": None,
+                "exit_code": None,
+            },
+            {
+                "id": "node-2",
+                "objective": "Add unit tests for the endpoint",
+                "depends_on": ["node-1"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {
+                    "command": "echo 'assert api.json contains \"health\": \"OK\"' > /home/seeker/freetalon-workspace/test.sh && chmod +x /home/seeker/freetalon-workspace/test.sh"
+                },
+                "outputs": [f"{ws}/test.sh"],
+                "acceptance": ["File exists"],
+                "error": None,
+                "criteria": [
+                    {"type": "file_exists", "path": f"{ws}/test.sh"},
+                ],
+                "reversible": True,
+                "timeout_s": 300.0,
+                "max_retries": 0,
+                "hypothesis": "",
+                "responds_to": "",
+                "differs_by": "",
+                "measurement": {},
+                "duration_s": None,
+                "exit_code": None,
+            },
+            {
+                "id": "node-3",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["node-2"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": f"{ws}/test.sh"},
+                "outputs": ["verification"],
+                "acceptance": ["Exit code 0"],
+                "error": None,
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "reversible": True,
+                "timeout_s": 300.0,
+                "max_retries": 0,
+                "hypothesis": "",
+                "responds_to": "",
+                "differs_by": "",
+                "measurement": {},
+                "duration_s": None,
+                "exit_code": None,
+            },
+        ]
+
+    def _valid_health_plan_nodes(self) -> list[dict]:
+        """A real /health plan: extend the module, run tests, curl live."""
+        return [
+            {
+                "id": "step_1",
+                "objective": "Extend the health endpoint",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": self.api_path, "content": "# extended health"},
+                "outputs": [self.api_path],
+                "criteria": [{"type": "file_exists", "path": self.api_path}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Run the test suite",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "python3 -m unittest discover -s tests"},
+                "outputs": ["test results"],
+                "criteria": [{"type": "tests_pass", "suite": "tests"}],
+            },
+            {
+                "id": "step_3",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -s http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+
+    def _good_delta_node(self) -> dict:
+        return {
+            "id": "step_1",
+            "objective": "Extend the health endpoint in freetalon/api.py",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {"file_path": self.api_path, "content": "# extended health"},
+            "outputs": [self.api_path],
+            "criteria": [{"type": "file_exists", "path": self.api_path}],
+            "responds_to": "node-1",
+            "differs_by": "edit the existing module instead of a new file",
+        }
+
+    def _brief(self, memory: list[dict] | None = None) -> dict:
+        failed_measurement = {
+            "verdict": "FAIL",
+            "exit_code": 127,
+            "duration_s": 0.002,
+            "results": [
+                {"passed": False, "measured": True, "detail": "exit_code 127 != 0"}
+            ],
+        }
+        return {
+            "goal": {
+                "objective": self.HEALTH_GOAL,
+                "success_measures": [
+                    {"name": "endpoint live", "metric": "health_ok", "op": "==", "value": 1}
+                ],
+                "budget": {"max_wall_clock_s": 3600.0, "max_replans": 2},
+                "risk_class": "read_only",
+                "stop_conditions": [],
+                "irreversible_actions": [],
+            },
+            "plan_id": "plan-7885a4ef9d99",
+            "plan_version": 1,
+            "failed_nodes": [
+                {
+                    "id": "node-3",
+                    "objective": "Verify the endpoint live",
+                    "hypothesis": "Verify the endpoint live",
+                    "assigned_claw": "bash",
+                    "measurement": failed_measurement,
+                    "error": None,
+                }
+            ],
+            "measurements": [
+                dict({"node_id": "node-3"}, **failed_measurement),
+            ],
+            "memory": memory if memory is not None else [self._MEMORY_RECORD],
+            "remaining_budget": {
+                "replans": 1,
+                "wall_clock_s": 3000.0,
+                "max_attempts_per_hypothesis": 3,
+                "max_nodes": 10,
+                "max_money": 0.0,
+            },
+            "instruction": (
+                "Produce a delta plan: name which failed hypothesis each new "
+                "node responds to (responds_to) and what it does differently "
+                "(differs_by). Do not repeat a recorded failed approach "
+                "without a stated reason. Shrink scope before growing it."
+            ),
+        }
+
+    # --- Weakness 1: anti-fake validation ---
+
+    def test_parse_rejects_verbatim_fake_health_plan(self) -> None:
+        message = ""
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(self._fake_health_plan_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+        message = str(caught.exception)
+        self.assertIn("3 errors", message)
+        self.assertIn("fix ALL of them", message)
+        # node-1: a static JSON file that asserts the answer.
+        self.assertIn("node-1", message)
+        self.assertIn("static file", message)
+        # node-2: a static assert string posing as a test.
+        self.assertIn("node-2", message)
+        # No node reads, modifies, or calls the real /health route.
+        self.assertIn("freetalon/api.py", message)
+        self.assertIn("/health", message)
+
+    def test_parse_accepts_valid_health_plan(self) -> None:
+        nodes, _ = parse_planner_response(
+            self._dag(self._valid_health_plan_nodes()),
+            goal_text=self.HEALTH_GOAL,
+        )
+        self.assertEqual(len(nodes), 3)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+
+    def test_static_rule_ignores_plain_echo(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Write a scratch file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "echo hello > /tmp/out.txt"},
+            "outputs": ["/tmp/out.txt"],
+            "criteria": [{"type": "file_exists", "path": "/tmp/out.txt"}],
+        }
+        nodes, _ = parse_planner_response(
+            self._dag([node]), goal_text="Write a scratch file"
+        )
+        self.assertEqual(len(nodes), 1)
+
+    def test_static_rule_flags_json_literal_without_route(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Write a JSON file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "echo '{\"ok\": true}' > /tmp/x.json"},
+            "outputs": ["/tmp/x.json"],
+            "criteria": [{"type": "file_exists", "path": "/tmp/x.json"}],
+        }
+        with self.assertRaisesRegex(LLMResponseError, "static file"):
+            parse_planner_response(
+                self._dag([node]), goal_text="Write a JSON file"
+            )
+
+    def test_route_rule_only_fires_when_goal_names_a_route(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Run the test suite",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "python3 -m unittest discover -s tests"},
+            "outputs": ["test results"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        # No route named: the same plan is fine.
+        nodes, _ = parse_planner_response(
+            self._dag([node]), goal_text="Run the test suite"
+        )
+        self.assertEqual(len(nodes), 1)
+        # The /health goal names the route, and this plan never touches it.
+        with self.assertRaisesRegex(LLMResponseError, "freetalon/api.py"):
+            parse_planner_response(
+                self._dag([node]), goal_text=self.HEALTH_GOAL
+            )
+
+    def test_plan_repairs_fake_plan_then_succeeds(self) -> None:
+        fake = self._dag(self._fake_health_plan_nodes())
+        good = self._dag(self._valid_health_plan_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[fake, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(len(plan.nodes), 3)
+        self.assertEqual(plan.nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(call_mock.call_count, 2)
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("static file", repair_prompt)
+        self.assertIn("freetalon/api.py", repair_prompt)
+
+    # --- Weakness 2: prose re-plan brief ---
+
+    def test_replan_brief_renders_memory_as_prose(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        good = self._dag([self._good_delta_node()])
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=good
+        ) as call_mock:
+            replan_from_brief(self._brief())
+        user_prompt = call_mock.call_args[0][1]
+        # No verbatim memory JSON anywhere in the prompt: no record keys.
+        self.assertNotIn('"run_id"', user_prompt)
+        self.assertNotIn('"goal_key"', user_prompt)
+        self.assertNotIn('"node_id"', user_prompt)
+        self.assertNotIn('"approach"', user_prompt)
+        self.assertNotIn('"measurement"', user_prompt)
+        self.assertNotIn('"lesson"', user_prompt)
+        # The same facts are present as prose, measurements exact.
+        self.assertIn("ScaffoldAPIendpoint", user_prompt)
+        self.assertIn("exit 127", user_prompt)
+        self.assertIn("verdict FAIL", user_prompt)
+        self.assertIn("failed criterion: exit_code 127 != 0", user_prompt)
+        self.assertIn("Decision: ESCALATE", user_prompt)
+        self.assertTrue(user_prompt.rstrip().endswith("JSON Output:"))
+
+    def test_format_brief_keeps_measurements_exact(self) -> None:
+        from freetalon.orchestrator.planner import _format_brief_for_prompt
+
+        text = _format_brief_for_prompt(self._brief())
+        self.assertIn("exit 127", text)
+        self.assertIn("verdict FAIL", text)
+        self.assertIn("failed criterion: exit_code 127 != 0", text)
+        self.assertIn("Success measure: endpoint live", text)
+        self.assertIn("health_ok == 1", text)
+        self.assertIn("Remaining budget: replans=1", text)
+        self.assertNotIn('"run_id"', text)
+        self.assertNotIn('"goal_key"', text)
+        self.assertNotIn("{", text.split("Re-plan brief:")[1].split("Goal:")[0])
+
+    def test_replan_repairs_echoed_memory_record_then_succeeds(self) -> None:
+        import json
+
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        # The exact failure from retry #2: the model returns the memory
+        # record verbatim as the nodes array. The repair round must break
+        # the echo and produce a valid delta plan in one round.
+        echo = json.dumps({"nodes": [self._MEMORY_RECORD], "metadata": {}})
+        good = self._dag([self._good_delta_node()])
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[echo, good]
+        ) as call_mock:
+            nodes = replan_from_brief(self._brief())
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(call_mock.call_count, 2)
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        # The failed output is described, never pasted back: the verbatim
+        # memory record must not appear in the repair prompt.
+        self.assertNotIn(echo, repair_prompt)
+        self.assertNotIn('"run_id"', repair_prompt)
+        self.assertNotIn('"goal_key"', repair_prompt)
+
+    def test_replan_gives_up_after_memory_echo_budget(self) -> None:
+        import json
+
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        echo = json.dumps({"nodes": [self._MEMORY_RECORD], "metadata": {}})
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=echo
+        ) as call_mock:
+            with self.assertRaisesRegex(
+                LLMResponseError, "did not match PlanNode schema"
+            ):
+                replan_from_brief(self._brief())
+        # Initial attempt + 2 repair retries, then the last error is raised.
+        self.assertEqual(call_mock.call_count, 3)
+
+    def test_prompts_state_no_fake_deliverables_and_prose_brief(self) -> None:
+        from freetalon.orchestrator.prompts import (
+            PLANNER_SYSTEM_PROMPT,
+            REPLAN_SYSTEM_PROMPT,
+        )
+
+        self.assertIn("Never fake a deliverable", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("live service", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("re-plan brief as prose", REPLAN_SYSTEM_PROMPT)
+        self.assertNotIn("Re-plan brief JSON", REPLAN_SYSTEM_PROMPT)

@@ -52,6 +52,11 @@ health file; put the work in freetalon/api.py itself. The FreeTalon API
 runs on port 8765. Port 8000 is the OpenAI-compatible LLM backend, not a
 service to curl or verify.
 
+Never fake a deliverable: do not write a static file containing the
+expected answer (for example, echoing a hardcoded JSON response into
+api.json) and claim the endpoint exists. Implement the work in the module
+that serves it, and verify it by calling the live service.
+
 CRITICAL SCHEMA RULES:
 1. "acceptance", "outputs", and "depends_on" MUST ALWAYS be JSON arrays of strings (e.g. ["Command exits with code 0"]), NEVER a bare string.
 2. Root nodes MUST have "depends_on": []. Downstream nodes MUST list parent step IDs in "depends_on".
@@ -177,13 +182,15 @@ Output DAG:
 REPLAN_SYSTEM_PROMPT = """You are the FreeTalon re-planner. A plan failed, and you must produce a
 revised plan — a DELTA plan — from the measurements, not a fresh guess.
 
-You will receive a re-plan brief as JSON with:
-- goal: the goal contract. It is UNCHANGED. You may not lower a threshold,
-  edit a criterion, or reclassify a failure to keep the run alive.
-- failed_nodes: what failed, with the measurement that proves it.
-- measurements: every measurement so far in this run.
-- memory: relevant past experiments (do not repeat a recorded failure).
-- remaining_budget: how many re-plans, seconds, and attempts are left.
+You will receive a re-plan brief as prose lines with:
+- Goal: the goal contract and its success measures. It is UNCHANGED. You
+  may not lower a threshold, edit a criterion, or reclassify a failure to
+  keep the run alive.
+- Failed nodes: what failed, with the measurement that proves it.
+- Measurements: every measurement so far in this run.
+- Past experiments: relevant past experiments in prose — what was tried,
+  what happened, the lesson (do not repeat a recorded failure).
+- Remaining budget: how many re-plans, seconds, and attempts are left.
 
 Rules:
 - Return ONLY a JSON object with a "nodes" array and "metadata". Do NOT

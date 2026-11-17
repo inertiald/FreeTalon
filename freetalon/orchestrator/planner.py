@@ -25,6 +25,7 @@ from .measure import (
     CRITERION_METRIC,
     CRITERION_TESTS_PASS,
     custom_checkers,
+    measurement_failed_detail,
 )
 from .models import ExecutionPlan, PlanNode, PlanStatus, TaskIntent
 from .prompts import PLANNER_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT
@@ -129,12 +130,17 @@ def sanitize_llm_output(raw_text: str) -> str:
     return cleaned
 
 def parse_planner_response(
-    raw_text: str, *, repo_root: str | Path | None = None
+    raw_text: str,
+    *,
+    repo_root: str | Path | None = None,
+    goal_text: str | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Validate raw planner output into normalized PlanNodes plus metadata.
 
     ``repo_root`` overrides the repo the grounding check reads; by default
-    it is the checkout holding this package.
+    it is the checkout holding this package. ``goal_text`` is the goal the
+    plan serves; when it names an existing API route, the plan must engage
+    that route (anti-fake rule).
     """
     raw_text = sanitize_llm_output(raw_text)
     print(f"\n--- RAW PLANNER OUTPUT ---\n{raw_text}\n--------------------------\n")
@@ -178,7 +184,7 @@ def parse_planner_response(
     # All per-node errors are collected and reported in ONE rejection, so a
     # plan with several independent errors can be fixed in a single repair
     # round instead of burning the repair budget one error at a time.
-    errors = _collect_plan_errors(nodes, repo_root)
+    errors = _collect_plan_errors(nodes, repo_root, goal_text)
     if errors:
         noun = "error" if len(errors) == 1 else "errors"
         lines = "\n".join(
@@ -453,22 +459,27 @@ def _grounding_error(node: PlanNode, index: Any) -> str | None:
 
 
 def _collect_plan_errors(
-    nodes: list[PlanNode], repo_root: str | Path | None = None
+    nodes: list[PlanNode],
+    repo_root: str | Path | None = None,
+    goal_text: str | None = None,
 ) -> list[str]:
-    """Collect EVERY per-node validation error, grouped by node.
+    """Collect EVERY plan validation error, grouped by node, plus plan-level rules.
 
     Each node is checked against every rule (claw allowlist, structured
     criteria, command/port validation, repo grounding) and every failure is
     reported, so a single rejection can drive one repair round that fixes
-    them all. Structural errors (bad JSON, duplicate ids, dependency
-    cycles) are not collected here — they are raised first by
-    normalize_plan_nodes, since the node list cannot be interpreted at all
-    until the DAG is structurally valid.
+    them all. Two plan-level rules run after the per-node checks: static
+    stand-in files (a node that echo-writes a hardcoded answer and then
+    claims it exists) and route engagement (a goal naming an existing API
+    route must have a node that reads, modifies, or calls it). Structural
+    errors (bad JSON, duplicate ids, dependency cycles) are not collected
+    here — they are raised first by normalize_plan_nodes, since the node
+    list cannot be interpreted at all until the DAG is structurally valid.
     """
     errors: list[str] = []
     needs_index = any(
         node.assigned_claw in ("scaffold", "file_writer") for node in nodes
-    )
+    ) or goal_text is not None
     index = build_repo_index(repo_root) if needs_index else None
     for node in nodes:
         error = _claw_error(node)
@@ -480,8 +491,345 @@ def _collect_plan_errors(
             error = _grounding_error(node, index)
             if error is not None:
                 errors.append(error)
+    errors.extend(_static_standin_errors(nodes))
+    if index is not None:
+        errors.extend(_route_engagement_errors(nodes, index, goal_text))
     return errors
 
+
+# --- Anti-fake validation (retry #2, run-20261117T054715Z-698173) ---
+
+_LITERAL_WRITE_RE = re.compile(
+    r"^\s*(?:echo|printf)\s+(?P<body>.*?)\s*(?:>>|>)\s*(?P<target>\S+)",
+    re.DOTALL,
+)
+_HEREDOC_RE = re.compile(
+    r"^\s*cat\s*>>?\s*(?P<target>\S+)\s*<<-?\s*['\"]?(?P<marker>[A-Za-z_][A-Za-z0-9_]*)['\"]?",
+    re.MULTILINE,
+)
+
+
+def _quoted_segments(body: str) -> list[str]:
+    """Quoted segments of a shell fragment, in order.
+
+    Only quoted text can be a hardcoded answer: an unquoted word is a
+    variable, a substitution, or a plain word, not a literal the model
+    wrote. Single quotes nest double quotes and vice versa, so the scan
+    pairs each opening quote with the next matching one.
+    """
+    segments: list[str] = []
+    index = 0
+    while index < len(body):
+        quote = body[index]
+        if quote in ("'", '"'):
+            close = body.find(quote, index + 1)
+            if close == -1:
+                break
+            segments.append(body[index + 1 : close])
+            index = close + 1
+        else:
+            index += 1
+    return segments
+
+
+def _literal_write(command: str) -> tuple[str, str] | None:
+    """If a bash command only writes a quoted literal to a file, return (path, literal).
+
+    Matches ``echo '...' > path``, ``printf '...' > path`` (and ``>>``),
+    and ``cat > path <<'MARKER'`` heredocs. Returns None when the command
+    does anything else. This is a heuristic for the observed fake shapes,
+    not a shell parser.
+    """
+    heredoc = _HEREDOC_RE.search(command)
+    if heredoc:
+        marker = heredoc.group("marker")
+        lines = command[heredoc.end() :].splitlines()
+        body: list[str] = []
+        for line in lines:
+            if line.strip() == marker:
+                break
+            body.append(line)
+        else:
+            return None
+        return heredoc.group("target"), "\n".join(body)
+    match = _LITERAL_WRITE_RE.match(command)
+    if not match:
+        return None
+    segments = _quoted_segments(match.group("body"))
+    if not segments:
+        return None
+    return match.group("target"), " ".join(segments)
+
+
+def _literal_is_answer(literal: str) -> bool:
+    """True when a written literal is a hardcoded answer, not data.
+
+    A JSON object/array literal (``{"health": "OK", ...}``) or a string
+    containing ``assert`` is the expected answer written out by hand.
+    Plain text (``echo hello > out.txt``) is ordinary scratch output and
+    is not flagged.
+    """
+    text = literal.strip()
+    if "assert" in text.lower():
+        return True
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(parsed, (dict, list))
+
+
+def _same_path(left: str, right: str) -> bool:
+    """True when two path spellings name the same file."""
+    return left == right or left.endswith("/" + right) or right.endswith("/" + left)
+
+
+def _static_standin_errors(nodes: list[PlanNode]) -> list[str]:
+    """Flag nodes that manufacture their own evidence.
+
+    A bash node that echo-writes a hardcoded answer (a JSON literal or an
+    assert string) into a file and then claims file_exists on that same
+    file never ran any code or service: the file's contents were asserted,
+    not produced. (Retry #2: node-1 echoed a hardcoded api.json; node-2
+    echoed an assert sentence into test.sh.) The escape hatch is the
+    scaffold claw for real files, or a node that runs the real code and
+    checks ITS output.
+    """
+    errors: list[str] = []
+    for node in nodes:
+        if node.assigned_claw not in ("bash", "shell_exec"):
+            continue
+        command = node.inputs.get("command") or node.inputs.get("cmd")
+        if not isinstance(command, str):
+            continue
+        written = _literal_write(command)
+        if written is None:
+            continue
+        target, literal = written
+        if not _literal_is_answer(literal):
+            continue
+        for criterion in node.criteria or []:
+            if (
+                isinstance(criterion, dict)
+                and criterion.get("type") == CRITERION_FILE_EXISTS
+                and isinstance(criterion.get("path"), str)
+                and _same_path(criterion["path"], target)
+            ):
+                errors.append(
+                    f"Planner node '{node.id}' writes a static file {target!r} "
+                    "containing a hardcoded answer and then claims it exists — "
+                    "that manufactures the deliverable instead of producing it. "
+                    "Run the real code or service and check ITS output instead "
+                    "(implement the endpoint in its module, run the tests, "
+                    "curl the live service)."
+                )
+                break
+    return errors
+
+
+def _routes_named_in_goal(goal_text: str, index: Any) -> list[tuple[str, str]]:
+    """Existing routes the goal names, as (route, serving module) pairs.
+
+    A route is named when the goal contains its path literal (``/health``)
+    or the route name with ``endpoint``/``route`` (``health endpoint``).
+    Bare words like ``status`` or ``metrics`` do not count on their own —
+    they are too common to mean the API route.
+    """
+    text = (goal_text or "").lower()
+    named: list[tuple[str, str]] = []
+    for route in sorted(index.routes):
+        name = route.strip("/").split("/", 1)[0]
+        if not name:
+            continue
+        path_hit = re.search(rf"{re.escape('/' + name)}(?![A-Za-z0-9_.\-])", text)
+        word_hit = re.search(rf"\b{re.escape(name)}\s+(endpoint|route)\b", text)
+        if path_hit or word_hit:
+            named.append((route, index.routes[route]))
+    return named
+
+
+def _route_engagement_errors(
+    nodes: list[PlanNode], index: Any, goal_text: str | None
+) -> list[str]:
+    """Reject a plan that claims route work without touching the route.
+
+    When the goal names an existing API route, at least one node must
+    engage it: mention the module that serves it, or call the live route.
+    (Retry #2: the goal asked for GET /health in freetalon/api.py, but no
+    node read, modified, or called anything in freetalon/api.py — the plan
+    wrote a static api.json instead.)
+    """
+    if not goal_text:
+        return []
+    errors: list[str] = []
+    for route, module in _routes_named_in_goal(goal_text, index):
+        engaged = False
+        route_re = re.compile(rf"{re.escape(route)}(?![A-Za-z0-9_.\-])")
+        for node in nodes:
+            for text in _node_path_strings(node):
+                if module in text or route_re.search(text):
+                    engaged = True
+                    break
+            if engaged:
+                break
+        if not engaged:
+            errors.append(
+                f"Planner goal asks for the {route} endpoint, served by "
+                f"{module}, but no node reads, modifies, or calls it — "
+                f"extend {module} instead of writing a stand-in file."
+            )
+    return errors
+
+
+def _short_value(value: Any, limit: int = 80) -> str:
+    """One-line rendering of a value, truncated so a long literal (a bash
+    command echoing a JSON answer, say) is never handed to the model whole."""
+    text = str(value)
+    if len(text) > limit:
+        return text[:limit] + "… (truncated)"
+    return text
+
+
+def _describe_measurement(measurement: Any) -> str:
+    """One prose line for a measurement dict; numbers stay exact."""
+    if not isinstance(measurement, dict):
+        return str(measurement)
+    bits: list[str] = []
+    if measurement.get("node_id"):
+        bits.append(f"node {measurement['node_id']}")
+    if measurement.get("verdict"):
+        bits.append(f"verdict {measurement['verdict']}")
+    if measurement.get("exit_code") is not None:
+        bits.append(f"exit {measurement['exit_code']}")
+    if measurement.get("duration_s") is not None:
+        bits.append(f"{measurement['duration_s']}s")
+    if measurement.get("verdict") in ("FAIL", "UNMEASURABLE"):
+        bits.append(measurement_failed_detail(measurement))
+    return "; ".join(bits) if bits else "no measurement recorded"
+
+
+def _describe_memory_record(record: Any) -> str:
+    """One prose line for an experiment-memory record — never its JSON.
+
+    The record's keys (run_id, goal_key, node_id, approach, ...) are a
+    copyable JSON object at temperature 0: in the /health retry #2 the
+    replan returned one verbatim as the nodes array. Prose carries the
+    same facts (what was tried, what happened, the lesson) with nothing
+    to copy. Long values are truncated so a literal the model could echo
+    is never handed over whole.
+    """
+    if not isinstance(record, dict):
+        return str(record)
+    approach = record.get("approach") or {}
+    if not isinstance(approach, dict):
+        approach = {}
+    capability = approach.get("capability", "")
+    params = approach.get("key_params") or {}
+    param_text = ""
+    if isinstance(params, dict) and params:
+        param_text = "; ".join(
+            f"{key}={_short_value(value)}" for key, value in params.items()
+        )
+    data_window = approach.get("data_window", "")
+    bits = [
+        f"Past experiment in run {record.get('run_id', '')} "
+        f"({record.get('ts', '')}): node {record.get('node_id', '')} "
+        f"tried {capability}"
+    ]
+    if param_text:
+        bits.append(f"with {param_text}")
+    if data_window:
+        bits.append(f"data window {data_window}")
+    bits.append(f"— outcome: {_describe_measurement(record.get('measurement') or {})}")
+    if record.get("decision"):
+        bits.append(f"Decision: {record['decision']}.")
+    if record.get("hypothesis"):
+        bits.append(f"Hypothesis: {record['hypothesis']}.")
+    if record.get("lesson"):
+        bits.append(f"Lesson: {record['lesson']}")
+    return " ".join(bits)
+
+
+def _format_brief_for_prompt(brief: dict[str, Any]) -> str:
+    """Render a re-plan brief as prose lines, never as JSON.
+
+    The brief used to be pasted verbatim (``Re-plan brief JSON: {...}``),
+    including the memory records as JSON objects. At temperature 0 the
+    model copies the JSON it last saw: in the /health retry #2 the replan
+    returned an experiment-memory record verbatim as the nodes array.
+    Prose carries the same facts — the unchanged goal and its exact
+    thresholds, the failed nodes with their exact measurements, the
+    relevant memory as lessons, the remaining budget — with nothing
+    copyable. (Same fix family as the intent prose rendering in 04b76e1.)
+    """
+    lines = ["Re-plan brief:"]
+    goal = brief.get("goal", {})
+    if isinstance(goal, dict):
+        if goal.get("objective"):
+            lines.append(f"Goal: {goal['objective']}")
+        for measure in goal.get("success_measures") or []:
+            if isinstance(measure, dict):
+                lines.append(
+                    f"Success measure: {measure.get('name', '')} — "
+                    f"{measure.get('metric', '')} {measure.get('op', '')} "
+                    f"{measure.get('value', '')}"
+                )
+        budget = goal.get("budget") or {}
+        if isinstance(budget, dict) and budget:
+            lines.append(
+                "Goal budget: "
+                + "; ".join(f"{key}={value}" for key, value in budget.items())
+            )
+        if goal.get("risk_class"):
+            lines.append(f"Risk class: {goal['risk_class']}")
+        for condition in goal.get("stop_conditions") or []:
+            lines.append(f"Stop condition: {condition}")
+        for action in goal.get("irreversible_actions") or []:
+            lines.append(f"Irreversible action (needs a gate): {action}")
+    elif isinstance(goal, str) and goal:
+        lines.append(f"Goal: {goal}")
+    lines.append(
+        f"Plan: {brief.get('plan_id', '')} (version {brief.get('plan_version', '')})"
+    )
+    for node in brief.get("failed_nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        lines.append(
+            f"Failed node {node.get('id', '')}: {node.get('objective', '')} "
+            f"(claw: {node.get('assigned_claw', '')}). "
+            f"Hypothesis: {node.get('hypothesis', '')}. "
+            f"Measurement: {_describe_measurement(node.get('measurement') or {})}. "
+            f"Error: {node.get('error', '') or 'none'}."
+        )
+    measurements = brief.get("measurements") or []
+    if measurements:
+        lines.append("Measurements so far:")
+        for measurement in measurements:
+            lines.append(f"- {_describe_measurement(measurement)}")
+    memory = brief.get("memory") or []
+    if memory:
+        lines.append("Relevant past experiments (do not repeat a recorded failure):")
+        for record in memory:
+            lines.append(f"- {_describe_memory_record(record)}")
+    remaining = brief.get("remaining_budget") or {}
+    if isinstance(remaining, dict) and remaining:
+        lines.append(
+            "Remaining budget: "
+            + "; ".join(f"{key}={value}" for key, value in remaining.items())
+        )
+    if brief.get("instruction"):
+        lines.append(f"Instruction: {brief['instruction']}")
+    return "\n".join(lines)
+
+
+def _goal_text_from_brief(brief: dict[str, Any]) -> str:
+    """The goal's objective text from a re-plan brief, for route matching."""
+    goal = brief.get("goal", {})
+    if isinstance(goal, dict):
+        return str(goal.get("objective", "") or "")
+    if isinstance(goal, str):
+        return goal
+    return ""
 
 def _format_intent_for_prompt(intent: TaskIntent) -> str:
     """Render a TaskIntent as plain prose lines for the planner prompt.
@@ -540,6 +888,7 @@ def _call_llm_with_repair(
     settings: LLMSettings | None,
     *,
     max_repairs: int = 2,
+    goal_text: str | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
 
@@ -555,7 +904,7 @@ def _call_llm_with_repair(
     for attempt in range(max_repairs + 1):
         response_text = call_llm(system_prompt, prompt, settings=settings)
         try:
-            return parse_planner_response(response_text)
+            return parse_planner_response(response_text, goal_text=goal_text)
         except LLMResponseError as exc:
             last_error = exc
             if attempt >= max_repairs:
@@ -616,6 +965,7 @@ def plan_task_intent(
         "JSON Output:",
         settings,
         max_repairs=max_repairs,
+        goal_text=intent.goal,
     )
     return build_execution_plan(intent, nodes, metadata, plan_id=plan_id)
 
@@ -634,16 +984,16 @@ def replan_from_brief(
     and normalized exactly like an initial plan; the caller (the loop) runs
     the judge's duplicate-approach validation before accepting it.
     """
-    import json as _json
 
     context = format_repo_context(build_repo_index(repo_root))
     nodes, _metadata = _call_llm_with_repair(
         REPLAN_SYSTEM_PROMPT,
-        f"{context}\n\nRe-plan brief JSON:\n{_json.dumps(brief, indent=2, default=str)}\n\n"
+        f"{context}\n\n{_format_brief_for_prompt(brief)}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
         "quote, or echo the brief — it is your input, not your output.\n"
         "JSON Output:",
         settings,
         max_repairs=max_repairs,
+        goal_text=_goal_text_from_brief(brief),
     )
     return nodes

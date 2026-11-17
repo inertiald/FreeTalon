@@ -433,3 +433,41 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   calls) explains it.
 - Still blocked: gh token invalid — commits local-only until Pat
   re-auths gh on seeker7 (device flow, as before; PAT idea dropped).
+
+## Update - 2026-11-16 (evening)
+
+- Planner fake + memory-prose fix DONE (CPU-only, no LLM calls, no GPU
+  load): both weaknesses from /health retry #2 fixed and tested.
+  - Anti-fake validation (planner.py): (1) static stand-in rule - a bash
+    node that echo/printf/heredoc-writes a literal JSON/assert answer into
+    a file and then claims file_exists on that same file is rejected
+    ("manufactures the deliverable instead of producing it"); plain echo
+    writes are untouched. (2) route-engagement rule - when the goal names
+    an existing API route (path literal or "<name> endpoint"), at least
+    one node must read, modify, or call the module that serves it
+    (freetalon/api.py for /health); otherwise the plan is rejected naming
+    the module and route. Both rules are collected into the single
+    all-errors rejection, so a repair round sees them together.
+    PLANNER_SYSTEM_PROMPT gains "Never fake a deliverable".
+  - Prose re-plan brief (planner.py, prompts.py): replan_from_brief now
+    renders the brief as prose lines (goal + success measures, failed
+    nodes with exact measurements, past experiments as prose with the
+    lesson, remaining budget) instead of pasting the brief JSON verbatim.
+    No copyable memory JSON is ever last in the prompt; measurements stay
+    exact (exit 127, verdict FAIL, failed-criterion detail). Repair
+    re-prompts describe the failed output instead of pasting it, so a
+    memory-record echo cannot be reinforced. Temperature stays 0.
+  - Tests: 408 -> 419/419 green (+11 TestPlannerFakeAndMemoryFix). One
+    older grounding test needed its mocked plan retargeted at
+    freetalon/api.py (it scaffolded fib.py for a /health goal, which the
+    new route rule now correctly rejects).
+  - Mocked demos: (a) the verbatim retry-#2 plan-v001.json nodes are now
+    rejected at plan time with 3 errors (node-1 static api.json, node-2
+    static test.sh, route engagement); (b) a mocked replan whose first
+    reply echoes the memory record verbatim repairs to a valid delta plan
+    in one round (2 calls), and gives up after the budget (3 calls).
+  - M5 smoke passes (finance run-20261117T060055Z-fa301c, ECU
+    run-20261117T060055Z-f541c8).
+- Next: /health retry #3 - NOT run here (loads the GPU; separate step).
+  Still blocked: gh token invalid - commits local-only until Pat re-auths
+  gh on seeker7 (device flow, as before).
