@@ -1,0 +1,56 @@
+name: GPU tests
+
+# Runs GPU / live-verification checks on Pat's home server (seeker7).
+# The main suite stays on GitHub-hosted runners (tests.yml) so fork PRs
+# can never execute code on this machine: this workflow triggers ONLY on
+# push to dev/** and workflow_dispatch. NEVER pull_request or
+# pull_request_target -- a self-hosted runner on a public repo would run
+# untrusted fork code if it ever accepted PR events.
+on:
+  push:
+    branches:
+      - "dev/**"
+  workflow_dispatch:
+
+jobs:
+  gpu-tests:
+    runs-on: [self-hosted, gpu]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: GPU health check
+        run: |
+          set -e
+          nvidia-smi --query-gpu=name,temperature.gpu,power.draw,power.limit,pcie.link.width.current --format=csv
+          LIMIT=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader | head -1 | tr -d ' W')
+          test "$LIMIT" = "300.00" || { echo "power limit is $LIMIT W, expected 300.00 W"; exit 1; }
+          WIDTH=$(nvidia-smi --query-gpu=pcie.link.width.current --format=csv,noheader | head -1)
+          test "$WIDTH" = "16" || { echo "PCIe link width is x$WIDTH, expected x16"; exit 1; }
+          if sudo dmesg | grep -qiE "xid (79|154)"; then echo "Xid 79/154 in dmesg -- GPU has fallen off the bus"; exit 1; fi
+          echo "GPU healthy: 300W limit, x16, no Xid errors"
+
+      - name: Ollama smoke test
+        run: |
+          set -e
+          curl -fsS http://127.0.0.1:11434/api/tags | grep -q "gemma-3-abliterated:latest"
+          curl -fsS -X POST http://127.0.0.1:11434/api/generate \
+            -H "Content-Type: application/json" \
+            -d '{"model":"gemma-3-abliterated:latest","prompt":"Say hi in five words.","stream":false,"options":{"num_predict":20}}' \
+            | grep -q '"done":true'
+          echo "Ollama answered on GPU"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
