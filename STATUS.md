@@ -561,3 +561,27 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   shows the exact retry-#4 plan rejected and a correct plan accepted.
   Log: logs/planner-route-fix-2026-11-16.log.
   - Next: /health retry #5 (live, GPU) - not run here by design.
+
+## Update - 2026-11-16 22:45
+
+- /health retry #5 FAILED at planning (no run created, DRIVER_EXIT:1,
+  ~108s, 1 intake + 3 planner calls). The port-aware rule WORKED as a
+  steering signal - attempt 3's probe plan (curl 11434/health, nvidia-smi,
+  echo JSON answer) was rejected with the wrong-service error naming the
+  fix ("Call /health on port 8765 or extend freetalon/api.py") - but the
+  model burned its first two attempts on the retry-#2 fake verbatim
+  (echo hardcoded JSON > api.json, fake test.sh), so no repair round was
+  left for the engagement error. Endpoint NOT extended, no new tests,
+  suite 437/437 green, no stray files, api.py untouched.
+  GPU survived: 59C at check after, 300W limit held, x16, zero Xid;
+  fans 85% during, restored to auto. Log:
+  logs/llm-end-to-end-health-retry5-2026-11-16.log.
+  - Next fix (same family): the model keeps reaching for the fake and
+    for probe/echo nodes instead of the grounded ROUTE GOAL shape
+    (edit freetalon/api.py via scaffold/heredoc -> write + run tests ->
+    curl :8765/health). The anti-fake rejection steers away from the
+    fake but not TOWARD the grounded shape, and the repair budget (max
+    2) is spent before the engagement error ever fires. Consider: name
+    the grounded shape in the anti-fake rejection too, or give the
+    planner a first-attempt route-goal template so it does not have to
+    discover the shape by trial and error.
