@@ -2197,3 +2197,267 @@ class TestPlannerRouteEngagementFix(unittest.TestCase):
 
         self.assertIn("never re-serialize the brief", REPLAN_SYSTEM_PROMPT)
         self.assertIn('"delta_plan"', REPLAN_SYSTEM_PROMPT)
+
+
+class TestPlannerGroundedShapeFix(unittest.TestCase):
+    """Name the grounded shape in the anti-fake rejection + first-attempt template (retry #5).
+
+    Retry #5 (log llm-end-to-end-health-retry5-2026-11-16.log) failed at
+    the planning stage: attempts 1-2 were the retry-#2 fake verbatim
+    (echo a hardcoded JSON answer into api.json, fake test.sh), and
+    attempt 3 was a probe/echo plan rejected by the port-aware
+    route-engagement rule with the exact fix named — but the repair
+    budget (max 2) was already spent, so the model never got a repair
+    round for the engagement error. The deeper pattern: the anti-fake
+    rejection steers AWAY from the fake but not TOWARD the grounded
+    ROUTE GOAL shape (edit freetalon/api.py via scaffold/heredoc ->
+    write + run tests -> curl :8765/health), and the first-attempt
+    prompt never named the shape at all. Two fixes: (1) when the goal
+    names an existing route, the anti-fake rejection names the grounded
+    move (serving module, real tests, live API port); (2) the initial
+    planner prompt carries the same ROUTE GOAL shape the replan prompt
+    already had, so the first attempt has the valid move in front of
+    it.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#5 attempt-1 plan, verbatim from the first RAW
+    # PLANNER OUTPUT block of
+    # logs/llm-end-to-end-health-retry5-2026-11-16.log. Embedded (not
+    # read from the log) so the test stays hermetic in CI. The commands
+    # below are the JSON-parsed values (plain double quotes), not the
+    # log's backslash-escaped spellings.
+    @staticmethod
+    def _retry5_fake_nodes() -> list[dict]:
+        ws = "/home/seeker/freetalon-workspace"
+        return [
+            {
+                "id": "step_1",
+                "objective": "Add health endpoint to FreeTalon's API",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "echo '{\"health\": \"OK\", \"ollama_reachable\": true, \"gpu_temp\": 60}' > /home/seeker/freetalon-workspace/api.json"},
+                "outputs": ["/home/seeker/freetalon-workspace/api.json"],
+                "acceptance": ["File exists"],
+                "criteria": [{"type": "file_exists", "path": "/home/seeker/freetalon-workspace/api.json"}],
+                "error": None,
+            },
+            {
+                "id": "step_2",
+                "objective": "Add unit tests for the endpoint",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "echo 'assert api.json contains \"health\": \"OK\"' > /home/seeker/freetalon-workspace/test.sh && chmod +x /home/seeker/freetalon-workspace/test.sh"},
+                "outputs": ["/home/seeker/freetalon-workspace/test.sh"],
+                "acceptance": ["File exists"],
+                "criteria": [{"type": "file_exists", "path": "/home/seeker/freetalon-workspace/test.sh"}],
+                "error": None,
+            },
+            {
+                "id": "step_3",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "/home/seeker/freetalon-workspace/test.sh"},
+                "outputs": ["verification"],
+                "acceptance": ["Exit code 0"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+                "error": None,
+            },
+        ]
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
+        )
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        """The grounded plan: edit the module, heredoc the tests, curl 8765."""
+        ws = self.WS
+        return [
+            {
+                "id": "step_1",
+                "objective": "Extend the health endpoint in freetalon/api.py",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {"file_path": self.api_path, "content": "# extended health"},
+                "outputs": [self.api_path],
+                "criteria": [{"type": "file_exists", "path": self.api_path}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Write the health endpoint test file",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": TestPlannerHeredocFix.HEREDOC_TEST},
+                "outputs": [f"{ws}/test_health.py"],
+                "criteria": [{"type": "file_exists", "path": f"{ws}/test_health.py"}],
+            },
+            {
+                "id": "step_3",
+                "objective": "Run the health endpoint tests",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": f"python3 {ws}/test_health.py"},
+                "outputs": ["test results"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_4",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_3"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -s http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+
+    # --- Fix 1: the anti-fake rejection names the grounded move ---
+
+    def test_parse_rejects_retry5_fake_and_names_grounded_shape(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(self._retry5_fake_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+        message = str(caught.exception)
+        # node-1 static JSON fake, node-2 static assert fake, route engagement.
+        self.assertIn("3 errors", message)
+        self.assertIn("static file", message)
+        # The rejection now points TOWARD the grounded move, not just away
+        # from the fake: serving module, real tests, live API port.
+        self.assertIn("grounded move", message)
+        self.assertIn("freetalon/api.py", message)
+        self.assertIn("8765", message)
+        self.assertIn("scaffold", message)
+        self.assertIn("heredoc", message)
+        self.assertIn("curl http://localhost:8765/health", message)
+
+    def test_fake_repairs_to_grounded_plan_in_one_round(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        fake = self._dag(self._retry5_fake_nodes())
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[fake, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        nodes = plan.nodes
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(nodes[0].inputs["file_path"], self.api_path)
+        self.assertIn("curl -s http://localhost:8765/health", nodes[-1].inputs["command"])
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("grounded move", repair_prompt)
+        self.assertIn("freetalon/api.py", repair_prompt)
+        self.assertIn("8765", repair_prompt)
+        # The first attempt already carried the shape (fix 2), so the
+        # repair is not the model's first sight of the grounded move.
+        first_prompt = call_mock.call_args_list[0][0][1]
+        self.assertIn("ROUTE GOAL", first_prompt)
+
+    # --- Fix 2: the first-attempt prompt carries the ROUTE GOAL shape ---
+
+    def test_first_attempt_prompt_has_route_shape_only_for_route_goals(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=good
+        ) as call_mock:
+            plan_task_intent(self.intent, settings=self.settings)
+        prompt = call_mock.call_args[0][1]
+        self.assertIn("ROUTE GOAL", prompt)
+        self.assertIn("the plan must follow this shape", prompt)
+        self.assertNotIn("the delta plan must follow this shape", prompt)
+        self.assertIn("freetalon/api.py", prompt)
+        self.assertIn("curl http://localhost:8765/health", prompt)
+
+        non_route_intent = TaskIntent(
+            goal="Run the test suite",
+            project_type="bash",
+            capabilities=["bash"],
+            constraints={"workspace": self.WS},
+            missing_inputs=[],
+        )
+        plain = self._dag(
+            [
+                {
+                    "id": "step_1",
+                    "objective": "Run the test suite",
+                    "depends_on": [],
+                    "assigned_claw": "bash",
+                    "inputs": {"command": "python3 -m unittest discover -s tests"},
+                    "outputs": ["test results"],
+                    "criteria": [{"type": "exit_code", "equals": 0}],
+                }
+            ]
+        )
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=plain
+        ) as call_mock:
+            plan = plan_task_intent(non_route_intent, settings=self.settings)
+        self.assertEqual(len(plan.nodes), 1)
+        self.assertNotIn("ROUTE GOAL", call_mock.call_args[0][1])
+
+    def test_replan_prompt_still_says_delta_plan(self) -> None:
+        from freetalon.orchestrator.planner import _route_goal_shape
+
+        shape = _route_goal_shape(self.HEALTH_GOAL)
+        self.assertIn("ROUTE GOAL", shape)
+        self.assertIn("the delta plan must follow this shape", shape)
+
+    # --- Regression guards: the earlier fixes still hold ---
+
+    def test_parse_still_rejects_retry4_plan_wrong_service(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "different service"):
+            parse_planner_response(
+                self._dag(TestPlannerRouteEngagementFix._retry4_plan_nodes()),
+                goal_text=self.HEALTH_GOAL,
+            )
+
+    def test_parse_still_rejects_retry3_glued_echo(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Write the health endpoint test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": TestPlannerHeredocFix.GLUED_ECHO},
+            "outputs": [f"{self.WS}/test_health.py"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        with self.assertRaisesRegex(LLMResponseError, "glued together") as ctx:
+            parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
+        self.assertIn("heredoc", str(ctx.exception))
+        self.assertIn("scaffold", str(ctx.exception))
+
+    def test_parse_accepts_valid_heredoc_health_plan(self) -> None:
+        nodes, _ = parse_planner_response(
+            self._dag(self._grounded_health_nodes()), goal_text=self.HEALTH_GOAL
+        )
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")

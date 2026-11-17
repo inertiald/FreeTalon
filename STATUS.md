@@ -585,3 +585,40 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
     the grounded shape in the anti-fake rejection too, or give the
     planner a first-attempt route-goal template so it does not have to
     discover the shape by trial and error.
+
+## Update - 2026-11-16 22:48
+
+- Planner grounded-shape fix DONE (retry #5): the anti-fake rejection
+  now names the grounded move (extend the serving module via
+  scaffold/heredoc, write real tests, curl the live API port) when the
+  goal names an existing route, and the first-attempt planner prompt
+  carries the ROUTE GOAL shape the replan prompt already had
+  (_route_goal_shape gains a delta flag: "the plan must follow this
+  shape" for first attempts, "the delta plan..." for replans).
+  Tests 437 -> 444/444 green (new TestPlannerGroundedShapeFix, 7
+  tests), M5 smoke passes (finance run-20261117T064804Z-7758b4, ecu
+  run-20261117T064804Z-31927b). Demo tools/demo-grounded-shape.py
+  shows the exact retry-#5 fake rejected with the shape named and a
+  mocked repair landing on a grounded plan in one round (2 calls).
+  Log: logs/planner-grounded-shape-fix-2026-11-16.log.
+  - Next: /health retry #6 (live, GPU) - not run here by design.
+Verification (all CPU-only, mocked, no LLM, no GPU):
+- Full suite: 444/444 OK (was 437; +7 new TestPlannerGroundedShapeFix).
+- M5 smoke: OK - finance run-20261117T064804Z-7758b4, ecu run-20261117T064804Z-31927b.
+- Demo (a): verbatim retry-#5 attempt-1 fake (read from
+  logs/llm-end-to-end-health-retry5-2026-11-16.log) rejected at plan
+  time with 3 errors, and the rejection names the grounded move
+  (freetalon/api.py, 8765, scaffold/heredoc, curl :8765/health).
+- Demo (b): mocked first reply with that fake repairs to a valid
+  grounded plan in one round (2 calls); node-1 scaffolds
+  freetalon/api.py, last node curls :8765/health; the repair prompt
+  contains the grounded move and the first prompt carries ROUTE GOAL.
+  Demo tool: /home/seeker/freetalon-workspace/tools/demo-grounded-shape.py,
+  log logs/demo-grounded-shape.log.
+- Regression guards pass: retry-#4 plan rejected (wrong service),
+  retry-#3 glued echo rejected (heredoc alternative named), valid
+  heredoc /health plan passes; replan prompt still says "delta plan".
+- No stray files (no api.json, test.sh, test_health.py, api/health.py).
+Deliberately left out:
+- Live /health retry #6 was NOT run - loads the GPU, separate step.
+- No push (per instructions).

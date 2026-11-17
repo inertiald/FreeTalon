@@ -516,7 +516,7 @@ def _collect_plan_errors(
             error = _grounding_error(node, index)
             if error is not None:
                 errors.append(error)
-    errors.extend(_static_standin_errors(nodes))
+    errors.extend(_static_standin_errors(nodes, index=index, goal_text=goal_text))
     if index is not None:
         errors.extend(_route_engagement_errors(nodes, index, goal_text))
     return errors
@@ -658,7 +658,27 @@ def _same_path(left: str, right: str) -> bool:
     return left == right or left.endswith("/" + right) or right.endswith("/" + left)
 
 
-def _static_standin_errors(nodes: list[PlanNode]) -> list[str]:
+def _grounded_move_sentence(route: str, module: str, api_port: int) -> str:
+    """One sentence naming the valid move for a route goal.
+
+    The sentence is the concrete form of the ROUTE GOAL shape: extend
+    the serving module, write real tests, verify against the live API
+    port. It is appended to the anti-fake rejection so the repair round
+    is pointed TOWARD the real work, not just away from the fake.
+    """
+    return (
+        f"The grounded move is: extend {module} (scaffold claw, or a bash "
+        f"heredoc) to implement {route}; write the tests (scaffold or "
+        f"heredoc) and run them; verify live with "
+        f"curl http://localhost:{api_port}{route}."
+    )
+
+
+def _static_standin_errors(
+    nodes: list[PlanNode],
+    index: Any | None = None,
+    goal_text: str | None = None,
+) -> list[str]:
     """Flag nodes that manufacture their own evidence.
 
     A bash node that echo-writes a hardcoded answer (a JSON literal or an
@@ -667,9 +687,23 @@ def _static_standin_errors(nodes: list[PlanNode]) -> list[str]:
     not produced. (Retry #2: node-1 echoed a hardcoded api.json; node-2
     echoed an assert sentence into test.sh.) The escape hatch is the
     scaffold claw for real files, or a node that runs the real code and
-    checks ITS output.
+    checks ITS output. When the goal names an existing route, the
+    rejection also names the grounded move (extend the serving module,
+    write real tests, curl the live API port): the rule used to steer
+    AWAY from the fake without pointing TOWARD the real work, so the
+    model burned repair rounds re-discovering it (retry #5: two fakes,
+    then a wrong-service probe, budget spent before the engagement
+    error fired).
     """
     errors: list[str] = []
+    grounded = ""
+    if index is not None and goal_text:
+        named = _routes_named_in_goal(goal_text, index)
+        if named:
+            grounded = " " + " ".join(
+                _grounded_move_sentence(route, module, index.api_port)
+                for route, module in named
+            )
     for node in nodes:
         if node.assigned_claw not in ("bash", "shell_exec"):
             continue
@@ -695,7 +729,7 @@ def _static_standin_errors(nodes: list[PlanNode]) -> list[str]:
                     "that manufactures the deliverable instead of producing it. "
                     "Run the real code or service and check ITS output instead "
                     "(implement the endpoint in its module, run the tests, "
-                    "curl the live service)."
+                    f"curl the live service).{grounded}"
                 )
                 break
     return errors
@@ -953,15 +987,25 @@ def _goal_text_from_brief(brief: dict[str, Any]) -> str:
     return ""
 
 
-def _route_goal_shape(goal_text: str | None, repo_root: str | Path | None = None) -> str:
+def _route_goal_shape(
+    goal_text: str | None,
+    repo_root: str | Path | None = None,
+    *,
+    delta: bool = True,
+) -> str:
     """A concrete node shape for a goal naming an existing API route.
 
-    When the goal names a route, the delta plan has a known shape — edit
-    the serving module, write tests, call the live route on the API port —
-    so the replan prompt hands the model a NEW structure to produce
-    instead of leaving it to re-serialize the brief's failed steps as
-    JSON (retry #4 replan 1 echoed the brief's delta steps verbatim).
-    Returns "" when the goal names no route.
+    When the goal names a route, the plan has a known shape — edit the
+    serving module, write tests, call the live route on the API port —
+    so the prompt hands the model a NEW structure to produce instead of
+    leaving it to discover the shape by trial and error inside a
+    3-attempt budget (retry #5 burned attempts 1-2 on the fake before
+    the engagement error fired) or to re-serialize the brief's failed
+    steps as JSON (retry #4 replan 1 echoed the brief's delta steps
+    verbatim). ``delta`` says whether the plan is a re-plan delta
+    ("the delta plan must follow this shape") or a first attempt
+    ("the plan must follow this shape"). Returns "" when the goal
+    names no route.
     """
     if not goal_text:
         return ""
@@ -969,7 +1013,8 @@ def _route_goal_shape(goal_text: str | None, repo_root: str | Path | None = None
     named = _routes_named_in_goal(goal_text, index)
     if not named:
         return ""
-    lines = ["ROUTE GOAL — the delta plan must follow this shape:"]
+    plan_word = "delta plan" if delta else "plan"
+    lines = [f"ROUTE GOAL — the {plan_word} must follow this shape:"]
     for route, module in named:
         lines.append(
             f"- {route} is served by {module} on port {index.api_port}: "
@@ -1102,13 +1147,18 @@ def plan_task_intent(
     Rejected output (bad JSON, unknown claw, unmeasurable node) is sent
     back to the model for correction, up to ``max_repairs`` times. The
     prompt carries the repo context (fix 1) so the model plans against
-    the code that actually exists.
+    the code that actually exists. When the goal names an existing route,
+    the prompt also carries the grounded ROUTE GOAL shape, so the first
+    attempt already has the valid move in front of it instead of having
+    to discover it by trial and error.
     """
     context = format_repo_context(build_repo_index(repo_root))
+    shape = _route_goal_shape(intent.goal, repo_root, delta=False)
+    shape_block = f"\n\n{shape}" if shape else ""
     nodes, metadata = _call_llm_with_repair(
         PLANNER_SYSTEM_PROMPT,
         f"{context}\n\n"
-        f"{_format_intent_for_prompt(intent)}\n\n"
+        f"{_format_intent_for_prompt(intent)}{shape_block}\n\n"
         "Produce a NEW execution plan DAG for the goal above. Your output "
         "must be a JSON object with a \"nodes\" array — do NOT repeat the "
         "goal text or any JSON from this prompt.\n"
