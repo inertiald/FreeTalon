@@ -869,3 +869,31 @@ Deliberately left out:
   and the node-shape fix (091ebfd): show the depends_on shape
   (node ids only) and convert unknown-dependency errors into
   repairable rejections.
+
+## Update - 2026-11-16 (evening, planner depends_on fix)
+
+  Planner depends_on fix DONE (retry #10 weakness): the planner
+  prompt (schema rule 5 + NODE SHAPE block), the replan prompt, and
+  _NODE_SHAPE_EXAMPLE now show the depends_on shape -- node ids only
+  (e.g. "step_1"), never an output name, a file path, or a
+  description. Unknown-dependency errors are collected into ONE
+  numbered rejection naming the node, the bad value, the available
+  node ids, and -- when the value is an output of some node -- which
+  node produces it and the id to depend on instead (retry-#10
+  attempt 3: "endpoint_implemented" is an output of step_1, depend
+  on step_1). Duplicate ids, dependency cycles, and self-dependency
+  still raise first. Tests 498 -> 514/514 green (+16
+  TestPlannerDependsOnFix), M5 smoke passes, verbatim retry-#10
+  attempt-3 output now rejected with 2 errors (no structural raise),
+  mocked repair lands on a grounded plan with correct depends_on in
+  one round; regression guards pass (retry-#9 wrong location,
+  retry-#8 unwritten file, retry-#7 invented schema 11 errors,
+  retry-#5 fake, retry-#4 wrong service, retry-#3 glued echo,
+  bare-dict criteria coercion; duplicate ids / cycles /
+  self-dependency still raise). Demo:
+  freetalon-workspace/tools/demo-depends-on.py, log
+  freetalon-workspace/logs/demo-depends-on.log; apply script
+  freetalon-workspace/tools/apply-planner-depends-on-fix.py
+  (verified byte-for-byte against a pristine 3b17997 worktree).
+  Log: freetalon-workspace/logs/planner-depends-on-fix-2026-11-16.log.
+  Next: /health retry #11 (GPU load, separate step).

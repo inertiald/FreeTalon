@@ -71,10 +71,11 @@ CRITICAL SCHEMA RULES:
 2. Root nodes MUST have "depends_on": []. Downstream nodes MUST list parent step IDs in "depends_on".
 3. "error" MUST be null.
 4. "criteria" MUST ALWAYS be a JSON array (a LIST) of criterion objects (e.g. [{"type": "exit_code", "equals": 0}]), NEVER a single object like {"tests_pass": true}.
+5. "depends_on" lists NODE IDS only — the "id" of an earlier node (e.g. "step_1"), never an output name (like "endpoint_implemented"), a file path, or a description. "outputs" names what a node produces; "depends_on" names which earlier node it waits for.
 
 NODE SHAPE — every entry of \"nodes\" MUST be exactly this object:
 {\"id\": \"step_1\", \"objective\": \"<what the node delivers>\", \"depends_on\": [], \"assigned_claw\": \"scaffold\" | \"bash\", \"inputs\": {\"file_path\": \"<path>\", \"content\": \"<file contents>\"} | {\"command\": \"<shell command>\"}, \"outputs\": [\"<path or result>\"], \"acceptance\": [\"<human-readable check>\"], \"criteria\": [{\"type\": \"exit_code\", \"equals\": 0}], \"error\": null}
-There is NO \"type\" field and NO \"write_file\" / \"execute_command\" node kind. To write a file use the \"scaffold\" claw (inputs \"file_path\" and \"content\"); to run a command use the \"bash\" claw (inputs \"command\"). \"assigned_claw\" MUST be one of the ALLOWED CLAWS above — never a node \"type\".
+There is NO \"type\" field and NO \"write_file\" / \"execute_command\" node kind. To write a file use the \"scaffold\" claw (inputs \"file_path\" and \"content\"); to run a command use the \"bash\" claw (inputs \"command\"). \"depends_on\" lists node ids only (e.g. \"step_1\") — never an output name, a file path, or a description. \"assigned_claw\" MUST be one of the ALLOWED CLAWS above — never a node \"type\".
 
 MEASURABLE CRITERIA — every node MUST have a "criteria" array with at least one criterion, next to the human-readable "acceptance" strings. A node with no measurable criterion is rejected. Criterion shapes:
 - {"type": "exit_code", "equals": 0} — for "bash" nodes: the command must exit 0.
@@ -222,6 +223,8 @@ Rules:
   Never invent a claw name.
 - Every node must name "responds_to" (the failed node id it answers) and
   "differs_by" (what it does differently from the failed attempt).
+- "depends_on" lists node ids only (e.g. "step_1") — the "id" of an
+  earlier node, never an output name, a file path, or a description.
 - Do not repeat a failed approach (same capability and hypothesis) without
   a stated differs_by — the judge rejects such plans.
 - Ground in the repo: if an endpoint or module already exists, extend it;

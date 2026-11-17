@@ -58,7 +58,23 @@ _NODE_SHAPE_EXAMPLE = (
     '"criteria": [{"type": "exit_code", "equals": 0}]}. There is NO '
     '"type" field and NO "write_file" / "execute_command" node kind — '
     'to write a file use the "scaffold" claw, to run a command use the '
-    '"bash" claw.'
+    '"bash" claw. "depends_on" lists node ids only (e.g. "step_1") — '
+    'never an output name, a file path, or a description.'
+)
+
+
+# The depends_on shape, spelled out wherever a dependency error is
+# reported. Retry #10: the model put output names ("endpoint_implemented",
+# "tests_written") in depends_on, and the bare "depends on unknown node"
+# raise never showed it the shape or the available node ids, so the
+# repair budget died on the same error. Short on purpose: it rides along
+# in every unknown-dependency rejection.
+_DEPENDS_ON_SHAPE = (
+    '"depends_on" lists NODE IDS only — the "id" of an earlier node in the '
+    'same plan (e.g. "step_1"), never an output name (like '
+    '"endpoint_implemented"), never a file path, never a description. '
+    'A node that needs another node\'s output depends on that node\'s id. '
+    'Root nodes use "depends_on": [].'
 )
 
 
@@ -129,6 +145,37 @@ def _coerce_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[PlanNode
     return _validate_raw_nodes(list(nodes))
 
 
+def _unknown_dependency_error(
+    node: PlanNode, node_map: dict[str, PlanNode], dependency: str
+) -> str:
+    """One unknown depends_on entry as a plain sentence naming the fix.
+
+    The error names the bad value, the node ids that exist in this plan,
+    and -- when the value is an output name of some node -- which node
+    produces it and the id to depend on instead. Retry #10 attempt 3
+    depended on "endpoint_implemented" (an output of step_1) and
+    "tests_written" (an output of step_2); the bare raise said only
+    "unknown node", so the model never learned the fix.
+    """
+    producers = [
+        other.id
+        for other in node_map.values()
+        if dependency in (other.outputs or [])
+    ]
+    hint = ""
+    if producers:
+        hint = (
+            f" '{dependency}' is an output of node '{producers[0]}' — "
+            f"depend on '{producers[0]}' (the node id), not on its output name."
+        )
+    return (
+        f"Planner node '{node.id}' depends on unknown node '{dependency}' — "
+        f"'depends_on' lists node ids only, never output names."
+        f"{hint} The nodes in this plan are: "
+        f"{', '.join(sorted(node_map))}."
+    )
+
+
 def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[PlanNode]:
     """Validate a DAG, topologically order it, and assign deterministic node ids."""
     nodes = _coerce_nodes(nodes)
@@ -139,6 +186,33 @@ def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[P
     if len(node_map) != len(nodes):
         raise LLMResponseError("Planner response contained duplicate node ids.")
 
+    # Unknown dependencies are a repairable rejection, not a structural
+    # raise: retry #10 attempt 3 put output names ("endpoint_implemented",
+    # "tests_written") in depends_on, and the bare raise never showed the
+    # model the shape or the available node ids, so the repair budget died
+    # on the same error. Collect every unknown dependency into ONE
+    # numbered rejection in the same format as _validate_raw_nodes, so the
+    # repair loop gets a round to fix them. Duplicate ids, dependency
+    # cycles, and self-dependency still raise first, as before.
+    unknown_dep_errors: list[str] = []
+    for node in nodes:
+        for dependency in node.depends_on:
+            if dependency == node.id:
+                raise LLMResponseError(f"Planner node '{node.id}' cannot depend on itself.")
+            if dependency not in node_map:
+                unknown_dep_errors.append(
+                    _unknown_dependency_error(node, node_map, dependency)
+                )
+    if unknown_dep_errors:
+        noun = "error" if len(unknown_dep_errors) == 1 else "errors"
+        lines = "\n".join(
+            f"{index}. {error}" for index, error in enumerate(unknown_dep_errors, start=1)
+        )
+        raise LLMResponseError(
+            f"Planner output was rejected with {len(unknown_dep_errors)} {noun} — "
+            f"fix ALL of them:\n{lines}\n{_DEPENDS_ON_SHAPE}"
+        )
+
     original_order = {node.id: index for index, node in enumerate(nodes)}
     adjacency: dict[str, list[str]] = {node.id: [] for node in nodes}
     indegree = {node.id: 0 for node in nodes}
@@ -147,12 +221,6 @@ def normalize_plan_nodes(nodes: list[PlanNode] | list[dict[str, Any]]) -> list[P
         unique_dependencies: list[str] = []
         seen_dependencies: set[str] = set()
         for dependency in node.depends_on:
-            if dependency == node.id:
-                raise LLMResponseError(f"Planner node '{node.id}' cannot depend on itself.")
-            if dependency not in node_map:
-                raise LLMResponseError(
-                    f"Planner node '{node.id}' depends on unknown node '{dependency}'."
-                )
             if dependency not in seen_dependencies:
                 seen_dependencies.add(dependency)
                 unique_dependencies.append(dependency)
@@ -977,10 +1045,13 @@ def _collect_plan_errors(
     that reads, modifies, or calls it). Per-node
     schema errors (missing fields, invented fields) are collected the
     same way in _validate_raw_nodes, before this runs. DAG-level
-    structural errors (bad JSON, duplicate ids, dependency cycles) are
-    not collected — they are raised first by normalize_plan_nodes, since
-    the node list cannot be interpreted at all until the DAG is
-    structurally valid.
+    structural errors (bad JSON, duplicate ids, dependency cycles,
+    self-dependency) are not collected — they are raised first by
+    normalize_plan_nodes, since the node list cannot be interpreted at
+    all until the DAG is structurally valid. Unknown dependencies are
+    the exception: normalize_plan_nodes collects them as a numbered
+    rejection (retry #10), so the repair loop can fix them instead of
+    the driver dying on a bare raise.
     """
     errors: list[str] = []
     needs_index = any(

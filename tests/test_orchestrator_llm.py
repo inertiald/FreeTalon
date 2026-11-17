@@ -3770,3 +3770,314 @@ class TestPlannerRepoRootFix(unittest.TestCase):
         message = str(caught.exception)
         self.assertNotIn("did not match PlanNode schema", message)
         self.assertIn("criteria MUST be a JSON array", message)
+
+class TestPlannerDependsOnFix(unittest.TestCase):
+    """Show the depends_on shape; unknown dependencies are numbered rejections (retry #10).
+
+    Retry #10 (log llm-end-to-end-health-retry10-2026-11-16.log) failed
+    at planning (~80s, DRIVER_EXIT:1, no run created). Intake succeeded.
+    Planner attempts: (1) {"nodes": []} -- empty; (2) the stdout-echo fake
+    again, no criteria on any node -- rejected; (3) a comment-only plan
+    whose step_1/2 commands are just "# Add code..." comments, with
+    file_exists criteria on the CORRECT repo paths -- the repo-root fix
+    IS steering -- but step_2 depends_on ["endpoint_implemented"], an
+    OUTPUT name, not a node id (step_3 the same with "tests_written"),
+    so normalize_plan_nodes raised "Planner node 'step_2' depends on
+    unknown node 'endpoint_implemented'" before validation could produce
+    a numbered rejection -> repair budget exhausted. Two fixes, same
+    family as the bare-dict criteria fix (798a116) and the node-shape
+    fix (091ebfd): (1) the planner prompt (and the replan prompt / NODE
+    SHAPE block) shows the depends_on shape -- node ids only, never
+    output names; (2) unknown-dependency errors are collected into ONE
+    numbered rejection naming the node, the bad value, the available
+    node ids, and -- when the value is an output of some node -- which
+    node produces it and the id to depend on instead.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#10 attempt-3 nodes, verbatim from the third RAW
+    # PLANNER OUTPUT block of
+    # logs/llm-end-to-end-health-retry10-2026-11-16.log. Embedded (not
+    # read from the log) so the test stays hermetic in CI.
+    @staticmethod
+    def _retry10_attempt3_nodes() -> list[dict]:
+        api = "/home/seeker/projects/FreeTalon/freetalon/api.py"
+        return [
+            {
+                "id": "step_1",
+                "objective": "Implement the /health endpoint in freetalon/api.py",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "# Add code to freetalon/api.py to implement the /health endpoint"},
+                "outputs": ["endpoint_implemented"],
+                "acceptance": ["Endpoint implemented successfully."],
+                "criteria": [{"type": "file_exists", "path": api}],
+                "error": None,
+            },
+            {
+                "id": "step_2",
+                "objective": "Write unit tests for the /health endpoint",
+                "depends_on": ["endpoint_implemented"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "# Add unit tests to freetalon/api.py for the /health endpoint"},
+                "outputs": ["tests_written"],
+                "acceptance": ["Unit tests written successfully."],
+                "criteria": [{"type": "file_exists", "path": api}],
+                "error": None,
+            },
+            {
+                "id": "step_3",
+                "objective": "Verify the /health endpoint is live with curl",
+                "depends_on": ["tests_written"],
+                "assigned_claw": "bash",
+                "status": "draft",
+                "inputs": {"command": "curl http://localhost:8765/health"},
+                "outputs": ["endpoint_live"],
+                "acceptance": ["Endpoint is live and returns a 200 OK response."],
+                "criteria": [{"type": "process_exit", "code": 0}],
+                "error": None,
+            },
+        ]
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.api_path = str(
+            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
+        )
+        self.repo_root = str(Path(__file__).resolve().parent.parent)
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        """The grounded plan, from the previous fix's test class."""
+        grounded = TestPlannerGroundedShapeFix()
+        grounded.setUp()
+        return grounded._grounded_health_nodes()
+
+    # --- Fix: the depends_on shape is shown, unknown deps are numbered ---
+
+    def test_parse_rejects_retry10_attempt3_numbered(self) -> None:
+        # The exact retry-#10 attempt-3 output: two unknown dependencies,
+        # both output names. This must be a numbered rejection naming the
+        # node, the bad value, the available node ids, and the producing
+        # node -- NOT a bare structural raise.
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(self._retry10_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 2 errors", message)
+        self.assertIn("fix ALL of them", message)
+        self.assertIn("depends on unknown node 'endpoint_implemented'", message)
+        self.assertIn("depends on unknown node 'tests_written'", message)
+        self.assertIn("The nodes in this plan are: step_1, step_2, step_3", message)
+        self.assertIn("depend on 'step_1' (the node id)", message)
+        self.assertIn("depend on 'step_2' (the node id)", message)
+        self.assertIn('"depends_on" lists NODE IDS only', message)
+        self.assertNotIn("did not match PlanNode schema", message)
+
+    def test_output_name_depends_on_repairs_to_grounded_plan_in_one_round(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        bad = self._dag(self._retry10_attempt3_nodes())
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        nodes = plan.nodes
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(nodes[0].inputs["file_path"], self.api_path)
+        self.assertEqual(nodes[1].depends_on, ["node-1"])
+        self.assertIn("curl -s http://localhost:8765/health", nodes[-1].inputs["command"])
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("unknown node", repair_prompt)
+        self.assertIn("endpoint_implemented", repair_prompt)
+        self.assertIn('"depends_on" lists NODE IDS only', repair_prompt)
+        # The first attempt already carried the depends_on shape in the
+        # system prompt (schema rules).
+        system_prompt = call_mock.call_args_list[0][0][0]
+        self.assertIn('"depends_on" lists NODE IDS only', system_prompt)
+        self.assertIn("never an output name", system_prompt)
+
+    # --- Fix: the shape is in the prompts ---
+
+    def test_prompts_carry_depends_on_shape(self) -> None:
+        from freetalon.orchestrator.planner import _DEPENDS_ON_SHAPE, _NODE_SHAPE_EXAMPLE
+        from freetalon.orchestrator.prompts import PLANNER_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT
+
+        self.assertIn('"depends_on" lists NODE IDS only', PLANNER_SYSTEM_PROMPT)
+        self.assertIn("never an output name", PLANNER_SYSTEM_PROMPT)
+        self.assertIn('"depends_on" lists node ids only', REPLAN_SYSTEM_PROMPT)
+        self.assertIn("never an output name", REPLAN_SYSTEM_PROMPT)
+        self.assertIn('"depends_on" lists NODE IDS only', _DEPENDS_ON_SHAPE)
+        self.assertIn('"depends_on" lists node ids only', _NODE_SHAPE_EXAMPLE)
+
+    def test_replan_prompt_carries_depends_on_shape(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        route = TestPlannerRouteEngagementFix()
+        route.setUp()
+        good = self._dag(route._good_delta_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", return_value=good
+        ) as call_mock:
+            nodes = replan_from_brief(route._brief())
+        self.assertEqual(len(nodes), 2)
+        prompt = call_mock.call_args[0][1]
+        self.assertIn("NODE SHAPE", prompt)
+        self.assertIn("node ids only", prompt)
+
+    # --- Valid depends_on still passes ---
+
+    def test_parse_accepts_valid_depends_on(self) -> None:
+        nodes, _ = parse_planner_response(
+            self._dag(self._grounded_health_nodes()),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+        )
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[1].depends_on, ["node-1"])
+        self.assertEqual(nodes[2].depends_on, ["node-2"])
+        self.assertEqual(nodes[3].depends_on, ["node-3"])
+
+    def test_parse_accepts_plan_without_depends_on(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Run the test suite",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "python3 -m unittest discover -s tests"},
+            "outputs": ["test results"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        nodes, _ = parse_planner_response(
+            self._dag([node]), goal_text="Run the test suite", workspace=self.WS
+        )
+        self.assertEqual(len(nodes), 1)
+
+    # --- Regression guards: the earlier fixes still hold ---
+
+    def test_parse_rejects_retry9_plan_wrong_location(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerRepoRootFix._retry9_v1_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("2 errors", message)
+        self.assertIn("repo root", message)
+
+    def test_parse_rejects_retry8_stdout_echo_fake(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerUnwrittenFileFix._retry8_v1_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        self.assertIn("unmeasurable", str(caught.exception))
+
+    def test_parse_rejects_retry7_invented_schema_numbered(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerNodeShapeFix._retry7_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 11 errors", message)
+        self.assertIn("every node MUST be a PlanNode object", message)
+        self.assertIn('There is NO "type" field', message)
+
+    def test_parse_still_rejects_retry5_fake(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "grounded move"):
+            parse_planner_response(
+                self._dag(TestPlannerGroundedShapeFix._retry5_fake_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+
+    def test_parse_still_rejects_retry4_plan_wrong_service(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "different service"):
+            parse_planner_response(
+                self._dag(TestPlannerRouteEngagementFix._retry4_plan_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+
+    def test_parse_still_rejects_retry3_glued_echo(self) -> None:
+        node = {
+            "id": "step_1",
+            "objective": "Write the health endpoint test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": TestPlannerHeredocFix.GLUED_ECHO},
+            "outputs": [f"{self.WS}/test_health.py"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+        with self.assertRaisesRegex(LLMResponseError, "glued together") as ctx:
+            parse_planner_response(
+                self._dag([node]), goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        self.assertIn("heredoc", str(ctx.exception))
+        self.assertIn("scaffold", str(ctx.exception))
+
+    def test_bare_dict_criteria_still_coerces(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(TestPlannerCriteriaShapeFix._retry6_attempt3_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertNotIn("did not match PlanNode schema", message)
+        self.assertIn("criteria MUST be a JSON array", message)
+
+    # --- Structural errors still raise first, unchanged ---
+
+    def test_normalize_still_raises_duplicate_ids_first(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "duplicate node ids"):
+            normalize_plan_nodes(
+                [
+                    {"id": "a", "objective": "First", "depends_on": []},
+                    {"id": "a", "objective": "Second", "depends_on": []},
+                ]
+            )
+
+    def test_normalize_still_raises_dependency_cycles_first(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "dependency cycle"):
+            normalize_plan_nodes(
+                [
+                    {"id": "a", "objective": "First", "depends_on": ["b"]},
+                    {"id": "b", "objective": "Second", "depends_on": ["a"]},
+                ]
+            )
+
+    def test_normalize_still_raises_self_dependency_first(self) -> None:
+        with self.assertRaisesRegex(LLMResponseError, "cannot depend on itself"):
+            normalize_plan_nodes(
+                [{"id": "a", "objective": "First", "depends_on": ["a"]}]
+            )
