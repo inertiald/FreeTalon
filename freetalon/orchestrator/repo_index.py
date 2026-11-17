@@ -82,11 +82,61 @@ def _framework_of_imports(names: set[str]) -> str | None:
 
 
 def framework_in_text(text: str) -> str | None:
-    """The web framework a blob of Python source imports, if any."""
+    """The web framework a blob of Python source imports or uses, if any."""
     names: set[str] = set()
     for match in _IMPORT_LINE_RE.finditer(text):
         names.add(match.group(1) or match.group(2))
-    return _framework_of_imports(names)
+    found = _framework_of_imports(names)
+    if found is not None:
+        return found
+    for label, patterns in _FRAMEWORK_USAGE:
+        if any(pattern.search(text) for pattern in patterns):
+            return label
+    return None
+
+
+# Framework usage markers, for blobs of source that use a framework
+# without importing it: retry #18 attempt 2's heredoc wrote a Flask app
+# (@app.route + jsonify) with no import statement, so the import-only
+# check never saw it. A route decorator, a framework response helper,
+# or an app-object construction identifies the framework the same way
+# an import does. Ordered like _WEB_FRAMEWORKS; the first match wins.
+# Deliberately narrow: a bare `app.get(...)` call is not a marker (it
+# is also a test-client call), and @app.get/@app.post are Flask's route
+# shortcuts as well as FastAPI's, so they are claimed by neither side —
+# @router.get/@router.post is FastAPI-specific, and @*.route is Flask's.
+_FRAMEWORK_USAGE: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = (
+    (
+        "Flask",
+        (
+            re.compile(r"\bjsonify\s*\("),
+            re.compile(r"\bFlask\s*\("),
+            re.compile(r"@\w+\.route\s*\("),
+            re.compile(r"\brender_template\s*\("),
+        ),
+    ),
+    (
+        "FastAPI",
+        (
+            re.compile(r"\bFastAPI\s*\("),
+            re.compile(r"@router\.(?:get|post|put|delete|patch)\s*\("),
+        ),
+    ),
+    (
+        "aiohttp",
+        (
+            re.compile(r"\bweb\.Application\s*\("),
+            re.compile(r"\bapp\.router\.add_(?:get|post|put|delete|patch)\s*\("),
+        ),
+    ),
+    (
+        "Starlette",
+        (
+            re.compile(r"\bStarlette\s*\("),
+            re.compile(r"\bRoute\s*\(\s*[\"']/"),
+        ),
+    ),
+)
 
 
 # How much of the module inventory the prompt context carries. The index

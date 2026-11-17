@@ -1112,6 +1112,213 @@ def _validate_bash_command(node: PlanNode) -> list[str]:
     return errors
 
 
+def _sed_scan_delimited(text: str, index: int) -> tuple[str | None, int]:
+    """Scan a delimited pattern starting at text[index] (the delimiter).
+
+    Returns (pattern, index just past the closing delimiter), or
+    (None, len(text)) when unterminated. Backslash-escaped delimiters
+    do not close the pattern.
+    """
+    delim = text[index]
+    start = index + 1
+    cursor = start
+    while cursor < len(text):
+        char = text[cursor]
+        if char == "\\":
+            cursor += 2
+            continue
+        if char == delim:
+            return text[start:cursor], cursor + 1
+        cursor += 1
+    return None, len(text)
+
+
+def _sed_script_patterns(script: str) -> list[str]:
+    """The search patterns of a sed script, or [] when it has none to judge.
+
+    Handles `s<delim>pattern<delim>replacement<delim>[flags]` (any
+    delimiter, escaped delimiters skipped) and `/pattern/<command>`
+    addresses (delete, print, ...), including an address in front of an
+    `s` command (`/addr/s/pat/rep/` yields both patterns). Line-number
+    addresses (`10s/a/b/`, `1,5d`) carry no pattern of their own. A
+    script whose pattern cannot be parsed (unterminated) yields [] —
+    the command would fail at runtime, not silently, so there is
+    nothing to judge here.
+    """
+    text = script.strip()
+    patterns: list[str] = []
+    if text.startswith("/"):
+        pattern, after = _sed_scan_delimited(text, 0)
+        if pattern is None:
+            return []
+        patterns.append(pattern)
+        text = text[after:]
+    else:
+        match = re.match(r"\d+(?:,\d+)?", text)
+        if match:
+            text = text[match.end():]
+    if text.startswith("s") and len(text) >= 2:
+        pattern, _after = _sed_scan_delimited(text, 1)
+        if pattern is not None:
+            patterns.append(pattern)
+    return patterns
+
+
+def _sed_pattern_matches(pattern: str, text: str) -> bool:
+    """True when sed would find the pattern: literal text or a regex match.
+
+    sed's default regex is BRE, where ( ) { } + ? | are literal and
+    \\( \\) are groups — the opposite of Python's re. Checking both the
+    literal string and the Python-regex match covers both dialects: a
+    pattern that matches either way is one sed would act on.
+    """
+    if pattern in text:
+        return True
+    try:
+        return re.search(pattern, text) is not None
+    except re.error:
+        return False
+
+
+def _sed_in_place_edits(shell: str) -> list[tuple[str, str]]:
+    """(script, file) pairs for `sed -i` in-place edits in a shell string.
+
+    Tokenizes with shlex (heredoc bodies already stripped by the
+    caller). A `sed` token at a command position (start of the shell, or
+    after && / || / ; / | / sudo) starts an invocation; `-i`,
+    `-iSUFFIX`, `--in-place[=SUFFIX]`, and bundles containing `i` mark
+    an in-place edit; `-e SCRIPT` (attached or separate) collects a
+    script; `-f` is skipped. The first non-flag token is the script
+    when no `-e` was given; the rest are files, up to a command
+    separator or a redirect. Returns [] when the shell does not
+    tokenize or the edit is not in place. A `sed` inside a quoted
+    argument (echoed, not run) is not a command position and is skipped;
+    a `sed` run through xargs/find -exec is not seen either — both
+    noted, not covered.
+    """
+    try:
+        tokens = shlex.split(shell)
+    except ValueError:
+        return []
+    edits: list[tuple[str, str]] = []
+    index = 0
+    at_command_start = True
+    while index < len(tokens):
+        token = tokens[index]
+        if token in ("&&", "||", ";", "|"):
+            at_command_start = True
+            index += 1
+            continue
+        if token == "sudo":
+            index += 1
+            continue
+        if not at_command_start or (token != "sed" and not token.endswith("/sed")):
+            at_command_start = False
+            index += 1
+            continue
+        index += 1
+        in_place = False
+        scripts: list[str] = []
+        files: list[str] = []
+        while index < len(tokens):
+            arg = tokens[index]
+            if arg in ("&&", "||", ";", "|") or re.fullmatch(
+                r"\d*[<>]+", arg
+            ):
+                break
+            if arg.startswith("-") and arg != "-":
+                if arg == "-e":
+                    if index + 1 < len(tokens):
+                        scripts.append(tokens[index + 1])
+                        index += 2
+                    else:
+                        index += 1
+                    continue
+                if arg.startswith("-e"):
+                    scripts.append(arg[2:])
+                    index += 1
+                    continue
+                if arg.startswith("-f"):
+                    index += 1 if len(arg) > 2 else 2
+                    continue
+                if arg == "--in-place" or arg.startswith("--in-place="):
+                    in_place = True
+                    index += 1
+                    continue
+                if arg.startswith("--"):
+                    index += 1
+                    continue
+                if "i" in arg[1:]:
+                    in_place = True
+                index += 1
+                continue
+            if not scripts:
+                scripts.append(arg)
+            else:
+                files.append(arg)
+            index += 1
+        if in_place:
+            for script in scripts:
+                for target in files:
+                    edits.append((script, target))
+        at_command_start = True
+    return edits
+
+
+def _sed_noop_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    goal_text: str | None = None,
+    index: Any | None = None,
+) -> list[str]:
+    """Reject sed -i edits whose search pattern never occurs in the file.
+
+    Retry #18 attempt 3 step 1 ran `sed -i 's/def health(self):/.../'`
+    on freetalon/api.py, but api.py has no `def health(self):` — sed -i
+    with a non-matching pattern is a silent no-op: exit 0, file
+    unchanged, and the plan proceeds as if the endpoint were added.
+    General: when a bash node uses sed -i (in-place) against a file
+    that exists on disk at plan time, the search pattern must occur in
+    that file (as literal text or as a regex match); otherwise the edit
+    is rejected by name with the grounded move. Scoped to existing
+    files whose contents are readable at plan time — an edit to a file
+    the plan itself creates is not judged, and a pattern that cannot be
+    parsed is skipped (the command would fail at runtime, not
+    silently). `perl -pi -e` and other in-place editors are not covered.
+    """
+    errors: list[str] = []
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    grounded = _grounded_move_text(index, goal_text)
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("bash", "shell_exec"):
+            continue
+        command = node.inputs.get("command") or node.inputs.get("cmd")
+        if not isinstance(command, str) or not command:
+            continue
+        shell = _strip_heredoc_bodies(command)
+        for script, target in _sed_in_place_edits(shell):
+            path = _resolve_plan_target(target, root)
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            patterns = _sed_script_patterns(script)
+            if not patterns:
+                continue
+            missing = [p for p in patterns if not _sed_pattern_matches(p, text)]
+            if not missing:
+                continue
+            errors.append(
+                f"Planner node '{node.id}' runs sed -i on {target!r}, but "
+                f"the search pattern {missing[0]!r} does not occur in the "
+                f"file — sed -i with a non-matching pattern changes "
+                f"nothing (exit 0, file unchanged). Check the file's real "
+                f"contents and edit what is actually there.{grounded}"
+            )
+            break
+    return errors
+
+
 def _claw_error(node: PlanNode) -> str | None:
     """Return an error if the node's assigned_claw is not a registered claw."""
     claw = node.assigned_claw or ""
@@ -1182,6 +1389,17 @@ def _tmp_write_errors(
     passed route engagement because the /tmp path contains the module
     name as a substring.) General: any write node targeting /tmp on a
     route goal is flagged, naming the serving module(s).
+
+    Every write counts, not only a command that IS a single literal
+    write: retry #18 attempt 2 step 3 ran `curl ... | jq . >
+    /tmp/health_response.json` inside a compound command, and the old
+    check — which only recognized a command that is one echo/printf
+    write or one heredoc — never saw the redirect. The written paths
+    come from _node_written_paths (scaffold target, heredoc targets,
+    and every redirect in the shell, heredoc bodies and quoted
+    segments stripped first), so a redirect in any segment of a piped
+    or &&-chained command is flagged. A `tee` write is not caught —
+    there is no redirect to scan — noted, not fixed.
     """
     if not goal_text:
         return []
@@ -1191,22 +1409,7 @@ def _tmp_write_errors(
     modules = ", ".join(sorted({module for _, module in named}))
     errors: list[str] = []
     for node in nodes:
-        targets: list[str] = []
-        if node.assigned_claw in ("bash", "shell_exec"):
-            command = node.inputs.get("command") or node.inputs.get("cmd")
-            if isinstance(command, str):
-                written = _literal_write(command)
-                if written is not None:
-                    targets.append(written[0])
-        elif node.assigned_claw in ("scaffold", "file_writer"):
-            target = (
-                node.inputs.get("file_path")
-                or node.inputs.get("path")
-                or (node.outputs[0] if node.outputs else "")
-            )
-            if isinstance(target, str) and target:
-                targets.append(target)
-        for target in targets:
+        for target in sorted(_node_written_paths(node)):
             if target == "/tmp" or target.startswith("/tmp/"):
                 errors.append(
                     f"Planner node '{node.id}' writes to {target!r} — for a "
@@ -1255,7 +1458,10 @@ def _framework_errors(
     not use (retry #7 attempts 2-3 wrote a Flask app for /health,
     which freetalon/api.py serves with stdlib http.server). General:
     any written content (scaffold content, or a heredoc body) that
-    imports a web framework different from the serving module's.
+    imports OR uses a web framework different from the serving
+    module's. Use counts as well as imports: retry #18 attempt 2's
+    heredoc wrote @app.route + jsonify with no import statement, so
+    the import-only check never saw the Flask app.
     """
     if not goal_text:
         return []
@@ -1386,6 +1592,61 @@ def _wrong_location_errors(
                     f"is {counterpart}. Use the repo path, not the "
                     f"workspace path."
                 )
+    return errors
+
+
+def _missing_directory_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    index: Any | None = None,
+) -> list[str]:
+    """Reject writes to a repo-tree directory that does not exist.
+
+    Retry #18 attempts 2-3 both wrote their test file to
+    freetalon/tests/test_api.py — a directory that does not exist (repo
+    tests live at repo-root tests/), and nothing named it: the
+    wrong-location rule only flags paths under the workspace, and the
+    code-append parse check only names the file's syntax. A write whose
+    parent directory is missing can never land: the heredoc fails at
+    execution, or the file is created somewhere the suite never looks.
+    General: any write node (scaffold file_path, bash heredoc or
+    redirect) targeting a path under a repo tree (freetalon/ or tests/)
+    whose parent directory does not exist on disk is rejected by name,
+    with the correct location. Genuine generated files at the workspace
+    root and paths that actually exist on disk are not flagged.
+
+    Disk-independent: the target is resolved to its repo-relative form
+    first (an absolute fixture path outside this checkout reads this
+    checkout's copy), so the check answers the same on seeker7 and in
+    CI. A directory the plan itself creates (mkdir -p) is not
+    credited — noted, not covered.
+    """
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    errors: list[str] = []
+    for node in nodes:
+        for target in sorted(_node_written_paths(node)):
+            rel = _repo_relative_target(target, root)
+            if rel is None:
+                continue
+            parent = root / Path(rel).parent
+            if parent.exists():
+                continue
+            if rel.startswith("freetalon/tests/"):
+                test_name = rel[len("freetalon/tests/"):]
+                hint = (
+                    f"Repo tests live at {root}/tests/, not freetalon/tests/ — "
+                    f"write the test file to {root}/tests/{test_name}."
+                )
+            else:
+                hint = (
+                    f"Create the directory first, or write under an existing "
+                    f"directory in the repo (repo root {root})."
+                )
+            errors.append(
+                f"Planner node '{node.id}' writes to {target!r}, but its "
+                f"directory {str(parent)!r} does not exist in the repo. {hint}"
+            )
+            break
     return errors
 
 
@@ -1702,6 +1963,59 @@ def _resolve_target_path(path: str, repo_root: str | Path | None) -> Path:
     return rooted if rooted.exists() else candidate
 
 
+# First path components that mark a repo tree (code lives here).
+_REPO_TREE_ROOTS = ("freetalon", "tests")
+
+
+def _repo_relative_target(target: str, root: Path) -> str | None:
+    """The repo-relative form of a write/edit target, or None.
+
+    A target is a repo-tree path when its first component (after
+    resolving to the repo) is freetalon/ or tests/. Relative targets
+    are repo-relative already; absolute targets under the checkout root
+    resolve against it; absolute targets elsewhere (a fixture's absolute
+    seeker7 path read in CI) resolve from the first freetalon/ or
+    tests/ component, so a check built on this answers the same on
+    seeker7 and in CI. Anything else (workspace files, /tmp, /etc) is
+    not a repo-tree path and returns None.
+    """
+    candidate = Path(target)
+    if candidate.is_absolute():
+        try:
+            rel = str(candidate.relative_to(root))
+        except ValueError:
+            parts = candidate.parts
+            for position, part in enumerate(parts):
+                if part in _REPO_TREE_ROOTS:
+                    rel = "/".join(parts[position:])
+                    break
+            else:
+                return None
+    else:
+        rel = target
+    first = rel.split("/", 1)[0]
+    if first not in _REPO_TREE_ROOTS:
+        return None
+    return rel
+
+
+def _resolve_plan_target(target: str, root: Path) -> Path:
+    """The on-disk path a plan target names, resolved against the repo root.
+
+    Absolute repo-tree paths resolve via their repo-relative form, so a
+    fixture's absolute seeker7 path reads this checkout's copy in CI
+    (disk-independent, like _repo_relative_target); other absolute paths
+    read as-is; relative paths resolve against the repo root.
+    """
+    rel = _repo_relative_target(target, root)
+    if rel is not None:
+        return root / rel
+    candidate = Path(target)
+    if candidate.is_absolute():
+        return candidate
+    return root / candidate
+
+
 def _syntax_error_detail(exc: SyntaxError) -> str:
     """One-line syntax-error detail: message + the error line.
 
@@ -1879,6 +2193,7 @@ def _collect_plan_errors(
     )
     errors.extend(placeholder_errors)
     errors.extend(_code_append_errors(nodes, repo_root, goal_text, index))
+    errors.extend(_sed_noop_errors(nodes, repo_root, goal_text, index))
     standin_errors = _static_standin_errors(nodes, index=index, goal_text=goal_text)
     errors.extend(standin_errors)
     if index is not None:
@@ -1886,6 +2201,7 @@ def _collect_plan_errors(
         errors.extend(_tmp_write_errors(nodes, index, goal_text))
         errors.extend(_framework_errors(nodes, index, goal_text))
         errors.extend(_wrong_location_errors(nodes, index, workspace))
+    errors.extend(_missing_directory_errors(nodes, repo_root, index))
     # Cheap rejection (retry #12): the only errors are stand-in /
     # code-overwrite fakes, so re-prompting costs the model nothing to
     # fix and must not spend the repair budget. A rejection whose only

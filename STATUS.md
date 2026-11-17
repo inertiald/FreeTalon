@@ -1628,3 +1628,76 @@ Deliberately left out:
   __file__, which exists in real CI under /home/runner (and all 5 passed
   in the real CI 679 run).
 - Next: signal-loss fix (retry #18 weakness 1), then /health retry #19.
+
+## Update - 2026-11-17 (planner signal-loss fix, retry #18 weaknesses)
+
+- All five retry-#18 weaknesses fixed, CPU-only. Diagnosis, verified
+  by probe before editing: _collect_plan_errors already aggregates
+  all errors into one rejection -- the "signal loss" was that three
+  checks were blind to these shapes, so fixing the checks restores
+  the aggregation; there is no separate parse-error raise path.
+  (1) Parse-error rejection now carries the per-node validation
+  errors: _code_append_errors returns the split plan nodes and the
+  parse rejection is built from _collect_plan_errors on those nodes,
+  so one rejection names the parse error AND the framework / /tmp /
+  wrong-location defects. This also unbounds the
+  forbid-repeated-approaches mechanism, which can only forbid
+  approaches the rejection names -- Flask is now forbidden after
+  the first rejection.
+  (2) Framework check detects usage as well as imports:
+  RepoIndex.framework_in_text now also matches route decorators
+  (@app.route, @router.get), response helpers (jsonify), and
+  app-object construction (Flask(...), FastAPI(...)) in scaffold
+  content and heredoc bodies. Imports are checked first, usage
+  second; bare app.get(...) is deliberately not a marker.
+  (3) sed -i no-ops rejected at plan time: new _sed_noop_errors
+  parses sed scripts (s/// with any delimiter, -i/-iSUFFIX/
+  --in-place, bundles with i, -e scripts; -f skipped) and requires
+  each pattern to occur in the target file on disk (literal
+  substring or regex match, covering BRE vs ERE). Grounded move
+  appended. Only files that exist on disk are checked; edits to
+  files the plan itself creates are not rejected.
+  (4) Missing-directory check: new _missing_directory_errors
+  rejects a write node targeting a path under a repo-tree directory
+  that does not exist on disk, naming the correct location
+  (freetalon/tests/ -> repo-root tests/). Genuine generated files
+  at the workspace root and paths that actually exist are NOT
+  flagged.
+  (5) /tmp check scans every redirect segment: _tmp_write_errors
+  now uses _node_written_paths (all redirects in compound/piped
+  commands), not only a bare redirect.
+- Verbatim retry-#18 attempt 2 is now rejected with 4 errors
+  (parse + framework + missing-directory + /tmp); attempt 3 with
+  5 errors (the old 3 + sed no-op + missing-directory). Mocked
+  [Flask-heredoc, grounded] and [sed-no-op, grounded] both land
+  on the grounded plan in one repair round.
+- Tests 679 -> 708/708 green (+29 TestPlannerSignalLossFix):
+  verbatim attempt-2/attempt-3 rejections, both mocked repairs,
+  grounded-plan pass (incl. sed against an existing pattern and
+  writes to existing dirs), framework-usage / /tmp-in-compound /
+  sed-parser / missing-directory unit cases, and regression guards
+  for retries #17-#3, bare-dict criteria, duplicate ids, cycles,
+  self-dependency (retry-#10 count via _expected_retry10_error_count,
+  retry-#16 line via _expected_retry16_error_line -- no hard-coded
+  disk-dependent values).
+- Demo: tools/demo-signal-loss.py, log logs/demo-signal-loss.log
+  (ALL CHECKS PASSED) -- verbatim attempt 2 rejected with the parse
+  error plus framework, missing-directory, and /tmp errors; mocked
+  repair lands on the grounded plan in one round with Flask named
+  forbidden in the repair prompt.
+- M5 smoke passes (finance run-20261117T122820Z-90a451, ECU
+  run-20261117T122820Z-a3c7e4). freetalon/api.py untouched (219
+  lines, 0-line diff). No stray files. No LLM calls, no GPU, no
+  e2e driver, no push, no reboot, no power-limit change.
+- Known gaps still open (unchanged): file_matches outputs-only
+  hole; literal JSON answer to a NEW non-code file with only an
+  exit_code criterion; scaffold content not parse-checked (bash
+  writes only); scaffold-with-fragment overwriting a whole module;
+  echo regex misses a '>' inside a quoted echo body; tee writes
+  not caught by the /tmp check; perl -pi -e and other in-place
+  editors not covered by the sed check; a mkdir -p earlier in the
+  plan is not credited by the missing-directory check;
+  _validate_raw_nodes (schema-error path) runs only the stand-in
+  check, so a parse error in a plan that also has schema errors is
+  still lost there.
+- Next: /health retry #19.
