@@ -1013,3 +1013,39 @@ Deliberately left out:
   Known remaining gap: a literal JSON answer to a NEW non-code file
   with only an exit_code criterion still passes validation.
   Next: /health retry #13.
+
+## /health retry #13 (2026-11-16 evening)
+
+  FAILED at planning (DRIVER_EXIT:1, ~86s, no run created). Pre-flight
+  green (52C, 300W, x16, 0 Xid, head 51bdfc3, 555/555; fans 85%).
+  Intake succeeded. Four planner calls: (1) {"nodes":[]} -- empty plan,
+  CHEAP rejection, free re-prompt (the new fix worked); (2) the
+  retry-#12 echo fake verbatim (echo JSON answer > freetalon/api.py,
+  int ids) -- rejected with 3 schema errors (id/depends_on must be
+  strings); the code-overwrite stand-in error did NOT fire because
+  schema validation raises before the stand-in check runs, so this
+  one still spent a repair round -- the cheap path only triggers when
+  the stand-in error is the ONLY error; (3) a scaffold plan writing
+  a Flask app to freetalon/api.py -- otherwise well-shaped (correct
+  repo paths, string ids, correct node-id depends_on, all fields
+  present; the shape fixes ARE steering) -- rejected with 1 error by
+  the framework rule; (4) a MORE elaborate Flask scaffold (Ollama and
+  nvidia-smi subprocess checks, app.run on 8765) -- rejected with 1
+  error by the framework rule again. The model got a repair round for
+  the Flask error and used it to double down on Flask instead of
+  switching to http.server; budget exhausted -> driver raised at
+  plan_task_intent (planner.py:1890). Judge/replan never ran.
+  Endpoint NOT extended, no new tests, suite 555/555 green after, no
+  stray files. GPU survived (56C, 300W, x16, zero Xid; fans auto).
+  Log: freetalon-workspace/logs/llm-end-to-end-health-retry13-
+  2026-11-16.log. Note: an early --help probe accidentally started a
+  real run that head -30 killed mid-intake (SIGPIPE); it created no
+  run dir and left nothing behind; the real run was re-launched after
+  a 60s idle. Next weakness: the model converges on the Flask
+  scaffold and doubles down across repair rounds instead of switching
+  to http.server -- the framework rejection should name the grounded
+  move concretely (extend api.py's existing http.server handler in
+  place; add a do_GET branch for /health), the way the anti-fake
+  rejection names the grounded move. Secondary: the stand-in check
+  should run even when schema errors are present, so the int-id echo
+  fake is a cheap rejection instead of a repair-consuming one.
