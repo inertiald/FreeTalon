@@ -1381,3 +1381,57 @@ Deliberately left out:
   rejection not naming Flask//tmp (secondary -- the structural defect
   IS named, but the framework//tmp defects never reach the repair
   round on this path).
+
+## Update - 2026-11-17 (early, planner code-append fix)
+
+- Code-append fix DONE (CPU-only, no LLM/e2e/push/reboot): the three
+  retry-#16 weaknesses are fixed in freetalon/orchestrator/planner.py.
+  (1) Bash writes into an EXISTING code file are now guarded: for
+  Python the write is simulated at plan time (existing file + appended
+  lines, dash-echo escapes interpreted the way execution interprets
+  them) and the result must still parse with ast.parse; for other code
+  files (.js, .sh, ...) the plan must contain a node that measures the
+  file still working (tests_pass, a test-suite run, or py_compile on
+  the file). The exact retry-#16 v1 plan is now rejected with 1 error
+  naming node-2, freetalon/api.py, and the grounded move. Legit writes
+  still pass: heredoc/scaffold of real code to a NEW file, writes to
+  non-code files, writes followed by a validity check. (2) After any
+  empty reply the repair prompt carries a CONCRETE PLAN SKELETON for
+  the route goal (a fill-in-the-blanks 4-node shape with the serving
+  module, a test file, a test run, and a live curl -- a template to
+  complete, not a canned plan); an escalation on empty plans names the
+  grounded move. Mocked empty x2 then grounded lands in 3 calls;
+  mocked empty x5 escalates with the grounded move named (5 calls).
+  (3) The duplicate-key rejection now also carries the per-node
+  validation errors from the split nodes: verbatim retry-#15
+  attempt-2 is rejected with 7 errors -- duplicate keys, nesting,
+  2 parse errors, 2 /tmp errors, 1 Flask error. Also fixed: an
+  unterminated heredoc body now runs to the end of the command, so the
+  framework//tmp rules can see it; and repo_root is threaded from
+  _call_llm_with_repair into parse_planner_response.
+- Bugs found by the fix's own verification (all fixed, all now
+  covered by tests): the echo-write regex matched an empty op (the
+  first ">" belongs to the (?P<op> group syntax -- use >{1,2}); the
+  regex could not span the real newline inside retry-#16 node-2's
+  quoted literal (needs re.DOTALL); the split/hoist in
+  _duplicate_key_errors popped fields out of the inputs dicts before
+  the nesting check read them, so the nesting error vanished.
+- Tests: 653/653 green (626 + 27 new TestPlannerCodeAppendFix).
+  M5 smoke passes (finance run-20261117T110403Z-9b33db, ECU
+  run-20261117T110403Z-e49f2b). Demo tools/demo-code-append-guard.py
+  passes all checks (log logs/demo-code-append-guard.log, 54 lines):
+  retry-#16 v1 rejected by name, retry-#15 attempt-2 rejected naming
+  both duplicate keys and Flask//tmp, mocked empty-replan sequence
+  lands on a grounded plan.
+- freetalon/api.py untouched (219 lines, 0-line diff vs HEAD). No
+  stray files. GPU baseline: 47C, 43.01W, limit 300W, link x16,
+  zero Xid 79/154.
+- Known remaining gaps (not fixed): file_matches has the same
+  outputs-only hole the unwritten-file fix closed for file_exists; a
+  literal JSON answer written to a NEW non-code file with only an
+  exit_code criterion still passes; a scaffold whose content is real
+  code but syntactically invalid (retry-#13 attempt-4's Flask app) is
+  not parse-checked; a scaffold-with-fragment overwriting a whole
+  module is a pre-existing hazard (the scaffold handler replaces the
+  file; the ROUTE GOAL shape already steers there).
+- Next: /health retry #17 on the fixed planner.

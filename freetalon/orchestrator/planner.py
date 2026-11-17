@@ -1,6 +1,7 @@
 """LLM-backed planner for producing validated execution DAGs."""
 
 from __future__ import annotations
+import ast
 import json
 import re
 import shlex
@@ -121,6 +122,19 @@ class CheapRejectionError(LLMResponseError):
     so the repair loop re-prompts for free, up to a small cap, instead
     of burning a repair round. A subclass of LLMResponseError, so
     callers that catch LLMResponseError are unaffected.
+    """
+
+
+class EmptyPlanError(CheapRejectionError):
+    """An empty plan ({"nodes": []}) — a degenerate output, not a plan.
+
+    Retry #16: the re-planner returned empty plans 5 times in a row after
+    an informative failure, and the escalation carried no grounded
+    guidance. A distinct subclass lets the repair loop tell an empty reply
+    from any other cheap rejection, so a run of empties can be answered
+    with a concrete grounded skeleton instead of the same rejection again.
+    A subclass of CheapRejectionError, so the free re-prompt accounting
+    and every caller that catches CheapRejectionError are unaffected.
     """
 
 
@@ -294,7 +308,7 @@ def normalize_plan_nodes(
     if not nodes:
         # Cheap rejection (retry #12): an empty plan is a degenerate
         # output, not a plan that needs a repair round to fix.
-        raise CheapRejectionError("Planner response must include at least one plan node.")
+        raise EmptyPlanError("Planner response must include at least one plan node.")
 
     node_map = {node.id: node for node in nodes}
     if len(node_map) != len(nodes):
@@ -432,7 +446,9 @@ def _looks_like_prose_reserialization(payload: dict[str, Any]) -> bool:
     return prose_like * 2 >= len(keys)
 
 
-def _duplicate_key_errors(raw_text: str) -> list[str]:
+def _duplicate_key_errors(
+    raw_text: str,
+) -> tuple[list[str], list[dict[str, Any]]]:
     """Duplicate JSON keys in the raw planner output, as named rejections.
 
     Retry #15 attempt 2: the three nodes were concatenated into a single
@@ -442,8 +458,15 @@ def _duplicate_key_errors(raw_text: str) -> list[str]:
     the nonexistent node-2 -- and the only error the model saw was the
     unknown dependency, nothing about the real defect (a Flask heredoc
     to /tmp). Runs on the RAW text before the normal parse collapses it;
-    returns [] when the text is not parseable JSON (the normal parse
+    returns ([], []) when the text is not parseable JSON (the normal parse
     raises "not valid JSON" then) or has no duplicates.
+
+    Also returns the split nodes: when a node-shaped object has duplicate
+    keys, the merged object is split back into the nodes it was
+    concatenated from (a new node starts whenever a key repeats), with
+    outputs/acceptance/criteria hoisted out of inputs — so the caller can
+    run the per-node validation on what the model meant to write, instead
+    of only on the collapsed node.
 
     Only node-shaped objects count: a flat prose object whose keys are
     repeated words (retry #8 tokenized prose) is a prose re-serialization,
@@ -465,6 +488,7 @@ def _duplicate_key_errors(raw_text: str) -> list[str]:
     for attempt in attempts:
         found: list[tuple[str, list[str], list[int]]] = []
         nested_fields: set[str] = set()
+        split_nodes: list[dict[str, Any]] = []
 
         def hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             obj: dict[str, Any] = {}
@@ -486,12 +510,11 @@ def _duplicate_key_errors(raw_text: str) -> list[str]:
                     "criteria",
                 )
             )
-            if dups and (is_top or is_node):
-                if is_top:
-                    label = "the top-level object"
-                else:
-                    label = "node object (id " + repr(obj.get("id")) + ")"
-                found.append((label, dups, [counts[key] for key in dups]))
+            # Nesting is detected BEFORE the split below hoists fields
+            # out of the inputs dicts: the hoist pops outputs/acceptance/
+            # criteria out of the same dict objects, so a check after it
+            # would see nothing nested (retry #15 attempt 2 lost the
+            # nesting error this way).
             inputs = obj.get("inputs")
             if isinstance(inputs, dict):
                 nested_fields.update(
@@ -499,6 +522,35 @@ def _duplicate_key_errors(raw_text: str) -> list[str]:
                     for field in ("outputs", "acceptance", "criteria")
                     if field in inputs
                 )
+            if dups and (is_top or is_node):
+                if is_top:
+                    label = "the top-level object"
+                else:
+                    label = "node object (id " + repr(obj.get("id")) + ")"
+                found.append((label, dups, [counts[key] for key in dups]))
+                if is_node:
+                    # Split the merged object back into the nodes it was
+                    # concatenated from: a new node starts whenever a key
+                    # repeats (retry #15 attempt 2). The split nodes let
+                    # the caller run the per-node validation on what the
+                    # model meant to write, instead of only on the
+                    # collapsed node.
+                    split: list[dict[str, Any]] = []
+                    current: dict[str, Any] = {}
+                    for key, value in pairs:
+                        if key in current:
+                            split.append(current)
+                            current = {}
+                        current[key] = value
+                    if current:
+                        split.append(current)
+                    for node in split:
+                        node_inputs = node.get("inputs")
+                        if isinstance(node_inputs, dict):
+                            for field in ("outputs", "acceptance", "criteria"):
+                                if field in node_inputs:
+                                    node[field] = node_inputs.pop(field)
+                    split_nodes.extend(split)
             return obj
 
         try:
@@ -508,7 +560,7 @@ def _duplicate_key_errors(raw_text: str) -> list[str]:
         if not isinstance(parsed, dict):
             continue
         if not found and not nested_fields:
-            return []
+            return [], []
         errors: list[str] = []
         sep = "},{"
         for label, dups, dup_counts in found:
@@ -534,8 +586,8 @@ def _duplicate_key_errors(raw_text: str) -> list[str]:
                 "out of the \"inputs\" object so each node has its own outputs, "
                 "acceptance and criteria."
             )
-        return errors
-    return []
+        return errors, split_nodes
+    return [], []
 
 
 def parse_planner_response(
@@ -557,14 +609,34 @@ def parse_planner_response(
     raw_text = sanitize_llm_output(raw_text)
     print(f"\n--- RAW PLANNER OUTPUT ---\n{raw_text}\n--------------------------\n")
     
-    dup_errors = _duplicate_key_errors(raw_text)
+    dup_errors, split_nodes = _duplicate_key_errors(raw_text)
     if dup_errors:
-        noun = "error" if len(dup_errors) == 1 else "errors"
+        # Retry #15 attempt 2: the duplicate-key rejection named only the
+        # structural defect (the collapse), so the repair round never saw
+        # the Flask heredoc to /tmp — the framework and /tmp signals were
+        # lost, the same way they were lost on the unknown-dependency raise
+        # before b66c5ac. Run the per-node validation on the split nodes
+        # (what the model meant to write) and carry those errors in the
+        # same rejection, so the repair round sees the real defects.
+        repo_index = build_repo_index(repo_root) if goal_text else None
+        views = [
+            view
+            for view in (
+                _lenient_node_view(raw, position)
+                for position, raw in enumerate(split_nodes, start=1)
+            )
+            if view is not None
+        ]
+        extra_errors, _cheap = _collect_plan_errors(
+            views, repo_root, goal_text, workspace, index=repo_index
+        )
+        all_errors = dup_errors + extra_errors
+        noun = "error" if len(all_errors) == 1 else "errors"
         lines = "\n".join(
-            f"{index}. {error}" for index, error in enumerate(dup_errors, start=1)
+            f"{index}. {error}" for index, error in enumerate(all_errors, start=1)
         )
         raise LLMResponseError(
-            f"Planner output was rejected with {len(dup_errors)} {noun} — "
+            f"Planner output was rejected with {len(all_errors)} {noun} — "
             f"fix ALL of them:\n{lines}\n{_NODE_SHAPE_EXAMPLE}"
         )
     payload = parse_json_object(raw_text)
@@ -1108,6 +1180,12 @@ def _heredoc_bodies(command: str) -> list[str]:
             (i for i, line in enumerate(lines) if line.strip() == marker), None
         )
         if marker_idx is None:
+            # Unterminated heredoc: the shell reads to EOF (with a warning)
+            # and writes what it got, so the rest of the command IS the
+            # body. (Retry #15 attempt 2: the Flask heredoc had no closing
+            # EOF line, so the old code returned no body and the framework
+            # rule never saw the Flask app.)
+            bodies.append("".join(lines[1:]))
             return bodies
         bodies.append("".join(lines[1:marker_idx]))
         rest = "".join(lines[marker_idx + 1 :])
@@ -1424,6 +1502,253 @@ def _placeholder_scaffold_errors(
     return errors
 
 
+_ECHO_ESCAPES = {
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "\\": "\\",
+    '"': '"',
+    "'": "'",
+}
+
+_ECHO_WRITE_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:echo|printf)\s+(?P<body>.*?)\s*(?P<op>>{1,2})\s*(?P<target>[^\s;&|]+)",
+    re.DOTALL,
+)
+
+_TEST_RUN_RE = re.compile(
+    r"python3?\s+(?:-m\s+unittest|\S*test_\w+\.py)|pytest\b"
+)
+
+
+def _interpret_echo_escapes(text: str) -> str:
+    """Interpret backslash escapes the way the executor's shell echo does.
+
+    Bash commands run under /bin/sh (dash), whose echo interprets \\n,
+    \\t, \\\\, and friends. Retry #16 node-2 echoed 'def health():\\nreturn
+    "OK"' and the file received two lines, not one literal backslash-n —
+    so plan-time validation must decode the escapes the same way, or it
+    validates a different file than execution produces.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text) and text[index + 1] in _ECHO_ESCAPES:
+            out.append(_ECHO_ESCAPES[text[index + 1]])
+            index += 2
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+def _bash_code_writes(command: str) -> list[tuple[str, str, bool]]:
+    """Every (target, content, is_append) code write in a bash command.
+
+    Heredocs (body verbatim — a quoted marker means no escape
+    interpretation) and echo/printf redirects (quoted segments only,
+    with dash-echo escapes interpreted — the same rule _literal_write
+    uses for a single write). Unquoted echo bodies are not extracted:
+    they may hold variables or globs, not a literal the model wrote.
+    Returns [] when the command writes nothing extractable.
+    """
+    writes: list[tuple[str, str, bool]] = []
+    bodies = _heredoc_bodies(command)
+    for position, match in enumerate(_STRIP_HEREDOC_RE.finditer(command)):
+        if position >= len(bodies):
+            break
+        head = match.group(0).split("<<", 1)[0]
+        writes.append((match.group("target"), bodies[position], ">>" in head))
+    shell = _strip_heredoc_bodies(command)
+    for match in _ECHO_WRITE_RE.finditer(shell):
+        segments = _quoted_segments(match.group("body"))
+        if not segments:
+            continue
+        content = _interpret_echo_escapes(" ".join(segments))
+        writes.append((match.group("target"), content, match.group("op") == ">>"))
+    return writes
+
+
+def _plan_measures_validity(nodes: list[PlanNode], path: str) -> bool:
+    """True when some node in the plan measures that a file still works.
+
+    A tests_pass criterion runs the suite; a test-suite run (unittest /
+    pytest / a test file) measures the repo's code; a py_compile on the
+    file itself measures that file. The escape hatch for writes the
+    planner cannot parse at plan time (a non-Python code file).
+    """
+    for node in nodes:
+        for criterion in node.criteria or []:
+            if isinstance(criterion, dict) and criterion.get("type") == CRITERION_TESTS_PASS:
+                return True
+        if (node.assigned_claw or "") not in ("bash", "shell_exec"):
+            continue
+        command = node.inputs.get("command") or node.inputs.get("cmd")
+        if not isinstance(command, str):
+            continue
+        shell = _strip_heredoc_bodies(command)
+        if "py_compile" in shell and path in shell:
+            return True
+        if _TEST_RUN_RE.search(shell):
+            return True
+    return False
+
+
+def _grounded_move_text(index: Any | None, goal_text: str | None) -> str:
+    """The grounded-move sentence(s) for a route goal, or "".
+
+    The same sentence _static_standin_errors appends: extend the serving
+    module in place, write real tests, curl the live API port. Shared so
+    every rejection that steers toward the grounded move names it the
+    same way.
+    """
+    if index is None or not goal_text:
+        return ""
+    named = _routes_named_in_goal(goal_text, index)
+    if not named:
+        return ""
+    return " " + " ".join(
+        _grounded_move_sentence(
+            route,
+            str(index.root / module),
+            index.api_port,
+            index.route_handlers.get(route),
+        )
+        for route, module in named
+    )
+
+
+def _resolve_target_path(path: str, repo_root: str | Path | None) -> Path:
+    """The on-disk path a plan target names (same resolution as _path_exists_on_disk)."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    rooted = resolve_repo_root(repo_root) / candidate
+    return rooted if rooted.exists() else candidate
+
+
+def _syntax_error_detail(exc: SyntaxError) -> str:
+    """One-line syntax-error detail: message + the error line.
+
+    The parser's message may already end with the line where the
+    construct starts ("expected an indented block after function
+    definition on line 220") while exc.lineno is the line where the
+    error was detected (221) — strip the trailing reference so the
+    detail reads "… on line 221", not "… on line 220 on line 221".
+    """
+    msg = re.sub(r" on line \d+$", "", exc.msg)
+    if exc.lineno is not None:
+        return f"{msg} on line {exc.lineno}"
+    return msg
+
+
+def _code_append_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    goal_text: str | None = None,
+    index: Any | None = None,
+) -> list[str]:
+    """Reject bash writes that would corrupt an existing code file.
+
+    Retry #16: node-1 and node-2 echoed two lines into freetalon/api.py
+    (a comment, then 'def health():\\nreturn "OK"') with only exit_code
+    criteria — both measured PASS while the module broke (IndentationError
+    on line 221; the suite fell to 608 tests, 18 failures + 2 errors).
+    The placeholder guard covers scaffold only, and the stand-in rule
+    fires only on JSON literals, so an echo-append of broken code was
+    unguarded. Two mechanisms, by language:
+
+    - Python (.py): simulate the write at plan time (append to the file
+      on disk, or the content alone for a new file) and parse the result
+      with ast.parse. A write that leaves the file unparseable is
+      rejected by name, with the syntax error and the grounded move.
+      Echo escapes are interpreted the way dash echo does, so the
+      simulated file is the file execution produces.
+    - Other code files (.js, .sh, ...): no parser is available, so the
+      write is rejected unless some node in the plan measures the file
+      still working (a tests_pass criterion, a test-suite run, or a
+      py_compile on the file).
+
+    Skipped when the written literal is already a hardcoded answer: the
+    stand-in rule owns that defect (retry #12: a JSON literal echoed
+    over api.py). Skipped when the existing file itself no longer parses
+    — it is already broken, and this rule cannot judge the write. A
+    scaffold write is NOT parse-checked here: the placeholder guard
+    covers the observed scaffold hole, and a scaffold whose content is
+    real code but syntactically invalid (retry #13 attempt 4's Flask app)
+    is a separate, unobserved hole.
+    """
+    errors: list[str] = []
+    grounded = _grounded_move_text(index, goal_text)
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("bash", "shell_exec"):
+            continue
+        command = node.inputs.get("command") or node.inputs.get("cmd")
+        if not isinstance(command, str) or not command:
+            continue
+        for target, content, is_append in _bash_code_writes(command):
+            if not is_code_path(target):
+                continue
+            if _literal_is_answer(content):
+                continue
+            exists = _path_exists_on_disk(target, repo_root)
+            if Path(target).suffix.lower() == ".py":
+                if exists:
+                    try:
+                        existing = _resolve_target_path(target, repo_root).read_text(
+                            encoding="utf-8"
+                        )
+                    except OSError:
+                        continue
+                    try:
+                        ast.parse(existing)
+                    except SyntaxError:
+                        continue
+                    if is_append:
+                        simulated = existing
+                        if not simulated.endswith("\n"):
+                            simulated += "\n"
+                        simulated += content
+                        if not simulated.endswith("\n"):
+                            simulated += "\n"
+                    else:
+                        simulated = content
+                    try:
+                        ast.parse(simulated)
+                    except SyntaxError as exc:
+                        errors.append(
+                            f"Planner node '{node.id}' writes code into "
+                            f"{target!r} that would break the module: after "
+                            f"this write the file no longer parses as Python "
+                            f"({_syntax_error_detail(exc)}). A bash append "
+                            "or heredoc must not corrupt an existing code "
+                            "file — write the edit with real code (scaffold "
+                            "claw, or a bash heredoc) and verify the file "
+                            "still parses (python -m py_compile "
+                            f"{target}) and the tests pass.{grounded}"
+                        )
+                else:
+                    try:
+                        ast.parse(content)
+                    except SyntaxError as exc:
+                        errors.append(
+                            f"Planner node '{node.id}' writes {target!r} "
+                            "with code that does not parse as Python "
+                            f"({_syntax_error_detail(exc)}) — write valid "
+                            f"code.{grounded}"
+                        )
+            elif exists and not _plan_measures_validity(nodes, target):
+                errors.append(
+                    f"Planner node '{node.id}' writes into {target!r}, an "
+                    "existing code file, but no node in the plan measures "
+                    "that the file still works — add a node that runs the "
+                    f"tests or otherwise verifies {target!r} still parses "
+                    f"and works.{grounded}"
+                )
+    return errors
+
+
 def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
@@ -1475,6 +1800,7 @@ def _collect_plan_errors(
                 errors.append(error)
     errors.extend(_unwritten_file_errors(nodes, repo_root))
     errors.extend(_placeholder_scaffold_errors(nodes, repo_root))
+    errors.extend(_code_append_errors(nodes, repo_root, goal_text, index))
     standin_errors = _static_standin_errors(nodes, index=index, goal_text=goal_text)
     errors.extend(standin_errors)
     if index is not None:
@@ -1585,8 +1911,9 @@ def _literal_write(command: str) -> tuple[str, str] | None:
             if line.strip() == marker:
                 break
             body.append(line)
-        else:
-            return None
+        # No closing marker: the shell reads to EOF and writes what it got
+        # (retry #15 attempt 2), so the body is everything after the
+        # heredoc line either way.
         return heredoc.group("target"), "\n".join(body)
     match = _LITERAL_WRITE_RE.match(command)
     if not match:
@@ -2173,6 +2500,130 @@ def _dropped_fields_note(prev_text: str | None, cur_text: str) -> str:
     )
 
 
+def _grounded_move_for_goal(goal_text: str | None, repo_root: str | Path | None) -> str:
+    """The grounded-move sentence(s) for a route goal, or "".
+
+    Used when the repair loop gives up on empty plans (retry #16): the
+    escalation names the valid move instead of failing silently on an
+    empty reply. Builds the index from repo_root (the checkout holding
+    this package when None).
+    """
+    if not goal_text:
+        return ""
+    try:
+        index = build_repo_index(repo_root)
+    except OSError:
+        return ""
+    return _grounded_move_text(index, goal_text)
+
+
+def _grounded_skeleton(
+    goal_text: str | None,
+    repo_root: str | Path | None = None,
+    workspace: str | None = None,
+) -> str:
+    """A concrete fill-in-the-blanks plan skeleton for a route goal, or "".
+
+    Retry #16: after an informative failure the re-planner returned
+    {"nodes": []} five times in a row — the ROUTE GOAL shape in prose was
+    not enough to get it writing again. A skeleton lowers the generation
+    burden to filling in the code: the node ids, claws, file paths, and
+    criteria are already there, mirroring the grounded plan shape (edit
+    the serving module, write + run the tests, curl the live route).
+    The skeleton is a SHAPE to complete, not a plan to copy verbatim:
+    every "# TODO" line must be replaced with real code, and a TODO
+    comment copied into a scaffold is rejected by the placeholder guard
+    (it would overwrite the existing module with a comment stub), so a
+    verbatim copy cannot slip through as a plan.
+    Returns "" when the goal names no existing route.
+    """
+    if not goal_text:
+        return ""
+    try:
+        index = build_repo_index(repo_root)
+    except OSError:
+        return ""
+    named = _routes_named_in_goal(goal_text, index)
+    if not named:
+        return ""
+    route, module = named[0]
+    module_path = str(index.root / module)
+    handler = index.route_handlers.get(route)
+    if handler is not None:
+        edit = (
+            f"Extend {module_path} in place — add a {route} branch to {handler}"
+        )
+    else:
+        edit = f"Extend {module_path} in place to implement {route}"
+    test_path = (
+        f"{str(workspace).rstrip('/')}/test_health.py"
+        if workspace
+        else str(index.root / "tests" / "test_health.py")
+    )
+    nodes: list[dict[str, Any]] = [
+        {
+            "id": "step-1",
+            "objective": edit,
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": module_path,
+                "content": f"# TODO: replace this comment with the real code — {edit.lower()}",
+            },
+            "outputs": [module_path],
+            "acceptance": [f"The {route} endpoint is implemented in {module_path}."],
+            "criteria": [{"type": "file_exists", "path": module_path}],
+        },
+        {
+            "id": "step-2",
+            "objective": f"Write the tests for {route}",
+            "depends_on": ["step-1"],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": (
+                    f"cat > {test_path} <<'EOF'\n"
+                    f"# TODO: replace this comment with the real test code for {route}\n"
+                    "EOF"
+                )
+            },
+            "outputs": [test_path],
+            "acceptance": [f"The tests for {route} exist."],
+            "criteria": [{"type": "file_exists", "path": test_path}],
+        },
+        {
+            "id": "step-3",
+            "objective": f"Run the tests for {route}",
+            "depends_on": ["step-2"],
+            "assigned_claw": "bash",
+            "inputs": {"command": f"python3 {test_path}"},
+            "outputs": ["test results"],
+            "acceptance": [f"The tests for {route} pass."],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        },
+        {
+            "id": "step-4",
+            "objective": f"Verify {route} live",
+            "depends_on": ["step-3"],
+            "assigned_claw": "bash",
+            "inputs": {"command": f"curl -s http://localhost:{index.api_port}{route}"},
+            "outputs": ["verification"],
+            "acceptance": [f"{route} returns its JSON live."],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        },
+    ]
+    skeleton = json.dumps({"nodes": nodes}, indent=2)
+    return (
+        "CONCRETE PLAN SKELETON — your previous reply was an empty plan "
+        "({\"nodes\": []}). Do not return an empty plan again. Complete the "
+        "skeleton below with REAL code and REAL tests, then return the "
+        "completed JSON as your output. The skeleton is the SHAPE of your "
+        "output, not instruction text to re-serialize: every \"# TODO\" line "
+        "must be replaced with real code. Copying a TODO comment into a "
+        "scaffold will be rejected — the scaffold must contain the real "
+        f"implementation.\n{skeleton}"
+    )
+
+
 def _call_llm_with_repair(
     system_prompt: str,
     user_prompt: str,
@@ -2182,6 +2633,7 @@ def _call_llm_with_repair(
     max_free_reprompts: int = 2,
     goal_text: str | None = None,
     workspace: str | None = None,
+    repo_root: str | Path | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
 
@@ -2207,33 +2659,54 @@ def _call_llm_with_repair(
     keeps coming eventually spends repairs and the loop still ends
     (at most 1 + max_free_reprompts + max_repairs calls). A cheap
     rejection past the free cap falls through to the repair budget.
+
+    A run of empty plans is answered with a concrete grounded skeleton
+    (retry #16): after any empty reply the next repair prompt carries a
+    fill-in-the-blanks plan skeleton for the route goal, so the model has
+    structure to complete instead of giving up again. And when the budget
+    is exhausted on empty plans, the raised error names the grounded move
+    instead of failing silently on an empty reply.
     """
     prompt = user_prompt
     last_error: LLMResponseError | None = None
     prev_response_text: str | None = None
     repairs_used = 0
     free_used = 0
+    empty_streak = 0
     while True:
         response_text = call_llm(system_prompt, prompt, settings=settings)
         try:
             return parse_planner_response(
-                response_text, goal_text=goal_text, workspace=workspace
+                response_text,
+                goal_text=goal_text,
+                workspace=workspace,
+                repo_root=repo_root,
             )
         except LLMResponseError as exc:
             last_error = exc
+            if isinstance(exc, EmptyPlanError):
+                empty_streak += 1
+            else:
+                empty_streak = 0
             if isinstance(exc, CheapRejectionError) and free_used < max_free_reprompts:
                 free_used += 1
             elif repairs_used < max_repairs:
                 repairs_used += 1
             else:
                 break
+            skeleton_block = ""
+            if empty_streak >= 1:
+                skeleton = _grounded_skeleton(goal_text, repo_root, workspace)
+                if skeleton:
+                    skeleton_block = f"\n{skeleton}\n"
             prompt = (
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
                 f"Rejection reason: {exc}\n"
                 f"Previous output: {_describe_failed_output(response_text)}\n"
                 f"{_dropped_fields_note(prev_response_text, response_text)}"
-                f"\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n\n"
+                f"\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n"
+                f"{skeleton_block}\n"
                 "Return ONLY a corrected JSON object with a \"nodes\" array that "
                 "fixes ALL of the rejection reasons listed above. Every node "
                 "must match the NODE SHAPE above — do not drop a field from it "
@@ -2242,6 +2715,18 @@ def _call_llm_with_repair(
             )
             prev_response_text = response_text
     assert last_error is not None
+    if isinstance(last_error, EmptyPlanError):
+        # Retry #16: the re-planner returned empty plans five times in a
+        # row, and the escalation said only "must include at least one
+        # plan node" — no grounded guidance for the next attempt or the
+        # operator. Name the grounded move in the escalation itself.
+        grounded = _grounded_move_for_goal(goal_text, repo_root)
+        if grounded:
+            raise EmptyPlanError(
+                f"{last_error}{grounded} The model returned empty plans "
+                "repeatedly instead of a plan DAG — produce the grounded "
+                "plan above, do not return another empty plan."
+            ) from last_error
     raise last_error
 
 
@@ -2298,6 +2783,7 @@ def plan_task_intent(
         max_repairs=max_repairs,
         goal_text=intent.goal,
         workspace=workspace,
+        repo_root=repo_root,
     )
     return build_execution_plan(intent, nodes, metadata, plan_id=plan_id)
 
@@ -2338,5 +2824,6 @@ def replan_from_brief(
         max_repairs=max_repairs,
         goal_text=_goal_text_from_brief(brief),
         workspace=brief.get("workspace"),
+        repo_root=repo_root,
     )
     return nodes

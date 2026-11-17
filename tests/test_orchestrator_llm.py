@@ -6368,3 +6368,557 @@ class TestPlannerDuplicateKeysFix(unittest.TestCase):
             normalize_plan_nodes(
                 [{"id": "a", "objective": "First", "depends_on": ["a"]}]
             )
+
+class TestPlannerCodeAppendFix(unittest.TestCase):
+    """Bash appends into an existing code file are unguarded (retry #16); the re-planner gives up with empty plans; the duplicate-key rejection loses the Flask//tmp signal.
+
+    Retry #16 (log llm-end-to-end-health-retry16-2026-11-16.log, run
+    run-20261117T102447Z-e8bfa4) failed twice over. First, the accepted
+    v1 plan echoed two lines into the real freetalon/api.py (a comment,
+    then 'def health():\\nreturn "OK"') with only exit_code criteria --
+    both measured PASS while the module broke (IndentationError on line
+    221; the suite fell to 608 tests, 18 failures + 2 errors). The
+    placeholder guard covers scaffold only, and the stand-in rule fires
+    only on JSON literals, so an echo-append of broken code was
+    unguarded. Second, after the informative failure the re-planner
+    returned {"nodes":[]} five times in a row and escalated with no
+    grounded guidance. Third, the retry-#15 Flask heredoc plan was
+    rejected for duplicate keys only -- the Flask//tmp defects never
+    reached the repair round on that path.
+
+    Three fixes: (1) a bash write into an existing code file is
+    rejected by name unless the plan measures the file still working --
+    for Python the write is simulated at plan time (existing file +
+    appended lines) and the result must still parse with ast.parse
+    (dash-echo escapes interpreted the way execution interprets them);
+    for other code files a validity measurement is required. (2) After
+    any empty reply the repair prompt carries a concrete grounded
+    skeleton for the route goal (a fill-in-the-blanks plan shape, not a
+    canned plan), and an escalation on empty plans names the grounded
+    move. (3) The duplicate-key rejection also carries the per-node
+    validation errors (framework, /tmp, prose, stand-in, route
+    engagement, unwritten file) from the split nodes, mirroring the
+    unknown-dependency fix from b66c5ac. The heredoc EOF terminator is
+    also fixed: an unterminated heredoc body runs to the end of the
+    command, so the framework//tmp rules can see it.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+    # A generic (non-route) goal for the validity-measurement tests: the
+    # /tmp, framework and route-engagement rules are route-scoped, so a
+    # goal that names no route keeps those tests focused on the
+    # code-append rule.
+    GENERIC_GOAL = "Add a logging helper to the app and verify it works."
+
+    # The exact retry-#16 v1 plan nodes, read from
+    # runs/run-20261117T102447Z-e8bfa4/plan-v001.json (the node-2 command
+    # carries a real newline inside its quoted literal, exactly as the
+    # parsed plan holds it).
+    RETRY16_V1_NODES = [
+        {
+            "id": "node-1",
+            "objective": "Create the /health endpoint in api.py",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": "echo '# /health endpoint' >> /home/seeker/projects/FreeTalon/freetalon/api.py"
+            },
+            "outputs": ["/home/seeker/projects/FreeTalon/freetalon/api.py"],
+            "acceptance": ["The /health endpoint is created in api.py"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        },
+        {
+            "id": "node-2",
+            "objective": "Add the health check logic to api.py",
+            "depends_on": ["node-1"],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": "echo 'def health():\nreturn \"OK\"' >> /home/seeker/projects/FreeTalon/freetalon/api.py"
+            },
+            "outputs": ["/home/seeker/projects/FreeTalon/freetalon/api.py"],
+            "acceptance": ["The health check logic is added to api.py"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        },
+        {
+            "id": "node-3",
+            "objective": "Verify the /health endpoint returns OK",
+            "depends_on": ["node-2"],
+            "assigned_claw": "bash",
+            "inputs": {"command": "curl http://localhost:8765/health | grep \"OK\""},
+            "outputs": ["The output of the curl command"],
+            "acceptance": ["The /health endpoint returns OK"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        },
+    ]
+
+    def setUp(self) -> None:
+        self.intent = TaskIntent(
+            goal=self.HEALTH_GOAL,
+            project_type="bash",
+            capabilities=["scaffold", "bash", "llm_synthesis"],
+            constraints={"workspace": "/home/seeker/freetalon-workspace"},
+            missing_inputs=[],
+        )
+        self.settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _grounded_health_nodes(self) -> list[dict]:
+        """The grounded plan, from the previous fix's test class."""
+        grounded = TestPlannerGroundedShapeFix()
+        grounded.setUp()
+        return grounded._grounded_health_nodes()
+
+    def _brief(self) -> dict:
+        """The re-plan brief, from the fake-and-memory fix's test class."""
+        fake = TestPlannerFakeAndMemoryFix()
+        fake.setUp()
+        return fake._brief()
+
+    def _retry16_v1_nodes(self) -> list[dict]:
+        import copy
+
+        return copy.deepcopy(self.RETRY16_V1_NODES)
+
+    @staticmethod
+    def _bash_node(
+        command: str,
+        node_id: str = "step_1",
+        depends_on: list[str] | None = None,
+        outputs: list[str] | None = None,
+    ) -> dict:
+        return {
+            "id": node_id,
+            "objective": "Do the work",
+            "depends_on": depends_on or [],
+            "assigned_claw": "bash",
+            "inputs": {"command": command},
+            "outputs": outputs or ["result"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+
+    # --- (a) The exact retry-#16 v1 plan is rejected by name ---
+
+    def test_retry16_v1_echo_append_rejected_by_name(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(self._retry16_v1_nodes()),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        # Exactly one error: node-2's append breaks the module. (In CI the
+        # seeker7 path does not exist, so the content alone is
+        # parse-checked; on seeker7 the append is simulated against the
+        # real file. Both branches reject with one error.)
+        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("node-2", message)
+        self.assertIn("freetalon/api.py", message)
+        self.assertIn("parses as Python", message)
+        self.assertIn("expected an indented block", message)
+        self.assertIn("grounded move", message)
+
+    # --- (b) A mocked echo-append reply repairs to a grounded plan ---
+
+    def test_echo_append_repairs_to_grounded_plan_in_one_round(self) -> None:
+        bad = self._dag(self._retry16_v1_nodes())
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=[bad, good]
+        ) as call_mock:
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        self.assertEqual(call_mock.call_count, 2)
+        nodes = plan.nodes
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(nodes[0].inputs["file_path"], self.api_path)
+        repair_prompt = call_mock.call_args[0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("parses as Python", repair_prompt)
+        self.assertIn("freetalon/api.py", repair_prompt)
+
+    # --- (c) Validity measurements, new files, and non-code files pass ---
+
+    def test_append_to_js_file_with_test_run_passes(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            js_path = os.path.join(tmp, "app.js")
+            Path(js_path).write_text('console.log("start");\n', encoding="utf-8")
+            nodes = [
+                self._bash_node(
+                    f"echo 'console.log(\"hi\");' >> {js_path}", node_id="step_1"
+                ),
+                self._bash_node(
+                    f"python3 -m unittest discover -s {tmp}/tests",
+                    node_id="step_2",
+                    depends_on=["step_1"],
+                ),
+            ]
+            parsed, _metadata = parse_planner_response(
+                self._dag(nodes), goal_text=self.GENERIC_GOAL
+            )
+        self.assertEqual(len(parsed), 2)
+
+    def test_append_to_js_file_without_measurement_rejected(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            js_path = os.path.join(tmp, "app.js")
+            Path(js_path).write_text('console.log("start");\n', encoding="utf-8")
+            nodes = [
+                self._bash_node(
+                    f"echo 'console.log(\"hi\");' >> {js_path}", node_id="step_1"
+                ),
+            ]
+            with self.assertRaises(LLMResponseError) as caught:
+                parse_planner_response(
+                    self._dag(nodes), goal_text=self.GENERIC_GOAL
+                )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("app.js", message)
+        self.assertIn("still works", message)
+
+    def test_append_to_py_file_with_py_compile_passes(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            py_path = os.path.join(tmp, "helper.py")
+            Path(py_path).write_text("x = 0\n", encoding="utf-8")
+            nodes = [
+                self._bash_node(f"echo 'x = 1' >> {py_path}", node_id="step_1"),
+                self._bash_node(
+                    f"python3 -m py_compile {py_path}",
+                    node_id="step_2",
+                    depends_on=["step_1"],
+                ),
+            ]
+            parsed, _metadata = parse_planner_response(
+                self._dag(nodes), goal_text=self.GENERIC_GOAL
+            )
+        self.assertEqual(len(parsed), 2)
+
+    def test_heredoc_to_new_py_file_passes(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            new_path = os.path.join(tmp, "newmod.py")
+            command = (
+                f"cat > {new_path} <<'EOF'\n"
+                "# a new module\n"
+                "def greet():\n"
+                '    return "hi"\n'
+                "EOF"
+            )
+            nodes = [self._bash_node(command, node_id="step_1")]
+            parsed, _metadata = parse_planner_response(
+                self._dag(nodes), goal_text=self.GENERIC_GOAL
+            )
+        self.assertEqual(len(parsed), 1)
+
+    def test_write_to_non_code_file_passes(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            txt_path = os.path.join(tmp, "notes.txt")
+            nodes = [
+                self._bash_node(f"echo 'hello' >> {txt_path}", node_id="step_1"),
+            ]
+            parsed, _metadata = parse_planner_response(
+                self._dag(nodes), goal_text=self.GENERIC_GOAL
+            )
+        self.assertEqual(len(parsed), 1)
+
+    # --- (d) Empty re-plans get a skeleton; five empties escalate grounded ---
+
+    def test_empty_replans_then_grounded_plan_lands(self) -> None:
+        from freetalon.orchestrator.planner import replan_from_brief
+
+        empty = '{"nodes": [], "metadata": {}}'
+        good = self._dag(self._grounded_health_nodes())
+        with patch(
+            "freetalon.orchestrator.planner.call_llm",
+            side_effect=[empty, empty, good],
+        ) as call_mock:
+            nodes = replan_from_brief(self._brief())
+        # Two empty replies are free re-prompts (cap 2); the grounded plan
+        # lands on the third call, inside the existing budget.
+        self.assertEqual(call_mock.call_count, 3)
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        # The second call's repair prompt carries the grounded skeleton.
+        second_prompt = call_mock.call_args_list[1][0][1]
+        self.assertIn("CONCRETE PLAN SKELETON", second_prompt)
+        self.assertIn("freetalon/api.py", second_prompt)
+        self.assertIn("step_1", second_prompt)
+
+    def test_empty_replans_five_times_escalates_with_grounded_move(self) -> None:
+        from freetalon.orchestrator.planner import EmptyPlanError, replan_from_brief
+
+        empty = '{"nodes": [], "metadata": {}}'
+        with patch(
+            "freetalon.orchestrator.planner.call_llm",
+            side_effect=[empty, empty, empty, empty, empty],
+        ) as call_mock:
+            with self.assertRaises(EmptyPlanError) as caught:
+                replan_from_brief(self._brief())
+        # 1 initial + 2 free re-prompts + 2 repairs = 5 calls, then the
+        # budget is exhausted -- and the escalation names the grounded move.
+        self.assertEqual(call_mock.call_count, 5)
+        message = str(caught.exception)
+        self.assertIn("grounded move", message)
+        self.assertIn("freetalon/api.py", message)
+        self.assertIn("empty plans", message)
+
+    # --- (e) Retry-#15 attempt 2 names duplicate keys AND Flask//tmp ---
+
+    def test_retry15_attempt2_names_duplicate_keys_and_flask_tmp(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                TestPlannerDuplicateKeysFix.RETRY15_ATTEMPT2_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        # 7 = duplicate keys + nesting + 2 parse errors + 2 /tmp errors +
+        # 1 framework error.
+        self.assertIn("was rejected with 7 errors", message)
+        self.assertIn("duplicate JSON keys", message)
+        self.assertIn("nests", message)
+        self.assertIn("Flask", message)
+        self.assertIn("/tmp/freetalon_api.py", message)
+        self.assertIn("/tmp/freetalon_api_test.py", message)
+        self.assertIn("does not parse as Python", message)
+
+    # --- (f) Regression guards: every earlier fix still holds ---
+
+    def test_retry14_v1_three_prose_errors(self) -> None:
+        nodes = TestPlannerScaffoldGuardFix._retry14_v1_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 3 errors", message)
+        self.assertEqual(
+            message.count("bash command is prose, not a shell command"), 3
+        )
+
+    def test_retry14_v2_two_errors(self) -> None:
+        nodes = TestPlannerScaffoldGuardFix._retry14_v2_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 2 errors", message)
+        self.assertIn("freetalon/api.py", message)
+        self.assertIn("placeholder", message)
+
+    def test_retry14_v3_one_error_names_api(self) -> None:
+        guard = TestPlannerScaffoldGuardFix()
+        guard.setUp()
+        node = guard._retry14_v3_node()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag([node]),
+                goal_text=self.HEALTH_GOAL,
+                repo_root=self.repo_root,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("freetalon/api.py", message)
+        self.assertIn("placeholder", message)
+
+    def test_retry13_attempt2_is_a_cheap_rejection(self) -> None:
+        from freetalon.orchestrator.planner import CheapRejectionError
+
+        nodes = TestPlannerStandinOverwriteFix._retry12_attempt2_nodes()
+        with self.assertRaises(CheapRejectionError):
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+
+    def test_retry13_attempt4_flask_handler_branch_named(self) -> None:
+        nodes = TestPlannerFrameworkSteerFix._retry13_attempt4_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("add a /health branch to the do_GET method", message)
+
+    def test_retry12_string_ids_code_overwrite(self) -> None:
+        nodes = TestPlannerStandinOverwriteFix._retry12_attempt2_string_ids_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("overwrites code with a hardcoded answer", message)
+        self.assertIn("freetalon/api.py", message)
+        self.assertIn("grounded move", message)
+
+    def test_retry11_attempt3_numbered(self) -> None:
+        nodes = TestPlannerShapeSurvivesRepair._retry11_attempt3_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with", message)
+        self.assertNotIn("did not match PlanNode schema", message)
+
+    def test_retry10_attempt3_numbered_names_unknown_dependency(self) -> None:
+        nodes = TestPlannerDependsOnFix._retry10_attempt3_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 7 errors", message)
+        self.assertIn("depends on unknown node", message)
+        self.assertIn("endpoint_implemented", message)
+
+    def test_retry9_v1_wrong_location(self) -> None:
+        nodes = TestPlannerRepoRootFix._retry9_v1_nodes()
+        with self.assertRaisesRegex(LLMResponseError, "workspace"):
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+
+    def test_retry8_v1_unwritten_file(self) -> None:
+        nodes = TestPlannerUnwrittenFileFix._retry8_v1_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with", message)
+        self.assertIn("health.json", message)
+
+    def test_retry7_attempt3_numbered(self) -> None:
+        nodes = TestPlannerNodeShapeFix._retry7_attempt3_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 11 errors", message)
+        self.assertNotIn("did not match PlanNode schema", message)
+
+    def test_retry5_fake_grounded_move_named(self) -> None:
+        nodes = TestPlannerGroundedShapeFix._retry5_fake_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+            )
+        message = str(caught.exception)
+        self.assertIn("grounded move", message)
+        self.assertIn("freetalon/api.py", message)
+        self.assertIn("8765", message)
+
+    def test_retry4_wrong_service(self) -> None:
+        nodes = TestPlannerRouteEngagementFix._retry4_plan_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+            )
+        message = str(caught.exception)
+        self.assertIn("1 error", message)
+        self.assertIn("11434", message)
+        self.assertIn("8765", message)
+        self.assertIn("different service", message)
+
+    def test_retry3_glued_echo_heredoc_named(self) -> None:
+        heredoc_fix = TestPlannerHeredocFix()
+        heredoc_fix.setUp()
+        node = heredoc_fix._bash_node(TestPlannerHeredocFix.GLUED_ECHO)
+        with self.assertRaisesRegex(LLMResponseError, "glued together") as ctx:
+            parse_planner_response(
+                self._dag([node]), goal_text=self.HEALTH_GOAL
+            )
+        self.assertIn("heredoc", str(ctx.exception))
+        self.assertIn("scaffold", str(ctx.exception))
+
+    def test_bare_dict_criteria_coerces_and_rejected_by_name(self) -> None:
+        nodes = TestPlannerCriteriaShapeFix._retry6_attempt3_nodes()
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+            )
+        message = str(caught.exception)
+        self.assertNotIn("did not match PlanNode schema", message)
+        self.assertIn("criteria MUST be a JSON array", message)
+
+    def test_structural_errors_still_raise_first(self) -> None:
+        # Duplicate ids, dependency cycles, and self-dependency still raise
+        # first, before any numbered rejection.
+        with self.assertRaisesRegex(LLMResponseError, "duplicate node ids"):
+            normalize_plan_nodes(
+                [
+                    {"id": "a", "objective": "First", "depends_on": []},
+                    {"id": "a", "objective": "Second", "depends_on": []},
+                ]
+            )
+        with self.assertRaisesRegex(LLMResponseError, "dependency cycle"):
+            normalize_plan_nodes(
+                [
+                    {"id": "a", "objective": "First", "depends_on": ["b"]},
+                    {"id": "b", "objective": "Second", "depends_on": ["a"]},
+                ]
+            )
+        with self.assertRaisesRegex(LLMResponseError, "cannot depend on itself"):
+            normalize_plan_nodes(
+                [{"id": "a", "objective": "First", "depends_on": ["a"]}]
+            )
+
+    def test_retry15_attempt2_still_a_duplicate_key_collapse(self) -> None:
+        # The weakness-3 fix adds the Flask//tmp defects to the rejection;
+        # the duplicate-key collapse itself is still named first.
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                TestPlannerDuplicateKeysFix.RETRY15_ATTEMPT2_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("duplicate JSON keys", message)
+        self.assertIn("node object (id 'node-3')", message)
+        self.assertIn("separate each node", message)
+        self.assertNotIn("depends on unknown node", message)
