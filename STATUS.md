@@ -394,3 +394,42 @@ Mainline: `2085f6cd`. Plan: `PLAN.md`.
   load and Pat's go. No LLM calls were made for this fix.
 - Still blocked: gh token invalid — commits local-only until Pat
   re-auths gh on seeker7 (classic PAT plan, 2026-11-17).
+
+## Update - 2026-11-16 21:55 (/health retry #2 — plan produced, execution failed, replan echoed memory)
+
+- /health retry #2 (Pat: "Go — retry the /health goal", echo fix in
+  place): run-20261117T054715Z-698173, goal verdict FAIL in 65s. Log:
+  freetalon-workspace/logs/llm-end-to-end-health-retry2-2026-11-16.log.
+  Plan id plan-7885a4ef9d99 — the same id as attempt 1.
+- Progress vs attempt 2: the initial planner echo is FIXED — Gemma
+  produced a real plan DAG on the first call (prose intent prompt
+  works). But the plan was still wrong in the same way as attempt 1:
+  node-1 (bash) wrote a hardcoded fake {"health": "OK", ...} to
+  freetalon-workspace/api.json instead of extending the existing
+  /health in freetalon/api.py; node-2 wrote a fake test.sh instead of
+  real unit tests. The repo-grounding rule did not stop the model
+  from faking the endpoint with a static file. Node-1 PASS (file
+  exists), node-2 PASS (file exists), node-3 FAIL — running test.sh
+  exits 127 (its contents are an assert line, not a command). Judge
+  chose REPLAN.
+- Replan failed: Gemma echoed the replan brief's own content instead
+  of a delta plan — first repair echoed the instruction +
+  remaining_budget fields, second returned an experiment-memory record
+  from attempt 1 (run-20261116T013052Z-917367, node-1) as the "nodes"
+  array. That failed PlanNode schema validation (10 errors: missing
+  id/objective, extra run_id/goal_key/domain/node_id/ts/approach/
+  decision/lesson forbidden) and the run escalated to FAILED. The
+  replan brief includes memory records verbatim — same echo family,
+  new surface.
+- Cleanup: fake api.json and test.sh deleted from the workspace. Repo
+  tree clean; freetalon/api.py untouched (existing minimal /health at
+  api.py:44 still the only one). No new tests written, no live
+  verification. Suite still 408/408 green.
+- GPU survived — third CUDA load since the reseat: peak 76C at 263.7W
+  during the run (limit held at 300W, link x16 throughout), cooled to
+  56C after; zero Xid 79/154. Fans manual 65% during, restored to
+  auto. 76C is the hottest seen yet (previous peaks 62-63C) but below
+  the 85C pause threshold; the longer run (intake + plan + 2 replan
+  calls) explains it.
+- Still blocked: gh token invalid — commits local-only until Pat
+  re-auths gh on seeker7 (device flow, as before; PAT idea dropped).
