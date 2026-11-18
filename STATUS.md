@@ -3369,3 +3369,54 @@ Deliberately left out:
   keeps those fixtures green is untested; it is
   the question the next success-shaped run
   answers.
+
+## Update - 2026-11-18 (Live re-run #7, Arm 3: qwen2.5-coder:14b at temperature 0.4 — one criterion away, three times)
+
+- Run (FREETALON_OLLAMA_MODEL=qwen2.5-coder:14b,
+  FREETALON_LLM_TEMPERATURE=0.4, timeout 900,
+  formatter OFF, critic OFF; driver exit 1; GPU
+  peak observed 74C, no thermal pause; fans manual
+  85% during, auto after, verified): 3 raw outputs,
+  all rejected at planning (replayed offline
+  through parse_planner_response). Nothing
+  executed, no files changed (porcelain 0), no run
+  or memory records, no restore or suite re-run
+  needed.
+- Output 1 (1 error): the anchored do_GET replace
+  and a written tests/test_health.py, stopped only
+  by step_4's metric criterion ('json_response' is
+  not reported by the bash claw). Output 2 (3
+  errors) regressed — an unparseable full-module
+  scaffold, the tests/test_api.py overwrite again
+  (scaffold_overwrite), and step_4's file_matches
+  on a workspace health_response.json no node
+  writes. Output 3 (1 error) recovered the anchored
+  shape and — new — answered the overwrite
+  rejection with an ANCHORED insert into
+  test_api.py (anchor APIEndpointTests, position
+  after): the repair round acted on that error.
+  But it repeated output 2's file_matches
+  verbatim, and repair was exhausted.
+- Re-run #7 verdict: no verified end-to-end
+  success in any arm, and the questions cycle 9
+  was built to answer are answered. The hoist
+  works live (Arm 2: the first 27B acceptance and
+  execution). Qwen writes the test file and the
+  computing anchored edit in round one at both
+  temperatures, and in Arm 3 visibly learned the
+  anchored-insert move from an error — yet every
+  Qwen plan died on exactly one unusable criterion
+  in its verify node (file_matches on a response
+  file no node writes, in both Qwen arms) or on
+  repeating a shown error once too often. The
+  remaining gap is a single enumerable criterion
+  shape, not substance and not structure; the
+  custom_check registry text remains untested
+  live (no arm attempted one). Arm 2 adds the
+  second open thread: an executed full-module
+  rewrite breaks 13 planner-grounding fixtures
+  while breaking no API behavior test — the
+  suite-green criterion is coupled to api.py's
+  grounding properties, and whether a faithful
+  anchored edit keeps those fixtures green is the
+  question the next success-shaped run answers.
