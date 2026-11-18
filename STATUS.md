@@ -4045,3 +4045,55 @@ Deliberately left out:
   (logs/rerun9-arm3-suite-post-restore.out).
   Log: logs/health-rerun9-2026-11-18.log.
 
+## Update - 2026-11-18 (Live re-run #9, Arm 4: gemma4:31b on cycle 12 — GENERATION EMPTY on the first planning call; re-run #9 closes with no verified success)
+
+- Run (FREETALON_OLLAMA_MODEL=gemma4:31b,
+  FREETALON_LLM_TEMPERATURE=0.0, timeout 900,
+  formatter OFF, critic OFF; driver exit 1;
+  no plan, no run directory, no file changes,
+  tree porcelain 0; GPU peak observed 58C;
+  fans manual 85% during, auto after, verified
+  GPUFanControlState=0): intake OK; the FIRST
+  planning call returned an empty
+  message.content and _call_ollama raised
+  LLMBackendError, which propagated straight
+  out of the driver (~2 minutes). Zero raw
+  planner outputs were captured — there is no
+  plan JSON to inspect. The arm's briefed
+  early-abort check (empty/think-only first
+  output -> end the arm as GENERATION EMPTY)
+  was satisfied by the driver's own error
+  path; no kill was needed.
+- This reproduces the step-0 diagnostic
+  exactly (real intake + plan_task_intent:
+  intake OK in 12.6s, planning LLMBackendError
+  in 78.3s, 0 raw outputs). The Ollama
+  upgrade did NOT fix gemma4's long-prompt
+  behavior: under 0.40.16 its thinking is at
+  least surfaced as a separate field (step-0
+  re-probe: 2004 thinking chars inside a
+  600-token cap, response 0), but on the real
+  planner call the model still produces no
+  content at all. Decode speed is again not
+  the issue (72.4 tok/s measured).
+- Verdict: FAIL at planning (generation
+  empty). Re-run #9 closes: step 0's upgrade
+  (0.31.1 -> 0.40.16) unblocked qwen3.8 and
+  all four candidate models ran on cycle-12
+  code. No verified end-to-end success. The
+  two executing arms (Qwen-14B control,
+  Devstral) both wrote clean, computing
+  /health code with cycle-12-correct suite
+  placement and died at the suite node — on
+  their own unrunnable tests plus the repo's
+  fixture couplings to the pre-goal tree.
+  The two thinking models never reached
+  execution: qwen3.8 truncates its plan
+  against the 12288 context, gemma4 returns
+  no content. The campaign's next decisions
+  are harness-side, and they are the parent's:
+  thinking-model handling for planner calls,
+  and decoupling the suite's fixtures from
+  the tree the goal is supposed to change.
+  Log: logs/health-rerun9-2026-11-18.log.
+
