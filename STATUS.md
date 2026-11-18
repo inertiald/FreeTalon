@@ -2973,3 +2973,107 @@ Deliberately left out:
   a loop-execution seam cannot move it. Pins changed:
   none. No live driver runs this cycle; re-run #6 is the
   test of the seam.
+
+## Update - 2026-11-18 (Live re-run #6 on cycle 8: the local-repair seam fires — the model answers with the payload, not the code)
+
+- Pre-flight (once): GPU 52C idle; power limit exactly
+  300.00W; link gen4 x16; 0 Xid 79/154; Ollama tags list
+  gemma-3-abliterated:latest; head 7cad8a5 clean; baseline
+  suite 1083/1083 in 465.2s. Fans manual 85% during each
+  run, auto after (GPUFanControlState=0 verified after
+  each run); 0 Xid throughout.
+- Run 1 (production defaults; driver exit 0;
+  run-20261118T123743Z-883f13; loop elapsed 102.2s; GPU
+  peak 74C, no pause): planning took 2 raw outputs (empty,
+  then the accepted plan) — plan-7885a4ef9d99 accepted,
+  5 nodes. placeholder_value and missing_target fired
+  0 times; no Ellipsis in any raw output. v1 executed:
+  node-1 PASS (anchored replace — do_GET returned with
+  the /health branch UNEXTENDED:
+  return self._send(200,{"ok":True,"status":"ready"});
+  file diff +16/-24, whitespace-collapsed retype);
+  node-2 PASS (the real RouteEndpointTests written to
+  the workspace test_health.py); node-3 FAIL exit 1 in
+  0.776s — AssertionError: 'service_status' not found
+  in {'ok': True, 'status': 'ready'}. Judge replan.
+  THE SEAM FIRED: offline replay against the recorded
+  artifacts (tools/probe_local_repair_rerun6.py and
+  probe_local_repair2_rerun6.py) proves the culprit
+  mapping succeeded — culprit node-1; exactly one linked
+  file (freetalon/api.py, via the test script's
+  imports); window HiveAPIServer.start.Handler.do_GET,
+  span 39-108, byte-identical to disk — and the repair
+  call was made with the goal line, the criterion
+  detail, the cycle-5 diagnostics excerpt, and the
+  definition exactly as it stands on disk. The model's
+  answer — replayed at temperature 0 through the
+  identical prompt and settings (logs/rerun6-probe2.out;
+  the response saved at logs/rerun6-probe-response.txt)
+  — was a JSON payload fragment:
+  {"ok":true,"status":"ready","service_status":"running"}
+  — the endpoint's desired OUTPUT, not the definition's
+  code. Extraction found no definition, try_local_repair
+  returned None, and the loop fell back to whole-task
+  re-plan exactly as designed (no
+  loop.replan.local_repair audit event — it logs only
+  when the seam serves a version). The whole-task
+  re-plan produced 3 candidates: a degenerate
+  {"nodes":[{"id":"hive",...}]}; the clobber-shaped
+  standalone module carrying REAL probe code (a urllib3
+  Ollama check, a subprocess nvidia-smi parse) that
+  also omitted service_status; and a 2-node bash plan
+  rejected with exactly 1 error (stand-in: no node
+  touches freetalon/api.py). Re-planner failed ->
+  escalate. Verdict FAIL.
+- Run 2 (FREETALON_LLM_TEMPERATURE=0.4; driver exit 1 —
+  planning failure; wall 163s; GPU peak 69C, no pause):
+  3 raw outputs, all rejected, repair exhausted before
+  any plan was accepted: meta-nodes about validating
+  JSON; a verification-only plan (curl the endpoints,
+  run nvidia-smi — no edit, no tests); and a Flask
+  rewrite whose step_1 scaffolded api.py as a Flask
+  app. The terminal rejection carried exactly 3 errors
+  — scaffold_overwrite twice (api.py dropping 12 of 12
+  definitions; tests/test_api.py dropping 27 of 27)
+  and the framework rejection (Flask banned outright,
+  grounded-move steering attached). Nothing executed,
+  no files changed, no run record; the local-repair
+  seam was never reached. placeholder_value fired
+  0 times in this run too.
+- Memory: Run 1 recorded ids 160-162 (stage=executed,
+  full stderr on the node-3 FAIL; decisions
+  CONTINUE/CONTINUE/REPLAN); its escalation was a
+  re-planner rejection, not a memory lock — the cycle-3
+  signature fix held live again. Run 2 never produced
+  a run, so memory recorded nothing.
+- Files/suites: Run 1 modified freetalon/api.py and
+  wrote the workspace test_health.py; all restored/
+  removed after profiling (git checkout api.py; the
+  workspace test file deleted; porcelain 0) and the
+  post-run suite re-ran 1083/1083 (460.1s). Run 2
+  changed nothing, so no restore or suite re-run was
+  needed. GPU left at 51C idle, 300.00W limit intact.
+  The pre-existing workspace api.py and fib.py strays
+  predate this session and were left untouched.
+- Verdict on the cycle-8 question: the seam works —
+  mapping, prompt, and fallback all fired live in the
+  exact fixture shape — and the smallest possible ask
+  still did not get the substance. Asked for one
+  definition's replacement, with the failure quoted and
+  the current code in front of it, the model returned
+  the payload the endpoint should produce instead of
+  the code that produces it. The copy/compute split
+  from re-run #5 sharpens into a three-way split: the
+  model can state the answer's shape (the payload),
+  copy the definition exactly, or compute the fields
+  in a free-standing draft — it does not combine them
+  into the anchored edit, in any of the three ask
+  shapes now tried (whole-plan, whole-task re-plan
+  with verbatim diagnostics, node-local repair). The
+  harness side is complete: sound planning, execution,
+  measurement, verbatim feedback, and now a focused
+  one-definition repair that fires and falls back
+  cleanly. The binding limit is the 12B planner
+  itself; the remaining fork is Pat's
+  stronger-planner-model decision or a proving-ground
+  change.
