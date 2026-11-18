@@ -19298,3 +19298,300 @@ class TestPlannerLocalRepair(unittest.TestCase):
         result, calls = self._run(self.REPAIRED_DO_GET, nodes)
         self.assertIsNone(result)
         self.assertEqual(calls, [])
+
+
+class TestPlannerCycle9CriteriaHoist(unittest.TestCase):
+    """Cycle 9: deterministic nesting hoist + criteria discipline in the open.
+
+    Track A (model A/B, 2026-11-18) measured the two stronger planners'
+    failure classes. gemma3:27b produced two complete plans whose large
+    scaffold node nested outputs/acceptance/criteria inside "inputs" —
+    shape-perfect values one level too deep — and planning repair never
+    fixed the nesting. qwen2.5-coder:14b's closest-ever output died on
+    criteria discipline only: a tests_pass suite naming a directory the
+    node never names, and custom_check criteria first nameless, then
+    named with names no registry holds (the registry is EMPTY — no
+    production code registers a checker). Fixes: (1) a shape-gated
+    deterministic hoist at the parse seam moves a reserved field out of
+    "inputs" when the value has the field's shape and the node carries
+    no top-level twin; anything else is left alone and the nesting
+    rejection proceeds as before; (2) the validator's criteria errors
+    and the prompts' criteria guidance state the registry and the
+    tests_pass rule in the validator's own terms; (3) prompt-only
+    steering: a write-tests goal needs a node that WRITES the test file.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+        # The custom-checker registry must be deterministic for the
+        # error-text pins below: tests/test_measure.py registers
+        # "always_ok" with no cleanup, and it leaks into this module
+        # in a full-suite process. Snapshot, clear, restore.
+        from freetalon.orchestrator import measure as measure_module
+
+        self._measure_module = measure_module
+        self._saved_checkers = dict(measure_module._CUSTOM_CHECKERS)
+        measure_module._CUSTOM_CHECKERS.clear()
+        self.addCleanup(self._restore_checkers)
+
+    def _restore_checkers(self) -> None:
+        self._measure_module._CUSTOM_CHECKERS.clear()
+        self._measure_module._CUSTOM_CHECKERS.update(self._saved_checkers)
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _grounded_nodes(self) -> list[dict]:
+        """The canonical grounded /health plan (anchored edit form)."""
+        return [
+            {
+                "id": "step_1",
+                "objective": "Extend the health endpoint",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {
+                    "file_path": self.api_path,
+                    "anchor": "HiveAPIServer.start.Handler.do_GET",
+                    "position": "replace",
+                    "content": GROUNDED_DO_GET_DELTA,
+                },
+                "outputs": [self.api_path],
+                "acceptance": ["File exists and /health is extended"],
+                "criteria": [{"type": "file_exists", "path": self.api_path}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Run the test suite",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "python3 -m unittest discover -s tests"},
+                "outputs": ["test results"],
+                "acceptance": ["Suite passes"],
+                "criteria": [{"type": "tests_pass", "suite": "tests"}],
+            },
+            {
+                "id": "step_3",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -s http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "acceptance": ["Endpoint answers"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+
+    # --- (1) The hoist ---
+
+    def test_27b_shape_all_three_fields_hoisted_and_plan_accepted(self) -> None:
+        # The gemma3:27b shape: step_1 nests outputs, acceptance AND
+        # criteria inside "inputs", carrying none of them at top level.
+        nodes = self._grounded_nodes()
+        step_1 = nodes[0]
+        inputs = dict(step_1["inputs"])
+        inputs["outputs"] = step_1.pop("outputs")
+        inputs["acceptance"] = step_1.pop("acceptance")
+        inputs["criteria"] = step_1.pop("criteria")
+        step_1["inputs"] = inputs
+        parsed, _meta = parse_planner_response(
+            self._dag(nodes), goal_text=self.HEALTH_GOAL, workspace=self.WS
+        )
+        self.assertEqual(len(parsed), 3)
+        first = parsed[0]
+        self.assertEqual(first.outputs, [self.api_path])
+        self.assertEqual(first.acceptance, ["File exists and /health is extended"])
+        self.assertEqual(
+            first.criteria, [{"type": "file_exists", "path": self.api_path}]
+        )
+        for field in ("outputs", "acceptance", "criteria"):
+            self.assertNotIn(field, first.inputs)
+        # The scaffold's own inputs survive the hoist: file_path is
+        # intact and the anchored edit materialized as usual (anchor
+        # consumed, full module content in its place).
+        self.assertEqual(first.inputs["file_path"], self.api_path)
+        self.assertIn("class HiveAPIServer", first.inputs["content"])
+
+    def test_criteria_only_nesting_hoisted(self) -> None:
+        nodes = self._grounded_nodes()
+        step_1 = nodes[0]
+        step_1["inputs"] = dict(
+            step_1["inputs"], criteria=step_1.pop("criteria")
+        )
+        parsed, _meta = parse_planner_response(
+            self._dag(nodes), goal_text=self.HEALTH_GOAL, workspace=self.WS
+        )
+        self.assertEqual(
+            parsed[0].criteria, [{"type": "file_exists", "path": self.api_path}]
+        )
+        self.assertNotIn("criteria", parsed[0].inputs)
+        self.assertEqual(parsed[0].outputs, [self.api_path])
+
+    def test_both_levels_present_is_not_hoisted(self) -> None:
+        # The node carries criteria at top level AND a shape-valid
+        # criteria inside inputs: ambiguous, left exactly as written —
+        # the nesting rejection proceeds as before the hoist existed.
+        nodes = self._grounded_nodes()
+        nodes[0]["inputs"] = dict(
+            nodes[0]["inputs"],
+            criteria=[{"type": "exit_code", "equals": 0}],
+        )
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes), goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        message = str(caught.exception)
+        self.assertIn("nests", message)
+        self.assertIn("'criteria'", message)
+        self.assertIn('inside "inputs"', message)
+
+    def test_non_criterion_shaped_nested_criteria_is_not_hoisted(self) -> None:
+        # An inputs value that merely shares the name: a list of dicts
+        # with no "type" is not the criteria field's shape, and a bare
+        # string is not either. Neither is hoisted; the nesting
+        # rejection proceeds exactly as today.
+        for bogus in ([{"note": "not a criterion"}], "the plan checklist"):
+            nodes = self._grounded_nodes()
+            step_1 = nodes[0]
+            del step_1["criteria"]
+            step_1["inputs"] = dict(step_1["inputs"], criteria=bogus)
+            with self.assertRaises(LLMResponseError) as caught:
+                parse_planner_response(
+                    self._dag(nodes),
+                    goal_text=self.HEALTH_GOAL,
+                    workspace=self.WS,
+                )
+            self.assertIn("nests", str(caught.exception))
+
+    def test_non_string_outputs_value_is_not_hoisted(self) -> None:
+        nodes = self._grounded_nodes()
+        step_1 = nodes[0]
+        del step_1["outputs"]
+        step_1["inputs"] = dict(step_1["inputs"], outputs=[{"path": "x"}])
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes), goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        self.assertIn("nests", str(caught.exception))
+
+    # --- (2) Criteria errors state the registry and the rule ---
+
+    def _criteria_error_text(self, node: dict) -> str:
+        from freetalon.orchestrator.models import PlanNode
+        from freetalon.orchestrator.planner import _criteria_errors
+
+        return "\n".join(_criteria_errors(PlanNode(**node)))
+
+    def _bash_node(self, criteria: list[dict], command: str) -> dict:
+        return {
+            "id": "step_2",
+            "objective": "Run or verify something",
+            "assigned_claw": "bash",
+            "inputs": {"command": command},
+            "outputs": ["result"],
+            "criteria": criteria,
+        }
+
+    def test_tests_pass_error_states_acceptable_targets(self) -> None:
+        # Qwen output 1's exact defect: the suite is the absolute tests
+        # directory, which the node's own command never names.
+        node = self._bash_node(
+            [
+                {
+                    "type": "tests_pass",
+                    "suite": "/home/seeker/projects/FreeTalon/tests",
+                }
+            ],
+            "cd /home/seeker/projects/FreeTalon && "
+            "./.venv/bin/python -m unittest discover -s tests",
+        )
+        text = self._criteria_error_text(node)
+        self.assertIn("is not a file this node writes or runs", text)
+        self.assertIn("must be named by this node itself", text)
+        self.assertIn("does not count", text)
+
+    def test_tests_pass_suite_named_in_command_is_usable(self) -> None:
+        node = self._bash_node(
+            [{"type": "tests_pass", "suite": "tests"}],
+            "python3 -m unittest discover -s tests",
+        )
+        self.assertEqual(self._criteria_error_text(node), "")
+
+    def test_custom_check_nameless_error_lists_registry_state(self) -> None:
+        # Qwen output 1's exact shape: a "command" but no "name", with
+        # the (production-true) empty registry.
+        node = self._bash_node(
+            [
+                {
+                    "type": "custom_check",
+                    "command": "curl -sf http://localhost:8765/health",
+                }
+            ],
+            "curl -sf http://localhost:8765/health",
+        )
+        text = self._criteria_error_text(node)
+        self.assertIn("needs a non-empty 'name' naming a registered checker", text)
+        self.assertIn("no custom checkers are registered", text)
+        self.assertIn("custom_check is unavailable", text)
+        self.assertIn("a criterion may carry its own 'command'", text)
+
+    def test_custom_check_unregistered_error_lists_registry_state(self) -> None:
+        # Qwen output 2's exact names.
+        for name in ("check_health_endpoint", "verify_json_response"):
+            node = self._bash_node(
+                [{"type": "custom_check", "name": name}],
+                "curl -sf http://localhost:8765/health",
+            )
+            text = self._criteria_error_text(node)
+            self.assertIn(f"custom_check '{name}' is not a registered checker", text)
+            self.assertIn("no custom checkers are registered", text)
+
+    def test_custom_check_errors_list_registered_names_when_any(self) -> None:
+        from freetalon.orchestrator.measure import register_checker
+
+        register_checker("health_probe", lambda env, wd: (True, "ok"))
+        node = self._bash_node(
+            [{"type": "custom_check", "name": "check_health_endpoint"}],
+            "curl -sf http://localhost:8765/health",
+        )
+        text = self._criteria_error_text(node)
+        self.assertIn("is not a registered checker", text)
+        self.assertIn("registered checkers: 'health_probe'", text)
+        # And the registered name itself is a usable criterion.
+        ok_node = self._bash_node(
+            [{"type": "custom_check", "name": "health_probe"}],
+            "curl -sf http://localhost:8765/health",
+        )
+        self.assertEqual(self._criteria_error_text(ok_node), "")
+
+    # --- (2)/(3) Prompt guidance pins ---
+
+    def test_planner_prompt_states_tests_pass_rule_and_registry(self) -> None:
+        self.assertIn("must be named by THIS node itself", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("no custom checkers are registered", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("every \"custom_check\" criterion is rejected", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("may carry its own \"command\"", PLANNER_SYSTEM_PROMPT)
+
+    def test_planner_prompt_requires_a_test_writing_node(self) -> None:
+        self.assertIn(
+            "a node that only runs an existing test suite does not "
+            "satisfy a write-tests requirement",
+            PLANNER_SYSTEM_PROMPT,
+        )
+
+    def test_replan_prompt_carries_the_same_discipline(self) -> None:
+        from freetalon.orchestrator.prompts import REPLAN_SYSTEM_PROMPT
+
+        self.assertIn("no custom checkers are registered", REPLAN_SYSTEM_PROMPT)
+        self.assertIn("spelled exactly as in the command", REPLAN_SYSTEM_PROMPT)
+        self.assertIn(
+            "running an existing suite does not satisfy a "
+            "write-tests requirement",
+            REPLAN_SYSTEM_PROMPT,
+        )

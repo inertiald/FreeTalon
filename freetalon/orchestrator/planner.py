@@ -715,6 +715,78 @@ def _looks_like_prose_reserialization(payload: dict[str, Any]) -> bool:
     return prose_like * 2 >= len(keys)
 
 
+# Node fields a model may nest inside "inputs" (cycle 9, Track A):
+# gemma3:27b's complete plans put outputs/acceptance/criteria inside
+# the large scaffold node's "inputs" object — the values shape-perfect,
+# one level too deep — and planning repair never fixed the nesting
+# across two rounds. The envelope schema cannot prevent it ("inputs"
+# is a free-form object by design; a grammar over it cannot express
+# "these keys belong one level up"), so the parse seam repairs it
+# deterministically, the way the payload channel repairs heredocs.
+_RESERVED_NODE_FIELDS = ("outputs", "acceptance", "criteria")
+
+
+def _reserved_field_shape_ok(field: str, value: Any) -> bool:
+    """True when ``value`` has the shape ``field`` carries at node level.
+
+    outputs/acceptance are string lists (a bare string is the shape the
+    parse seam's own coercions already accept for them at top level);
+    criteria is a list of criterion objects — dicts carrying a string
+    "type" — or a single such dict (the bare-dict shape the same
+    coercions accept). Anything else is not the field's shape: a claw
+    input that merely shares the name is left alone.
+    """
+    if field in ("outputs", "acceptance"):
+        if isinstance(value, str):
+            return True
+        return isinstance(value, list) and all(
+            isinstance(item, str) for item in value
+        )
+    if isinstance(value, dict):
+        return isinstance(value.get("type"), str)
+    return isinstance(value, list) and all(
+        isinstance(item, dict) and isinstance(item.get("type"), str)
+        for item in value
+    )
+
+
+def _nested_field_hoistable(node: dict[str, Any], field: str) -> bool:
+    """True when ``field`` sits in node's inputs in hoistable form.
+
+    All-or-nothing per field: the field is present in "inputs", the
+    node does NOT already carry it at its own level, and the nested
+    value has the field's shape. Both levels present, or a value that
+    is not the field's shape, is not hoistable — the node is left
+    exactly as written and the nesting rejection proceeds as before.
+    """
+    inputs = node.get("inputs")
+    if not isinstance(inputs, dict) or field not in inputs:
+        return False
+    if field in node:
+        return False
+    return _reserved_field_shape_ok(field, inputs[field])
+
+
+def _hoist_nested_node_fields(nodes_raw: list[Any]) -> None:
+    """Move hoistable reserved fields out of "inputs" to the node level.
+
+    Runs on the raw node dicts in parse_planner_response, before the
+    coercions, schema validation, and error collection, so every later
+    stage sees the node the model meant to write. _duplicate_key_errors
+    applies the same gate when deciding whether nesting is an error at
+    all, so a hoisted field is never also named as a nesting defect.
+    """
+    for node in nodes_raw:
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for field in _RESERVED_NODE_FIELDS:
+            if _nested_field_hoistable(node, field):
+                node[field] = inputs.pop(field)
+
+
 def _duplicate_key_errors(
     raw_text: str,
 ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -736,6 +808,11 @@ def _duplicate_key_errors(
     outputs/acceptance/criteria hoisted out of inputs — so the caller can
     run the per-node validation on what the model meant to write, instead
     of only on the collapsed node.
+
+    Cycle 9: nesting that the deterministic hoist can repair (right
+    shape, no top-level twin — see _hoist_nested_node_fields) is not
+    reported as an error here at all; only a nesting the hoist must
+    leave alone is named.
 
     Only node-shaped objects count: a flat prose object whose keys are
     repeated words (retry #8 tokenized prose) is a prose re-serialization,
@@ -786,10 +863,21 @@ def _duplicate_key_errors(
             # nesting error this way).
             inputs = obj.get("inputs")
             if isinstance(inputs, dict):
+                # Cycle 9: a nesting the deterministic hoist can repair
+                # (right shape, no top-level twin — see
+                # _nested_field_hoistable) is not an error: the parse
+                # seam hoists it before validation. Only a nesting the
+                # hoist must leave alone is named here — and an object
+                # with duplicate keys is always left alone: it is not
+                # one node but several collapsed into one (retry #15),
+                # the parse raises on the collapse regardless, and its
+                # nesting is part of that wreckage, not a hoistable
+                # single-node defect.
                 nested_fields.update(
                     field
                     for field in ("outputs", "acceptance", "criteria")
                     if field in inputs
+                    and not (not dups and _nested_field_hoistable(obj, field))
                 )
             if dups and (is_top or is_node):
                 if is_top:
@@ -976,6 +1064,15 @@ def parse_planner_response(
             STAGE_SCHEMA,
         )
 
+    # Deterministic nesting hoist (cycle 9): a reserved node field
+    # (outputs/acceptance/criteria) nested inside "inputs" in the
+    # field's own shape, with no top-level twin, is moved to the node
+    # level here — before the coercions below and every later stage —
+    # so validation judges the node the model meant to write.
+    # _duplicate_key_errors applied the same gate above, so a hoisted
+    # field was never named as a nesting error either.
+    _hoist_nested_node_fields(nodes_raw)
+
     # Defensive normalization: coerce plain strings into single-element
     # lists, and a bare-dict "criteria" into a one-element list (retry #6).
     for node in nodes_raw:
@@ -1141,6 +1238,30 @@ def _criterion_path_is_node_path(criterion_path: str, node: PlanNode) -> bool:
     return False
 
 
+def _custom_checker_registry_text() -> str:
+    """The registered custom checkers, as error text (cycle 9).
+
+    Derived from the live registry at call time: the names verbatim
+    when any are registered; an explicit unavailability statement when
+    none are — which is every production run today (register_checker
+    has no production caller, and the planner prompt already bans the
+    type without saying why or what to use instead — qwen2.5-coder
+    reached for it in 4 nodes across 2 outputs, twice with a "command"
+    it expected to be run). When the registry is empty the text names
+    the alternatives, including exit_code with its own "command" —
+    the capability the model was actually reaching for.
+    """
+    names = sorted(custom_checkers())
+    if names:
+        return "registered checkers: " + ", ".join(repr(n) for n in names)
+    return (
+        "no custom checkers are registered, so custom_check is "
+        "unavailable — use exit_code (a criterion may carry its own "
+        "'command'), file_exists, file_matches, metric, or tests_pass "
+        "instead"
+    )
+
+
 def _usable_criterion_error(
     criterion: Any, node: PlanNode, repo_root: str | Path | None = None
 ) -> str | None:
@@ -1217,14 +1338,33 @@ def _usable_criterion_error(
         if not isinstance(suite, str) or not suite:
             return "tests_pass criterion needs a non-empty 'suite'"
         if not _criterion_path_is_node_path(suite, node):
-            return f"tests_pass suite {suite!r} is not a file this node writes or runs"
+            # Cycle 9: state the rule in the validator's own terms —
+            # qwen2.5-coder named the suite as an absolute directory
+            # its command never mentions ("... -s tests"), and the old
+            # text named no acceptable form, so the repair round had
+            # nothing to steer by.
+            return (
+                f"tests_pass suite {suite!r} is not a file this node writes or runs"
+                " — the suite must be named by this node itself: a test "
+                "file this node writes (its file_path, a redirect or "
+                "heredoc target) or a path that appears in this node's "
+                "command (for example the exact directory its unittest "
+                "command runs against); a path only another node "
+                "touches does not count"
+            )
         return None
     # CRITERION_CUSTOM_CHECK: usable only when the checker is registered.
     name = criterion.get("name")
     if not isinstance(name, str) or not name:
-        return "custom_check criterion needs a non-empty 'name'"
+        return (
+            "custom_check criterion needs a non-empty 'name' naming a "
+            f"registered checker — {_custom_checker_registry_text()}"
+        )
     if name not in custom_checkers():
-        return f"custom_check {name!r} is not a registered checker"
+        return (
+            f"custom_check {name!r} is not a registered checker — "
+            f"{_custom_checker_registry_text()}"
+        )
     return None
 
 

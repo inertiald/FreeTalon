@@ -3186,3 +3186,76 @@ Deliberately left out:
   attempt with that steering in place, or the
   critic track's live run — is the next direction
   call.
+
+## Update - 2026-11-18 (Cycle 9: criteria discipline + the nesting hoist — the bookkeeping stops hiding the substance)
+
+- Built against Track A's measured failure classes
+  (log logs/cycle9-criteria-2026-11-18.log). The 6
+  Track A raw outputs now live in a separate corpus
+  (tools/planner-corpus/model-ab-corpus.json) with a
+  per-model replay; the original 28-output corpus is
+  untouched and its replay is byte-identical to
+  cycle 8's (56/56 rows, 0 field diffs).
+- The hoist: gemma3:27b nested outputs/acceptance/
+  criteria inside step-1's "inputs" — shape-perfect
+  values one level too deep. The envelope schema
+  cannot prevent it ("inputs" is a free-form object
+  by design), so the parse seam now repairs it:
+  _hoist_nested_node_fields moves a reserved field
+  out of "inputs" when the value has the field's own
+  shape and the node carries no top-level twin;
+  _duplicate_key_errors applies the same gate, so a
+  hoisted field is never also named as a nesting
+  error. Both levels present, a shape mismatch, or a
+  duplicate-key-collapsed object (retry #15's class —
+  not one node, so never hoistable) all proceed
+  exactly as before. Zero pins changed.
+- Replay, before -> after: the two 27B outputs drop
+  from 2 errors (nesting + route engagement, the
+  latter a consequence of the nesting) to exactly 1 —
+  and the surfaced error is real: step_2 scaffolds a
+  fresh tests/test_api.py over the existing module,
+  dropping all 27 of its definitions
+  (scaffold_overwrite). Step-1's own full-module
+  scaffold passes retention clean. The nesting class
+  is closed; what remains is a content defect with
+  grounded-move steering in its error text. Whether
+  the 27B repairs it in a round is a live question.
+- The registry, in the open: investigation found NO
+  production caller of register_checker — the
+  custom-checker registry is empty in every real
+  run, so every custom_check criterion is unusable
+  whatever its name. The validator's custom_check
+  errors now derive from the live registry: they list
+  the registered names verbatim when any exist, and
+  state the unavailability plus the alternatives
+  (including exit_code with its own "command" — the
+  capability Qwen's custom_check+command shape was
+  reaching for) when none do. The tests_pass target
+  error now states the acceptable forms in the
+  validator's own terms (named by this node itself:
+  a file it writes, or a path appearing in its
+  command, spelled as in the command).
+- Prompts: PLANNER_SYSTEM_PROMPT's tests_pass bullet
+  states the same rule (it previously invited a
+  "test file or directory" — looser than the
+  validator, and exactly Qwen's failing answer); the
+  custom_check line states the empty registry; the
+  exit_code bullet gains the own-"command" clause;
+  COVER EVERY STEP now requires a node that WRITES
+  the test file when the goal asks for tests (running
+  an existing suite does not satisfy it — no Qwen
+  output wrote one). REPLAN_SYSTEM_PROMPT carries
+  the same discipline in compressed form.
+- Qwen's corpus errors are unchanged in count
+  (3/2/3) by design: the fix is informational — the
+  errors and the prompt now carry what a repair round
+  needs to fix them. Acceptance for Qwen is a live
+  question, not an offline one; no claim made here.
+- Suite 1096/1096 (1083 + 13 new, TestPlannerCycle9
+  CriteriaHoist), framework guard ALL CHECKS PASSED.
+  No live runs in this cycle. Next: a live re-run #7
+  with the A/B winner(s) — Qwen first (its defects
+  are now steered in both prompt and error text),
+  27B second (its plan now reaches the overwrite
+  question in round one).

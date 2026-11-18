@@ -87,15 +87,15 @@ NODE SHAPE — every entry of \"nodes\" MUST be exactly this object:
 There is NO \"type\" field and NO \"write_file\" / \"execute_command\" node kind. To write a file use the \"scaffold\" claw (inputs \"file_path\" and \"content\"); to run a command use the \"bash\" claw (inputs \"command\"). \"depends_on\" lists node ids only (e.g. \"step_1\") — never an output name, a file path, or a description. \"assigned_claw\" MUST be one of the ALLOWED CLAWS above — never a node \"type\".
 
 MEASURABLE CRITERIA — every node MUST have a "criteria" array with at least one criterion, next to the human-readable "acceptance" strings. A node with no measurable criterion is rejected. Criterion shapes:
-- {"type": "exit_code", "equals": 0} — for "bash" nodes: the command must exit 0.
+- {"type": "exit_code", "equals": 0} — for "bash" nodes: the command must exit 0. An exit_code criterion may carry its own "command" ({"type": "exit_code", "equals": 0, "command": "<shell command>"}), which is run and measured instead of the node's command — use that to verify one specific command (for example a curl) instead of inventing a criterion type for it.
 - {"type": "file_exists", "path": "<absolute path>"} — the file must exist after the node runs.
 - {"type": "file_matches", "path": "<absolute path>", "sha256": "<hex>"} — file contents must match a hash.
 - {"type": "metric", "name": "<metric>", "op": ">=", "value": <number>} — a numeric metric the node's claw reports (e.g. "summary_chars" for "llm_synthesis", "trade_count" for "backtest"). "bash" and "scaffold" report NO metrics — never put a metric criterion on them.
-- {"type": "tests_pass", "suite": "<path to a test file or directory>"} — the suite must pass.
-- "custom_check" is NOT available. Do not use it.
+- {"type": "tests_pass", "suite": "<path>"} — the suite must pass. The suite must be named by THIS node itself: a test file this node writes, or a path that appears in this node's command (for example the exact directory its unittest command runs against, spelled exactly as in the command). A path only another node touches — or a directory path that never appears in this node's command or inputs — is rejected.
+- "custom_check" is NOT available: no custom checkers are registered, so every "custom_check" criterion is rejected, whatever "name" it carries. Do not use it — use one of the types above.
 A file criterion's "path" MUST be a file the plan actually produces or that already exists: a file the node writes (its "file_path" input, a bash redirect, or a heredoc target), a file a node runs or reads in its "bash" command, or a file that already exists on disk. Listing a path in "outputs" alone does NOT count — echoing an answer to stdout does not create the file. A later node may check a file an earlier node wrote.
 
-COVER EVERY STEP — if the goal says write a file, run it, and verify the output, the plan needs a node for each of those steps, in dependency order. Never collapse a multi-step goal into a single node. Write files at the exact path the goal requests (or the "workspace" path in the TaskIntent constraints when the goal says "in the workspace"); never substitute /tmp or another directory.
+COVER EVERY STEP — if the goal says write a file, run it, and verify the output, the plan needs a node for each of those steps, in dependency order. Never collapse a multi-step goal into a single node. If the goal asks for tests to be written or added, the plan MUST include a node that WRITES the test file(s) (the "scaffold" claw, or a bash heredoc) — a node that only runs an existing test suite does not satisfy a write-tests requirement. Write files at the exact path the goal requests (or the "workspace" path in the TaskIntent constraints when the goal says "in the workspace"); never substitute /tmp or another directory.
 
 FEW-SHOT EXAMPLES:
 
@@ -253,7 +253,13 @@ Rules:
   a single object like {"tests_pass": true}. A file criterion's "path"
   must be a file the plan writes (scaffold, redirect, or heredoc), a
   file a node runs or reads, or a file that already exists — listing it
-  in "outputs" alone does not count. "custom_check" is NOT available.
+  in "outputs" alone does not count. A tests_pass criterion's "suite"
+  must be named by that node itself: a test file it writes, or a path
+  that appears in its command, spelled exactly as in the command.
+  "custom_check" is NOT available: no custom checkers are registered,
+  so every custom_check criterion is rejected. If the goal asks for
+  tests to be written, include a node that WRITES the test file —
+  running an existing suite does not satisfy a write-tests requirement.
 - Do not wrap the JSON in markdown. Return exactly one JSON object.
 """
 
