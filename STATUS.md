@@ -2733,3 +2733,72 @@ Deliberately left out:
   validation of the fake vessel, memory escalation of
   the vacuous repeat — and the model still does not
   produce a substantive delta.
+
+
+## Update - 2026-11-18 (Cycle 7: complete code — the skeleton stops teaching slots)
+
+- Re-run #4 closed every feedback channel: the model was told
+  at planning, by name, what was wrong and what to write
+  instead, and still could not produce the delta. The
+  investigation for this cycle worked from the two positive
+  signals in the wreckage: the grounded skeleton's sketch
+  teaches the slot shape (the model copies the worked form it
+  is shown), and the model's only real-valued code in five
+  runs was a complete standalone function. Cycle 7 changes
+  what the harness asks for, not another gate: the
+  anchored-delta sketch no longer rebuilds the route branch
+  as a payload dict with '...' slots — it is the anchored
+  definition exactly as it stands, for every branch shape —
+  and the step-1 guidance around it names the route's
+  derived fields and demands the model's own computations:
+  probe the service or run the command the goal names and
+  parse its output; a fallible probe is attempted and
+  reports None (False for a yes/no field) when it fails;
+  never an invented constant, never '...'.
+- Node-local repair: investigated, NOT built. The loop's
+  re-plan is whole-plan only (Judge -> brief ->
+  replan_from_brief replaces the plan wholesale; passed
+  nodes re-execute; RETRY is timeout-only). No culprit
+  mapping from a failed measurement node to the earlier
+  edit node exists, and no plan-surgery seam — building
+  both in the same cycle as the ask change would confound
+  which lever moved the model. Deferred as its own cycle
+  if the ask change alone does not move live acceptance.
+- A no-op rejection (a 'replace' whose materialized module
+  is byte-identical to the current text) was built and
+  REVERTED with evidence: the suite's grounded fixtures
+  offer the verbatim current body as the canonical
+  replace-delta (GROUNDED_DO_GET_DELTA), so the gate
+  redefined the anchored-edit contract under 98 pins
+  (3 failures + 95 errors, every one traced to the gate)
+  across ~30 classes. The replace contract stands — any
+  complete version materializes; whether the goal's change
+  is in it is judged by the plan's own tests at execution.
+- Secondary BUILT: PlanError code missing_target (37 codes
+  total) — the narrow floor of cycle 6's deferred
+  required-inputs question. A scaffold/file_writer node
+  whose inputs name no target (no file_path/path, no
+  inputs['outputs'][0] — exactly the scaffold claw's own
+  target expression, mirrored) is a planning rejection.
+  Re-run #4 run 2's accepted empty-inputs node is now
+  rejected at planning; the full required-inputs table
+  stays deferred.
+- Measurement: suite 1069/1069 (1063 baseline + 6 new,
+  TestPlannerCompleteCodeFix). Framework guard ALL CHECKS
+  PASSED. Corpus replay: the per-plan table is
+  byte-identical to cycle 6 code (verified by replaying
+  HEAD vs cycle-7 planner and diffing all 56 rows) —
+  accepted 0/28, accepted-sound 0/28, mean errors/output
+  1.32; zero movement, because no corpus verdict turned on
+  the sketch (prompt-side, not parse-side) and none carries
+  a verbatim-copy step-1 or a no-target scaffold. Pins
+  changed: 3, each documented in its test — the two sketch
+  pins now assert the verbatim definition (real return
+  line, no payload rebuild, no slots), and the
+  verbatim-skeleton pin now asserts the skeleton
+  materializes as the module unchanged plus the brief's
+  fixture: the same skeleton completed with real
+  expressions (a urllib Ollama probe, an nvidia-smi parse)
+  materializes and validates with all definitions
+  retained. No live driver runs this cycle; re-run #5 is
+  the test of the new ask.

@@ -4443,6 +4443,50 @@ def _command_error_records(
     ]
 
 
+def _missing_target_errors(nodes: list[PlanNode]) -> list[str]:
+    """A scaffold/file_writer node whose inputs name no target file.
+
+    Cycle 7 — the narrow floor of the required-inputs question
+    cycle 6 deferred. The scaffold claw determines its target in
+    exactly one place (tool_registry's scaffold handler): inputs
+    "file_path", else "path", else the first inputs "outputs"
+    entry — and raises when none of them names one. A node with
+    no determinable target can therefore only fail at execution,
+    after its plan was accepted (live re-run #4, run 2: a scaffold
+    node with empty inputs {} was accepted, and only experiment
+    memory stopped it). Mirroring the claw's one expression here
+    names the defect at planning instead. This is NOT the full
+    required-inputs table cycle 6 deferred: every other input
+    keeps the behavior it has today — a node WITH a target and no
+    content writes an empty file, which is the claw's defined
+    behavior, not this floor's business. The outputs access is
+    guarded to list/tuple: the claw itself would crash on an
+    exotic outputs value at execution, and a planning rejection
+    is the honest name for that too.
+    """
+    errors: list[str] = []
+    for node in nodes:
+        if node.assigned_claw not in ("scaffold", "file_writer"):
+            continue
+        inputs = node.inputs or {}
+        target = inputs.get("file_path") or inputs.get("path")
+        if not target:
+            outputs = inputs.get("outputs")
+            if isinstance(outputs, (list, tuple)) and outputs:
+                target = outputs[0]
+        if isinstance(target, str) and target:
+            continue
+        errors.append(
+            f"Planner node '{node.id}' uses the scaffold claw but "
+            "names no target file: its inputs carry no 'file_path', "
+            "'path', or 'outputs' entry, so the claw has nothing "
+            "to write. Name the file the node writes in "
+            "'file_path' and give its full new content in "
+            "'content'."
+        )
+    return errors
+
+
 def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
@@ -4630,6 +4674,9 @@ def _collect_plan_error_records(
             _missing_directory_errors(nodes, repo_root, index),
         )
     )
+    records.extend(
+        _error_records("missing_target", _missing_target_errors(nodes))
+    )
     # Cheap rejection (retry #12): the only errors are stand-in /
     # code-overwrite fakes, so re-prompting costs the model nothing to
     # fix and must not spend the repair budget. A rejection whose only
@@ -4638,8 +4685,10 @@ def _collect_plan_error_records(
     # and so is a rejection whose only errors are placeholder bash
     # heredocs (retry #20), and so is one whose only errors are
     # placeholder values (cycle 6): a bare '...' costs the model nothing
-    # to replace with the real expression. Any other error mixed in
-    # makes it a real rejection.
+    # to replace with the real expression. A missing-target rejection
+    # (cycle 7) is NOT cheap: the node is structurally incomplete — a
+    # schema-class defect, like the raw-node schema errors. Any other
+    # error mixed in makes it a real rejection.
     cheap = (
         bool(records)
         and len(standin_records)
@@ -5844,6 +5893,7 @@ _CONTENT_DEFECT_CODES = frozenset(
         "placeholder_bash",
         "placeholder_delta",  # materialized edit whose delta is placeholder-only
         "placeholder_value",  # bare Ellipsis assigned as a value (cycle 6)
+        "missing_target",  # scaffold node names no target file (cycle 7)
         "static_standin",  # hardcoded literal answers
         "framework",  # Flask / FastAPI over a stdlib module
         "scaffold_overwrite",  # retention guard: drops existing definitions
@@ -6183,7 +6233,10 @@ def _grounded_move_for_goal(goal_text: str | None, repo_root: str | Path | None)
 # sketch keeps the branch as it exists. ONE table for both steps
 # (retry #32): step-1's delta sketch extends the branch with
 # exactly the fields step-2's test asserts, so the two can never
-# drift apart.
+# drift apart. Cycle 7: the sketch no longer extends the branch —
+# the table's step-1 role is now naming the fields in the step-1
+# GUIDANCE, so the extension is the model's own code to write; the
+# two steps still read the one table, so they still cannot drift.
 _SKELETON_ROUTE_FIELDS: dict[str, tuple[tuple[str, str | None], ...]] = {
     "/health": (
         ("service_status", None),
@@ -6191,31 +6244,6 @@ _SKELETON_ROUTE_FIELDS: dict[str, tuple[tuple[str, str | None], ...]] = {
         ("gpu_temperature", "(int, float)"),
     ),
 }
-
-
-def _route_branch_if(source: str, route: str) -> ast.If | None:
-    """The ast.If dispatching on ``route`` in a module, or None.
-
-    The branch shape _route_branch_anchor and repo_index._route_branch
-    both read: a Compare whose single Eq comparator is the route
-    literal. Assumes the source parses (callers check); returns the
-    first match in walk order, like _route_branch_anchor.
-    """
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        test = node.test
-        if (
-            isinstance(test, ast.Compare)
-            and len(test.ops) == 1
-            and isinstance(test.ops[0], ast.Eq)
-            and len(test.comparators) == 1
-            and isinstance(test.comparators[0], ast.Constant)
-            and test.comparators[0].value == route
-        ):
-            return node
-    return None
 
 
 def _anchored_delta_sketch(
@@ -6229,94 +6257,45 @@ def _anchored_delta_sketch(
     retry #31's model copied it into the edit's content verbatim —
     the second consecutive echo of whatever prose occupied an
     example's content slot (retry #30 echoed the old step-1 the
-    same way). The blank is now the anchored definition's REAL
+    same way). The blank became the anchored definition's REAL
     current source — signature and full body sliced verbatim from
     the module at the anchor's span (decorators included), at its
-    true file indentation — with the route branch extended in code
-    form: when the branch's body is a single ``return <call>(...,
-    {dict})`` and the route has derived response fields
-    (_SKELETON_ROUTE_FIELDS), the branch is rebuilt as
+    true file indentation.
 
-        payload = {<the branch's real dict>}
-        payload["<field>"] = ...      (per field not already a key)
-        return <the real call, its dict argument now ``payload``>
-
-    at the branch body's real indentation, every expression taken
-    from the source segments, so nothing is invented but the field
-    names the shape code already derives. The ``...`` values are
-    the sketch's open slots — the steering text AROUND the slot
-    (the skeleton's step-1 guidance) tells the model to replace
-    them with real computations; no instruction text lives inside
-    the content slot anymore. Any other branch shape, no derived
-    fields, or every field already present leaves the definition
-    source unchanged: still real code at true indentation. Returns
-    None when the anchor has no span in the source.
+    Retry #32 also rebuilt the route branch in code form when its
+    body was a single ``return <call>(..., {dict})``: the real
+    dict bound to a payload name, one ``payload["<field>"] = ...``
+    line per derived field (_SKELETON_ROUTE_FIELDS), the real
+    call returning the payload — the ``...`` values as open slots
+    the step-1 guidance told the model to replace with real
+    computations. Cycle 7 removes the rebuild: across five live
+    runs the model copied the sketch verbatim, slots and all,
+    every time — a worked form the model can copy is a form it
+    WILL copy, and the slot lines taught the placeholder shape
+    the rest of the harness then had to reject (cycle 6's
+    placeholder_value names it). The sketch is now the definition
+    exactly as it stands, for every branch shape; the extension
+    is the model's own code to write — the step-1 guidance names
+    the fields and demands the computations. A verbatim copy of
+    the sketch materializes as the module unchanged: the
+    anchored-edit contract accepts any complete version of the
+    definition, and whether the goal's change is in it is judged
+    by the plan's own tests at execution, not by a planning gate
+    (cycle 7 built that gate and reverted it — the suite's
+    grounded fixtures encode the replace contract across ~98
+    pins, and the cycle's rule is to change the ask, not add a
+    gate). ``route`` no longer shapes the sketch (the guidance
+    reads the fields table); it stays in the signature for the
+    call site. Returns None when the anchor has no span in the
+    source.
     """
-    span: tuple[int, int] | None = None
     for span_name, span_start, span_end, _span_indent in _definition_spans(
         module_source
     ):
         if span_name == anchor:
-            span = (span_start, span_end)
-            break
-    if span is None:
-        return None
-    start, end = span
-    lines = module_source.splitlines()
-    definition_lines = lines[start - 1 : end]
-    fields = [
-        field for field, _types in _SKELETON_ROUTE_FIELDS.get(route, ())
-    ]
-    if not fields:
-        return "\n".join(definition_lines)
-    branch = _route_branch_if(module_source, route)
-    if branch is None or not (start <= branch.lineno <= end):
-        return "\n".join(definition_lines)
-    if len(branch.body) != 1 or not isinstance(branch.body[0], ast.Return):
-        return "\n".join(definition_lines)
-    ret = branch.body[0]
-    if not isinstance(ret.value, ast.Call):
-        return "\n".join(definition_lines)
-    dict_node = next(
-        (arg for arg in ret.value.args if isinstance(arg, ast.Dict)), None
-    )
-    if dict_node is None:
-        return "\n".join(definition_lines)
-    existing_keys = {
-        key.value
-        for key in dict_node.keys
-        if isinstance(key, ast.Constant) and isinstance(key.value, str)
-    }
-    new_fields = [field for field in fields if field not in existing_keys]
-    if not new_fields:
-        return "\n".join(definition_lines)
-    dict_segment = ast.get_source_segment(module_source, dict_node)
-    call_segment = ast.get_source_segment(module_source, ret.value)
-    if dict_segment is None or call_segment is None:
-        return "\n".join(definition_lines)
-    definition_text = "\n".join(definition_lines)
-    payload_name = next(
-        (
-            candidate
-            for candidate in ("payload", "response_payload", "route_payload")
-            if not re.search(rf"\b{candidate}\b", definition_text)
-        ),
-        None,
-    )
-    if payload_name is None:
-        return "\n".join(definition_lines)
-    body_indent = " " * ret.col_offset
-    rebuilt = [f"{body_indent}{payload_name} = {dict_segment}"]
-    rebuilt += [
-        f'{body_indent}{payload_name}["{field}"] = ...'
-        for field in new_fields
-    ]
-    rebuilt.append(
-        f"{body_indent}return "
-        + call_segment.replace(dict_segment, payload_name, 1)
-    )
-    definition_lines[ret.lineno - start : ret.end_lineno - start + 1] = rebuilt
-    return "\n".join(definition_lines)
+            lines = module_source.splitlines()
+            return "\n".join(lines[span_start - 1 : span_end])
+    return None
 
 
 def _grounded_skeleton(
@@ -6365,7 +6344,13 @@ def _grounded_skeleton(
     (_anchored_delta_sketch), and the instructions live in the
     step-1 guidance AROUND the slot. A verbatim copy now copies
     plausible code at the right indentation, which materialization
-    judges on content like any other delta.
+    judges on content like any other delta. Cycle 7: five live runs
+    copied the slot sketch verbatim anyway — the guidance said
+    "replace the slots" and the model returned the slots — so the
+    sketch no longer extends the branch at all: step-1's content is
+    the definition exactly as it stands, and the guidance names the
+    fields and demands the computations as the model's own code
+    (see _anchored_delta_sketch).
     Step-2's test is runnable real code, not a stub (retry #21): the old
     skeleton showed a "# TODO: replace this comment with the real test
     code" heredoc, and the model copied the TODO verbatim into its plan
@@ -6429,6 +6414,12 @@ def _grounded_skeleton(
         # When no anchor is derivable (module unreadable or
         # unparseable, branch outside any definition), step-1
         # keeps the legacy full-content form below.
+        # Cycle 7: the sketch is the definition exactly as it
+        # stands — the retry-#32 branch rebuild (the payload
+        # slots) is gone, because the model copied it verbatim in
+        # five live runs; the extension is the model's own code
+        # to write, and the step-1 guidance below carries the
+        # field names and the computation demand instead.
         anchor_indent = 0
         delta_sketch: str | None = None
         try:
@@ -6472,22 +6463,48 @@ def _grounded_skeleton(
             "position": "replace",
             "content": content,
         }
+        # Cycle 7: the fields the extended branch must report are
+        # named here, in the guidance — the sketch itself no longer
+        # carries them as "..." slots (the model copied the slots
+        # verbatim in five live runs). The demand is for the model's
+        # own computations, in the anti-fabrication voice the
+        # stand-in checks already use.
+        fields = [
+            field for field, _types in _SKELETON_ROUTE_FIELDS.get(route, ())
+        ]
+        fields_guidance = ""
+        if fields:
+            fields_guidance = (
+                " The extended branch must also report "
+                + ", ".join(fields)
+                + ": write the real code that computes each one "
+                "inside the definition — probe the service or run "
+                "the command the goal names and parse its output; "
+                "where a probe can fail, attempt it and report "
+                "None (False for a yes/no field) when it fails. "
+                "Never assign an invented constant for a value "
+                "that exists only by measuring it — a fabricated "
+                "reading is a wrong answer, not a shortcut — and "
+                "never assign \"...\" (a placeholder, rejected by "
+                "name at planning)."
+            )
         step1_guidance = (
             "Step-1 is an anchored edit of the serving module: its "
             "\"content\" is the anchored definition's current code, "
-            f"with the {route} branch already extended in code form "
-            "— the fields the goal asks the endpoint to report are "
-            "present with \"...\" sketch values. Return the complete "
-            "new version of the anchored definition (def line "
-            "included, at its indentation in the file — "
-            f"{anchor_indent} spaces) with every \"...\" value "
-            "replaced by the real computation of what the goal asks "
-            "the endpoint to report, keeping the rest of the "
-            "definition's code as it is; the system inserts it into "
-            "the current module, so do not write the whole module. "
-            "The content is code to complete, not text to copy back "
-            "unchanged — a definition still carrying \"...\" sketch "
-            "values does not implement the goal."
+            f"exactly as it stands in the file today — the {route} "
+            "branch is NOT extended yet. Return the complete new "
+            "version of the anchored definition (def line included, "
+            "at its indentation in the file — "
+            f"{anchor_indent} spaces) with the {route} branch "
+            "extended to report what the goal asks the endpoint to "
+            "report, keeping the rest of the definition's code as "
+            "it is; the system inserts it into the current module, "
+            "so do not write the whole module. The content is code "
+            "to extend, not text to copy back unchanged — a "
+            "definition returned unchanged changes nothing, and "
+            "the plan's own tests then fail the endpoint's new "
+            "behavior at execution."
+            + fields_guidance
         )
     else:
         step1_inputs = {"file_path": module_path, "content": content}

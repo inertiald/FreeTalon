@@ -16258,10 +16258,28 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
         # slots filled with real expressions, the same skeleton
         # materializes as a real plan exactly as this pin
         # originally asserted.
+        #
+        # Planner cycle 7 flips the mechanism again: the sketch no
+        # longer carries slots at all (the model copied the worked
+        # form verbatim in every live run), so step-1's content is
+        # the definition exactly as it stands. The verbatim
+        # skeleton therefore materializes as the module unchanged —
+        # the anchored-edit contract accepts any complete version
+        # of the definition, and whether the goal's change is in it
+        # is judged by the plan's own tests at execution (a
+        # planning-stage no-op rejection was built in this cycle
+        # and reverted: it redefined the replace contract ~98
+        # suite pins encode, and the cycle's rule is to change the
+        # ask, not add a gate). Completed the way the cycle-7
+        # guidance asks — the branch extended with real
+        # computations, written out below — the same skeleton
+        # materializes as a real plan exactly as this pin
+        # originally asserted, with the three fields as real
+        # expressions.
         import json
 
         from freetalon.orchestrator.planner import (
-            CheapRejectionError,
+            _definition_spans,
             _grounded_skeleton,
         )
         from freetalon.orchestrator.repo_index import qualified_def_names
@@ -16270,17 +16288,75 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
             self.HEALTH_GOAL, str(self.repo_root), self.WS
         )
         raw = skeleton.split("\n", 1)[1]
-        with self.assertRaises(CheapRejectionError) as caught:
-            parse_planner_response(
-                raw, goal_text=self.HEALTH_GOAL, workspace=self.WS
-            )
-        self.assertEqual(
-            {record.code for record in caught.exception.plan_errors},
-            {"placeholder_value"},
+        source = Path(self.api_path).read_text(encoding="utf-8")
+        verbatim_nodes, _meta = parse_planner_response(
+            raw, goal_text=self.HEALTH_GOAL, workspace=self.WS
         )
-        self.assertIn("payload['gpu_temperature']", str(caught.exception))
+        self.assertEqual(len(verbatim_nodes), 5)
+        # The verbatim step-1 materializes to the module exactly
+        # as it stands — the definition was already complete code.
+        self.assertEqual(verbatim_nodes[0].inputs["content"], source)
+        # Complete step-1 by hand: the current do_GET with the
+        # /health branch extended by real computations — an Ollama
+        # probe and an nvidia-smi reading, each attempted and
+        # falling back when it fails.
+        parsed = json.loads(raw)
+        spans = {
+            name: (start, end)
+            for name, start, end, _indent in _definition_spans(source)
+        }
+        start, end = spans["HiveAPIServer.start.Handler.do_GET"]
+        do_get = "\n".join(source.splitlines()[start - 1 : end])
+        branch = (
+            '                if path == "/health":\n'
+            "                    return self._send(200, "
+            '{"ok": True, "status": "ready"})'
+        )
+        extended_branch = "\n".join(
+            [
+                '                if path == "/health":',
+                "                    import subprocess",
+                "                    import urllib.request",
+                "",
+                "                    try:",
+                "                        with urllib.request.urlopen(",
+                '                            "http://localhost:11434/api/tags",',
+                "                            timeout=2,",
+                "                        ) as response:",
+                "                            ollama_reachable = response.status == 200",
+                "                    except Exception:",
+                "                        ollama_reachable = False",
+                "                    try:",
+                "                        reading = subprocess.run(",
+                "                            [",
+                '                                "nvidia-smi",',
+                '                                "--query-gpu=temperature.gpu",',
+                '                                "--format=csv,noheader",',
+                "                            ],",
+                "                            capture_output=True,",
+                "                            text=True,",
+                "                            timeout=5,",
+                "                        )",
+                "                        gpu_temperature = float(reading.stdout.strip())",
+                "                    except Exception:",
+                "                        gpu_temperature = None",
+                "                    return self._send(",
+                "                        200,",
+                "                        {",
+                '                            "ok": True,',
+                '                            "status": "ready",',
+                '                            "service_status": "ready",',
+                '                            "ollama_reachable": ollama_reachable,',
+                '                            "gpu_temperature": gpu_temperature,',
+                "                        },",
+                "                    )",
+            ]
+        )
+        extended = do_get.replace(branch, extended_branch)
+        self.assertNotEqual(extended, do_get)
+        parsed["nodes"][0]["inputs"]["content"] = extended
         nodes, _meta = parse_planner_response(
-            _fill_health_slots(raw),
+            json.dumps(parsed),
             goal_text=self.HEALTH_GOAL,
             workspace=self.WS,
         )
@@ -16291,11 +16367,11 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
         self.assertNotIn("anchor", inputs)
         self.assertNotIn("position", inputs)
         content = inputs["content"]
-        source = Path(self.api_path).read_text(encoding="utf-8")
         self.assertEqual(
             qualified_def_names(content), qualified_def_names(source)
         )
-        self.assertIn('payload["gpu_temperature"] = 25.0', content)
+        self.assertIn('"ollama_reachable": ollama_reachable', content)
+        self.assertIn("nvidia-smi", content)
         # Silence the unused-import lint pattern used elsewhere.
         self.assertIsInstance(json.loads(raw), dict)
 
@@ -16509,14 +16585,35 @@ class TestPlannerDeltaBlankFix(unittest.TestCase):
         self.assertEqual(len(branch_lines), 1)
         self.assertFalse(branch_lines[0].lstrip().startswith("#"))
         ast.parse(textwrap.dedent(content))
-        # The branch is extended in code form: the real response
-        # dict bound to payload, the goal's fields as sketch
-        # values, the real return sending the payload.
-        self.assertIn('payload = {"ok": True, "status": "ready"}', content)
-        self.assertIn('payload["service_status"] = ...', content)
-        self.assertIn('payload["ollama_reachable"] = ...', content)
-        self.assertIn('payload["gpu_temperature"] = ...', content)
-        self.assertIn("return self._send(200, payload)", content)
+        # Cycle 7 flips the extension pins: retry #32's sketch
+        # rebuilt the branch in code form (the real dict bound to
+        # payload, the goal's fields as "..." sketch values, the
+        # real return sending the payload), and five live runs
+        # copied that form verbatim — slots and all — so the
+        # sketch taught the placeholder shape cycle 6 then had to
+        # reject. The content is now the definition EXACTLY as it
+        # stands in the file: the branch unextended, its real
+        # return line untouched, no payload rebuild, no slots.
+        # The extension is the model's own code to write; the
+        # guidance (asserted in TestPlannerCompleteCodeFix) names
+        # the fields and demands the computations.
+        from freetalon.orchestrator.planner import _definition_spans
+
+        source = Path(self.api_path).read_text(encoding="utf-8")
+        spans = {
+            name: (start, end)
+            for name, start, end, _indent in _definition_spans(source)
+        }
+        start, end = spans["HiveAPIServer.start.Handler.do_GET"]
+        self.assertEqual(
+            content, "\n".join(source.splitlines()[start - 1 : end])
+        )
+        self.assertIn(
+            'return self._send(200, {"ok": True, "status": "ready"})',
+            content,
+        )
+        self.assertNotIn("payload", content)
+        self.assertNotIn("= ...", content)
         # No instruction prose inside the content slot: every
         # phrase of the old blank is gone from it.
         for phrase in (
@@ -16571,9 +16668,16 @@ class TestPlannerDeltaBlankFix(unittest.TestCase):
         sketch = _anchored_delta_sketch(source, anchor, "/health")
         self.assertIsNotNone(sketch)
         assert sketch is not None
-        self.assertIn('payload = {"ok": True}', sketch)
-        self.assertIn('payload["gpu_temperature"] = ...', sketch)
-        self.assertIn("return self._send(200, payload)", sketch)
+        # Cycle 7: even for the single-dict-return branch shape
+        # the sketch is the definition verbatim — retry #32's
+        # payload rebuild ('payload = {...}', one
+        # 'payload["<field>"] = ...' slot per derived field, the
+        # return sending the payload) taught the placeholder
+        # shape the live runs copied verbatim, so the rebuild is
+        # gone and the branch keeps its real return line.
+        self.assertIn('return self._send(200, {"ok": True})', sketch)
+        self.assertNotIn("payload", sketch)
+        self.assertNotIn("= ...", sketch)
         # The other branch is untouched real code.
         self.assertIn('return self._send(404, {"ok": False})', sketch)
         # A route with no derived fields: the definition verbatim.
@@ -18527,6 +18631,263 @@ class TestPlannerPlaceholderValueFix(unittest.TestCase):
         raw = self._dag([self._edit_node(self.ELLIPSIS_DELTA)])
         self.assertEqual(
             planner_module._shape_steering_block(raw, {"placeholder_value"}),
+            "",
+        )
+        self.assertIn(
+            "SHAPE was right",
+            planner_module._shape_steering_block(raw, {"criteria"}),
+        )
+
+
+
+class TestPlannerCompleteCodeFix(unittest.TestCase):
+    """Cycle 7: elicit complete code — change what the harness asks for.
+
+    Every feedback channel was complete and verified live by cycle
+    6 — execution feedback quoting the assertion verbatim (cycle
+    5), a named planning-stage rejection of the placeholder values
+    (cycle 6) — and the planner still could not produce the /health
+    delta's substance: at temperature 0 it re-emitted the Ellipsis
+    delta until budgets exhausted; at 0.4 it routed around with
+    fabricated constants and vacuous scaffolds. Two positive
+    signals named the remaining lever. (1) The grounded skeleton's
+    own sketch taught the slot shape: _anchored_delta_sketch
+    rebuilt the route branch as payload[...] = ... open slots, and
+    the model — which copies the form it is shown — returned the
+    slots. (2) The model's only real-valued code in five runs was
+    a COMPLETE standalone function, never a filled delta. So this
+    cycle changes the ask, not the gates: the sketch is the
+    anchored definition exactly as it stands (no worked form to
+    copy), and the step-1 guidance names the route's derived
+    fields and demands the model's own computations (probe and
+    parse, attempt-and-report-None on failure, no invented
+    constants). A planning-stage rejection of the verbatim copy
+    (a no-op "replace") was built in this cycle and REVERTED with
+    evidence: the suite's grounded fixtures offer the verbatim
+    current body as the canonical replace-delta (see
+    GROUNDED_DO_GET_DELTA's header), so the gate redefined the
+    anchored-edit contract under ~98 pins across ~30 classes —
+    not the smallest coherent change, and a gate where the cycle
+    called for a better ask. Whether the goal's change is in a
+    complete version stays judged by the plan's own tests at
+    execution, as the loop is designed. Node-local repair was
+    investigated and deferred: the loop's re-plan is whole-plan
+    only, and a culprit-mapping + plan-surgery seam in the same
+    cycle would confound attribution.
+
+    Secondary (the narrow floor of cycle 6's deferred
+    required-inputs question): a scaffold/file_writer node whose
+    inputs name no target file is a planning rejection
+    (missing_target, 37 codes) — the claw's target determination
+    is one expression in one place, mirrored here; the full
+    required-inputs table stays deferred.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # Qualified definitions (7): alpha, beta, Server, Server.start,
+    # Server.start.Handler, Server.start.Handler.do_GET, Server.stop.
+    MODULE_SOURCE = TestPlannerPlaceholderValueFix.MODULE_SOURCE
+
+    # The fixture do_GET exactly as it stands in MODULE_SOURCE.
+    VERBATIM_DO_GET = (
+        "            def do_GET(self):\n"
+        "                path = urlparse(self.path).path\n"
+        '                if path == "/health":\n'
+        '                    return self._send(200, {"ok": True, "status": "ready"})\n'
+        '                return self._send(404, {"ok": False})\n'
+    )
+
+    # The same definition with one real change.
+    CHANGED_DO_GET = VERBATIM_DO_GET.replace(
+        'return self._send(404, {"ok": False})',
+        'return self._send(404, {"ok": False, "error": "Not Found"})',
+    )
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_root = Path(self._tmp.name)
+        self.module_path = str(self.tmp_root / "fixture_module.py")
+        Path(self.module_path).write_text(self.MODULE_SOURCE, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _edit_node(self, content: str) -> dict:
+        return {
+            "id": "step-1",
+            "objective": "Extend the fixture module in place",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": self.module_path,
+                "anchor": "Server.start.Handler.do_GET",
+                "position": "replace",
+                "content": content,
+            },
+            "outputs": [self.module_path],
+            "acceptance": ["The module is edited."],
+            "criteria": [{"type": "file_exists", "path": self.module_path}],
+        }
+
+    # --- The emitted form: guidance carries the demand ---
+
+    def test_skeleton_guidance_names_fields_and_demands_computations(
+        self,
+    ) -> None:
+        import json
+
+        from freetalon.orchestrator.planner import _grounded_skeleton
+
+        skeleton = _grounded_skeleton(
+            self.HEALTH_GOAL, str(self.repo_root), self.WS
+        )
+        # The demand lives in the guidance around the content slot:
+        # the fields named from the shared table, the computation
+        # demand, the anti-fabrication rule, the no-op warning.
+        self.assertIn(
+            "must also report service_status, ollama_reachable, "
+            "gpu_temperature",
+            skeleton,
+        )
+        self.assertIn(
+            "write the real code that computes each one", skeleton
+        )
+        self.assertIn("Never assign an invented constant", skeleton)
+        self.assertIn(
+            "a definition returned unchanged changes nothing",
+            skeleton,
+        )
+        # None of the demand is inside the content slot itself —
+        # the content is the definition's code and nothing else.
+        parsed = json.loads(skeleton.split("\n", 1)[1])
+        content = parsed["nodes"][0]["inputs"]["content"]
+        self.assertNotIn("must also report", content)
+        self.assertNotIn("invented constant", content)
+
+    # --- The replace contract: any complete version materializes ---
+
+    def test_verbatim_replace_materializes_as_the_module_unchanged(
+        self,
+    ) -> None:
+        # The contract the reverted no-op gate collided with,
+        # pinned deliberately: a "replace" whose content is the
+        # definition exactly as it stands is a complete version of
+        # it, so it materializes (to the module unchanged). The
+        # cycle-7 change is what the planner is SHOWN — the sketch
+        # no longer teaches slots — not a new planning gate on
+        # what a complete version may be.
+        nodes, _meta = parse_planner_response(
+            self._dag([self._edit_node(self.VERBATIM_DO_GET)])
+        )
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].inputs["content"], self.MODULE_SOURCE)
+        self.assertNotIn("anchor", nodes[0].inputs)
+
+    def test_changed_replace_still_materializes(self) -> None:
+        nodes, _meta = parse_planner_response(
+            self._dag([self._edit_node(self.CHANGED_DO_GET)])
+        )
+        self.assertEqual(len(nodes), 1)
+        content = nodes[0].inputs["content"]
+        self.assertIn('"error": "Not Found"', content)
+        self.assertNotIn("anchor", nodes[0].inputs)
+
+    # --- Secondary: the missing-target floor ---
+
+    def test_missing_target_floor_unit(self) -> None:
+        from freetalon.orchestrator.models import PlanNode
+        from freetalon.orchestrator.planner import _missing_target_errors
+
+        def node(claw: str, inputs: dict) -> PlanNode:
+            return PlanNode(
+                id="n1", objective="Write a file",
+                assigned_claw=claw, inputs=inputs,
+            )
+
+        # The re-run #4 shape: empty inputs, and content with no
+        # target — the claw has nothing to write either way.
+        self.assertEqual(len(_missing_target_errors([node("scaffold", {})])), 1)
+        self.assertEqual(
+            len(
+                _missing_target_errors(
+                    [node("scaffold", {"content": "x = 1\n"})]
+                )
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(_missing_target_errors([node("file_writer", {})])), 1
+        )
+        # Every way the claw itself finds a target passes the floor.
+        for inputs in (
+            {"file_path": "/tmp/x.py"},
+            {"path": "/tmp/x.py"},
+            {"outputs": ["/tmp/x.py"]},
+        ):
+            self.assertEqual(
+                _missing_target_errors([node("scaffold", inputs)]),
+                [],
+                inputs,
+            )
+        # Not a write claw: the floor does not apply.
+        self.assertEqual(_missing_target_errors([node("bash", {})]), [])
+
+    def test_missing_target_floor_fires_in_a_plan(self) -> None:
+        # The live re-run #4 run-2 node, verbatim in shape: a
+        # scaffold node with empty inputs was ACCEPTED before this
+        # floor (only experiment memory stopped it). Other
+        # validators may name other defects of the same plan; the
+        # floor's code must be among them.
+        raw = self._dag(
+            [
+                {
+                    "id": "node-1",
+                    "objective": "Scaffold the endpoint module",
+                    "depends_on": [],
+                    "assigned_claw": "scaffold",
+                    "inputs": {},
+                    "outputs": [],
+                    "acceptance": ["The module exists."],
+                    "criteria": [
+                        {"type": "file_exists", "path": self.module_path}
+                    ],
+                }
+            ]
+        )
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw)
+        self.assertIn(
+            "missing_target",
+            {record.code for record in caught.exception.plan_errors},
+        )
+        self.assertIn("names no target file", str(caught.exception))
+
+    def test_missing_target_counts_as_content_defect_for_steering(
+        self,
+    ) -> None:
+        # Without the code in _CONTENT_DEFECT_CODES, the shape
+        # block would bless a missing-target rejection with "none
+        # of its code was rejected — keep the same code" (the
+        # retry-#28/#33 contradiction). With it, the block stays
+        # silent for this rejection and still fires for a
+        # string-only defect.
+        from freetalon.orchestrator import planner as planner_module
+
+        raw = self._dag([self._edit_node(self.CHANGED_DO_GET)])
+        self.assertEqual(
+            planner_module._shape_steering_block(raw, {"missing_target"}),
             "",
         )
         self.assertIn(
