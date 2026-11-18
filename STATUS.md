@@ -3521,3 +3521,71 @@ Deliberately left out:
   error-count pins changed. No live runs, no
   GPU. Log:
   logs/cycle10-crediting-2026-11-18.log.
+
+## Update - 2026-11-18 (Cycle 11: steering for the three remaining discipline classes — file-criteria invention, unreportable metric, test-module overwrite)
+
+- Premise check (log
+  logs/cycle11-steering-2026-11-18.log): all
+  three rejections from re-run #7 were correct;
+  what was missing was the steer. One brief
+  shorthand corrected from the artifacts: Qwen
+  Arm 3 output 1's json_response is a metric
+  NAME on a bash node (type metric), not a
+  criterion type — bash reports no metrics, so
+  the criterion could never be measured there.
+- File-criteria discipline: the planner and
+  re-plan prompts now state the credited write
+  set in the validator's terms (scaffold/
+  file_writer target, heredoc, redirect,
+  curl -o / wget -O download, tee, dd of=,
+  cp/mv destination, touch) and the
+  constructive alternative for live-endpoint
+  verification — an exit_code criterion on the
+  node whose command curls the endpoint
+  (stdout is the response; a bare curl writes
+  no file, so no file criterion can measure
+  it). The per-node criterion error and both
+  plan-level unwritten_file errors carry the
+  same pointer via one shared constant
+  (_FILE_CRITERION_GUIDANCE); codes unchanged.
+- Reportable criteria in the open: the
+  prompts publish the per-claw metric set
+  DERIVED from tool_registry.CLA_METRICS — the
+  same map metrics_reported_by feeds the
+  validator — via prompts.planner_system_
+  prompt() / replan_system_prompt(), resolved
+  at the two planner call sites. (A top-level
+  import in prompts.py cycles:
+  tool_registry -> intake -> prompts; the
+  derivation is lazy for exactly that reason.)
+  The unknown-criterion-type error now names
+  the valid types (derived from
+  _CRITERION_TYPES); the metric-on-a-no-metrics
+  -claw error names the exit_code alternative;
+  the reporting-claw branch already listed its
+  set and is unchanged.
+- New-tests placement: both prompts state it
+  up front — new tests in a NEW test file
+  (e.g. tests/test_health.py), never scaffold
+  a replacement for an existing test module,
+  anchored insert to add cases to one. The
+  scaffold_overwrite error, when the target is
+  an existing test module (_is_test_file_path,
+  reused), names those two alternatives
+  instead of the generic retype-the-module
+  advice; non-test targets keep the old text
+  byte-for-byte.
+- Measurement: suite 1117/1117 (1107 + 10 new
+  pins in TestPlannerCycle11SteeringFix);
+  framework guard ALL CHECKS PASSED; original
+  corpus unchanged (0/28 accepted, mean 1.32,
+  0 of 56 rows moved substantively); model-ab
+  corpus unchanged (gemma3:27b mean 1.67,
+  qwen2.5-coder:14b mean 2.67, accepted 0, 0
+  of 12 rows moved) — as expected for
+  generation-side steering: the recorded
+  outputs still fail for the reasons they
+  failed, and the effect lands on the next
+  live generation. Pins changed: NONE. No
+  live runs, no GPU. Log:
+  logs/cycle11-steering-2026-11-18.log.

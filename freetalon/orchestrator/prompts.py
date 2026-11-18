@@ -2,6 +2,42 @@
 
 from __future__ import annotations
 
+
+def _reportable_metrics_text() -> str:
+    """The per-claw reportable metric names, derived from CLA_METRICS.
+
+    Cycle 11: the planner prompt publishes the same set the validator
+    enforces (planner._usable_criterion_error derives its metric
+    errors from tool_registry.metrics_reported_by, which reads this
+    same map), so the prompt and the validator cannot drift apart —
+    there is no hand-maintained second list. Aliases repeat their
+    canonical claw's set because CLA_METRICS keys them separately.
+    The import is lazy: tool_registry imports intake, and intake
+    imports this module, so a top-level import here would cycle.
+    """
+    from .tool_registry import CLA_METRICS
+
+    parts = []
+    for claw in sorted(CLA_METRICS):
+        names = sorted(CLA_METRICS[claw])
+        parts.append(f"{claw}: {', '.join(names) if names else 'none'}")
+    return "; ".join(parts)
+
+
+def planner_system_prompt() -> str:
+    """PLANNER_SYSTEM_PROMPT with the derived metric set filled in."""
+    return PLANNER_SYSTEM_PROMPT.replace(
+        "__REPORTABLE_METRICS__", _reportable_metrics_text()
+    )
+
+
+def replan_system_prompt() -> str:
+    """REPLAN_SYSTEM_PROMPT with the derived metric set filled in."""
+    return REPLAN_SYSTEM_PROMPT.replace(
+        "__REPORTABLE_METRICS__", _reportable_metrics_text()
+    )
+
+
 INTAKE_SYSTEM_PROMPT = """You normalize user requests into a strict JSON TaskIntent object.
 
 Return exactly one JSON object and nothing else.
@@ -90,12 +126,12 @@ MEASURABLE CRITERIA — every node MUST have a "criteria" array with at least on
 - {"type": "exit_code", "equals": 0} — for "bash" nodes: the command must exit 0. An exit_code criterion may carry its own "command" ({"type": "exit_code", "equals": 0, "command": "<shell command>"}), which is run and measured instead of the node's command — use that to verify one specific command (for example a curl) instead of inventing a criterion type for it.
 - {"type": "file_exists", "path": "<absolute path>"} — the file must exist after the node runs.
 - {"type": "file_matches", "path": "<absolute path>", "sha256": "<hex>"} — file contents must match a hash.
-- {"type": "metric", "name": "<metric>", "op": ">=", "value": <number>} — a numeric metric the node's claw reports (e.g. "summary_chars" for "llm_synthesis", "trade_count" for "backtest"). "bash" and "scaffold" report NO metrics — never put a metric criterion on them.
+- {"type": "metric", "name": "<metric>", "op": ">=", "value": <number>} — a numeric metric the node's claw reports. The metrics each claw reports are exactly: __REPORTABLE_METRICS__. "bash" and "scaffold" report NO metrics — never put a metric criterion on them, and never invent a metric name (for example "json_response") for a check no claw reports: to verify a response a bash command produces, use an "exit_code" criterion on that node instead.
 - {"type": "tests_pass", "suite": "<path>"} — the suite must pass. The suite must be named by THIS node itself: a test file this node writes, or a path that appears in this node's command (for example the exact directory its unittest command runs against, spelled exactly as in the command). A path only another node touches — or a directory path that never appears in this node's command or inputs — is rejected.
 - "custom_check" is NOT available: no custom checkers are registered, so every "custom_check" criterion is rejected, whatever "name" it carries. Do not use it — use one of the types above.
-A file criterion's "path" MUST be a file the plan actually produces or that already exists: a file the node writes (its "file_path" input, a bash redirect, or a heredoc target), a file a node runs or reads in its "bash" command, or a file that already exists on disk. Listing a path in "outputs" alone does NOT count — echoing an answer to stdout does not create the file. A later node may check a file an earlier node wrote.
+A file criterion's "path" MUST be a file the plan actually produces or that already exists: a file some node demonstrably writes — a scaffold/file_writer "file_path" target, a heredoc target, a bash redirect (">" or ">>"), a download target (curl -o/--output or wget -O), a tee target, a "dd of=" target, a cp/mv destination, or a touch target — a file a node runs or reads in its "bash" command, or a file that already exists on disk. Listing a path in "outputs" alone does NOT count — echoing an answer to stdout does not create the file, and a bare "curl" writes nothing: its response goes to stdout. To verify a live endpoint, do NOT name a file for the response — use an "exit_code" criterion on the node whose command curls the endpoint (for example "curl -sf http://localhost:8765/health"): the exit code is the verification and stdout is the response, so nothing needs to be written to a file. A later node may check a file an earlier node wrote.
 
-COVER EVERY STEP — if the goal says write a file, run it, and verify the output, the plan needs a node for each of those steps, in dependency order. Never collapse a multi-step goal into a single node. If the goal asks for tests to be written or added, the plan MUST include a node that WRITES the test file(s) (the "scaffold" claw, or a bash heredoc) — a node that only runs an existing test suite does not satisfy a write-tests requirement. Write files at the exact path the goal requests (or the "workspace" path in the TaskIntent constraints when the goal says "in the workspace"); never substitute /tmp or another directory.
+COVER EVERY STEP — if the goal says write a file, run it, and verify the output, the plan needs a node for each of those steps, in dependency order. Never collapse a multi-step goal into a single node. If the goal asks for tests to be written or added, the plan MUST include a node that WRITES the test file(s) (the "scaffold" claw, or a bash heredoc) — a node that only runs an existing test suite does not satisfy a write-tests requirement. Put new tests in a NEW test file (for example "tests/test_health.py") — never scaffold a replacement for an existing test module: a scaffold overwrites the whole file, so scaffolding an existing module like "tests/test_api.py" deletes every test already in it and is rejected. To add cases to an existing test module, use an anchored insert into that module (an "anchor" naming an existing definition, "position": "after", and content holding only the new test code) instead. Write files at the exact path the goal requests (or the "workspace" path in the TaskIntent constraints when the goal says "in the workspace"); never substitute /tmp or another directory.
 
 FEW-SHOT EXAMPLES:
 
@@ -250,16 +286,29 @@ Rules:
 - Every node needs testable acceptance: a "criteria" array with at least
   one criterion using the criterion types exit_code, file_exists,
   file_matches, metric, tests_pass — a LIST of criterion objects, never
-  a single object like {"tests_pass": true}. A file criterion's "path"
-  must be a file the plan writes (scaffold, redirect, or heredoc), a
+  a single object like {"tests_pass": true}. A "metric" criterion's
+  "name" must be a metric the node's claw reports — exactly:
+  __REPORTABLE_METRICS__; "bash" and "scaffold" report no metrics, and
+  an invented metric name (for example "json_response") is rejected —
+  verify a bash response with an "exit_code" criterion on that node
+  instead. A file criterion's "path"
+  must be a file the plan demonstrably writes (a scaffold/file_writer
+  target, a heredoc or redirect target, a curl -o / wget -O download
+  target, a tee target, a "dd of=" target, a cp/mv destination, or a
+  touch target), a
   file a node runs or reads, or a file that already exists — listing it
-  in "outputs" alone does not count. A tests_pass criterion's "suite"
+  in "outputs" alone does not count, and a bare curl writes no file:
+  to verify a live endpoint use an "exit_code" criterion on the node
+  whose command curls it. A tests_pass criterion's "suite"
   must be named by that node itself: a test file it writes, or a path
   that appears in its command, spelled exactly as in the command.
   "custom_check" is NOT available: no custom checkers are registered,
   so every custom_check criterion is rejected. If the goal asks for
   tests to be written, include a node that WRITES the test file —
   running an existing suite does not satisfy a write-tests requirement.
+  Put new tests in a NEW test file (for example "tests/test_health.py");
+  never scaffold a replacement for an existing test module — add cases
+  to an existing module with an anchored insert instead.
 - Do not wrap the JSON in markdown. Return exactly one JSON object.
 """
 
@@ -275,3 +324,4 @@ Rules:
 """
 
 FORMATTER_SYSTEM_PROMPT = """You are the FreeTalon plan formatter. You receive a draft execution plan and re-emit it as ONE JSON object with a "nodes" array of PlanNodes, in the exact NODE SHAPE the prompt shows. You never change the plan's content, node order, or meaning — you only put it into the required shape: the same ids, objectives, depends_on, assigned_claw values, inputs, outputs, acceptance and criteria, carried over exactly. Do not add nodes, drop nodes, fix code, or improve anything. Do not wrap the JSON in markdown. Return exactly one JSON object."""
+

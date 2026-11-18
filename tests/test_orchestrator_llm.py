@@ -20130,3 +20130,282 @@ class TestPlannerWrittenFileCreditingFix(unittest.TestCase):
         errors = _unwritten_file_matches_errors([node], str(self.repo_root))
         self.assertEqual(len(errors), 1)
         self.assertIn(".freetalon.pid", errors[0])
+
+
+class TestPlannerCycle11SteeringFix(unittest.TestCase):
+    """Steering for the three remaining discipline classes (cycle 11).
+
+    Re-run #7 (logs/health-rerun7-2026-11-18.log) left three
+    measured failure classes whose rejections were correct but
+    unsteered, one per model behavior:
+
+    - Qwen's verify node (every arm) put a file_matches on
+      health_response.json over a BARE curl -sf .../health: nothing
+      writes the file, so the rejection was right (cycle 10 proved
+      this from the artifacts and completed the written set), but
+      neither the prompt nor the unwritten_file error named the
+      full credited write set or the constructive alternative —
+      an exit_code criterion on the curl node itself, whose stdout
+      IS the response.
+    - Qwen Arm 3 output 1's sole error was a metric criterion
+      named json_response on a bash node: bash reports no metrics
+      (tool_registry.CLA_METRICS), and the prompt published only
+      two example metric names, never the per-claw set. The
+      prompt's per-claw line is now DERIVED from CLA_METRICS (the
+      validator's own source, via prompts.planner_system_prompt /
+      replan_system_prompt — lazy because tool_registry -> intake
+      -> prompts would cycle at import), the unknown-type error
+      names the valid criterion types, and the no-metrics error
+      names the exit_code alternative.
+    - The 27B's accepted-plan path died on step_2 scaffolding a
+      fresh tests/test_api.py over the existing module
+      (scaffold_overwrite, correct): the error's generic advice
+      (retype the FULL module) is the wrong steer for a test
+      module. It now names the two moves that serve a tests goal —
+      a NEW test file, or an anchored insert into the existing
+      module (the move Qwen Arm 3's repair made on its own) — and
+      the prompts state the placement rule up front.
+
+    Error codes and validation semantics are unchanged: every pin
+    below is content (prompt text / error text) or a rejection
+    that already fired before this cycle.
+    """
+
+    WS = "/home/seeker/freetalon-workspace"
+    HEALTH_JSON = "/home/seeker/freetalon-workspace/health_response.json"
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+        self.test_api_path = str(self.repo_root / "tests" / "test_api.py")
+
+    @staticmethod
+    def _bash_node(command, criteria):
+        from freetalon.orchestrator.models import PlanNode
+
+        return PlanNode(
+            id="step_4",
+            objective="Verify the /health endpoint live",
+            assigned_claw="bash",
+            inputs={"command": command},
+            outputs=[],
+            criteria=criteria,
+        )
+
+    def _matches(self):
+        return {
+            "type": "file_matches",
+            "path": self.HEALTH_JSON,
+            "json_keys": ["ok", "status"],
+        }
+
+    # --- (2) The reportable set, published from its source --------
+
+    def test_prompt_metric_line_is_derived_from_cla_metrics(self) -> None:
+        from freetalon.orchestrator.prompts import (
+            _reportable_metrics_text,
+            planner_system_prompt,
+            replan_system_prompt,
+        )
+        from freetalon.orchestrator.tool_registry import CLA_METRICS
+
+        text = _reportable_metrics_text()
+        for claw, names in CLA_METRICS.items():
+            self.assertIn(f"{claw}: ", text)
+            for name in names:
+                self.assertIn(name, text)
+        self.assertIn("bash: none", text)
+        self.assertIn("llm_synthesis: summary_chars", text)
+        self.assertIn(text, planner_system_prompt())
+        self.assertIn(text, replan_system_prompt())
+        self.assertNotIn("__REPORTABLE_METRICS__", planner_system_prompt())
+        self.assertNotIn("__REPORTABLE_METRICS__", replan_system_prompt())
+
+    def test_metric_on_bash_names_the_constructive_alternative(self) -> None:
+        # Re-run #7 Arm 3 output 1, step_4 verbatim: a metric named
+        # json_response on a bash node. Bash reports no metrics, so
+        # the error now says the criterion can never be measured
+        # there and names the exit_code form instead.
+        from freetalon.orchestrator.planner import _criteria_errors
+
+        node = self._bash_node(
+            "curl -sf http://localhost:8765/health",
+            [
+                {"type": "exit_code", "equals": 0},
+                {"type": "metric", "name": "json_response", "op": ">=", "value": 1},
+            ],
+        )
+        text = "\n".join(_criteria_errors(node))
+        self.assertIn(
+            "metric criterion 'json_response' is not reported by claw 'bash'",
+            text,
+        )
+        self.assertIn("reports no metrics", text)
+        self.assertIn("can never be measured on it", text)
+        self.assertIn("exit_code", text)
+
+    def test_metric_error_still_lists_a_reporting_claws_set(self) -> None:
+        from freetalon.orchestrator.models import PlanNode
+        from freetalon.orchestrator.planner import _criteria_errors
+
+        node = PlanNode(
+            id="step_1",
+            objective="Summarize",
+            assigned_claw="llm_synthesis",
+            inputs={"instruction": "Sum it up", "context": "text"},
+            outputs=["summary"],
+            criteria=[
+                {"type": "metric", "name": "bogus", "op": ">=", "value": 1}
+            ],
+        )
+        text = "\n".join(_criteria_errors(node))
+        self.assertIn("(it reports: summary_chars)", text)
+
+    def test_unknown_criterion_type_names_the_valid_types(self) -> None:
+        # The type-level twin of the json_response shape (and Arm 1
+        # output 3's type "command"): the bare "unknown criterion
+        # type" named nothing valid; it now lists the derived set.
+        from freetalon.orchestrator.planner import _criteria_errors
+
+        node = self._bash_node(
+            "curl -sf http://localhost:8765/health",
+            [{"type": "json_response", "equals": 0}],
+        )
+        text = "\n".join(_criteria_errors(node))
+        self.assertIn("unknown criterion type: 'json_response'", text)
+        self.assertIn("custom_check, exit_code, file_exists", text)
+        self.assertIn("file_matches, metric, tests_pass", text)
+
+    # --- (1) File-criteria discipline ------------------------------
+
+    def test_prompts_state_file_criterion_discipline(self) -> None:
+        from freetalon.orchestrator.prompts import (
+            planner_system_prompt,
+            replan_system_prompt,
+        )
+
+        planner = planner_system_prompt()
+        self.assertIn("a tee target", planner)
+        self.assertIn("curl -o/--output or wget -O", planner)
+        self.assertIn('a bare "curl" writes nothing', planner)
+        self.assertIn("nothing needs to be written to a file", planner)
+        replan = replan_system_prompt()
+        self.assertIn("a tee target", replan)
+        self.assertIn("curl -o / wget -O", replan)
+        self.assertIn("a bare curl writes no file", replan)
+
+    def test_unwritten_file_errors_carry_the_live_verify_pointer(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _unwritten_file_errors,
+            _unwritten_file_matches_errors,
+        )
+
+        matches_node = self._bash_node(
+            "curl -sf http://localhost:8765/health",
+            [{"type": "exit_code", "equals": 0}, self._matches()],
+        )
+        errors = _unwritten_file_matches_errors(
+            [matches_node], str(self.repo_root)
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn(
+            "must name a file some node in the plan demonstrably writes",
+            errors[0],
+        )
+        self.assertIn("tee target", errors[0])
+        self.assertIn(
+            "use an exit_code criterion on the node whose command "
+            "curls the endpoint",
+            errors[0],
+        )
+        self.assertIn("a bare curl writes no file", errors[0])
+
+        exists_node = self._bash_node(
+            "curl -sf http://localhost:8765/health",
+            [{"type": "file_exists", "path": self.HEALTH_JSON}],
+        )
+        errors = _unwritten_file_errors([exists_node], str(self.repo_root))
+        self.assertEqual(len(errors), 1)
+        self.assertIn(
+            "use an exit_code criterion on the node whose command "
+            "curls the endpoint",
+            errors[0],
+        )
+
+    def test_per_node_file_criterion_error_carries_the_pointer(self) -> None:
+        # The per-node text is the one Qwen Arm 1 actually saw
+        # ("is not a file this node writes or runs"); it carries the
+        # same guidance as the plan-level unwritten_file error.
+        from freetalon.orchestrator.planner import _criteria_errors
+
+        node = self._bash_node(
+            "curl -sf http://localhost:8765/health", [self._matches()]
+        )
+        text = "\n".join(_criteria_errors(node))
+        self.assertIn("is not a file this node writes or runs", text)
+        self.assertIn("demonstrably writes", text)
+        self.assertIn("use an exit_code criterion", text)
+
+    # --- (3) New-tests placement ------------------------------------
+
+    def test_prompts_state_new_test_placement(self) -> None:
+        from freetalon.orchestrator.prompts import (
+            planner_system_prompt,
+            replan_system_prompt,
+        )
+
+        for prompt in (planner_system_prompt(), replan_system_prompt()):
+            self.assertIn("NEW test file", prompt)
+            self.assertIn("tests/test_health.py", prompt)
+            self.assertIn("anchored insert", prompt)
+        self.assertIn(
+            "never scaffold a replacement for an existing test module",
+            planner_system_prompt(),
+        )
+
+    def test_scaffold_overwrite_on_test_module_names_alternatives(self) -> None:
+        # The 27B's shape: a fresh scaffold over tests/test_api.py
+        # dropping its definitions. The rejection now names the new
+        # test file and the anchored insert instead of the generic
+        # retype-the-module advice.
+        from freetalon.orchestrator.models import PlanNode
+        from freetalon.orchestrator.planner import _scaffold_overwrite_errors
+
+        node = PlanNode(
+            id="step_2",
+            objective="Write the health tests",
+            assigned_claw="scaffold",
+            inputs={
+                "file_path": self.test_api_path,
+                "content": "def test_new_case():\n    assert True\n",
+            },
+            outputs=[self.test_api_path],
+            criteria=[{"type": "file_exists", "path": self.test_api_path}],
+        )
+        errors = _scaffold_overwrite_errors([node], str(self.repo_root))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("existing test module", errors[0])
+        self.assertIn("NEW test file", errors[0])
+        self.assertIn("tests/test_health.py", errors[0])
+        self.assertIn("anchored insert", errors[0])
+        self.assertNotIn("FULL updated module", errors[0])
+
+    def test_scaffold_overwrite_on_code_module_keeps_generic_advice(self) -> None:
+        from freetalon.orchestrator.models import PlanNode
+        from freetalon.orchestrator.planner import _scaffold_overwrite_errors
+
+        node = PlanNode(
+            id="step_1",
+            objective="Rewrite the API module",
+            assigned_claw="scaffold",
+            inputs={
+                "file_path": self.api_path,
+                "content": "def brand_new():\n    return 1\n",
+            },
+            outputs=[self.api_path],
+            criteria=[{"type": "file_exists", "path": self.api_path}],
+        )
+        errors = _scaffold_overwrite_errors([node], str(self.repo_root))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("FULL updated module", errors[0])
+        self.assertNotIn("NEW test file", errors[0])

@@ -48,6 +48,8 @@ from .prompts import (
     LOCAL_REPAIR_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
     REPLAN_SYSTEM_PROMPT,
+    planner_system_prompt,
+    replan_system_prompt,
 )
 from .tool_registry import (
     CODE_FILE_SUFFIXES,
@@ -1293,6 +1295,26 @@ def _custom_checker_registry_text() -> str:
     )
 
 
+# The constructive pointer for file criteria (cycle 11), shared by the
+# per-node criterion error and the plan-level unwritten_file errors.
+# The write forms named are exactly the cycle-10 crediting set
+# (_node_written_paths): the forms the scaffold claw and the bash
+# claw's real shell demonstrably perform. The live-endpoint half
+# answers re-run #7's Qwen shape (a bare curl naming a response
+# file): the response is on stdout, no file exists to check, and the
+# measurable verification is the curl node's own exit code.
+_FILE_CRITERION_GUIDANCE = (
+    "name a file some node in the plan demonstrably writes (a "
+    "scaffold/file_writer target, a heredoc target, a bash redirect, "
+    "a download target such as curl -o or wget -O, a tee target, a "
+    "dd of= target, a cp/mv destination, or a touch target), a file a "
+    "node runs or reads in its command, or a file that already "
+    "exists — to verify a live endpoint response, use an exit_code "
+    "criterion on the node whose command curls the endpoint instead: "
+    "stdout is the response and a bare curl writes no file"
+)
+
+
 def _usable_criterion_error(
     criterion: Any,
     node: PlanNode,
@@ -1319,7 +1341,10 @@ def _usable_criterion_error(
             # instead of just the missing key, so the repair round can
             # fix it in one go.
             return f"criterion has no 'type': {_CRITERION_SHAPE_EXAMPLE}"
-        return f"unknown criterion type: {ctype!r}"
+        return (
+            f"unknown criterion type: {ctype!r} — the criterion types "
+            f"are: {', '.join(sorted(_CRITERION_TYPES))}"
+        )
     if ctype == CRITERION_EXIT_CODE:
         # Retry #23: an exit_code criterion with a `command` measures
         # that command (see measure._eval_exit_code) — the command is
@@ -1340,7 +1365,10 @@ def _usable_criterion_error(
         if not isinstance(path, str) or not path:
             return "file_exists criterion needs a non-empty 'path'"
         if not _criterion_path_is_credited(path, node, plan_written):
-            return f"file_exists path {path!r} is not a file this node writes or runs"
+            return (
+                f"file_exists path {path!r} is not a file this node "
+                f"writes or runs — {_FILE_CRITERION_GUIDANCE}"
+            )
         return None
     if ctype == CRITERION_FILE_MATCHES:
         path = criterion.get("path")
@@ -1349,7 +1377,10 @@ def _usable_criterion_error(
         if "sha256" not in criterion and "json_keys" not in criterion:
             return "file_matches criterion needs 'sha256' or 'json_keys'"
         if not _criterion_path_is_credited(path, node, plan_written):
-            return f"file_matches path {path!r} is not a file this node writes or runs"
+            return (
+                f"file_matches path {path!r} is not a file this node "
+                f"writes or runs — {_FILE_CRITERION_GUIDANCE}"
+            )
         return None
     if ctype == CRITERION_METRIC:
         name = criterion.get("name")
@@ -1373,7 +1404,11 @@ def _usable_criterion_error(
                 )
             return (
                 f"metric criterion {name!r} is not reported by claw {claw!r} "
-                "(that claw reports no metrics — use exit_code or file_exists)"
+                "(that claw reports no metrics, so a metric criterion can "
+                "never be measured on it — use exit_code (for a live "
+                "response check, an exit_code criterion on the node whose "
+                "command produces the response, or one carrying its own "
+                "'command') or file_exists instead)"
             )
         return None
     if ctype == CRITERION_TESTS_PASS:
@@ -3475,10 +3510,8 @@ def _unwritten_file_errors(
                 f"Planner node '{node.id}' has a file_exists criterion on "
                 f"{path!r}, but no node in the plan writes that file and it "
                 "does not exist on disk — the file would be unmeasurable. A "
-                "file_exists criterion must point at a file the plan writes "
-                "(scaffold file_path, a bash redirect, or a heredoc target), "
-                "a file a node runs or reads in its command, or a file that "
-                "already exists. Listing the path in 'outputs' does not "
+                f"file_exists criterion must {_FILE_CRITERION_GUIDANCE}. "
+                "Listing the path in 'outputs' does not "
                 "count: echoing an answer to stdout does not create the file."
             )
     return errors
@@ -3529,11 +3562,8 @@ def _unwritten_file_matches_errors(
                 f"Planner node '{node.id}' has a file_matches criterion on "
                 f"{path!r}, but no node in the plan writes that file and it "
                 "does not exist on disk — the file would be unmeasurable. A "
-                "file_matches criterion must point at a file the plan writes "
-                "(scaffold file_path, a bash redirect, a download target "
-                "such as curl -o, a tee target, or a heredoc target), "
-                "a file a node runs or reads in its command, or a file that "
-                "already exists. Listing the path in 'outputs' does not "
+                f"file_matches criterion must {_FILE_CRITERION_GUIDANCE}. "
+                "Listing the path in 'outputs' does not "
                 "count: echoing an answer to stdout does not create the file."
             )
     return errors
@@ -4616,15 +4646,35 @@ def _scaffold_overwrite_errors(
         shown = ", ".join(dropped[:8])
         if len(dropped) > 8:
             shown += f", ... ({len(dropped) - 8} more)"
+        if _is_test_file_path(target):
+            # Cycle 11: for an existing test module the generic advice
+            # (retype the full module) is the wrong steer — the moves
+            # that serve a tests goal are a NEW test file, or an
+            # anchored insert into this module (the move Qwen's Arm 3
+            # repair made on its own after this rejection in re-run
+            # #7). Name both in the rejection itself.
+            advice = (
+                "This is an existing test module: do not scaffold a "
+                "replacement for it. Put the new tests in a NEW test "
+                "file (for example tests/test_health.py), or add the "
+                "new cases to this module with an anchored insert "
+                "(inputs \"anchor\" naming an existing definition in "
+                "the module, \"position\": \"after\", and \"content\" "
+                "holding only the new test code) instead."
+            )
+        else:
+            advice = (
+                "Scaffold the FULL updated module (every existing "
+                "definition, plus the new code) or extend the module "
+                "in place with a bash heredoc instead."
+            )
         errors.append(
             f"Planner node '{node.id}' scaffolds {target!r} with content "
             f"that drops {len(dropped)} of the existing module's "
             f"{len(existing_names)} definitions ({shown}) — a scaffold "
             "overwrites the whole file, so every definition it omits is "
             "deleted, and a file_exists criterion cannot see the loss. "
-            "Scaffold the FULL updated module (every existing definition, "
-            "plus the new code) or extend the module in place with a bash "
-            f"heredoc instead.{grounded}"
+            f"{advice}{grounded}"
         )
     return errors
 
@@ -8074,7 +8124,7 @@ def plan_task_intent(
         "JSON Output:"
     )
     nodes, metadata = _call_llm_with_repair(
-        PLANNER_SYSTEM_PROMPT,
+        planner_system_prompt(),
         user_prompt,
         settings,
         max_repairs=max_repairs,
@@ -8163,7 +8213,7 @@ def replan_from_brief(
         "JSON Output:"
     )
     nodes, metadata = _call_llm_with_repair(
-        REPLAN_SYSTEM_PROMPT,
+        replan_system_prompt(),
         user_prompt,
         settings,
         max_repairs=max_repairs,
