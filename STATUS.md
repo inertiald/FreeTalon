@@ -3589,3 +3589,62 @@ Deliberately left out:
   live generation. Pins changed: NONE. No
   live runs, no GPU. Log:
   logs/cycle11-steering-2026-11-18.log.
+
+## Update - 2026-11-18 (Live re-run #8, Arm 1: qwen2.5-coder:14b on cycle 11 — steering fully taken up; the delta elides its sibling routes and a 60s criterion cap stops the run first)
+
+- Run (FREETALON_OLLAMA_MODEL=qwen2.5-coder:14b,
+  timeout 900, temperature 0, formatter OFF, critic
+  OFF; driver exit 0; run-20261118T161746Z-d57185,
+  loop elapsed 120.0s; GPU peak observed 61C, no
+  thermal pause; fans manual 85% during, auto
+  after, verified GPUFanControlState=0): ONE raw
+  output, accepted with no repair rounds as
+  plan-237682b2adf9 (4 nodes).
+- Cycle-11 steering acted on across the board:
+  file criteria are file_exists on the scaffold
+  targets themselves (freetalon/api.py,
+  tests/test_health.py) — no invented files, no
+  file_matches; the live-verify node carries an
+  exit_code criterion whose command is the curl
+  probe of localhost:8765/health; NO metric
+  criteria anywhere (bash nodes carry exit_code
+  only); the tests land in a NEW file,
+  tests/test_health.py. The hoist never fired
+  (nothing nested); placeholder_value and
+  missing_target fired 0 times.
+- Execution: node-1 PASS (file exists; grep
+  criterion exit 0); node-2 FAIL; nodes 3-4 never
+  ran. The executed /health branch COMPUTES both
+  fields (subprocess curl -sf probe of
+  localhost:11434 for ollama_reachable; subprocess
+  nvidia-smi query for gpu_temperature) — but the
+  anchored do_GET replacement ends at a literal
+  "# Existing code..." comment: every sibling GET
+  route (/status, /metrics, /tasks, /resources,
+  /gates) is gone from the executed file (diff
+  +14/-70). Definition retention passes (do_GET
+  replaced do_GET); the loss is branch-level, and
+  only the full suite would have caught it.
+- The suite never got to speak: node-2's exit_code
+  criterion carried the full-suite command itself
+  (./.venv/bin/python -m unittest discover -s
+  tests, ~477s) and criterion commands cap at 60s
+  — "criterion command timed out after 60s". The
+  judge read it as a transient timeout: RETRY,
+  the same timeout, retries exhausted, ESCALATE.
+  The timeout path never re-plans, so node-local
+  repair never engaged. The plan's own test file
+  also lacked "import json" while calling
+  json.loads — it would have failed on its own
+  terms. Verdict: FAIL at execution, escalated on
+  a measurement timeout, over a branch-eliding
+  delta the run never reached a verdict on.
+- Files changed: freetalon/api.py modified,
+  tests/test_health.py created (repo only;
+  workspace root unchanged); restored/removed
+  after profiling (porcelain 0); post-arm suite
+  re-run 1117/1117 OK (474.4s). Memory: records
+  165-167 (node-1 executed PASS/CONTINUE; node-2
+  executed FAIL/RETRY, then FAIL/ESCALATE) — no
+  memory-driven escalation. Log:
+  logs/health-rerun8-2026-11-18.log.
