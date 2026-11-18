@@ -3923,3 +3923,47 @@ Deliberately left out:
   (logs/rerun9-arm1-suite-post-restore.out).
   Log: logs/health-rerun9-2026-11-18.log.
 
+## Update - 2026-11-18 (Live re-run #9, Arm 2: qwen3.8:27b on cycle 12 — planning failure: the thinking model truncates its own plan against the 12288 context)
+
+- Run (FREETALON_OLLAMA_MODEL=qwen3.8:27b,
+  FREETALON_LLM_TEMPERATURE=0.0, timeout 900,
+  formatter OFF, critic OFF; driver exit 1 —
+  planning failure; no run directory, no file
+  changes, tree porcelain 0; GPU peak observed
+  75C in polling, no thermal pause; fans
+  manual 85% during, auto after, verified
+  GPUFanControlState=0): intake OK; the
+  planning call produced 3 raw outputs and
+  died with StuckRepairError — three
+  consecutive LLMResponseError rejections,
+  'LLM response was not valid JSON'.
+- The outputs are not malformed, they are
+  CUT OFF: all three end mid-string inside a
+  differs_by field (3335 / 6726 / 6726 chars;
+  blocks 2 and 3 identical at temperature 0).
+  The step-0 production-shape diagnostic
+  (real intake + plan_task_intent, no driver)
+  reproduced the identical three truncations
+  before the arm ran. What content survives
+  is strong — an anchored do_GET replace,
+  local imports, both fields computed — but
+  qwen3.8 spends its generation thinking
+  first (the step-0 probe: 2255 thinking
+  chars inside a 600-token cap, response 0),
+  and thinking + the planner prompt + this
+  plan's verbose free-text fields exceed the
+  planner's 12288 num_ctx, so the JSON never
+  closes. Decode speed is not the problem:
+  84.1 tok/s, the fastest measured here.
+- Verdict: FAIL at planning — a new wall,
+  distinct from every prior one: not
+  discipline (cycle 12's classes never get
+  the chance to fire), not substance, but
+  context budget against a thinking model's
+  hidden spend. A harness-side answer exists
+  (suppress thinking for planner calls, or
+  budget for it) but is a design change, not
+  a steering tweak; it is the parent's call.
+  Files changed: none. Log:
+  logs/health-rerun9-2026-11-18.log.
+
