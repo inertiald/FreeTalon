@@ -2664,3 +2664,72 @@ Deliberately left out:
   model would not repair from feedback. Whether the repair
   loop can now produce a substantive delta is the live
   re-run's question.
+
+## Update - 2026-11-18 (Live re-run #4 on cycle 6: placeholder_value fires — repair cannot comply at temp 0, temperature routes around it)
+
+- Pre-flight (once): GPU 51C idle; power limit exactly
+  300.00W; link gen4 x16; 0 Xid 79/154; Ollama tags list
+  gemma-3-abliterated:latest; head abc3fd7 clean; baseline
+  suite 1063/1063 in 455.2s. Fans manual 85% during each
+  run, auto after (GPUFanControlState=0 verified); 0 Xid
+  throughout; no thermal pauses (peaks 82C / 74C).
+- Run 1 (production defaults; driver exit 1 — planning
+  failure): 5 raw outputs. Outputs 2 and 5 were the full
+  5-node plan carrying the Ellipsis delta
+  (payload["service_status"] = ...,
+  payload["ollama_reachable"] = ...,
+  payload["gpu_temperature"] = ...); outputs 1 and 4 were
+  {"nodes":[]}; output 3 was a degenerate 1-node bash
+  plan (curl Ollama + nvidia-smi grep, no endpoint edit).
+  The terminal rejection was CheapRejectionError with
+  exactly 1 error — placeholder_value naming all three
+  targets in HiveAPIServer.start.Handler.do_GET, steering
+  demanding real expressions and explaining that a
+  skeleton slot is not code to copy. The rejection works
+  as designed; the repair loop does not: the delta never
+  changed across iterations — the model cycled empty ->
+  Ellipsis plan -> degenerate -> empty -> Ellipsis plan
+  and exhausted repair. No plan accepted, no execution,
+  no files changed, no experiment-memory record (no run
+  was created).
+- Run 2 (FREETALON_LLM_TEMPERATURE=0.4; driver exit 0):
+  3 raw outputs. Output 1 empty. Output 2 routed around
+  the rule — a 5-node bash plan writing a NEW standalone
+  /home/seeker/freetalon-workspace/api.py whose health()
+  returns hard-coded literals ("ollama_reachable": True,
+  "gpu_temperature": 25; comment: "Simulate a healthy
+  state"): the fake-constants route-around in a broken
+  vessel. It was not accepted (repair continued; its
+  file_exists criteria also carried "path": null).
+  Output 3 — node-1 a scaffold with EMPTY inputs (no
+  target, no content), node-2 a contentless scaffold
+  test write, node-3 a curl — was ACCEPTED, and the loop
+  escalated before any node executed: experiment memory
+  matched node-1's approach signature ('scaffold' write
+  of (no target)) to a measured-failed approach for this
+  goal — the signature class of re-run #3 run 2 v1's
+  executed no-target scaffold failure. Goal verdict
+  FAIL — escalated; every node stayed draft; no files
+  changed.
+- Accounting: placeholder_value fired as the terminal
+  rejection in run 1 (1 error, 3 named targets; the
+  Ellipsis delta was emitted twice at temperature 0). At
+  0.4 the Ellipsis shape never appeared — divergence
+  bought route-arounds (fake literals, vacuous
+  scaffolds), not substance. Neither run executed a
+  /health branch, so there is no executed code to quote
+  and no success — verified or hollow — to report. Tree
+  clean at abc3fd7 after both runs; no restores needed
+  (nothing was written); suites not re-run (no files
+  changed).
+- Net: cycle 6's rejection is live and exact, and the
+  binding limit stays on the planner model. Told at
+  planning time, by name, that the three assignments are
+  placeholders and what to write instead, Gemma at
+  temperature 0 re-emits them verbatim until repair is
+  exhausted; at 0.4 it avoids the shape only by
+  proposing fakes or empty scaffolds. Every harness
+  layer now fires — placeholder rejection pre-execution,
+  validation of the fake vessel, memory escalation of
+  the vacuous repeat — and the model still does not
+  produce a substantive delta.
