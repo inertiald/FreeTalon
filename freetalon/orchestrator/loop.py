@@ -34,7 +34,7 @@ from .models import (
     PlanStatus,
     TaskIntent,
 )
-from .planner import build_execution_plan, replan_from_brief
+from .planner import build_execution_plan, replan_from_brief, try_local_repair
 from .run_store import RunStore, new_run_id
 from .state_store import ExecutionPlanStateStore
 from .tool_registry import ToolRegistry
@@ -310,11 +310,37 @@ class LoopRunner:
                 if seed:
                     brief["seed_forbidden"] = list(seed)
                 replan = replan_fn or (lambda b: replan_from_brief(b))
-                try:
-                    new_nodes = replan(brief)
-                except Exception as exc:  # noqa: BLE001 - re-planner failure escalates
-                    escalation = f"re-planner failed: {exc}"
-                    break
+                new_nodes: list[PlanNode] | None = None
+                if replan_fn is None:
+                    # Cycle 8: before re-planning the whole task, try
+                    # repairing only the node that produced the code a
+                    # measurement failed on — the definition as it
+                    # stands on disk plus the failure's diagnostics,
+                    # in one focused call. The attempt rides THIS
+                    # re-plan decision: replans_used was incremented
+                    # above, before either path runs, so a local
+                    # repair and a whole-task re-plan each cost
+                    # exactly one budget unit, never two. Any doubt
+                    # in the local path returns None and the
+                    # whole-task re-plan below runs exactly as
+                    # before. An injected replan_fn is a caller
+                    # override of the whole re-plan step, so the
+                    # local seam — part of the default path — is not
+                    # attempted under it.
+                    new_nodes = try_local_repair(plan, brief)
+                    if new_nodes is not None:
+                        self._log(
+                            "loop.replan.local_repair",
+                            run_id=run_id,
+                            plan_id=plan.plan_id,
+                            version=version,
+                        )
+                if new_nodes is None:
+                    try:
+                        new_nodes = replan(brief)
+                    except Exception as exc:  # noqa: BLE001 - re-planner failure escalates
+                        escalation = f"re-planner failed: {exc}"
+                        break
                 rejection = judge.validate_delta_plan(
                     brief,
                     new_nodes,

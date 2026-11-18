@@ -38,12 +38,14 @@ from .measure import (
     CRITERION_FILE_MATCHES,
     CRITERION_METRIC,
     CRITERION_TESTS_PASS,
+    VERDICT_FAIL,
     custom_checkers,
     measurement_failed_detail,
 )
 from .models import ExecutionPlan, PlanNode, PlanStatus, TaskIntent
 from .prompts import (
     FORMATTER_SYSTEM_PROMPT,
+    LOCAL_REPAIR_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
     REPLAN_SYSTEM_PROMPT,
 )
@@ -7837,4 +7839,581 @@ def replan_from_brief(
         formatter=formatter_settings_from_env(),
     )
     brief["rejected_approaches"] = metadata.get("rejected_approaches", seed or [])
+    return nodes
+
+
+# ── Node-local repair (cycle 8) ──────────────────────────────────────
+#
+# When an executed measurement fails, the loop's re-plan re-asks the
+# whole task. Live re-run #5 showed the shape that cannot survive
+# that ask: the planner can copy a definition exactly OR compute its
+# fields freely, not both in one plan-shaped output — accepted v1
+# plans returned the definition unextended, and whole-task re-plans
+# lost the vessel (a clobber module carrying real probe code, a
+# complete do_GET at the wrong indentation, a stand-in plan). The
+# node-local repair is the seam the loop lacked: before a whole-task
+# re-plan, the harness identifies the edit node whose write produced
+# the code the failed measurement exercised, takes the definition
+# exactly as it stands in the file on disk (the harness holds the
+# copy), and asks for ONLY that definition's replacement — the model
+# supplies only the substance, in the smallest possible window.
+#
+# The mapping is conservative by construction: every step must hold
+# with no ambiguity, and any doubt returns None so the caller runs
+# today's whole-task re-plan unchanged. A produced candidate is
+# "same plan, one node replaced" — the culprit's content spliced,
+# every other node preserved, execution state reset as for any new
+# version — and it faces the FULL validator stack (every code,
+# placeholder_value included) before the loop may use it; a
+# candidate that fails validation is discarded, never repaired
+# further. The attempt rides the caller's re-plan decision, so it
+# consumes exactly one unit of the existing re-plan budget.
+
+_WRITE_CLAWS = ("scaffold", "file_writer")
+
+# The input keys the executor merges into a node after it runs
+# (memory._OUTPUT_INPUT_KEYS / _VOLATILE_INPUT_KEYS): a new plan
+# version's nodes must not carry the previous pass's residue.
+_EXECUTOR_RESIDUE_INPUT_KEYS = (
+    "exit_code",
+    "stdout",
+    "stderr",
+    "duration_s",
+    "workdir",
+    "timeout_s",
+)
+
+_TRACEBACK_FRAME_RE = re.compile(r'File "(?P<path>[^"]+\.py)", line (?P<line>\d+)')
+_CODE_FENCE_RE = re.compile(r"```(?:python|py)?\n(.*?)```", re.DOTALL)
+
+
+@dataclass(frozen=True)
+class _LocalRepairTarget:
+    """One confidently identified node-local repair (cycle 8)."""
+
+    failed_id: str
+    culprit_id: str
+    target_path: str  # resolved on-disk path of the measured module
+    qualified_name: str  # the definition to rewrite
+    span: tuple[int, int]  # (first line, last line) inside the culprit content
+    indent: int  # the definition's indentation in the file
+    window: str  # the definition's text, exactly as it stands
+    diagnostics: str  # the failed node's bounded diagnostics excerpt
+    criterion_detail: str  # the failed criterion's one-line detail
+
+
+def _node_write_target(node: PlanNode) -> str | None:
+    """The file a write node writes, by the claw's own expression.
+
+    Mirrors _missing_target_errors (cycle 7): inputs "file_path",
+    else "path", else the first inputs "outputs" entry. None when
+    the node is not a write node or names no target.
+    """
+    if node.assigned_claw not in _WRITE_CLAWS:
+        return None
+    inputs = node.inputs or {}
+    target = inputs.get("file_path") or inputs.get("path")
+    if not target:
+        outputs = inputs.get("outputs")
+        if isinstance(outputs, (list, tuple)) and outputs:
+            target = outputs[0]
+    if isinstance(target, str) and target:
+        return target
+    return None
+
+
+def _command_script_paths(command: str) -> list[str]:
+    """The .py script paths a command runs (never the interpreter).
+
+    Plain token scan of the failed node's command: the script a test
+    node executed is a token in its own command (`./.venv/bin/python
+    /abs/test_health.py`), while the interpreter token never ends in
+    .py. Redirect targets are writes, not runs, and are skipped.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return []
+    scripts: list[str] = []
+    previous = ""
+    for token in tokens:
+        if (
+            token.endswith(".py")
+            and previous not in (">", ">>")
+            and not token.startswith("-")
+            and token not in scripts
+        ):
+            scripts.append(token)
+        previous = token
+    return scripts
+
+
+def _script_source(plan: ExecutionPlan, script: str, root: Path) -> str | None:
+    """The source of a script a plan node ran.
+
+    The payload of the node that wrote it when the plan carries it
+    (a heredoc write or a scaffold content), else the file on disk —
+    the run may have written it outside the repo root, where only
+    the disk copy exists.
+    """
+    for node in plan.nodes:
+        inputs = node.inputs or {}
+        command = inputs.get("command")
+        if node.assigned_claw in ("bash", "shell_exec") and isinstance(
+            command, str
+        ):
+            sole = _sole_heredoc_write(command)
+            writes = [sole] if sole is not None else [
+                (target, content)
+                for target, content, is_append in _bash_code_writes(command)
+                if not is_append
+            ]
+            for target, payload in writes:
+                if _same_path(target, script):
+                    return payload
+        target = _node_write_target(node)
+        if target is not None and _same_path(target, script):
+            content = inputs.get("content")
+            if isinstance(content, str):
+                return content
+    try:
+        return _resolve_plan_target(script, root).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _imported_module_files(source: str, root: Path) -> list[Path]:
+    """Files under the repo root that a script's imports name.
+
+    `from freetalon.api import X` names freetalon/api.py; a longer
+    dotted name is shortened until a file matches, so a submodule
+    import still lands on the module file that defines the code
+    under test.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    modules: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.level == 0:
+                modules.append(node.module)
+    files: list[Path] = []
+    for module in modules:
+        parts = module.split(".")
+        for cut in range(len(parts), 0, -1):
+            candidate = root.joinpath(*parts[:cut]).with_suffix(".py")
+            if candidate.is_file():
+                files.append(candidate)
+                break
+            package = root.joinpath(*parts[:cut]) / "__init__.py"
+            if package.is_file():
+                files.append(package)
+                break
+    return files
+
+
+def _route_literals(source: str) -> list[str]:
+    """Route-shaped string constants ("/health") a script names."""
+    routes: list[str] = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return routes
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            value = node.value
+            if (
+                value.startswith("/")
+                and len(value) > 1
+                and " " not in value
+                and value not in routes
+            ):
+                routes.append(value)
+    return routes
+
+
+def _local_repair_target(
+    plan: ExecutionPlan, brief: dict[str, Any], root: Path
+) -> _LocalRepairTarget | None:
+    """Map a brief's first mappable failure to its culprit edit node.
+
+    Confidence is all-or-nothing; every requirement is mandatory and
+    any failure returns None (the caller falls back to whole-task
+    re-plan):
+
+    - the failed node has an executed FAIL measurement (at least one
+      measured, failing result) and a non-empty diagnostics excerpt;
+    - the failed node is not itself a write node (a failed write is
+      a different failure class — the seam repairs measured code,
+      not failed writes);
+    - exactly ONE file is linked to the failure: the test script the
+      failed node ran imports it, or a traceback frame in the
+      diagnostics names it — and exactly ONE completed write node in
+      this plan version wrote that file;
+    - exactly one window definition is identified inside the file:
+      the innermost definition containing a diagnostics frame line,
+      or the route-branch anchor of a route literal the test names;
+    - the window text in the culprit node's content is identical to
+      the text on disk, so the culprit is the file's current author
+      for that definition (no later writer drifted it).
+    """
+    nodes_by_id = {node.id: node for node in plan.nodes}
+    writers: dict[str, list[PlanNode]] = {}
+    for node in plan.nodes:
+        target = _node_write_target(node)
+        if target is None or node.status != PlanStatus.COMPLETED:
+            continue
+        resolved = str(_resolve_plan_target(target, root).resolve())
+        writers.setdefault(resolved, []).append(node)
+    if not writers:
+        return None
+    for entry in brief.get("failed_nodes") or []:
+        if not isinstance(entry, dict):
+            continue
+        target = _local_repair_target_for_entry(
+            plan, entry, nodes_by_id, writers, root
+        )
+        if target is not None:
+            return target
+    return None
+
+
+def _local_repair_target_for_entry(
+    plan: ExecutionPlan,
+    entry: dict[str, Any],
+    nodes_by_id: dict[str, PlanNode],
+    writers: dict[str, list[PlanNode]],
+    root: Path,
+) -> _LocalRepairTarget | None:
+    failed_id = entry.get("id")
+    failed_node = nodes_by_id.get(failed_id) if isinstance(failed_id, str) else None
+    if failed_node is None:
+        return None
+    if _node_write_target(failed_node) is not None:
+        return None
+    measurement = entry.get("measurement") or failed_node.measurement or {}
+    if not isinstance(measurement, dict) or measurement.get("verdict") != VERDICT_FAIL:
+        return None
+    results = measurement.get("results") or []
+    if not any(
+        isinstance(result, dict) and result.get("measured") and not result.get("passed")
+        for result in results
+    ):
+        return None
+    diagnostics = entry.get("diagnostics")
+    if not isinstance(diagnostics, str) or not diagnostics.strip():
+        return None
+    inputs = entry.get("inputs") or failed_node.inputs or {}
+    command = inputs.get("command")
+    if not isinstance(command, str):
+        command = (failed_node.inputs or {}).get("command") or ""
+
+    candidate_files: list[str] = []
+    frame_lines: dict[str, int] = {}
+    for match in _TRACEBACK_FRAME_RE.finditer(diagnostics):
+        resolved = str(_resolve_plan_target(match.group("path"), root).resolve())
+        if resolved in writers and resolved not in candidate_files:
+            candidate_files.append(resolved)
+            frame_lines[resolved] = int(match.group("line"))
+    script_sources: list[str] = []
+    for script in _command_script_paths(command):
+        source = _script_source(plan, script, root)
+        if source is None:
+            continue
+        script_sources.append(source)
+        for module_file in _imported_module_files(source, root):
+            resolved = str(module_file.resolve())
+            if resolved in writers and resolved not in candidate_files:
+                candidate_files.append(resolved)
+    if len(candidate_files) != 1:
+        return None
+    resolved = candidate_files[0]
+    culprits = writers[resolved]
+    if len(culprits) != 1:
+        return None
+    culprit = culprits[0]
+    content = (culprit.inputs or {}).get("content")
+    if not isinstance(content, str) or not content:
+        return None
+    try:
+        disk_source = Path(resolved).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    spans = _definition_spans(content)
+    if not spans:
+        return None
+    qualified: str | None = None
+    span: tuple[int, int] | None = None
+    indent = 0
+    if resolved in frame_lines:
+        line = frame_lines[resolved]
+        containing = [item for item in spans if item[1] <= line <= item[2]]
+        if containing:
+            chosen = min(containing, key=lambda item: item[2] - item[1])
+            qualified, span, indent = chosen[0], (chosen[1], chosen[2]), chosen[3]
+    if qualified is None:
+        anchors: set[str] = set()
+        for source in script_sources:
+            for route in _route_literals(source):
+                name = _route_branch_anchor(content, route)
+                if name is not None:
+                    anchors.add(name)
+        if len(anchors) != 1:
+            return None
+        qualified = anchors.pop()
+        for item in spans:
+            if item[0] == qualified:
+                span, indent = (item[1], item[2]), item[3]
+                break
+        if span is None:
+            return None
+    lines = content.splitlines()
+    window = "\n".join(lines[span[0] - 1 : span[1]])
+    disk_lines = disk_source.splitlines()
+    disk_span = {item[0]: item for item in _definition_spans(disk_source)}.get(
+        qualified
+    )
+    if disk_span is None:
+        return None
+    disk_window = "\n".join(disk_lines[disk_span[1] - 1 : disk_span[2]])
+    if disk_window != window:
+        return None
+    return _LocalRepairTarget(
+        failed_id=failed_id,
+        culprit_id=culprit.id,
+        target_path=resolved,
+        qualified_name=qualified,
+        span=span,
+        indent=indent,
+        window=window,
+        diagnostics=diagnostics,
+        criterion_detail=measurement_failed_detail(measurement),
+    )
+
+
+
+def _local_repair_prompts(
+    goal_text: str, target: _LocalRepairTarget
+) -> tuple[str, str]:
+    """The focused repair ask: the window as it stands, the failure,
+    and cycle 7's demand — complete real code, computed values,
+    attempt-and-fallback, no invented constants, no placeholders.
+    The window is shown unnumbered, as codebase grounding shows code.
+    """
+    user_prompt = (
+        f"THE TASK IS UNCHANGED: {goal_text}\n\n"
+        f"One step of the current plan (node {target.culprit_id}) wrote "
+        f"{target.target_path}, and a later step (node {target.failed_id}) "
+        f"measured the result and failed: {target.criterion_detail}.\n\n"
+        f"Captured output from failed node {target.failed_id} (tail):\n"
+        f"{target.diagnostics}\n\n"
+        f"The definition below is {target.qualified_name} in "
+        f"{target.target_path}, exactly as it stands in the file now:\n\n"
+        f"{target.window}\n\n"
+        "Return ONLY the complete new version of this one definition "
+        "(def line included, at its indentation in the file — "
+        f"{target.indent} spaces) with the failing behavior fixed, "
+        "keeping the rest of the definition's code as it is; the system "
+        "splices it into the current file, so do not write the whole "
+        "module and do not add other definitions. Write the real code "
+        "that computes each value the definition reports — probe the "
+        "service or run the command the goal names and parse its "
+        "output; where a probe can fail, attempt it and report None "
+        "(False for a yes/no field) when it fails. Never assign an "
+        "invented constant for a value that exists only by measuring "
+        'it, and never assign "..." — both are rejected.'
+    )
+    return LOCAL_REPAIR_SYSTEM_PROMPT, user_prompt
+
+
+def _extract_repaired_definition(
+    text: str, qualified_name: str
+) -> tuple[list[str], int] | None:
+    """The repaired definition's lines from an LLM response.
+
+    Deterministic extraction only (the materialization spirit): the
+    first fenced block that holds the definition when fences are
+    present, else the raw text; dedented; the span whose qualified
+    name matches the window's — exactly, or as a trailing part of it
+    (the model may return just the method, or the method inside its
+    class). The deepest unique match wins. Returns (lines, the
+    definition's indentation in the dedented text), or None when no
+    span matches or the deepest match is ambiguous.
+    """
+    blocks = [match.group(1) for match in _CODE_FENCE_RE.finditer(text)]
+    for candidate in blocks or [text]:
+        dedented = textwrap.dedent(candidate).strip("\n")
+        if not dedented.strip():
+            continue
+        matches = [
+            item
+            for item in _definition_spans(dedented)
+            if item[0] == qualified_name
+            or qualified_name.endswith("." + item[0])
+        ]
+        if not matches:
+            continue
+        deepest = max(item[0].count(".") for item in matches)
+        best = [item for item in matches if item[0].count(".") == deepest]
+        if len(best) != 1:
+            return None
+        _name, start, end, indent = best[0]
+        return dedented.splitlines()[start - 1 : end], indent
+    return None
+
+
+def _shift_lines(lines: list[str], shift: int) -> list[str] | None:
+    """Uniformly re-indent lines; None when a dedent would cross
+    column 0 (the response's shape cannot be placed in the window).
+    """
+    if shift == 0:
+        return list(lines)
+    shifted: list[str] = []
+    for line in lines:
+        if not line.strip():
+            shifted.append(line)
+            continue
+        if shift > 0:
+            shifted.append(" " * shift + line)
+        else:
+            if not line.startswith(" " * (-shift)):
+                return None
+            shifted.append(line[-shift:])
+    return shifted
+
+
+def _local_repair_candidate_nodes(
+    plan: ExecutionPlan, target: _LocalRepairTarget, new_content: str
+) -> list[PlanNode]:
+    """Same plan, one node replaced (cycle 8).
+
+    Every node is deep-copied with its execution state reset — the
+    state a freshly built version carries (status DRAFT, no
+    measurement, no error/exit/duration, inputs shed of executor
+    residue) — because build_execution_plan re-executes the version
+    wholesale. Only the culprit's content changes; it also records
+    what it answers (responds_to / differs_by) so the judge's delta
+    validation sees a genuine, stated difference from the failed
+    attempt rather than a repeat of it.
+    """
+    nodes: list[PlanNode] = []
+    for node in plan.nodes:
+        copied = node.model_copy(deep=True)
+        copied.status = PlanStatus.DRAFT
+        copied.measurement = {}
+        copied.error = None
+        copied.exit_code = None
+        copied.duration_s = None
+        inputs = dict(copied.inputs or {})
+        for key in _EXECUTOR_RESIDUE_INPUT_KEYS:
+            inputs.pop(key, None)
+        copied.inputs = inputs
+        if copied.id == target.culprit_id:
+            copied.inputs = {**inputs, "content": new_content}
+            note = (
+                f"node-local repair: {target.qualified_name} rewritten in "
+                f"response to the measured failure at {target.failed_id} "
+                f"({target.criterion_detail})"
+            )
+            copied.differs_by = (
+                f"{copied.differs_by}; {note}" if copied.differs_by else note
+            )
+            copied.responds_to = target.failed_id
+        nodes.append(copied)
+    return nodes
+
+
+def try_local_repair(
+    plan: ExecutionPlan,
+    brief: dict[str, Any],
+    settings: LLMSettings | None = None,
+) -> list[PlanNode] | None:
+    """Attempt a node-local repair of a failed plan version (cycle 8).
+
+    Returns the replacement node list for a new version of the same
+    plan — the culprit edit node's content spliced with the model's
+    repaired definition, every other node preserved — or None when
+    the culprit cannot be identified with confidence, the model's
+    answer cannot be spliced, the splice changes nothing, or the
+    candidate fails the full validator stack. None always means the
+    caller proceeds with the whole-task re-plan exactly as before;
+    this function never raises.
+    """
+    try:
+        return _try_local_repair(plan, brief, settings)
+    except Exception:  # noqa: BLE001 - any doubt falls back to whole-task re-plan
+        return None
+
+
+def _try_local_repair(
+    plan: ExecutionPlan,
+    brief: dict[str, Any],
+    settings: LLMSettings | None,
+) -> list[PlanNode] | None:
+    metadata = plan.metadata or {}
+    stamped = metadata.get("repo_root")
+    root = (
+        Path(stamped)
+        if isinstance(stamped, str) and stamped
+        else resolve_repo_root(None)
+    )
+    target = _local_repair_target(plan, brief, root)
+    if target is None:
+        return None
+    culprit = next(node for node in plan.nodes if node.id == target.culprit_id)
+    content = (culprit.inputs or {})["content"]
+    goal = brief.get("goal")
+    goal_text = plan.intent.goal
+    if isinstance(goal, dict) and isinstance(goal.get("objective"), str):
+        goal_text = goal["objective"]
+    system_prompt, user_prompt = _local_repair_prompts(goal_text, target)
+    effective = settings or LLMSettings.from_env()
+    if effective.num_ctx is None:
+        effective = dataclass_replace(effective, num_ctx=_PLANNER_NUM_CTX)
+    if effective.format_schema is not None:
+        # The repair returns one definition, not a plan envelope —
+        # the envelope grammar would corrupt the code payload (the
+        # cycle-2 two-channel finding).
+        effective = dataclass_replace(effective, format_schema=None)
+    response = call_llm(system_prompt, user_prompt, settings=effective)
+    extracted = _extract_repaired_definition(response, target.qualified_name)
+    if extracted is None:
+        return None
+    repaired_lines, response_indent = extracted
+    shifted = _shift_lines(repaired_lines, target.indent - response_indent)
+    if shifted is None:
+        return None
+    lines = content.splitlines()
+    new_content = "\n".join(
+        lines[: target.span[0] - 1] + shifted + lines[target.span[1] :]
+    )
+    if content.endswith("\n"):
+        new_content += "\n"
+    if new_content == content:
+        return None
+    new_spans = {item[0]: item for item in _definition_spans(new_content)}
+    new_span = new_spans.get(target.qualified_name)
+    if new_span is None:
+        return None
+    new_window = "\n".join(
+        new_content.splitlines()[new_span[1] - 1 : new_span[2]]
+    )
+    if new_window == target.window:
+        return None
+    nodes = _local_repair_candidate_nodes(plan, target, new_content)
+    workspace = (plan.intent.constraints or {}).get("workspace")
+    records, _cheap = _collect_plan_error_records(
+        nodes,
+        root,
+        goal_text,
+        workspace,
+        index=build_repo_index(root),
+        modules=_ModuleSourceCache(),
+    )
+    if records:
+        return None
     return nodes

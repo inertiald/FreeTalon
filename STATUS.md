@@ -2893,3 +2893,83 @@ Deliberately left out:
   plan-shaped output. Node-local repair remains the
   queued harness lever; the stronger-planner-model
   decision remains Pat's.
+
+## Update - 2026-11-18 (Cycle 8: node-local repair — the harness holds the copy)
+
+- Re-run #5's shape: the planner can copy a definition exactly
+  OR compute its fields freely, not both in one plan-shaped
+  output — accepted v1 plans returned the definition
+  unextended, and whole-task re-plans surfaced the substance
+  but lost the vessel. Cycle 7 deferred this seam by name;
+  this cycle builds it. When an executed measurement fails
+  and the edit node that produced the measured code is
+  identifiable with confidence, the loop's re-plan decision
+  is served first by a node-local repair: one focused call
+  gets the culprit definition exactly as it stands in the
+  file on disk plus the failure's diagnostics (cycle 5's
+  bounded excerpt) and returns ONLY that definition's
+  replacement — cycle 7's ask shape (complete code, real
+  computations, attempt-and-fallback, no invented
+  constants, no placeholders). The harness splices the
+  answer into the culprit node's content; every other node
+  is preserved and execution state is reset as for any new
+  version. The harness holds the copy; the model supplies
+  only the substance, in the smallest possible window.
+- The culprit mapping (planner._local_repair_target) is
+  all-or-nothing, read from what the records carry: the
+  failed node has an executed FAIL measurement with a
+  measured failing result and a diagnostics excerpt; it is
+  not itself a write node; exactly one file is linked to
+  the failure — the test script in the failed node's
+  command imports it, or a traceback frame in the
+  diagnostics names it — and exactly one completed write
+  node in the version wrote that file; exactly one window
+  definition is identified (the innermost definition
+  containing a frame line, or the route-branch anchor of a
+  route literal the test names); and the window text in
+  the culprit's content is identical to the text on disk,
+  so the culprit is the definition's current author. Any
+  doubt at any step returns None and the whole-task
+  re-plan runs unchanged.
+- The repair call is not a plan call: settings are derived
+  as the planner's own repair loop derives them (num_ctx
+  12288) with the envelope schema cleared — the answer is
+  a code payload, and cycle 2's two-channel finding says
+  code does not travel through the JSON envelope.
+  Extraction is deterministic (the first fenced block
+  holding the definition, else the raw text; dedent;
+  deepest unique span match, trailing-part names accepted
+  so a method-only answer re-indents into place; uniform
+  re-indent to the window). A verbatim copy-back, or a
+  splice that changes nothing, is not a repair. The
+  candidate faces the FULL validator stack (all 37 codes)
+  through the same _collect_plan_error_records the parse
+  path runs — a repair carrying placeholder_value is
+  discarded by exactly the gate cycle 6 built, never
+  repaired further.
+- Budget discipline (hard invariant): the attempt rides
+  the re-plan decision — judge.replans_used is
+  incremented once, before either path runs — so a local
+  repair and a whole-task re-plan cost exactly one unit
+  each; local + whole-task exhausts the budget of 2
+  exactly as two whole-task re-plans do (pinned end to
+  end in TestLoopLocalRepair: v1 + local v2 + whole-task
+  v3, then 're-plan budget spent'). No budget increase,
+  no new gates, no escalation changes; cycle 5's repeat
+  naming still fires on a repaired version that
+  reproduces the diagnostic, because the brief is built
+  before the seam runs. The seam is part of the default
+  re-plan path only: an injected replan_fn overrides the
+  whole re-plan step, seam included, so existing loop
+  fixtures stay hermetic.
+- Measurement: suite 1083/1083 (1069 baseline + 14 new:
+  TestPlannerLocalRepair 11, TestLoopLocalRepair 3;
+  450.4s). Framework guard ALL CHECKS PASSED. Corpus
+  replay unchanged: accepted 0/28, accepted-sound 0/28,
+  mean errors/output 1.32, and all 56 per-plan rows
+  substantively identical to HEAD 88a5357 (diffed with
+  only wall-clock seconds excluded) — the replay path
+  parses captured planner outputs and never executes, so
+  a loop-execution seam cannot move it. Pins changed:
+  none. No live driver runs this cycle; re-run #6 is the
+  test of the seam.

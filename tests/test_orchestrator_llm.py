@@ -18894,3 +18894,407 @@ class TestPlannerCompleteCodeFix(unittest.TestCase):
             "SHAPE was right",
             planner_module._shape_steering_block(raw, {"criteria"}),
         )
+
+
+
+class TestPlannerLocalRepair(unittest.TestCase):
+    """Cycle 8: node-local repair — the harness holds the copy, the
+    model supplies only the substance.
+
+    Live re-run #5 pinned the failure shape: the planner can copy a
+    definition exactly OR compute its fields freely, not both in one
+    plan-shaped output. Accepted v1 plans returned the anchored
+    definition unextended (the plan's own test caught it:
+    'service_status' not found), and whole-task re-plans surfaced
+    the substance but lost the vessel — a clobber module, a complete
+    do_GET at the wrong indentation, a stand-in plan. The seam built
+    here: when an executed measurement fails and the edit node that
+    produced the measured code is identifiable with confidence, one
+    focused call gets the definition exactly as it stands on disk
+    plus the failure's diagnostics and returns ONLY that
+    definition's replacement; the harness splices it into the
+    culprit node's content and the candidate faces the full
+    validator stack. Any doubt — ambiguous culprit, drifted disk,
+    unspliceable or no-op answer, a validation record — returns
+    None and the loop's whole-task re-plan runs unchanged. The
+    attempt rides the loop's re-plan decision, so it consumes
+    exactly one unit of the existing budget (the loop-level
+    accounting proof lives in tests/test_loop_m1.py).
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    MODULE_SOURCE = TestPlannerPlaceholderValueFix.MODULE_SOURCE
+
+    # The fixture do_GET exactly as it stands in MODULE_SOURCE
+    # (indent 12, inside Server.start.Handler).
+    VERBATIM_DO_GET = TestPlannerCompleteCodeFix.VERBATIM_DO_GET
+
+    # The repair the seam exists to elicit: the same vessel, the
+    # three fields computed (a literal status, a reachability call,
+    # a temperature call) — cycle 7's REAL_DELTA shape.
+    REPAIRED_DO_GET = TestPlannerPlaceholderValueFix.REAL_DELTA
+
+    # The cycle-6 defect shape as a repair answer: the slots copied.
+    ELLIPSIS_DO_GET = TestPlannerPlaceholderValueFix.ELLIPSIS_DELTA
+
+    TEST_SOURCE = (
+        "import fixture_module\n"
+        "\n"
+        "handler = fixture_module.Server().start()\n"
+        "request = handler()\n"
+        'request.path = "/health"\n'
+        "request._send = lambda code, payload: (code, payload)\n"
+        "code, payload = request.do_GET()\n"
+        'assert "service_status" in payload, (\n'
+        '    f"\'service_status\' not found in {payload}"\n'
+        ")\n"
+    )
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_root = Path(self._tmp.name)
+        self.module_path = str(self.tmp_root / "fixture_module.py")
+        self.test_path = str(self.tmp_root / "test_health.py")
+        Path(self.module_path).write_text(self.MODULE_SOURCE, encoding="utf-8")
+        Path(self.test_path).write_text(self.TEST_SOURCE, encoding="utf-8")
+        self.stderr = (
+            "Traceback (most recent call last):\n"
+            f'  File "{self.test_path}", line 8, in <module>\n'
+            '    assert "service_status" in payload, (\n'
+            "AssertionError: 'service_status' not found in "
+            "{'ok': True, 'status': 'ready'}\n"
+        )
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    # --- Fixture construction: the re-run #5 v1 shape ---
+
+    def _nodes(self, culprit_content: str | None = None) -> list:
+        from freetalon.orchestrator.models import PlanNode, PlanStatus
+
+        content = self.MODULE_SOURCE if culprit_content is None else culprit_content
+        return [
+            PlanNode(
+                id="node-1",
+                objective="Extend the fixture module's /health endpoint",
+                hypothesis="extending do_GET makes the endpoint report the fields",
+                assigned_claw="scaffold",
+                inputs={"file_path": self.module_path, "content": content},
+                outputs=[self.module_path],
+                acceptance=["The module is extended."],
+                criteria=[{"type": "file_exists", "path": self.module_path}],
+                status=PlanStatus.COMPLETED,
+            ),
+            PlanNode(
+                id="node-2",
+                objective="Write the /health test script",
+                hypothesis="a script can assert on the endpoint payload",
+                assigned_claw="bash",
+                inputs={
+                    "command": (
+                        f"cat > {self.test_path} <<'EOF'\n"
+                        f"{self.TEST_SOURCE}EOF\n"
+                    )
+                },
+                outputs=[self.test_path],
+                acceptance=["The test script exists."],
+                criteria=[{"type": "file_exists", "path": self.test_path}],
+                depends_on=["node-1"],
+                status=PlanStatus.COMPLETED,
+            ),
+            PlanNode(
+                id="node-3",
+                objective="Run the /health test script",
+                hypothesis="the endpoint reports service_status",
+                assigned_claw="bash",
+                inputs={
+                    "command": f"./.venv/bin/python {self.test_path}",
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": self.stderr,
+                    "duration_s": 0.4,
+                },
+                outputs=[],
+                acceptance=["The test passes."],
+                criteria=[{"type": "exit_code", "expected": 0}],
+                depends_on=["node-2"],
+                status=PlanStatus.FAILED,
+                error="exit_code 1 != 0",
+                exit_code=1,
+                measurement={
+                    "verdict": "FAIL",
+                    "results": [
+                        {
+                            "criterion": {"type": "exit_code", "expected": 0},
+                            "detail": "exit_code 1 != 0",
+                            "measured": True,
+                            "passed": False,
+                        }
+                    ],
+                    "exit_code": 1,
+                },
+            ),
+        ]
+
+    def _plan(self, nodes: list):
+        from freetalon.orchestrator.models import ExecutionPlan, TaskIntent
+
+        return ExecutionPlan(
+            plan_id="plan-local-repair",
+            intent=TaskIntent(
+                goal=self.HEALTH_GOAL,
+                constraints={"workspace": str(self.tmp_root)},
+            ),
+            nodes=nodes,
+            metadata={"repo_root": str(self.tmp_root)},
+        )
+
+    def _brief(self, nodes: list) -> dict:
+        from freetalon.orchestrator.judge import _failure_diagnostics
+
+        failed = next(node for node in nodes if node.id == "node-3")
+        return {
+            "goal": {"objective": self.HEALTH_GOAL},
+            "plan_id": "plan-local-repair",
+            "plan_version": 1,
+            "failed_nodes": [
+                {
+                    "id": failed.id,
+                    "objective": failed.objective,
+                    "hypothesis": failed.hypothesis,
+                    "assigned_claw": failed.assigned_claw,
+                    "inputs": dict(failed.inputs),
+                    "measurement": failed.measurement,
+                    "error": failed.error,
+                    "diagnostics": _failure_diagnostics(failed),
+                }
+            ],
+            "measurements": [],
+            "past_experiments": [],
+            "remaining_budget": {"replans": 2, "wall_seconds": None, "attempts": None},
+        }
+
+    def _run(self, response: str, nodes: list | None = None):
+        """try_local_repair with the LLM stubbed; returns (result, calls)."""
+        from unittest import mock
+
+        from freetalon.orchestrator import planner as planner_module
+
+        nodes = self._nodes() if nodes is None else nodes
+        plan = self._plan(nodes)
+        calls: list[tuple[str, str]] = []
+
+        def fake_call_llm(system_prompt, user_prompt, settings=None):
+            calls.append((system_prompt, user_prompt))
+            return response
+
+        with mock.patch.object(planner_module, "call_llm", fake_call_llm):
+            result = planner_module.try_local_repair(plan, self._brief(nodes))
+        return result, calls
+
+    # --- The happy path: only the culprit's definition changes ---
+
+    def test_repair_replaces_only_the_culprit_definition(self) -> None:
+        result, calls = self._run(self.REPAIRED_DO_GET)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(calls), 1)
+        system_prompt, user_prompt = calls[0]
+        # The ask carries the goal unchanged, the current definition
+        # exactly as it stands, and the failure's own words.
+        self.assertIn("node repairer", system_prompt)
+        self.assertIn(f"THE TASK IS UNCHANGED: {self.HEALTH_GOAL}", user_prompt)
+        self.assertIn(self.VERBATIM_DO_GET.rstrip("\n"), user_prompt)
+        self.assertIn("'service_status' not found", user_prompt)
+        self.assertIn("exit_code 1 != 0", user_prompt)
+        self.assertIn("Return ONLY the complete new version", user_prompt)
+        # The candidate: node-1's content is the module with exactly
+        # the do_GET span replaced; every other node is preserved in
+        # substance (ids, objectives, inputs minus executor residue,
+        # criteria, deps), with execution state reset for the new
+        # version.
+        expected = self.MODULE_SOURCE.replace(
+            self.VERBATIM_DO_GET, self.REPAIRED_DO_GET
+        )
+        self.assertNotEqual(expected, self.MODULE_SOURCE)
+        by_id = {node.id: node for node in result}
+        self.assertEqual(by_id["node-1"].inputs["content"], expected)
+        self.assertEqual(by_id["node-1"].responds_to, "node-3")
+        self.assertIn("node-local repair", by_id["node-1"].differs_by or "")
+        originals = {node.id: node for node in self._nodes()}
+        for node_id in ("node-2", "node-3"):
+            candidate, original = by_id[node_id], originals[node_id]
+            self.assertEqual(candidate.objective, original.objective)
+            self.assertEqual(candidate.assigned_claw, original.assigned_claw)
+            self.assertEqual(candidate.depends_on, original.depends_on)
+            self.assertEqual(candidate.criteria, original.criteria)
+            residue = {"exit_code", "stdout", "stderr", "duration_s",
+                       "workdir", "timeout_s"}
+            self.assertEqual(
+                candidate.inputs,
+                {k: v for k, v in original.inputs.items() if k not in residue},
+            )
+        from freetalon.orchestrator.models import PlanStatus
+
+        for node in result:
+            self.assertEqual(node.status, PlanStatus.DRAFT)
+            self.assertEqual(node.measurement, {})
+            self.assertIsNone(node.error)
+            self.assertIsNone(node.exit_code)
+
+    def test_repair_accepts_a_method_only_answer(self) -> None:
+        # The model returns just the method, dedented to column 0:
+        # extraction matches it as the window's trailing part and
+        # the splice re-indents it to the file's 12 spaces.
+        method_only = "\n".join(
+            line[12:] if line.startswith(" " * 12) else line
+            for line in self.REPAIRED_DO_GET.rstrip("\n").splitlines()
+        )
+        result, _calls = self._run(method_only)
+        self.assertIsNotNone(result)
+        by_id = {node.id: node for node in result}
+        self.assertEqual(
+            by_id["node-1"].inputs["content"],
+            self.MODULE_SOURCE.replace(self.VERBATIM_DO_GET, self.REPAIRED_DO_GET),
+        )
+
+    def test_repair_accepts_a_fenced_answer(self) -> None:
+        result, _calls = self._run(f"```python\n{self.REPAIRED_DO_GET}```\n")
+        self.assertIsNotNone(result)
+
+    # --- Fallbacks: any doubt returns None, no candidate ---
+
+    def test_two_writers_of_the_measured_module_fall_back(self) -> None:
+        from freetalon.orchestrator.models import PlanNode, PlanStatus
+
+        nodes = self._nodes()
+        nodes.insert(
+            1,
+            PlanNode(
+                id="node-1b",
+                objective="Rewrite the fixture module wholesale",
+                hypothesis="a full rewrite also extends the endpoint",
+                assigned_claw="scaffold",
+                inputs={
+                    "file_path": self.module_path,
+                    "content": self.MODULE_SOURCE,
+                },
+                outputs=[self.module_path],
+                acceptance=["The module is rewritten."],
+                criteria=[{"type": "file_exists", "path": self.module_path}],
+                depends_on=["node-1"],
+                status=PlanStatus.COMPLETED,
+            ),
+        )
+        nodes[2].depends_on = ["node-1b"]
+        result, calls = self._run(self.REPAIRED_DO_GET, nodes)
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])  # ambiguity is settled before any call
+
+    def test_no_writer_of_the_measured_module_falls_back(self) -> None:
+        # The module exists on disk but no node in this plan wrote
+        # it: there is no culprit node to repair.
+        nodes = self._nodes()
+        nodes[0].assigned_claw = "bash"
+        nodes[0].inputs = {"command": "true"}
+        result, calls = self._run(self.REPAIRED_DO_GET, nodes)
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
+
+    def test_placeholder_repair_output_falls_back(self) -> None:
+        # The cycle-6 defect as a repair answer: the candidate faces
+        # the full validator stack, placeholder_value included, and
+        # is discarded — the seam never repairs a repair.
+        result, calls = self._run(self.ELLIPSIS_DO_GET)
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 1)
+
+    def test_verbatim_copy_back_is_not_a_repair(self) -> None:
+        result, _calls = self._run(self.VERBATIM_DO_GET)
+        self.assertIsNone(result)
+
+    def test_unparseable_answer_falls_back(self) -> None:
+        result, _calls = self._run("I cannot determine the fix.")
+        self.assertIsNone(result)
+
+    def test_disk_drift_from_the_culprit_content_falls_back(self) -> None:
+        # A later hand edit changed do_GET on disk: the culprit node
+        # is no longer the definition's current author, so the
+        # harness will not splice into a file it cannot account for.
+        Path(self.module_path).write_text(
+            self.MODULE_SOURCE.replace(
+                'return self._send(404, {"ok": False})',
+                'return self._send(404, {"ok": False, "error": "x"})',
+            ),
+            encoding="utf-8",
+        )
+        result, calls = self._run(self.REPAIRED_DO_GET)
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
+
+    def test_failed_write_node_is_not_a_repair_target(self) -> None:
+        # The failure is the write node's own measurement, not a
+        # later measurement of the code it wrote: a different
+        # failure class, outside this seam.
+        from freetalon.orchestrator.models import PlanStatus
+
+        nodes = self._nodes()
+        failed = nodes[0]
+        failed.status = PlanStatus.FAILED
+        failed.measurement = {
+            "verdict": "FAIL",
+            "results": [
+                {
+                    "criterion": {"type": "file_exists", "path": self.module_path},
+                    "detail": "file_exists fixture_module.py: missing",
+                    "measured": True,
+                    "passed": False,
+                }
+            ],
+        }
+        failed.inputs = {**failed.inputs, "stderr": "write failed"}
+        brief = self._brief(nodes)
+        brief["failed_nodes"] = [
+            {
+                "id": failed.id,
+                "objective": failed.objective,
+                "hypothesis": failed.hypothesis,
+                "assigned_claw": failed.assigned_claw,
+                "inputs": dict(failed.inputs),
+                "measurement": failed.measurement,
+                "error": failed.error,
+                "diagnostics": "write failed",
+            }
+        ]
+        from unittest import mock
+
+        from freetalon.orchestrator import planner as planner_module
+
+        with mock.patch.object(
+            planner_module, "call_llm", side_effect=AssertionError("called")
+        ):
+            self.assertIsNone(
+                planner_module.try_local_repair(self._plan(nodes), brief)
+            )
+
+    def test_unmeasured_failure_falls_back(self) -> None:
+        # A FAIL verdict with no measured failing result (a gate or
+        # an unmeasurable criterion) carries no code-under-test
+        # signal: the seam does not guess.
+        nodes = self._nodes()
+        nodes[2].measurement = {
+            "verdict": "FAIL",
+            "results": [
+                {
+                    "criterion": {"type": "exit_code", "expected": 0},
+                    "detail": "exit_code unmeasured",
+                    "measured": False,
+                    "passed": False,
+                }
+            ],
+        }
+        result, calls = self._run(self.REPAIRED_DO_GET, nodes)
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
