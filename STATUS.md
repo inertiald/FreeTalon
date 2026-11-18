@@ -3129,3 +3129,60 @@ Deliberately left out:
   systematic shape habit (node fields nested inside
   "inputs" on the large scaffold node). Arm A2
   (qwen2.5-coder:14b) follows under the same protocol.
+
+## Update - 2026-11-18 (Model A/B Track A, Arm A2: qwen2.5-coder:14b — substance in the anchored form, criteria discipline is the wall)
+
+- Pull: qwen2.5-coder:14b into the same Docker Ollama
+  — 8.99 GB on disk, ~1.5 min. Speed measure (one
+  bounded generation, num_ctx 12288): 100% GPU, VRAM
+  11,103 MiB of 24,576; prefill 347 tok/s, decode
+  43.1 tok/s. Timeout kept at 900s (same sizing rule
+  as Arm A1).
+- Run (FREETALON_OLLAMA_MODEL=qwen2.5-coder:14b,
+  timeout 900, temperature 0, formatter OFF; driver
+  exit 1; wall ~5 min; GPU peak 81C, no thermal pause;
+  fans manual 85% during, auto after, verified):
+  3 raw outputs, all rejected at planning (errors
+  replayed offline through parse_planner_response).
+  Output 1 is the closest any planner has come: an
+  ANCHORED replace of
+  HiveAPIServer.start.Handler.do_GET whose /health
+  branch computes ollama_reachable via a subprocess
+  curl probe (except -> False) and gpu_temperature
+  via a subprocess nvidia-smi query (except -> "N/A")
+  — copy and computation in one plan-shaped output,
+  the combination the 12B never produced in three
+  ask shapes. Step-1 passed every content check; the
+  rejection was criteria discipline in the other
+  nodes (a tests_pass criterion naming a directory
+  the node neither writes nor runs; two custom_check
+  criteria with no name). Output 2 (full-module
+  scaffold, substance real again, retention clean)
+  named its custom_checks — and invented names are
+  not registered checkers (2 errors). Output 3
+  regressed to output 1's criteria defects; planning
+  failed on the repeat. One gap never reached a
+  deciding vote: no output writes a test file —
+  step_2 only runs the existing suite.
+- placeholder_value fired 0 times in either arm; no
+  Ellipsis; no invented constants — every /health
+  value in both new models' outputs is computed.
+  Nothing executed in either arm, so no files
+  changed (porcelain 0), no memory records, no
+  restores or suite re-runs needed.
+- Track A verdict: no verified end-to-end success —
+  the success-stop never fired — but the A/B answers
+  its question. The substance wall was the 12B
+  planner, not the harness or the goal: the 27B
+  computes the fields and trips a nesting habit;
+  Qwen-14B computes them inside the anchored edit
+  itself and trips only criterion-registry
+  discipline (tests_pass targets, custom_check
+  naming/registration) — an enumerable class the
+  repair loop can be taught to steer, and a far
+  smaller gap than authoring the computation. The
+  remaining choice — a criteria-discipline cycle
+  aimed at Qwen's failure class, a second 27B/Qwen
+  attempt with that steering in place, or the
+  critic track's live run — is the next direction
+  call.
