@@ -1905,3 +1905,53 @@ Deliberately left out:
   tests, 6 executor suite-timeout tests). Ran 997 in 378.1s, OK.
 - Next: CP2 -- 3 live /health runs on the refactored planner;
   reassess with Pat if no improvement after refactor + 2 cycles.
+
+## Update - 2026-11-17 (Checkpoint 2: 3 live /health runs on the refactored planner)
+
+- CP2 live A/B, new-planner arm: 3 driver runs of the /health goal
+  on c334196 under full retry discipline. Pre-flight: GPU 52C idle,
+  power limit exactly 300.00W, link x16, 0 Xid 79/154, Ollama tags
+  list gemma-3-abliterated:latest, head c334196 clean; baseline
+  suite 997/997 green (Ran 997 in 388.9s, OK). Fans manual 85%
+  during each run, auto after, GPUFanControlState=0 verified after
+  each run. All 3 runs DRIVER_EXIT=1, FAILED at planning; no run
+  changed any file (porcelain 0 after each; nothing to restore);
+  live /health never reached.
+- DETERMINISM: the 3 runs are byte-identical -- same INTENT
+  (md5 8abb5a6382a1687e22b7e5e4a85233b8) and all 4 raw planner
+  outputs md5-identical across runs. At planner temperature 0 the
+  live arm is one deterministic trace replicated 3x; CP2's live n
+  is effectively 1 distinct sample.
+- Per-run attempt profile (identical every run; structured codes
+  from tools/probe-cp2.py replays, same verdicts under
+  repo_root=None and the explicit root): output 1, the schema echo
+  {"ok":true,"status":"ready"} -> missing_nodes_array@schema;
+  output 2, {"nodes":[]} -> empty_plan@schema; output 3, the
+  5-node anchored-edit plan (dedented full do_GET delta absorbed
+  by the re-indent rule) -> rejected with exactly 1 error,
+  heredoc_parse@validate[step-2] (the test heredoc leaves
+  unittest.main() dedented out of the __main__ guard: "expected an
+  indented block after 'if' statement on line 54"); output 4
+  (repair) regresses to the 2-node elision-fragment scaffold ->
+  elision@validate[step_1], rejected by name.
+- Scoreboard vs the old-model live baseline (retries #28-#33,
+  6 runs): accepted 1/6 old (retry #33, unsound) -> 0/3 new;
+  accepted-sound 0/6 -> 0/3; end-to-end successes 0 -> 0. The two
+  old-arm failure signatures are now planning-stage rejections:
+  the plan class retry #33 ACCEPTED is stopped pre-execution by
+  heredoc_parse, and #33's accepted fragment family is stopped by
+  elision -- zero file damage across CP2, vs api.py clobbered and
+  restored in #33. Accepted-sound did NOT move above zero: the
+  binding defect is now the model's step-2 heredoc indentation,
+  and the repair output still regresses in form (code-keyed
+  steering contains the regression safely; it does not prevent
+  the model from producing it).
+- GPU: peak temps observed 79C (run 1), 77C (run 2), 82C (run 3),
+  all under the 85C pause threshold, no thermal intervention;
+  0 Xid 79/154 across CP2. Log:
+  logs/health-cp2-2026-11-17.log; per-run code probes
+  logs/cp2-run{1,2,3}-probe.txt; raw traces logs/cp2-run{1,2,3}.out.
+- Next: reassess with Pat per the A/B framework (refactor + CP1 +
+  CP2 complete; unsound-accepts are closed, accepted-sound still
+  0 -- the remaining gap is model-side plan substance, not
+  planner soundness).
