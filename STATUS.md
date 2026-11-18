@@ -2561,3 +2561,106 @@ Deliberately left out:
   appeared exactly once, as hardcoded constants inside a
   malformed node — the model can produce values, but not yet
   inside a well-formed edit in response to feedback.
+
+## Update - 2026-11-18 (Cycle 6: placeholder_value — the Ellipsis delta becomes a planning-stage rejection)
+
+- Re-run #3's answer set up the move this project has made at
+  every layer: a known-bad output shape becomes a named,
+  repairable planning-stage rejection. The accepted plan's
+  step-1 delta assigns the bare Ellipsis to service_status /
+  ollama_reachable / gpu_temperature; cycles 2-5 made the
+  harness sound around it (envelope, memory signature,
+  execution base, brief substance), and the model re-emitted
+  the shape anyway. Investigation found why the shape is so
+  sticky: the harness's own grounded skeleton teaches it —
+  the anchored-delta sketch rebuilds a route branch as a real
+  payload dict plus one 'payload["<field>"] = ...' line per
+  field, with '...' as deliberate open slots the steering text
+  tells the model to replace with real computations. Gemma
+  copies the sketch verbatim, slots and all.
+- Fix: PlanError code placeholder_value (36 codes total), one
+  validate-stage validator beside the elision rule. Anchored
+  edits are materialized into full-content scaffold nodes
+  before validation, so one check on scaffold content covers
+  both surfaces (raw scaffold payloads and delta new-content).
+  AST only: an Assign / AnnAssign / AugAssign / Return whose
+  WHOLE value is a bare Ellipsis constant is an offense, named
+  with its qualified scope and target (payload['service_status']
+  in HiveAPIServer.start.Handler.do_GET). Only offenses the
+  write introduces count — the same (scope, target) pairs in
+  the target file's current source are baseline, so a file
+  that already carries a sentinel is not made uneditable.
+  Exemptions, documented at the rule: non-.py targets (.pyi
+  stubs never reach it), test files (Ellipsis as a sentinel or
+  mock value is legitimate there), stub-shaped scopes
+  (Protocol members, @overload / @abstractmethod), and by
+  construction signature defaults, Ellipsis inside strings or
+  comments, '...' expression-statement stub bodies, and an
+  Ellipsis inside a container literal. The codebase audit
+  behind the boundary: no '= ...' assignments and no Ellipsis
+  signature defaults exist anywhere in freetalon/ today;
+  mesh/recon.py's bare '...' are stub bodies, which the rule
+  never sees. The error text names the targets, demands a real
+  expression, and says what a skeleton's '...' means — the
+  slot the value belongs in, not code to copy. The code counts
+  as a content defect for steering (the shape block never
+  claims the code was clean) and as a cheap rejection
+  (replacing a '...' with a real expression costs nothing
+  structural, so the repair loop re-prompts for free, bounded
+  by stuck detection). It is deliberately NOT a
+  placeholder-skeleton code: the grounded skeleton contains
+  the sketch's slots, so answering with it would hand the
+  model the defect's shape again.
+- Fixtures (TestPlannerPlaceholderValueFix, 12 tests): the
+  real plan-7885a4ef9d99 step-1 delta shape rejected naming
+  all three targets, as a cheap rejection; the same delta
+  with real expressions (a urllib reachability expression,
+  an nvidia-smi parse, a status string) accepted and
+  materialized; the whole-file scaffold variant caught; each
+  legitimate use above passing, including an existing
+  'SENTINEL = ...' treated as baseline (verbatim reproduction
+  passes; adding a second Ellipsis assignment names only the
+  new one).
+- Pins: four changed, all deliberate — the tests that pinned
+  acceptance of the retry-#32 / CP2 plans and the verbatim
+  grounded skeleton, whose step-1 IS the Ellipsis delta. Each
+  now asserts the verbatim plan is rejected with codes ==
+  {placeholder_value} exactly, and keeps every original
+  acceptance/materialization assertion on the same plan with
+  the three slots filled with real expressions (new test
+  helper _fill_health_slots, JSON-level, count-asserted). Two
+  also pin that no heredoc_parse rides beside
+  placeholder_value — step-2's payload is still repaired at
+  materialization, before validation. No other pins moved,
+  and no production-code counts changed.
+- Corpus: moved, as the pre-check predicted. Accepted 2/28
+  -> 0/28, accepted-sound 2/28 -> 0/28, accepted-unsound 0.
+  Per-plan: retry32-3 and retry33-3 — cycle 2's two
+  accepted-SOUND plans — are now rejected at validate with
+  exactly one placeholder_value error at both roots. Their
+  "sound" verdict was soundness of shape; the values their
+  step-1 writes are the defect this cycle exists to reject,
+  so the move is the rule working — reported, not silent. No
+  other corpus entry changed verdict.
+- Secondary (claw required-inputs at planning): deferred
+  with evidence. Required-input knowledge is scattered
+  across six modules with aliases (file_path|path,
+  command|cmd, topic|query), conjunctions (fetch_dataset
+  needs url AND dest), and defaults in place of raises
+  (finance, network) — no cheap central declaration exists
+  to check against, and a partial table would silently bless
+  the rest. The motivating case (re-run #3 run 2 v1: a
+  scaffold node holding only a bash command, raised at
+  execution) is recorded in the cycle log as the follow-up's
+  evidence.
+- Suite: 1063/1063 (441.0s; 1051 baseline + 12 new, 4 pins
+  updated as above). Framework guard: ALL CHECKS PASSED.
+  No live driver runs in this cycle.
+- Net: the last known hollow-write shape is now a
+  planning-stage rejection, so the repair loop — which
+  demonstrably fixes format-class errors — iterates on the
+  Ellipsis delta before execution, instead of the loop
+  executing it and spending judge budget on a failure the
+  model would not repair from feedback. Whether the repair
+  loop can now produce a substantive delta is the live
+  re-run's question.

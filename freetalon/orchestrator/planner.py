@@ -3967,6 +3967,229 @@ def _elision_errors(
     return errors
 
 
+_ELLIPSIS_STUB_DECORATORS = frozenset({"overload", "abstractmethod"})
+
+
+def _dotted_name_tail(node: ast.AST) -> str:
+    """The last component of a dotted name (``typing.Protocol`` -> ``Protocol``)."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _ellipsis_value_assignments(source: str) -> list[tuple[str, str]]:
+    """(scope, target) pairs for bare Ellipsis assigned as a whole value.
+
+    The AST walk behind _placeholder_value_errors: an assignment
+    (plain, annotated, or augmented) or a return whose ENTIRE value
+    is the bare ``...`` literal. Scope is the qualified definition
+    path ("" at module level; nested definitions — a handler class
+    defined inside a method — produce dotted scopes like
+    ``Server.start.Handler.do_GET``), and the target is the
+    assignment target's own source text (``ast.unparse``), so
+    ``payload["ollama_reachable"] = ...`` is recorded as
+    (``...do_GET``, ``payload['ollama_reachable']``) and a bare
+    ``return ...`` as (scope, ``return``). Pairs are de-duplicated,
+    first occurrence wins.
+
+    Only the bare whole-value form is recorded — the value must BE
+    the Ellipsis, not merely contain it:
+
+    - a signature default (``def f(x=...)``) is an argument default,
+      not an assignment, and never appears here;
+    - ``...`` inside a string or a comment is not an Ellipsis value
+      (a string constant is a str; comments never reach the AST);
+    - a ``...`` expression statement (a stub body — the form
+      freetalon/mesh/recon.py uses) is not an assignment;
+    - a container literal holding an Ellipsis (``{"a": ...}``)
+      assigns the container, not the Ellipsis.
+
+    Stub-shaped scopes are exempt: a function decorated @overload or
+    @abstractmethod, and any member of a Protocol class — their
+    bodies are declarations, not implementations. Unparseable source
+    yields no pairs (the parse checks own that defect).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    found: list[tuple[str, str]] = []
+
+    def is_ellipsis(node: ast.AST | None) -> bool:
+        return isinstance(node, ast.Constant) and node.value is Ellipsis
+
+    def visit(node: ast.AST, scope: str, exempt: bool) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            child_scope = f"{scope}.{node.name}" if scope else node.name
+            child_exempt = exempt or any(
+                _dotted_name_tail(decorator) in _ELLIPSIS_STUB_DECORATORS
+                for decorator in node.decorator_list
+            )
+            for child in node.body:
+                visit(child, child_scope, child_exempt)
+            return
+        if isinstance(node, ast.ClassDef):
+            child_scope = f"{scope}.{node.name}" if scope else node.name
+            child_exempt = exempt or any(
+                _dotted_name_tail(base) == "Protocol" for base in node.bases
+            )
+            for child in node.body:
+                visit(child, child_scope, child_exempt)
+            return
+        if not exempt:
+            if isinstance(node, ast.Return):
+                if is_ellipsis(node.value):
+                    found.append((scope, "return"))
+            else:
+                value: ast.AST | None = None
+                targets: list[ast.AST] = []
+                if isinstance(node, ast.Assign):
+                    value, targets = node.value, list(node.targets)
+                elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                    value, targets = node.value, [node.target]
+                elif isinstance(node, ast.AugAssign):
+                    value, targets = node.value, [node.target]
+                if is_ellipsis(value):
+                    for target in targets:
+                        found.append((scope, ast.unparse(target)))
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope, exempt)
+
+    for statement in tree.body:
+        visit(statement, "", False)
+    seen: set[tuple[str, str]] = set()
+    pairs: list[tuple[str, str]] = []
+    for pair in found:
+        if pair not in seen:
+            seen.add(pair)
+            pairs.append(pair)
+    return pairs
+
+
+def _placeholder_value_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    goal_text: str | None = None,
+    index: Any | None = None,
+    modules: _ModuleSourceCache | None = None,
+) -> list[str]:
+    """Reject scaffold writes that assign the bare Ellipsis as a value.
+
+    Cycle 6: across five live runs the accepted /health plan's step-1
+    assigned literal ... to the response fields (payload[...] = ...
+    inside the extended do_GET). The write is structurally complete
+    — a real module, a real branch, every definition retained — so
+    every existing content rule passed it: it is not placeholder
+    content (the file is full of code), not a placeholder stub (no
+    self-labeling comment), not an elision (no markers), not a
+    stand-in (no hardcoded literal answer). Only the plan's own test
+    caught it, at execution: "AssertionError: 'Ellipsis' is not an
+    instance of bool". Cycle 5 put that assertion in the re-plan
+    brief verbatim, and the model re-emitted the same delta anyway —
+    so the defect becomes a planning-stage rejection the repair loop
+    iterates on before execution, like every layer before it.
+
+    The shape has a teacher: the harness's own grounded skeleton
+    (_anchored_delta_sketch) sketches a route branch with
+    payload["<field>"] = ... lines whose "..." values are open slots
+    the surrounding steering tells the model to replace with real
+    computations, and the model copies the sketch verbatim, slots
+    and all. The error therefore says plainly that a "..." shown in
+    a skeleton or example marks the slot a value belongs in — it is
+    not code to copy.
+
+    Scope (the boundary is the point; _ellipsis_value_assignments
+    carries the AST half): scaffold/file_writer content for a
+    NON-test Python implementation file. .pyi stubs never reach the
+    check (their suffix is not .py — "x: int = ..." is the stub
+    idiom), and test files are exempt via _is_test_file_path: a test
+    may use Ellipsis as a sentinel or expected value, while the
+    implementation is what must be real. An assignment the target
+    file ALREADY carries (same scope, same target, judged from the
+    module's current source through the shared cache) is not an
+    offense — the rule names what the write INTRODUCES, so a
+    faithful full-module scaffold is never rejected for a
+    placeholder the module already had, and an anchored edit (whose
+    content reaches this stage materialized into the full module)
+    is judged on its own contribution. Content another rule owns is
+    skipped, with the neighbors' skip list: a hardcoded literal
+    answer (the stand-in check), placeholder content and placeholder
+    stubs (the placeholder check), unparseable content (the parse
+    check).
+    """
+    if modules is None:
+        modules = _ModuleSourceCache()
+    errors: list[str] = []
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("scaffold", "file_writer"):
+            continue
+        target = (
+            node.inputs.get("file_path")
+            or node.inputs.get("path")
+            or (node.outputs[0] if node.outputs else "")
+        )
+        content = node.inputs.get("content")
+        if not isinstance(target, str) or not target:
+            continue
+        if not isinstance(content, str):
+            continue
+        if not is_code_path(target):
+            continue
+        if Path(target).suffix.lower() != ".py":
+            continue
+        if _is_test_file_path(target):
+            continue
+        if _literal_is_answer(content):
+            continue
+        if is_placeholder_content(content) or _is_placeholder_stub(content):
+            continue
+        try:
+            ast.parse(content)
+        except SyntaxError:
+            continue  # _scaffold_parse_errors owns unparseable content
+        existing = modules.source(_resolve_plan_target(target, root))
+        existing_keys = (
+            set(_ellipsis_value_assignments(existing))
+            if existing is not None
+            else set()
+        )
+        introduced = [
+            pair
+            for pair in _ellipsis_value_assignments(content)
+            if pair not in existing_keys
+        ]
+        if not introduced:
+            continue
+        by_scope: dict[str, list[str]] = {}
+        for scope, target_name in introduced:
+            by_scope.setdefault(scope, []).append(target_name)
+        groups = []
+        for scope, target_names in by_scope.items():
+            shown = ", ".join(target_names[:8])
+            if len(target_names) > 8:
+                shown += f", ... ({len(target_names) - 8} more)"
+            where = f"in {scope}" if scope else "at module level"
+            groups.append(f"{where}: {shown}")
+        errors.append(
+            f"Planner node '{node.id}' scaffolds {target!r} with "
+            "placeholder values — the bare Ellipsis '...' assigned as "
+            f"a value ({'; '.join(groups)}). '...' is not a value the "
+            "code can use: at runtime the target holds the Ellipsis "
+            "object itself, not the data the assignment must produce, "
+            "so the write is a placeholder wearing a real assignment's "
+            "shape. Assign each named target the real expression that "
+            "computes its value (a call, a lookup, a parse of command "
+            "output, or a literal of the right type). Where a plan "
+            "skeleton or example shows '...' as a value, it marks the "
+            "slot the value belongs in — replace it with the "
+            "computation, never copy it as code."
+        )
+    return errors
+
+
 def _scaffold_overwrite_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None,
@@ -4278,8 +4501,8 @@ def _collect_plan_error_records(
 
     Returns (records, cheap): ``cheap`` is True when every error is a
     stand-in / code-overwrite fake (retry #12) or a placeholder scaffold
-    (retry #17) — a rejection the repair loop may re-prompt for free,
-    without spending the repair budget.
+    (retry #17), or placeholder values (cycle 6) — a rejection the repair
+    loop may re-prompt for free, without spending the repair budget.
     """
     if modules is None:
         modules = _ModuleSourceCache()
@@ -4360,6 +4583,13 @@ def _collect_plan_error_records(
             _elision_errors(nodes, repo_root, goal_text, index, modules=modules),
         )
     )
+    placeholder_value_records = _error_records(
+        "placeholder_value",
+        _placeholder_value_errors(
+            nodes, repo_root, goal_text, index, modules=modules
+        ),
+    )
+    records.extend(placeholder_value_records)
     records.extend(
         _error_records(
             "sed_noop",
@@ -4406,11 +4636,16 @@ def _collect_plan_error_records(
     # errors are placeholder scaffolds is cheap too (retry #17): a
     # comment stub costs the model nothing to replace with real code —
     # and so is a rejection whose only errors are placeholder bash
-    # heredocs (retry #20). Any other error mixed in makes it a real
-    # rejection.
+    # heredocs (retry #20), and so is one whose only errors are
+    # placeholder values (cycle 6): a bare '...' costs the model nothing
+    # to replace with the real expression. Any other error mixed in
+    # makes it a real rejection.
     cheap = (
         bool(records)
-        and len(standin_records) + len(placeholder_records) == len(records)
+        and len(standin_records)
+        + len(placeholder_records)
+        + len(placeholder_value_records)
+        == len(records)
     )
     return records, cheap
 
@@ -5608,6 +5843,7 @@ _CONTENT_DEFECT_CODES = frozenset(
         "placeholder_stub",
         "placeholder_bash",
         "placeholder_delta",  # materialized edit whose delta is placeholder-only
+        "placeholder_value",  # bare Ellipsis assigned as a value (cycle 6)
         "static_standin",  # hardcoded literal answers
         "framework",  # Flask / FastAPI over a stdlib module
         "scaffold_overwrite",  # retention guard: drops existing definitions

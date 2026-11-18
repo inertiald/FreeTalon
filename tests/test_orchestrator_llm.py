@@ -164,6 +164,50 @@ def _rejection_codes(raw: str, **kwargs: object) -> set:
         return {record.code for record in getattr(exc, "plan_errors", [])}
     raise AssertionError("expected the plan to be rejected")
 
+
+def _fill_health_slots(raw: str) -> str:
+    """``raw`` with the health delta's three Ellipsis slots filled.
+
+    Planner cycle 6: the captured plans that carry the grounded
+    skeleton's '...' payload values verbatim (retry #32 output 3,
+    the CP2 trace, the skeleton itself) are rejected with
+    placeholder_value, so the pins that assert their acceptance
+    now assert it on the same plan with the three slots filled
+    with real expressions — the smallest change that makes
+    step-1 substantive. Each slot must occur exactly once across
+    the plan's node contents.
+    """
+    import json
+
+    payload = json.loads(raw)
+    slots = (
+        (
+            'payload["service_status"] = ...',
+            'payload["service_status"] = "running"',
+        ),
+        (
+            'payload["ollama_reachable"] = ...',
+            'payload["ollama_reachable"] = True',
+        ),
+        (
+            'payload["gpu_temperature"] = ...',
+            'payload["gpu_temperature"] = 25.0',
+        ),
+    )
+    filled = 0
+    for node in payload["nodes"]:
+        content = node.get("inputs", {}).get("content")
+        if not isinstance(content, str):
+            continue
+        for slot, real in slots:
+            if slot in content:
+                assert content.count(slot) == 1, slot
+                content = content.replace(slot, real)
+                filled += 1
+        node["inputs"]["content"] = content
+    assert filled == 3, filled
+    return json.dumps(payload)
+
 # The retry-#16 v1 fixture appends to the same absolute seeker7 path
 # (RETRY10_API_PATH). The code-append parse check simulates the write
 # against the file on disk when it exists and against the appended
@@ -16202,17 +16246,43 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
         # the run's own tests judge the "..." sketch values. What
         # must not come back is a placeholder rejection for real
         # code (see TestPlannerDeltaBlankFix for the prose side).
+        #
+        # Planner cycle 6 flips the last clause: the "..." sketch
+        # values ARE now judged at planning (placeholder_value).
+        # Five live runs re-emitted the verbatim skeleton delta,
+        # executed it, and failed the plan's own type assertions
+        # without ever converging, so the values are rejected
+        # before execution and the planning repair loop iterates
+        # on them instead. The verbatim skeleton is rejected with
+        # exactly that code, naming the slots; with the three
+        # slots filled with real expressions, the same skeleton
+        # materializes as a real plan exactly as this pin
+        # originally asserted.
         import json
 
-        from freetalon.orchestrator.planner import _grounded_skeleton
+        from freetalon.orchestrator.planner import (
+            CheapRejectionError,
+            _grounded_skeleton,
+        )
         from freetalon.orchestrator.repo_index import qualified_def_names
 
         skeleton = _grounded_skeleton(
             self.HEALTH_GOAL, str(self.repo_root), self.WS
         )
         raw = skeleton.split("\n", 1)[1]
+        with self.assertRaises(CheapRejectionError) as caught:
+            parse_planner_response(
+                raw, goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        self.assertEqual(
+            {record.code for record in caught.exception.plan_errors},
+            {"placeholder_value"},
+        )
+        self.assertIn("payload['gpu_temperature']", str(caught.exception))
         nodes, _meta = parse_planner_response(
-            raw, goal_text=self.HEALTH_GOAL, workspace=self.WS
+            _fill_health_slots(raw),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
         )
         self.assertEqual(len(nodes), 5)
         inputs = nodes[0].inputs
@@ -16225,7 +16295,7 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
         self.assertEqual(
             qualified_def_names(content), qualified_def_names(source)
         )
-        self.assertIn('payload["gpu_temperature"] = ...', content)
+        self.assertIn('payload["gpu_temperature"] = 25.0', content)
         # Silence the unused-import lint pattern used elsewhere.
         self.assertIsInstance(json.loads(raw), dict)
 
@@ -16998,6 +17068,20 @@ class TestPlannerReindentFix(unittest.TestCase):
         return json.dumps({"nodes": payload["nodes"][:1], "metadata": {}})
 
     def test_retry32_output3_step1_materializes(self) -> None:
+        # Planner cycle 6 flips the judgment this pin used to
+        # encode. The sketch's '...' payload values were, by the
+        # design recorded in the original version of this test,
+        # judged at execution: the plan's own tests assert the
+        # fields' types (which Ellipsis fails), and the
+        # judge/replan loop was expected to converge on real
+        # values. Five live runs showed it does not — the model
+        # re-emitted the byte-identical delta at temperatures 0
+        # and 0.4 — so cycle 6 judges the values at planning
+        # instead: the verbatim step-1 is rejected with
+        # placeholder_value, cheaply, and the planning repair loop
+        # iterates on it. The materialization assertions below run
+        # on the same step-1 with the three slots filled with real
+        # expressions.
         import ast
 
         from freetalon.orchestrator import planner
@@ -17011,8 +17095,17 @@ class TestPlannerReindentFix(unittest.TestCase):
 
         api_source = Path(self.api_path).read_text(encoding="utf-8")
         for root in (None, str(self.repo_root)):
+            self.assertEqual(
+                _rejection_codes(
+                    self._step1_only_raw(),
+                    goal_text=self.HEALTH_GOAL,
+                    workspace=self.WS,
+                    repo_root=root,
+                ),
+                {"placeholder_value"},
+            )
             nodes, _meta = parse_planner_response(
-                self._step1_only_raw(),
+                _fill_health_slots(self._step1_only_raw()),
                 goal_text=self.HEALTH_GOAL,
                 workspace=self.WS,
                 repo_root=root,
@@ -17025,21 +17118,21 @@ class TestPlannerReindentFix(unittest.TestCase):
             self.assertEqual(
                 qualified_def_names(content), qualified_def_names(api_source)
             )
-            # The sketch's '...' payload values survive verbatim
-            # into the materialized module — by design no planning
-            # check judges them; the plan's own tests assert the
-            # fields' types (which Ellipsis fails), so substance is
-            # judged at execution by the judge/replan loop.
-            self.assertIn('payload["service_status"] = ...', content)
-            self.assertIn('payload["ollama_reachable"] = ...', content)
-            self.assertIn('payload["gpu_temperature"] = ...', content)
+            # The filled values survive verbatim into the
+            # materialized module.
+            self.assertIn('payload["service_status"] = "running"', content)
+            self.assertIn('payload["ollama_reachable"] = True', content)
+            self.assertIn('payload["gpu_temperature"] = 25.0', content)
             # The content checks the audit measured, run directly:
             # overwrite guard, placeholder/stub rules, framework
-            # guard — all silent on the materialized module.
+            # guard — all silent on the materialized module, and
+            # the cycle-6 placeholder-value rule is silent on the
+            # filled content too.
             self.assertEqual(planner._scaffold_overwrite_errors(nodes, root), [])
             self.assertEqual(
                 planner._placeholder_scaffold_errors(nodes, root), []
             )
+            self.assertEqual(planner._placeholder_value_errors(nodes, root), [])
             self.assertEqual(
                 planner._framework_errors(
                     nodes, build_repo_index(root), self.HEALTH_GOAL
@@ -17064,11 +17157,30 @@ class TestPlannerReindentFix(unittest.TestCase):
         # payload. The same flip is pinned on the CP2 trace itself
         # in TestPlannerABRefactor /
         # TestPlannerCycle2.test_cp2_output3_accepted_via_payload_channel.
+        #
+        # Planner cycle 6 flips it again: step-1's '...' payload
+        # values are now judged at planning (placeholder_value —
+        # see test_retry32_output3_step1_materializes), so the
+        # verbatim plan is rejected with exactly that one code.
+        # That no heredoc_parse rides beside it is itself the
+        # cycle-2 pin, one level up: step-2's payload is still
+        # repaired at materialization, before validation runs.
+        # With the three slots filled, the plan is ACCEPTED with
+        # step-2 in scaffold form, as cycle 2 pinned.
         import ast
 
         for root in (None, str(self.repo_root)):
+            self.assertEqual(
+                _rejection_codes(
+                    self.RETRY32_OUTPUT3_RAW,
+                    goal_text=self.HEALTH_GOAL,
+                    workspace=self.WS,
+                    repo_root=root,
+                ),
+                {"placeholder_value"},
+            )
             nodes, _meta = parse_planner_response(
-                self.RETRY32_OUTPUT3_RAW,
+                _fill_health_slots(self.RETRY32_OUTPUT3_RAW),
                 goal_text=self.HEALTH_GOAL,
                 workspace=self.WS,
                 repo_root=root,
@@ -17642,10 +17754,26 @@ class TestPlannerCycle2(unittest.TestCase):
         # accepted, with step-2 rerouted to the scaffold form
         # carrying the repaired payload, and both written modules
         # parsing as Python.
+        #
+        # Planner cycle 6: the verbatim output is rejected earlier
+        # — step-1 assigns the skeleton's '...' slots as values,
+        # now placeholder_value — with exactly that one code (the
+        # absence of heredoc_parse beside it shows step-2's payload
+        # is still repaired at materialization, before validation).
+        # The payload-channel assertions below run on the same
+        # output with the three slots filled with real expressions.
         import ast
 
+        self.assertEqual(
+            _rejection_codes(
+                self.CP2_OUTPUT_3,
+                goal_text=self.GOAL,
+                workspace="/home/seeker/freetalon-workspace",
+            ),
+            {"placeholder_value"},
+        )
         nodes, _meta = parse_planner_response(
-            self.CP2_OUTPUT_3,
+            _fill_health_slots(self.CP2_OUTPUT_3),
             goal_text=self.GOAL,
             workspace="/home/seeker/freetalon-workspace",
         )
@@ -18050,3 +18178,358 @@ class TestPlannerCycle2(unittest.TestCase):
         # back to the planner's own (valid) output.
         self.assertEqual(len(calls), 2)
         self.assertEqual(len(plan.nodes), 1)
+
+
+class TestPlannerPlaceholderValueFix(unittest.TestCase):
+    """Cycle 6: placeholder_value — a bare Ellipsis assigned as a value.
+
+    Five live runs accepted the same step-1 shape: a structurally
+    complete extension of the serving module whose new response
+    fields were assigned the bare Ellipsis (payload[...] = ...) —
+    the grounded skeleton's sketch slots, copied verbatim. Every
+    existing content rule passed it (real code, definitions
+    retained, no elision markers, no literal answer); the plan's own
+    test caught it only at execution, and cycle 5's brief — carrying
+    the assertion verbatim — did not move the model. The defect is
+    now a planning-stage rejection (code "placeholder_value") the
+    repair loop iterates on before execution: an Assign / AnnAssign
+    / AugAssign / Return whose WHOLE value is the bare Ellipsis, in
+    scaffold content for a non-test .py implementation file, judged
+    by AST and counting only assignments the write introduces (the
+    target file's current source is the baseline). Legitimate
+    Ellipsis uses are outside the rule by construction or by gate:
+    .pyi stubs, Protocol/overload/abstract stub scopes, signature
+    defaults, strings/comments, "..." stub bodies, container
+    literals holding an Ellipsis, and test files.
+    """
+
+    GOAL = "Extend the fixture module in place"
+
+    # Qualified definitions (7): alpha, beta, Server, Server.start,
+    # Server.start.Handler, Server.start.Handler.do_GET, Server.stop.
+    MODULE_SOURCE = (
+        '"""Fixture module for placeholder-value checks."""\n'
+        "from urllib.parse import urlparse\n"
+        "\n"
+        "\n"
+        "def alpha():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def beta():\n"
+        "    return 2\n"
+        "\n"
+        "\n"
+        "class Server:\n"
+        "    def start(self):\n"
+        "        class Handler:\n"
+        "            def do_GET(self):\n"
+        "                path = urlparse(self.path).path\n"
+        '                if path == "/health":\n'
+        '                    return self._send(200, {"ok": True, "status": "ready"})\n'
+        '                return self._send(404, {"ok": False})\n'
+        "\n"
+        "        return Handler\n"
+        "\n"
+        "    def stop(self):\n"
+        "        return None\n"
+    )
+
+    # The live plan-7885a4ef9d99 step-1 delta shape: the /health
+    # branch rebuilt around a payload dict whose three new fields
+    # are assigned the skeleton's "..." slots verbatim.
+    ELLIPSIS_DELTA = (
+        "            def do_GET(self):\n"
+        "                path = urlparse(self.path).path\n"
+        '                if path == "/health":\n'
+        '                    payload = {"ok": True, "status": "ready"}\n'
+        '                    payload["service_status"] = ...\n'
+        '                    payload["ollama_reachable"] = ...\n'
+        '                    payload["gpu_temperature"] = ...\n'
+        "                    return self._send(200, payload)\n"
+        '                return self._send(404, {"ok": False})\n'
+    )
+
+    # The same delta with real expressions: a literal of the right
+    # type, a reachability call, a parse call.
+    REAL_DELTA = (
+        "            def do_GET(self):\n"
+        "                path = urlparse(self.path).path\n"
+        '                if path == "/health":\n'
+        '                    payload = {"ok": True, "status": "ready"}\n'
+        '                    payload["service_status"] = "ready"\n'
+        '                    payload["ollama_reachable"] = _ollama_reachable()\n'
+        '                    payload["gpu_temperature"] = _gpu_temperature()\n'
+        "                    return self._send(200, payload)\n"
+        '                return self._send(404, {"ok": False})\n'
+    )
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_root = Path(self._tmp.name)
+        self.module_path = str(self.tmp_root / "fixture_module.py")
+        Path(self.module_path).write_text(self.MODULE_SOURCE, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _scaffold_node(
+        self, content: str, target: str | None = None, node_id: str = "step-1"
+    ) -> dict:
+        target = target or self.module_path
+        return {
+            "id": node_id,
+            "objective": "Rewrite the fixture module",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {"file_path": target, "content": content},
+            "outputs": [target],
+            "acceptance": ["The module is rewritten."],
+            "criteria": [{"type": "file_exists", "path": target}],
+        }
+
+    def _edit_node(self, content: str, node_id: str = "step-1") -> dict:
+        return {
+            "id": node_id,
+            "objective": "Extend the fixture module in place",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": self.module_path,
+                "anchor": "Server.start.Handler.do_GET",
+                "position": "replace",
+                "content": content,
+            },
+            "outputs": [self.module_path],
+            "acceptance": ["The module is edited."],
+            "criteria": [{"type": "file_exists", "path": self.module_path}],
+        }
+
+    def _caught(self, raw: str) -> LLMResponseError:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw, goal_text=self.GOAL)
+        return caught.exception
+
+    # --- The live defect shape, both surfaces ---
+
+    def test_ellipsis_delta_rejected_naming_all_three_targets(self) -> None:
+        exc = self._caught(self._dag([self._edit_node(self.ELLIPSIS_DELTA)]))
+        self.assertEqual(
+            {record.code for record in exc.plan_errors}, {"placeholder_value"}
+        )
+        message = str(exc)
+        self.assertIn("placeholder values", message)
+        self.assertIn("Server.start.Handler.do_GET", message)
+        for target in (
+            "payload['service_status']",
+            "payload['ollama_reachable']",
+            "payload['gpu_temperature']",
+        ):
+            self.assertIn(target, message)
+
+    def test_ellipsis_delta_rejection_is_cheap(self) -> None:
+        # Retry-#17 family: replacing a "..." with the real expression
+        # costs the model nothing structural, so a rejection whose
+        # only error is placeholder_value re-prompts for free.
+        from freetalon.orchestrator.planner import CheapRejectionError
+
+        with self.assertRaises(CheapRejectionError):
+            parse_planner_response(
+                self._dag([self._edit_node(self.ELLIPSIS_DELTA)]),
+                goal_text=self.GOAL,
+            )
+
+    def test_real_expression_delta_accepted(self) -> None:
+        nodes, _meta = parse_planner_response(
+            self._dag([self._edit_node(self.REAL_DELTA)]), goal_text=self.GOAL
+        )
+        self.assertEqual(len(nodes), 1)
+        content = nodes[0].inputs["content"]
+        self.assertIn('payload["ollama_reachable"] = _ollama_reachable()', content)
+        self.assertNotIn("= ...", content)
+
+    def test_full_scaffold_with_ellipsis_values_rejected(self) -> None:
+        content = self.MODULE_SOURCE.replace(
+            '                    return self._send(200, {"ok": True, "status": "ready"})\n',
+            '                    payload = {"ok": True, "status": "ready"}\n'
+            '                    payload["service_status"] = ...\n'
+            '                    payload["ollama_reachable"] = ...\n'
+            '                    payload["gpu_temperature"] = ...\n'
+            "                    return self._send(200, payload)\n",
+        )
+        self.assertNotEqual(content, self.MODULE_SOURCE)
+        exc = self._caught(self._dag([self._scaffold_node(content)]))
+        self.assertEqual(
+            {record.code for record in exc.plan_errors}, {"placeholder_value"}
+        )
+        self.assertIn("payload['gpu_temperature']", str(exc))
+
+    # --- The AST helper: what counts, and what never does ---
+
+    def test_helper_extracts_scopes_and_targets(self) -> None:
+        from freetalon.orchestrator import planner as planner_module
+
+        pairs = planner_module._ellipsis_value_assignments(
+            "VALUE = ...\n"
+            "count: int = ...\n"
+            "\n"
+            "\n"
+            "def f():\n"
+            "    result = ...\n"
+            "    return ...\n"
+        )
+        self.assertEqual(
+            pairs,
+            [("", "VALUE"), ("", "count"), ("f", "result"), ("f", "return")],
+        )
+
+    def test_helper_ignores_non_assignment_ellipsis(self) -> None:
+        from freetalon.orchestrator import planner as planner_module
+
+        source = (
+            "def f(x=...):\n"
+            "    return x\n"
+            "\n"
+            "\n"
+            'NOTE = "waiting..."\n'
+            "# remember to fill in ... later\n"
+            "\n"
+            "\n"
+            "def stub():\n"
+            "    ...\n"
+            "\n"
+            "\n"
+            'TABLE = {"gpu": ...}\n'
+        )
+        self.assertEqual(planner_module._ellipsis_value_assignments(source), [])
+
+    def test_helper_exempts_stub_scopes_only(self) -> None:
+        from freetalon.orchestrator import planner as planner_module
+
+        stub_source = (
+            "from typing import Protocol, overload\n"
+            "\n"
+            "\n"
+            "class Store(Protocol):\n"
+            "    def get(self):\n"
+            "        return ...\n"
+            "\n"
+            "\n"
+            "@overload\n"
+            "def parse(x: int) -> int:\n"
+            "    return ...\n"
+        )
+        self.assertEqual(
+            planner_module._ellipsis_value_assignments(stub_source), []
+        )
+        # The same body in a plain class is an implementation hole,
+        # not a declaration — the exemption is the Protocol marker,
+        # not the shape.
+        plain_source = (
+            "class Store:\n"
+            "    def get(self):\n"
+            "        return ...\n"
+        )
+        self.assertEqual(
+            planner_module._ellipsis_value_assignments(plain_source),
+            [("Store.get", "return")],
+        )
+
+    # --- The validator's gates and baseline ---
+
+    def _validator_errors(self, target: str, content: str) -> list[str]:
+        from freetalon.orchestrator import planner as planner_module
+        from freetalon.orchestrator.models import PlanNode
+
+        node = PlanNode(
+            id="step-1",
+            objective="Write the file",
+            assigned_claw="scaffold",
+            inputs={"file_path": target, "content": content},
+            criteria=[{"type": "file_exists", "path": target}],
+        )
+        return planner_module._placeholder_value_errors(
+            [node], str(self.tmp_root)
+        )
+
+    def test_validator_exempts_pyi_stubs_and_test_files(self) -> None:
+        pyi = str(self.tmp_root / "fixture.pyi")
+        self.assertEqual(
+            self._validator_errors(pyi, "x: int = ...\n\n\ndef f() -> int: ...\n"),
+            [],
+        )
+        test_file = str(self.tmp_root / "tests" / "test_fixture.py")
+        self.assertEqual(
+            self._validator_errors(
+                test_file,
+                "EXPECTED = ...\n\n\ndef test_x():\n    assert EXPECTED\n",
+            ),
+            [],
+        )
+
+    def test_validator_new_file_ellipsis_rejected(self) -> None:
+        target = str(self.tmp_root / "brand_new.py")
+        errors = self._validator_errors(target, "X = ...\n")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("placeholder values", errors[0])
+        self.assertIn("X", errors[0])
+
+    def test_validator_existing_assignment_is_baseline_not_introduced(self) -> None:
+        # The module already carries SENTINEL = ... — a scaffold that
+        # reproduces it verbatim introduces nothing; one that adds a
+        # second placeholder is named for the new one only.
+        disk = "SENTINEL = ...\n\n\ndef alpha():\n    return 1\n"
+        Path(self.module_path).write_text(disk, encoding="utf-8")
+        self.assertEqual(self._validator_errors(self.module_path, disk), [])
+        errors = self._validator_errors(
+            self.module_path, disk + "\nOTHER = ...\n"
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("OTHER", errors[0])
+        self.assertNotIn("SENTINEL", errors[0])
+
+    # --- Parse-level: legitimate content still plans clean ---
+
+    def test_signature_default_and_string_ellipsis_accepted(self) -> None:
+        target = str(self.tmp_root / "sentinel_default.py")
+        content = (
+            "def connect(timeout=...):\n"
+            "    return timeout\n"
+            "\n"
+            "\n"
+            'NOTE = "waiting..."\n'
+        )
+        nodes, _meta = parse_planner_response(
+            self._dag([self._scaffold_node(content, target=target)]),
+            goal_text=self.GOAL,
+        )
+        self.assertEqual(len(nodes), 1)
+
+    # --- Steering integration: the code is a content defect ---
+
+    def test_placeholder_value_counts_as_content_defect_for_steering(self) -> None:
+        # Without the code in _CONTENT_DEFECT_CODES, the shape block
+        # would bless a placeholder_value-only rejection with "none
+        # of its code was rejected — keep the same code" (the
+        # retry-#28/#33 contradiction). With it, the block stays
+        # silent for this rejection and still fires for a
+        # string-only defect.
+        from freetalon.orchestrator import planner as planner_module
+
+        raw = self._dag([self._edit_node(self.ELLIPSIS_DELTA)])
+        self.assertEqual(
+            planner_module._shape_steering_block(raw, {"placeholder_value"}),
+            "",
+        )
+        self.assertIn(
+            "SHAPE was right",
+            planner_module._shape_steering_block(raw, {"criteria"}),
+        )
