@@ -3077,3 +3077,55 @@ Deliberately left out:
   itself; the remaining fork is Pat's
   stronger-planner-model decision or a proving-ground
   change.
+
+## Update - 2026-11-18 (Model A/B Track A, Arm A1: gemma3:27b — the substance arrives, the plan shape trips)
+
+- Context: Pat resolved the fork by delegation
+  (2026-11-18 05:25 PST — download a new model, run
+  parallel tracks, keep going). Track A tests whether a
+  stronger planner closes /health. Setup: model selected
+  purely by env (FREETALON_OLLAMA_MODEL in
+  LLMSettings.from_env — no code changes); disk 724G
+  free; pre-flight green (GPU 51C idle, 300.00W limit,
+  link x16, 0 Xid 79/154, head f8edd0d clean, baseline
+  suite 1083/1083 in 459.0s).
+- Pull: gemma3:27b into the same Docker Ollama
+  (freetalon-ollama-1) — 17.41 GB on disk, ~3 min at
+  ~119 MB/s. Speed measure (one bounded generation,
+  num_ctx 12288): 100% GPU, VRAM 18,873 MiB of 24,576 —
+  fits with ~5.5 GB headroom; prefill 160 tok/s,
+  decode 38.6 tok/s (the 12B abliterated decodes at
+  ~10 tok/s — its 24.39 GB is fp16-class weight).
+  Timeout sized to 900s (~7x the worst estimated call).
+- Run (FREETALON_OLLAMA_MODEL=gemma3:27b, timeout 900,
+  temperature 0, formatter OFF; driver exit 1; wall
+  ~6 min; GPU peak 79C, no thermal pause; fans manual
+  85% during, auto after, verified): 3 raw outputs,
+  all rejected at planning (errors replayed offline
+  through parse_planner_response for exactness).
+  Output 1: a garbled single node — differs_by is a
+  run-on diff-condition string, no inputs, no criteria
+  (3 errors: no criteria; stand-in; missing_target).
+  Outputs 2 and 3: complete 5-node plans whose step-1
+  nests outputs/acceptance/criteria inside "inputs" —
+  2 errors each (the nesting, and the stand-in check
+  it blinds); the repair rounds did not fix the
+  nesting, so planning failed on the repeat.
+- The substance, though, is REAL — the first planner
+  outputs in this project that compute the fields:
+  ollama_reachable from a subprocess curl probe to
+  localhost:11434 (except -> False), gpu_temperature
+  parsed from nvidia-smi stdout (except -> "N/A"),
+  returned in the health payload. placeholder_value
+  fired 0 times; no Ellipsis anywhere; no invented
+  constants. The code never executed — the plan died
+  on shape before any node ran — so nothing changed
+  on disk (porcelain 0), no memory records, no
+  restore or suite re-run needed.
+- Verdict on Arm A1: FAIL at planning, and the
+  failure inverts the 12B's. The 12B reliably produced
+  the canonical plan shape with hollow substance;
+  the 27B produces the substance and trips one
+  systematic shape habit (node fields nested inside
+  "inputs" on the large scaffold node). Arm A2
+  (qwen2.5-coder:14b) follows under the same protocol.
