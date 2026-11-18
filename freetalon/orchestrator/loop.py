@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from .critic import CriticSettings, critic_settings_from_env, review_write_nodes
 from .executor import Executor
 from .gates import GateStatus, GateStore, build_packet, compute_packet_hash
 from .judge import Decision, Judge
@@ -79,6 +80,7 @@ class LoopRunner:
         max_concurrency: int = 8,
         memory_store: ExperimentStore | None = None,
         gate_store: GateStore | None = None,
+        critic_settings: CriticSettings | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -106,6 +108,10 @@ class LoopRunner:
                 else GateStore(audit_logger=audit_logger)
             )
         self._gate_packets: dict[str, str] = {}
+        # Track B: the substance critic (default None = off; the
+        # env-configured path is critic_settings_from_env, resolved
+        # per run in run_plan).
+        self._critic_settings = critic_settings
 
     # ── Public entry points ──────────────────────────────────────────────
 
@@ -122,6 +128,16 @@ class LoopRunner:
         started = time.monotonic()
         started_at = datetime.now(UTC).isoformat()
         judge = Judge(contract.budget)
+        # Track B: the substance critic for this run — injected
+        # settings win; otherwise the env decides (the production
+        # driver constructs the runner with no critic argument).
+        # None means no critic: the loop below is exactly the
+        # pre-critic loop.
+        critic = (
+            self._critic_settings
+            if self._critic_settings is not None
+            else critic_settings_from_env()
+        )
 
         if len(plan.nodes) > contract.budget.max_nodes:
             raise ValueError(
@@ -168,18 +184,34 @@ class LoopRunner:
                 version=version,
             )
             before = {n.id: n.status for n in plan.nodes}
-            executor = Executor(
-                self._store,
-                self._registry,
-                max_concurrency=self._max_concurrency,
-                run_store=self._run_store,
-                run_id=run_id,
-                custom_checkers=self._custom_checkers,
-                audit_logger=self._audit_logger,
-                plan_version=version,
-                gate_callback=self._gate_callback_for(run_id, plan.plan_id),
-            )
-            plan = asyncio.run(executor.run(plan.plan_id))
+            # Track B (GAN critic): an accepted version's write
+            # nodes are measured for substance before they
+            # execute. A hollow verdict fails those nodes with
+            # critic measurements (see _critic_review) and the
+            # version does not execute — the judge below
+            # consumes the failure exactly as an executed one.
+            # No critic configured, no hollow verdict, or a
+            # degraded critic all fall through to the executor
+            # unchanged.
+            if critic is not None and self._critic_review(
+                plan, contract, critic, run_id=run_id, version=version
+            ):
+                plan.status = PlanStatus.FAILED
+                plan.touch()
+                self._store.save(plan)
+            else:
+                executor = Executor(
+                    self._store,
+                    self._registry,
+                    max_concurrency=self._max_concurrency,
+                    run_store=self._run_store,
+                    run_id=run_id,
+                    custom_checkers=self._custom_checkers,
+                    audit_logger=self._audit_logger,
+                    plan_version=version,
+                    gate_callback=self._gate_callback_for(run_id, plan.plan_id),
+                )
+                plan = asyncio.run(executor.run(plan.plan_id))
             ran = [
                 n
                 for n in plan.nodes
@@ -378,6 +410,105 @@ class LoopRunner:
             started=started,
             started_at=started_at,
         )
+
+    def _critic_review(
+        self,
+        plan: ExecutionPlan,
+        contract: GoalContract,
+        critic: CriticSettings,
+        *,
+        run_id: str,
+        version: int,
+    ) -> bool:
+        """Measure a plan version's write nodes for substance (Track B).
+
+        Returns True when at least one write node was judged hollow:
+        each such node is FAILED with a critic measurement recorded
+        in the shape the executor records an executed failure in
+        (node.measurement set, the measurement appended to the run
+        store, the verdict text merged into the node's inputs as
+        stderr — so the judge's re-plan brief carries the critic's
+        reason as the failure's diagnostics, cycle 5). The version
+        then does not execute; the judge treats the verdicts as
+        informative failures and re-plans under the existing budget.
+
+        The criterion result is measured=False by design: the
+        approach was refused before it ran, so experiment memory
+        files the record as a planning-stage rejection (cycle 3's
+        stage rule) and the content-blind approach signatures in
+        failed_approaches are never poisoned by a content judgment.
+        Within the run the discipline is unaffected — the judge's
+        delta validation computes failed signatures from the brief's
+        failed nodes directly.
+
+        A critic that cannot judge (backend down, verdict
+        unparseable) degrades to no-critic: returns False, the
+        version executes, and the degradation is audit-logged. The
+        second model's availability never blocks the loop.
+        """
+        try:
+            review = review_write_nodes(plan, contract.objective, critic)
+        except Exception as exc:  # noqa: BLE001 - a broken critic degrades
+            review = None
+            degraded = f"{type(exc).__name__}: {exc}"
+        else:
+            degraded = review.degraded
+        if degraded is not None:
+            self._log(
+                "loop.critic.degraded",
+                run_id=run_id,
+                plan_id=plan.plan_id,
+                version=version,
+                detail=degraded,
+            )
+            return False
+        assert review is not None  # for the type checker; degraded is None here
+        if review.verdicts:
+            self._log(
+                "loop.critic.reviewed",
+                run_id=run_id,
+                plan_id=plan.plan_id,
+                version=version,
+                reviewed=len(review.verdicts),
+                hollow=len(review.hollow),
+            )
+        nodes = plan.node_map()
+        for verdict in review.hollow:
+            node = nodes[verdict.node_id]
+            detail = f"critic review (hollow): {verdict.reason}"
+            node.status = PlanStatus.FAILED
+            node.error = detail
+            node.inputs = dict(node.inputs or {})
+            node.inputs["stderr"] = detail
+            measurement: dict[str, Any] = {
+                "node_id": node.id,
+                "verdict": VERDICT_FAIL,
+                "results": [
+                    {
+                        "criterion": {"type": "critic_review"},
+                        "passed": False,
+                        "measured": False,
+                        "detail": detail,
+                    }
+                ],
+                "exit_code": None,
+                "duration_s": 0.0,
+                "metrics": {},
+                "envelope_status": "critic",
+                "measured_at": datetime.now(UTC).isoformat(),
+                "plan_version": version,
+            }
+            node.measurement = measurement
+            self._run_store.append_measurement(run_id, measurement)
+            self._log(
+                "loop.critic.hollow",
+                run_id=run_id,
+                plan_id=plan.plan_id,
+                version=version,
+                node_id=node.id,
+                reason=verdict.reason,
+            )
+        return bool(review.hollow)
 
     def _finish_run(
         self,

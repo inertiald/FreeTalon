@@ -3077,3 +3077,110 @@ Deliberately left out:
   itself; the remaining fork is Pat's
   stronger-planner-model decision or a proving-ground
   change.
+
+## Update - 2026-11-18 (Track B: the GAN critic — a second model as an internal measurement; branch dev/critic-experiment, NOT merged)
+
+- Built in an isolated worktree
+  (/home/seeker/projects/FreeTalon-critic at f8edd0d)
+  so the parallel Track A live runs on the main
+  checkout were never disturbed. No live driver run,
+  no GPU, no call to seeker88: the critic client is
+  stubbed in every test, as the formatter tests stub
+  theirs.
+- Design (Pat's GAN pairing): seeker88's llama3 is
+  the adversarial-but-collaborative critic of the
+  planner's work. The formatter role failed for
+  Llama (matrix Arm B: re-emission degraded
+  content); critique is a judgment task, not
+  re-emission, and was untested. The critic is wired
+  as an internal MEASUREMENT, not a human gate —
+  gates belong only at cliff edges.
+- Plumbing follows the cycle-2 formatter pattern:
+  freetalon/orchestrator/critic.py (new) with frozen
+  CriticSettings (base_url/model; None falls back to
+  the planner's settings) and
+  critic_settings_from_env(): FREETALON_CRITIC_ENABLED
+  or either of FREETALON_CRITIC_OLLAMA_BASE_URL /
+  FREETALON_CRITIC_OLLAMA_MODEL configures it;
+  otherwise None and the loop behaves exactly as
+  before (pinned). The critic's documented target is
+  the matrix Arm B endpoint: seeker88's Ollama at
+  http://100.87.140.12:11434, llama3:latest. Note the
+  fallback: enabling with FREETALON_CRITIC_ENABLED
+  alone points the critic at the PLANNER's endpoint
+  and model — seeker88 must be named in the endpoint
+  vars to get the second model.
+- Seam: inside LoopRunner.run_plan's per-version
+  loop, after the version's plan is loaded and
+  before the Executor is built — v1 and every
+  re-plan version are reviewed. When ON, each write
+  node (scaffold / file_writer carrying a content
+  payload; anchored edits arrive as scaffold nodes)
+  is judged on SUBSTANCE ONLY: a placeholder, an
+  invented constant for a measurable value, an
+  unchanged copy of the current code (the prompt
+  carries the target's on-disk content so this class
+  is judgeable), or the right code in a vessel that
+  cannot run. One call per node through
+  intake.call_llm with a shallow verdict schema
+  (substantive | hollow + one-line reason) and
+  temperature pinned 0.0 — a measurement must be
+  reproducible even when the planner is sampled.
+- A hollow verdict lands in the existing judge
+  machinery, not a parallel one: the node is FAILED
+  with a measurement in the executor's own shape
+  (criterion type critic_review; detail and stderr
+  carry "critic review (hollow): <reason>"), the
+  version does not execute, and the judge's re-plan
+  brief carries the reason as the node's diagnostics
+  (cycle 5). Budget accounting is untouched: one unit
+  per REPLAN decision, proven by fixture. The record
+  is measured=False by design — the approach was
+  refused before it ran, so experiment memory files
+  it as a planning-stage rejection (cycle 3's stage
+  rule) and the content-blind failed-approach
+  signatures are never poisoned by a content judgment
+  (pinned by fixture). Cycle-8 local repair cannot
+  serve a critic failure (its mapping requires the
+  failed node not be a writer; the hollow node is the
+  writer), so whole-task re-plan serves — same unit.
+- Degradation: a critic that is unreachable, errors,
+  times out, or answers unparseably voids the whole
+  review (a partial review is never trusted) and the
+  version executes as if there were no critic; the
+  degradation is audit-logged (loop.critic.degraded;
+  loop.critic.reviewed / loop.critic.hollow record
+  the reviews that do land). A second model's
+  availability never blocks the loop.
+- Fixtures (tests/test_critic.py, 15 tests, stubbed
+  client): (i) the real plan-7885a4ef9d99 Ellipsis
+  shape with a stubbed hollow verdict is NOT
+  executed (module byte-identical on disk), the
+  brief carries the critic's reason, the re-plan
+  proceeds; (ii) the cycle-6 filled-slots variant
+  with a substantive verdict executes normally;
+  (iii) critic OFF executes the same Ellipsis plan
+  exactly as before, critic never called; (iv) a
+  critic raising LLMBackendError degrades, executes,
+  and the audit log records it; (v) with
+  max_replans=1, a second hollow version escalates
+  on the spent budget — exactly one re-plan unit
+  consumed.
+- Measurement: full suite in the worktree 1098/1098
+  (1083 baseline + 15 new; ZERO pins changed — the
+  loop change is additive and gated on settings the
+  default path never has). Framework guard: ALL
+  CHECKS PASSED. Corpus replay identical to the
+  f8edd0d baseline (accepted 0/28, accepted-sound
+  0/28, mean errors/output 1.32, both rows): the
+  critic is execution-side and the replay never
+  executes, so no movement is expected or seen.
+- State: committed locally on dev/critic-experiment,
+  NOT pushed, NOT merged. Enabling it live is a
+  separate step: run the driver with
+  FREETALON_CRITIC_ENABLED=1,
+  FREETALON_CRITIC_OLLAMA_BASE_URL=http://100.87.140.12:11434
+  and FREETALON_CRITIC_OLLAMA_MODEL=llama3:latest,
+  and read whether llama3's verdicts separate the
+  Ellipsis shape from the filled-slots shape on the
+  real goal before trusting it with the loop.
