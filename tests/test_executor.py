@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -858,3 +860,223 @@ class TestSuiteNodeTimeout(unittest.TestCase):
                 store.save(_make_plan(plan_id, [self._node(command, timeout_s=0.2)]))
                 result = _run(Executor(store=store, registry=registry).run(plan_id))
                 self.assertEqual(result.nodes[0].status, expected, command)
+
+
+# ── Repo-root coherence (cycle 4) ────────────────────────────────────────────
+
+
+class TestExecutorRepoRootCoherence(unittest.TestCase):
+    """A repo-grounded plan executes against the repo it was planned against.
+
+    Cycle 4 (the /health re-run, head ddb3c0d): plan-7885a4ef9d99 was
+    accepted and executed in both live runs, nodes 1-2 PASS, but node-3
+    failed exit 127 in all 3 plan versions of both runs: the plan runs
+    ./.venv/bin/python — the grounded form the planner validates
+    against the repo root (_bash_interpreter_errors: the path "must
+    exist there") — while the executor ran the bash claw from the
+    node's run directory, where ./.venv does not exist. Same split for
+    writes: the planner resolves scaffold targets against the repo
+    root, the scaffold claw resolved them against the run directory,
+    so one test file landed in the workspace and another in the repo.
+
+    The fix is executor-side: the plan carries the repo root it was
+    grounded against in metadata["repo_root"] (stamped by
+    plan_task_intent), and Executor._node_workdir — the one base that
+    feeds the bash cwd, the scaffold handler's relative resolution,
+    and measurement — returns that root for a stamped plan. Plans
+    with no stamp keep the run-directory base exactly as before.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.store = _make_store(self.tmpdir.name)
+        self.registry = ToolRegistry()
+        register_default_claws(self.registry)
+        self.run_store = RunStore(Path(self.tmpdir.name) / "runs")
+        # A fake repo with its own .venv interpreter (a symlink to the
+        # real one) and a tests/ directory.
+        self.repo = Path(self.tmpdir.name) / "repo"
+        venv_bin = self.repo / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        os.symlink(sys.executable, venv_bin / "python")
+        (self.repo / "tests").mkdir()
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    def _plan(
+        self,
+        plan_id: str,
+        nodes: list[PlanNode],
+        *,
+        repo_root: str | None = None,
+    ) -> ExecutionPlan:
+        metadata = {} if repo_root is None else {"repo_root": repo_root}
+        return ExecutionPlan(
+            plan_id=plan_id,
+            intent=TaskIntent(goal="Test plan"),
+            nodes=nodes,
+            metadata=metadata,
+        )
+
+    def _run_plan(self, plan: ExecutionPlan) -> ExecutionPlan:
+        self.store.save(plan)
+        executor = Executor(
+            store=self.store,
+            registry=self.registry,
+            run_store=self.run_store,
+            run_id="test-run",
+        )
+        return _run(executor.run(plan.plan_id))
+
+    def _node_dir(self, node_id: str) -> Path:
+        return self.run_store.node_dir("test-run", node_id, 1)
+
+    def _place_tool(self, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        tool = directory / "tool.sh"
+        tool.write_text("#!/bin/sh\nprintf ran > marker.txt\n", encoding="utf-8")
+        tool.chmod(0o755)
+
+    def test_relative_interpreter_resolves_against_repo_root(self) -> None:
+        # The re-run's node-3 shape: a relative interpreter path in a
+        # repo-grounded plan, executed with a run store attached (so
+        # the pre-fix base is the node run directory -> exit 127).
+        node = PlanNode(
+            id="n3",
+            objective="Run the health tests with the repo venv",
+            assigned_claw="bash",
+            inputs={
+                "command": (
+                    "./.venv/bin/python -c "
+                    "'from pathlib import Path; "
+                    "Path(\"marker.txt\").write_text(\"ran\")'"
+                )
+            },
+            criteria=[{"type": "exit_code", "equals": 0}],
+        )
+        plan = self._plan("repo-interp", [node], repo_root=str(self.repo))
+        result = self._run_plan(plan)
+        self.assertEqual(result.nodes[0].status, PlanStatus.COMPLETED)
+        self.assertEqual(result.nodes[0].exit_code, 0)
+        # The marker proves the cwd: written relative, landed at the
+        # repo root — not in the node's run directory.
+        self.assertEqual((self.repo / "marker.txt").read_text(encoding="utf-8"), "ran")
+        self.assertFalse((self._node_dir("n3") / "marker.txt").exists())
+
+    def test_relative_scaffold_target_lands_in_repo(self) -> None:
+        # The two-landing-spots tangle: a repo-relative scaffold target
+        # in a repo-grounded plan lands in the repo, not the run dir.
+        content = (
+            "import unittest\n\n\n"
+            "class TestHealth(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n"
+        )
+        node = PlanNode(
+            id="s1",
+            objective="Write the health tests",
+            assigned_claw="scaffold",
+            inputs={"file_path": "tests/test_health.py", "content": content},
+            outputs=["tests/test_health.py"],
+            criteria=[
+                {"type": "exit_code", "equals": 0},
+                {"type": "file_exists", "path": "tests/test_health.py"},
+            ],
+        )
+        plan = self._plan("repo-scaffold", [node], repo_root=str(self.repo))
+        result = self._run_plan(plan)
+        self.assertEqual(result.nodes[0].status, PlanStatus.COMPLETED)
+        self.assertEqual(result.nodes[0].measurement["verdict"], VERDICT_PASS)
+        written = self.repo / "tests" / "test_health.py"
+        self.assertEqual(written.read_text(encoding="utf-8"), content)
+        self.assertFalse(
+            (self._node_dir("s1") / "tests" / "test_health.py").exists()
+        )
+
+    def test_explicit_cd_still_governs(self) -> None:
+        # A command that cds explicitly behaves as before: the shell's
+        # own cd wins over the injected base (the re-run's node-4 shape).
+        elsewhere = Path(self.tmpdir.name) / "elsewhere"
+        self._place_tool(elsewhere)
+        node = PlanNode(
+            id="n4",
+            objective="Run the tool from its own directory",
+            assigned_claw="bash",
+            inputs={"command": f"cd {elsewhere} && ./tool.sh"},
+            criteria=[{"type": "exit_code", "equals": 0}],
+        )
+        plan = self._plan("repo-explicit-cd", [node], repo_root=str(self.repo))
+        result = self._run_plan(plan)
+        self.assertEqual(result.nodes[0].status, PlanStatus.COMPLETED)
+        self.assertTrue((elsewhere / "marker.txt").exists())
+        self.assertFalse((self.repo / "marker.txt").exists())
+
+    def test_absolute_interpreter_path_unchanged(self) -> None:
+        marker = Path(self.tmpdir.name) / "abs-marker.txt"
+        command = (
+            f"{self.repo}/.venv/bin/python -c "
+            f"'from pathlib import Path; Path(\"{marker}\").write_text(\"ran\")'"
+        )
+        node = PlanNode(
+            id="n1",
+            objective="Run with an absolute interpreter path",
+            assigned_claw="bash",
+            inputs={"command": command},
+            criteria=[{"type": "exit_code", "equals": 0}],
+        )
+        plan = self._plan("repo-absolute", [node], repo_root=str(self.repo))
+        result = self._run_plan(plan)
+        self.assertEqual(result.nodes[0].status, PlanStatus.COMPLETED)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "ran")
+
+    def test_plan_without_repo_root_keeps_run_dir_base(self) -> None:
+        # No stamp: bash cwd and scaffold targets stay in the node run
+        # directories, exactly as before cycle 4.
+        self._place_tool(self._node_dir("n1"))
+        bash_node = PlanNode(
+            id="n1",
+            objective="Run the local tool",
+            assigned_claw="bash",
+            inputs={"command": "./tool.sh"},
+            criteria=[{"type": "exit_code", "equals": 0}],
+        )
+        scaffold_node = PlanNode(
+            id="s1",
+            objective="Write a scratch module",
+            assigned_claw="scaffold",
+            inputs={"file_path": "out.py", "content": "X = 1\n"},
+            outputs=["out.py"],
+            criteria=[
+                {"type": "exit_code", "equals": 0},
+                {"type": "file_exists", "path": "out.py"},
+            ],
+        )
+        plan = self._plan("no-repo-plan", [bash_node, scaffold_node])
+        result = self._run_plan(plan)
+        self.assertEqual(result.status, PlanStatus.COMPLETED)
+        self.assertTrue((self._node_dir("n1") / "marker.txt").exists())
+        self.assertEqual(
+            (self._node_dir("s1") / "out.py").read_text(encoding="utf-8"), "X = 1\n"
+        )
+        self.assertFalse((self.repo / "out.py").exists())
+
+    def test_stale_repo_root_stamp_falls_back_to_run_dir(self) -> None:
+        # A stamp naming a directory that no longer exists is ignored:
+        # the run falls back to today's base instead of crashing.
+        self._place_tool(self._node_dir("n1"))
+        node = PlanNode(
+            id="n1",
+            objective="Run the local tool",
+            assigned_claw="bash",
+            inputs={"command": "./tool.sh"},
+            criteria=[{"type": "exit_code", "equals": 0}],
+        )
+        plan = self._plan(
+            "stale-repo-plan",
+            [node],
+            repo_root=str(Path(self.tmpdir.name) / "no-such-repo"),
+        )
+        result = self._run_plan(plan)
+        self.assertEqual(result.nodes[0].status, PlanStatus.COMPLETED)
+        self.assertTrue((self._node_dir("n1") / "marker.txt").exists())

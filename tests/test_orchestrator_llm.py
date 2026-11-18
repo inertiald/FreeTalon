@@ -450,8 +450,21 @@ class TestPlanner(unittest.TestCase):
         # approaches rejected in this planning call (retry #20): the list
         # is empty here, but the key is always present so the loop can
         # seed the next replan from plan.metadata without guessing.
+        # Cycle 4 adds a second always-present key: repo_root, the repo
+        # this plan was grounded against, stamped by plan_task_intent so
+        # the executor resolves the plan's relative references against
+        # the same base (this assertion previously pinned the exact
+        # two-key dict; the stamp is cycle 4's change, so the pin grows
+        # the key rather than dropping the equality).
+        from freetalon.orchestrator.repo_index import resolve_repo_root
+
         self.assertEqual(
-            plan.metadata, {"planner": "llm", "rejected_approaches": []}
+            plan.metadata,
+            {
+                "planner": "llm",
+                "rejected_approaches": [],
+                "repo_root": str(resolve_repo_root()),
+            },
         )
         call_mock.assert_called_once()
 

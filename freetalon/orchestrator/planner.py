@@ -7472,6 +7472,17 @@ def plan_task_intent(
         repo_root=repo_root,
         formatter=formatter_settings_from_env(),
     )
+    # Cycle 4: record the repo this plan was grounded against in its
+    # metadata, so the executor resolves the plan's relative
+    # references (./.venv/bin/python, scaffold targets, criterion
+    # paths) against the same base the validators above judged them
+    # by. Plan metadata is the established channel for planning facts
+    # execution needs (cf. rejected_approaches, seeded the same way);
+    # the loop's re-plan rebuild copies the metadata dict whole, so
+    # the stamp survives into delta plans. This records a fact only —
+    # no validation or steering behavior changes.
+    metadata = dict(metadata or {})
+    metadata.setdefault("repo_root", str(resolve_repo_root(repo_root)))
     return build_execution_plan(intent, nodes, metadata, plan_id=plan_id)
 
 

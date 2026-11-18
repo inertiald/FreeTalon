@@ -148,6 +148,38 @@ def _effective_node_timeout(node: PlanNode) -> float:
     return node.timeout_s
 
 
+def _plan_repo_root(plan: ExecutionPlan) -> Path | None:
+    """The repo root a plan was grounded against, from its metadata.
+
+    Cycle 4: plan_task_intent stamps metadata["repo_root"] with the
+    root its validators judged the plan's relative references against
+    (the interpreter check requires ./.venv/bin/python to exist under
+    that root; scaffold targets and criterion paths resolve there).
+    Execution must resolve the same references against the same base
+    or a validated plan fails at run time — the /health re-run's
+    node-3 died with exit 127 in every plan version because the bash
+    claw ran from the node's run directory instead. A stamp that does
+    not name an existing directory is stale (the checkout moved):
+    ignore it, with a warning, and keep the default base rather than
+    crashing a run on metadata. Plans with no stamp — hand-built
+    plans, run_goal, every non-repo vertical — return None and keep
+    today's behavior exactly.
+    """
+    raw = (plan.metadata or {}).get("repo_root")
+    if not isinstance(raw, (str, Path)) or not str(raw).strip():
+        return None
+    root = Path(raw).expanduser()
+    if not root.is_dir():
+        logger.warning(
+            "Plan %s carries repo_root %r, which is not an existing "
+            "directory; ignoring the stamp.",
+            plan.plan_id,
+            raw,
+        )
+        return None
+    return root.resolve()
+
+
 class ExecutorError(RuntimeError):
     """Raised when the executor cannot make forward progress."""
 
@@ -185,11 +217,16 @@ class Executor:
         # pauses the node at AWAITING_APPROVAL. None means no gate is
         # configured — an irreversible node then fails rather than running.
         self._gate_callback = gate_callback
+        # Cycle 4: the repo root of the plan being executed, read from
+        # the plan itself in run() (see _plan_repo_root). None until a
+        # plan is loaded, and None for plans with no repo context.
+        self._plan_repo_root: Path | None = None
 
     async def run(self, plan_id: str) -> ExecutionPlan:
         plan = self._store.load(plan_id)
         if plan is None:
             raise ExecutorError(f"Plan {plan_id!r} not found in store.")
+        self._plan_repo_root = _plan_repo_root(plan)
 
         logger.info("Executor starting plan %s (%d nodes).", plan_id, len(plan.nodes))
         plan.status = PlanStatus.RUNNING
@@ -479,7 +516,22 @@ class Executor:
             logger.error("Could not record failure for node %s.", node_id)
 
     def _node_workdir(self, node_id: str) -> Path:
-        """Working directory for a node: its run directory, else the cwd."""
+        """Working directory for a node: its run directory, else the cwd.
+
+        Cycle 4: for a repo-grounded plan (see _plan_repo_root) the
+        base is the plan's repo root instead. This one method feeds
+        every relative reference at execution — the workdir input the
+        bash claw uses as its cwd, the base the scaffold claw resolves
+        relative targets against, and the base measure_node resolves
+        relative criterion paths against — so all three move together
+        onto the base the planner validated against. Commands that cd
+        explicitly or use absolute paths are unaffected (the shell
+        resolves those itself), a node-specified workdir input still
+        wins over the injected one, and the separate run_dir input
+        (artifact sharing) is unchanged.
+        """
+        if self._plan_repo_root is not None:
+            return self._plan_repo_root
         if self._run_store is not None and self._run_id is not None:
             node_dir = self._run_store.node_dir(
                 self._run_id, node_id, self._plan_version

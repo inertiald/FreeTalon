@@ -2281,3 +2281,59 @@ Deliberately left out:
   root as cwd (relative ./.venv/bin/python), plus the
   model's persistent Ellipsis-placeholder substance gap,
   which its own tests reliably catch once they can run.
+
+## Update - 2026-11-18 (Cycle 4: execution-environment coherence — one base per plan)
+
+- The re-run's node-3 failure was a base mismatch across the
+  planning/execution boundary, not a model error. The planner
+  validates a plan's relative references against the repo root:
+  _bash_interpreter_errors requires ./.venv/bin/python to exist
+  under that root ("the grounded form"), scaffold targets resolve
+  there, criterion paths resolve there. The executor resolved the
+  same references against a different base — the per-node run
+  directory that _node_workdir injects as every handler's workdir —
+  so the validated interpreter path did not exist at execution and
+  node-3 died with exit 127 in all 3 plan versions of both re-runs,
+  while relative scaffold targets and criterion paths silently
+  pointed at the run directory instead of the repo (the two
+  test_health.py landing spots).
+- Fix, executor-side (log logs/executor-cwd-2026-11-17.log): the
+  plan now carries its grounding context in metadata["repo_root"],
+  stamped by plan_task_intent with resolve_repo_root() — a data
+  recording in the established metadata channel (cf.
+  rejected_approaches; the loop's re-plan rebuild copies the dict
+  whole, so delta plans keep the stamp). No planner validation or
+  steering changed. In executor.py, _plan_repo_root(plan) reads the
+  stamp (a stamp naming a nonexistent directory is ignored with a
+  warning, never a crash) and _node_workdir returns it ahead of the
+  run directory. That one method feeds all three execution
+  consumers — the bash claw's cwd, the scaffold claw's relative
+  target base, and measure_node's criterion-path base — so they
+  move together onto the base the planner judged.
+- Invariants kept: plans with no stamp (hand-built, run_goal,
+  every non-repo vertical) keep today's run-directory base
+  exactly; a node-specified workdir input still wins (setdefault
+  untouched); explicit cd and absolute paths resolve in the shell
+  as before (the re-run's node-4 shape); the separate run_dir
+  input (artifact sharing) is unchanged.
+- Fixtures (tests/test_executor.py, TestExecutorRepoRootCoherence,
+  6 tests): the node-3 shape reproduced — red before the fix with
+  exit_code exactly 127, green after, with the marker file proving
+  the cwd is the repo root; a relative scaffold target lands in
+  the repo with no run-dir copy; explicit-cd and absolute-path
+  pins; an unstamped plan keeping the run-dir base for bash and
+  scaffold alike; a stale stamp falling back. One planner pin
+  changed: TestPlanner's exact-metadata assertion for
+  plan_task_intent gains the repo_root key (it pinned the
+  pre-stamp dict; the equality itself is kept).
+- Measurement: suite 1038 -> 1044/1044 green (428.4s);
+  demo-framework-guard ALL CHECKS PASSED; corpus replay
+  unchanged (accepted 2/28, accepted-sound 2/28, accepted-unsound
+  0, both root variants, mean errors/output 1.25) — expected,
+  since the replay calls parse_planner_response only and the
+  change is at execution. No live driver runs in this cycle.
+- Net: a repo-grounded plan now executes in the environment it
+  was validated for. The /health plan's node-3 (./.venv/bin/python
+  on the written tests) should reach the tests themselves next
+  live run — where the Ellipsis substance defect is waiting for
+  exactly that judgment.
