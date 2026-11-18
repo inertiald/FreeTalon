@@ -15520,8 +15520,39 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
         self.assertIn("does not parse as Python", message)
         self.assertIn("Server.start.Handler.do_GET", message)
 
-    def test_indent_mismatch(self) -> None:
+    def test_non_uniform_indentation_still_rejected(self) -> None:
+        # Retry #33 changed this pin (it was test_indent_mismatch):
+        # the delta it used before — the anchored definition
+        # dedented uniformly to column 0 — is exactly the copy
+        # normalization materialization now absorbs (see
+        # test_uniformly_dedented_replace_is_reindented below).
+        # What stays rejected is a delta whose lines do NOT share
+        # one shift: here the first line sits at 2 spaces while a
+        # later line dedents below that base, so no uniform
+        # re-indent exists and the error still names both indents.
         message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "replace",
+                        '  def do_GET(self):\n      return "ok"\n x = 1\n',
+                    )
+                ]
+            )
+        )
+        self.assertIn("starts at 2 spaces of indentation", message)
+        self.assertIn("sits at 12 spaces in the file", message)
+
+    def test_uniformly_dedented_replace_is_reindented(self) -> None:
+        # Retry #33: the model's copy of the anchored definition
+        # with the file's uniform indentation stripped (def at
+        # column 0, body at 4) is re-indented to the anchor's
+        # indentation and materializes; the materialized module is
+        # byte-identical to the splice of the correctly-indented
+        # delta.
+        nodes, _meta = parse_planner_response(
             self._dag(
                 [
                     self._edit_node(
@@ -15533,8 +15564,25 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
                 ]
             )
         )
-        self.assertIn("starts at 0 spaces of indentation", message)
-        self.assertIn("sits at 12 spaces in the file", message)
+        dedented_content = nodes[0].inputs["content"]
+        nodes, _meta = parse_planner_response(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "replace",
+                        '            def do_GET(self):\n'
+                        '                return "ok"\n',
+                    )
+                ]
+            )
+        )
+        self.assertEqual(dedented_content, nodes[0].inputs["content"])
+        self.assertIn(
+            '            def do_GET(self):\n                return "ok"\n',
+            dedented_content,
+        )
 
     def test_replace_losing_nested_definitions(self) -> None:
         message = self._rejection(
@@ -16201,23 +16249,29 @@ class TestPlannerDeltaBlankFix(unittest.TestCase):
         self.assertNotIn("spaces of indentation", message)
 
     def test_real_code_at_wrong_indentation_still_hits_the_gate(self) -> None:
-        # The ordering contrast: a REAL definition at the wrong
-        # indentation is not a placeholder — it reaches the
-        # indentation gate, with both indents stated.
+        # The ordering contrast: a REAL definition whose lines do
+        # not share one uniform shift is not a placeholder — it
+        # reaches the indentation gate, with both indents stated.
+        # Retry #33 changed this pin's delta: the uniformly
+        # dedented definition it used before is exactly the copy
+        # normalization materialization now absorbs (pinned in
+        # TestPlannerReindentFix); here the first line sits at 2
+        # spaces while a later line dedents below that base, so no
+        # uniform re-indent exists.
         message = self._rejection(
             self._dag(
                 [
                     self._edit_node(
                         self.api_path,
                         "HiveAPIServer.start.Handler.do_GET",
-                        'def do_GET(self):\n    return "ok"\n',
+                        '  def do_GET(self):\n      return "ok"\n x = 1\n',
                     )
                 ]
             ),
             goal_text=self.HEALTH_GOAL,
             workspace=self.WS,
         )
-        self.assertIn("starts at 0 spaces of indentation", message)
+        self.assertIn("starts at 2 spaces of indentation", message)
         self.assertIn("sits at 12 spaces in the file", message)
         self.assertNotIn("placeholder content only", message)
 
@@ -16259,3 +16313,541 @@ class TestPlannerDeltaBlankFix(unittest.TestCase):
             self.assertIn("has no 'criteria'", message)
             self.assertIn("does not parse as Python", message)
             self.assertIn("Flask", message)
+
+
+class TestPlannerReindentFix(unittest.TestCase):
+    """Uniform re-indentation of anchored-edit deltas + materialization repair steering (retry #32).
+
+    Retry #32 (log llm-end-to-end-health-retry32-2026-11-17.log,
+    DRIVER_EXIT 1) was the first run with the real-code delta blank
+    (38d30eb) live: output 3 used the edit form CORRECTLY — anchor
+    HiveAPIServer.start.Handler.do_GET, position "replace", the
+    grounded skeleton's real-code sketch as its delta — but the
+    model DEDENTED its copy: the uniform 12-space file indentation
+    was stripped (def at column 0, body at 4), so materialization
+    rejected it at the indentation gate. The placeholder gate
+    correctly did NOT fire (the delta carries real code — the
+    prose/code discrimination works). Output 4 (the repair)
+    regressed to a garbled Flask full-content scaffold — the third
+    consecutive near-miss -> Flask regression.
+
+    The copy-normalization pattern is now two runs deep (retry
+    #31: the model dropped the '#' markers re-wrapping prose;
+    retry #32: it dropped the uniform indent): the model's copy
+    normalizes whatever it carries. That is the same class of
+    mechanical variance the interpreter normalization (d7aab15)
+    absorbs for command strings — normalize the variance, judge
+    the substance.
+
+    Audit before coding (logs/reindent-fix-2026-11-17.log):
+    (a) The gate compared the delta's first line's indent to the
+        anchor span's ast col_offset — the same column for
+        "replace" and for an "after"/"before" sibling — so one
+        re-indent rule serves all three positions.
+    (b) Repair steering after a materialization rejection: the
+        extension block did NOT fire (0 chars on output 3's real
+        rejection — its trigger is the overwrite guard's phrase
+        alone), and the shape block DID fire (489 chars) telling
+        the repair round "none of its code was rejected — keep
+        the same code; fix ONLY the named strings" about a
+        rejection whose only defect was the delta's indentation:
+        the retry-#28 misfire one level down, and the plausible
+        mechanism for the Flask fallback.
+    (c) Output 3's delta with a hand-applied uniform re-indent
+        (+12): step-1 materializes and every content check passes
+        (parse OK; 12/12 qualified definitions; the overwrite
+        guard, the placeholder/stub rules, and the framework
+        guard all silent; the three Ellipsis payload lines
+        survive verbatim — by design no planning check judges
+        them; the plan's own step-2 test asserts the fields'
+        types, which Ellipsis fails, so an accepted plan would
+        meet the judge/replan loop at execution). The FULL
+        output-3 plan still rejects — with exactly ONE error, on
+        step-2: its test heredoc does not parse (unittest.main()
+        at column 0 under the __main__ guard). In the live run
+        that defect was masked, because materialization raises
+        before the full-plan checks run.
+
+    Fix (planner.py only; the guard, the placeholder check on
+    materialized content, interpreter normalization, and the
+    executor untouched):
+    1. Re-indentation in _materialize_scaffold_edit: when the
+       delta's indentation differs from the anchor's ONLY by a
+       uniform shift — dedented by its own base indent it is
+       coherent (for "replace", exactly the one anchored
+       definition; for "after"/"before", it parses as sibling
+       code) — the delta is re-indented to the anchor's file
+       indentation and materialization proceeds; every downstream
+       check judges the re-indented module exactly as before.
+       Non-uniform or incoherent deltas keep the indentation
+       error, both indents stated. Deliberately NO new rejection
+       for the sketch's '...' values: they are judged downstream,
+       by the plan's own tests and the judge/replan loop.
+    2. Repair steering: the materialization stems joined
+       _CONTENT_DEFECT_MARKERS (the shape block now stays silent
+       on materialization rejections, mirroring the retry-#28
+       guard fix), and _materialization_steering_block mirrors
+       _extension_steering_block for the edit-form failure: the
+       module's FULL definition list, the anchor's own
+       indentation, the module's skeleton, and the
+       keep-the-edit-form pattern. The placeholder-delta cheap
+       rejection is excluded — its repair round already gets the
+       grounded skeleton.
+
+    Two pre-existing pins changed, both pinning the defect itself
+    (a uniformly dedented real definition, now absorbed):
+    TestPlannerAnchoredEditFix.test_indent_mismatch (renamed
+    test_non_uniform_indentation_still_rejected, with a positive
+    re-indent test beside it) and
+    TestPlannerDeltaBlankFix.test_real_code_at_wrong_indentation_still_hits_the_gate
+    (same name; its delta is now non-uniform). The retry-#28..#31
+    fixtures keep their profiles (pinned by their own classes).
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+    MODULE_SOURCE = TestPlannerAnchoredEditFix.MODULE_SOURCE
+
+    # The exact retry-#32 output 3, verbatim from the RAW PLANNER
+    # OUTPUT blocks of the retry-#32 driver section of
+    # logs/llm-end-to-end-health-retry32-2026-11-17.log (the same
+    # extraction tools/probe-retry32-rejections.py performs).
+    # Embedded (not read from the log) so the tests stay hermetic
+    # in CI.
+    RETRY32_OUTPUT3_RAW = '{\n"nodes":[\n{"id":"step-1",\n"objective":"Extend /home/seeker/projects/FreeTalon/freetalon/api.py in place\\u2014add a /health branch to the do_GET method of the Handler class (defined inside HiveAPIServer.start)",\n"depends_on":[],\n"assigned_claw":"scaffold",\n"inputs":{\n"file_path":"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"anchor":"HiveAPIServer.start.Handler.do_GET",\n"position":"replace",\n"content":"\\ndef do_GET(self) -> None:\\n    parsed = urlparse(self.path)\\n    path = parsed.path\\n    qs = parse_qs(parsed.query)\\n\\n    if path == \\"/health\\":\\n        payload ={\\"ok\\":True, \\"status\\":\\"ready\\"}\\n        payload[\\"service_status\\"] = ...\\n        payload[\\"ollama_reachable\\"] = ...\\n        payload[\\"gpu_temperature\\"] = ...\\n        return self._send(200, payload)\\n\\n    if path == \\"/status\\":\\n        if not self._authorized():\\n            return\\n        return self._send(200,{\\"ok\\":True, \\"status\\":api.controller.status()})\\n\\n    if path == \\"/metrics\\":\\n        if not self._authorized():\\n            return\\n        status = api.controller.status()\\n        metrics ={\\n            \\"workers_healthy\\": status[\\"workers\\"][\\"healthy\\"],\\n            \\"workers_configured\\": status[\\"workers\\"][\\"configured\\"],\\n            \\"tasks_running\\": status[\\"queue\\"][\\"running\\"],\\n            \\"tasks_queued\\": status[\\"queue\\"][\\"queued\\"],\\n            \\"queue_max\\": status[\\"queue\\"][\\"max\\"]\\n        }\\n        return self._send(200,{\\"ok\\":True, \\"metrics\\": metrics})\\n\\n    if path.startswith(\\"/tasks/\\") and len(path.split(\\"/\\")) == 3:\\n        if not self._authorized():\\n            return\\n        task_id = path.split(\\"/\\")[2]\\n        task = api.controller.get_task(task_id)\\n        if task is None:\\n            return self._send(404,{\\"ok\\":False, \\"error\\":\\"Task not found\\"})\\n        return self._send(200,{\\"ok\\":True, \\"task\\": task})\\n\\n    if path == \\"/resources\\":\\n        if not self._authorized():\\n            return\\n        return self._send(200,{\\"ok\\":True, \\"resources\\": resource_summary_safe()})\\n\\n    #M4: approval gates\\u2014list packets, optionally filtered.\\n    if path == \\"/gates\\":\\n        if not self._authorized():\\n            return\\n        status_filter = qs.get(\\"status\\", [None])[0]\\n        run_filter = qs.get(\\"run_id\\", [None])[0]\\n        if run_filter:\\n            packets = api.gate_store.list_for_run(run_filter)\\n        elif status_filter == \\"pending\\":\\n            packets = api.gate_store.pending()\\n        else:\\n            packets = api.gate_store.all()\\n        return self._send(\\n            200,\\n            {\\"ok\\":True,\\n             \\"gates\\": [pkt.model_dump(mode=\\"json\\") for pkt in packets],\\n             \\"count\\": len(packets),\\n            }\\n        )\\n\\n    if path.startswith(\\"/gates/\\") and len(path.split(\\"/\\")) == 3:\\n        if not self._authorized():\\n            return\\n        packet_id = path.split(\\"/\\")[2]\\n        packet = api.gate_store.get(packet_id)\\n        if packet is None:\\n            return self._send(404,{\\"ok\\":False, \\"error\\":\\"Gate not found\\"})\\n        return self._send(200,{\\"ok\\":True, \\"gate\\": packet.model_dump(mode=\\"json\\")})\\n\\n    return self._send(404,{\\"ok\\":False, \\"error\\":\\"Not Found\\"})"\n},\n"outputs":[\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n],\n"acceptance":[\n"The /health endpoint is implemented in /home/seeker/projects/FreeTalon/freetalon/api.py."\n],\n"criteria":[\n{"type":"file_exists",\n"path":"/home/seeker/projects/FreeTalon/freetalon/api.py"\n}\n]\n},\n{"id":"step-2",\n"objective":"Write the tests for /health",\n"depends_on":[\n"step-1"\n],\n"assigned_claw":"bash",\n"inputs":{\n"command":"cat > /home/seeker/freetalon-workspace/test_health.py <<\'EOF\'\\nimport json\\nimport sys\\nimport tempfile\\nimport unittest\\nimport urllib.request\\nfrom pathlib import Path\\n\\nsys.path.insert(0, \\"/home/seeker/projects/FreeTalon\\")\\n\\nfrom freetalon.api import HiveAPIServer\\nfrom freetalon.config import HiveConfig\\nfrom freetalon.hive import HiveController\\n\\n\\nclass RouteEndpointTests(unittest.TestCase):\\n    def setUp(self):\\n        self.tmpdir = tempfile.TemporaryDirectory()\\n        base = Path(self.tmpdir.name)\\n        config = HiveConfig(\\n            workspace=base,\\n            state_path=base / \\"state.json\\",\\n            audit_log_path=base / \\"audit.log\\",\\n            worker_cap=2,\\n            queue_multiplier=3,\\n            poll_interval_seconds=0.02,\\n        )\\n        self.controller = HiveController(config)\\n        self.controller.start()\\n        self.server = HiveAPIServer(self.controller, \\"test-token\\")\\n        self.server.start(\\"127.0.0.1\\", 0)\\n        port = self.server._httpd.server_address[1]\\n        self.base = f\\"http://127.0.0.1:{port}\\"\\n\\n    def tearDown(self):\\n        self.server.stop()\\n        self.controller.stop()\\n        self.tmpdir.cleanup()\\n\\n    def test_route_answers(self):\\n        with urllib.request.urlopen(f\\"{self.base}/health\\", timeout=3) as resp:\\n            status = resp.status\\n            data = json.loads(resp.read())\\n            self.assertEqual(status, 200)\\n            self.assertTrue(data[\\"ok\\"])\\n            self.assertIn(\\"status\\", data)\\n            self.assertIn(\\"service_status\\", data)\\n            self.assertIn(\\"ollama_reachable\\", data)\\n            self.assertIsInstance(data[\\"ollama_reachable\\"], bool)\\n            self.assertIn(\\"gpu_temperature\\", data)\\n            self.assertIsInstance(data[\\"gpu_temperature\\"], (int, float))\\n\\n\\nif __name__ == \\"__main__\\":\\nunittest.main()\\nEOF"\n},\n"outputs":[\n"/home/seeker/freetalon-workspace/test_health.py"\n],\n"acceptance":[\n"The tests for /health exist."\n],\n"criteria":[\n{"type":"file_exists",\n"path":"/home/seeker/freetalon-workspace/test_health.py"\n}\n]\n},\n{"id":"step-3",\n"objective":"Run the tests for /health",\n"depends_on":[\n"step-2"\n],\n"assigned_claw":"bash",\n"inputs":{\n"command":"python3 /home/seeker/freetalon-workspace/test_health.py"\n},\n"outputs":[\n"test results"\n],\n"acceptance":[\n"The tests for /health pass."\n],\n"criteria":[\n{"type":"exit_code",\n"equals":0\n}\n]\n},\n{"id":"step-4",\n"objective":"Start the API server for /health",\n"depends_on":[\n"step-3"\n],\n"assigned_claw":"bash",\n"inputs":{\n"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli stop; ./venv/bin/python -m freetalon.cli start && for i in $(seq 1 30); do curl -sf http://localhost:8765/health && break; sleep 1; done; curl -sf http://localhost:8765/health"\n},\n"outputs":[\n"API server running"\n],\n"acceptance":[\n"The API server answers /health."\n],\n"criteria":[\n{"type":"exit_code",\n"equals":0\n}\n]\n},\n{"id":"step-5",\n"objective":"Verify /health live",\n"depends_on":[\n"step-4"\n],\n"assigned_claw":"bash",\n"inputs":{\n"command":"curl -s http://localhost:8765/health"\n},\n"outputs":[\n"verification"\n],\n"acceptance":[\n"/health returns its JSON live."\n],\n"criteria":[\n{"type":"exit_code",\n"equals":0\n}\n]\n}\n]\n}'
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_root = Path(self._tmp.name)
+        self.module_path = str(self.tmp_root / "fixture_module.py")
+        Path(self.module_path).write_text(self.MODULE_SOURCE, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _edit_node(
+        self,
+        target: str,
+        anchor: object,
+        position: object,
+        content: object,
+        node_id: str = "step-1",
+    ) -> dict:
+        return {
+            "id": node_id,
+            "objective": "Edit the module in place",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": target,
+                "anchor": anchor,
+                "position": position,
+                "content": content,
+            },
+            "outputs": [target],
+            "acceptance": ["The module is edited."],
+            "criteria": [{"type": "file_exists", "path": target}],
+        }
+
+    def _rejection(self, raw: str, **kwargs: object) -> str:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw, **kwargs)
+        return str(caught.exception)
+
+    def _content(self, target: str, anchor: str, position: str, delta: str) -> str:
+        nodes, _meta = parse_planner_response(
+            self._dag([self._edit_node(target, anchor, position, delta)])
+        )
+        return nodes[0].inputs["content"]
+
+    # --- Re-indentation: replace ---
+
+    def test_replace_uniform_dedent_byte_matches_correct_splice(self) -> None:
+        dedented = self._content(
+            self.module_path,
+            "Server.start.Handler.do_GET",
+            "replace",
+            'def do_GET(self):\n    return "ok-extended"\n',
+        )
+        correct = self._content(
+            self.module_path,
+            "Server.start.Handler.do_GET",
+            "replace",
+            '            def do_GET(self):\n'
+            '                return "ok-extended"\n',
+        )
+        self.assertEqual(dedented, correct)
+        self.assertIn(
+            '            def do_GET(self):\n'
+            '                return "ok-extended"\n',
+            dedented,
+        )
+
+    def test_replace_uniform_overindent_absorbed(self) -> None:
+        overindented = self._content(
+            self.module_path,
+            "Server.start.Handler.do_GET",
+            "replace",
+            '                    def do_GET(self):\n'
+            '                        return "ok-extended"\n',
+        )
+        correct = self._content(
+            self.module_path,
+            "Server.start.Handler.do_GET",
+            "replace",
+            '            def do_GET(self):\n'
+            '                return "ok-extended"\n',
+        )
+        self.assertEqual(overindented, correct)
+
+    def test_replace_nested_anchor_reindented(self) -> None:
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        content = self._content(
+            self.module_path,
+            "Server.start",
+            "replace",
+            "def start(self):\n"
+            "    class Handler:\n"
+            "        def do_GET(self):\n"
+            '            return "ok-2"\n'
+            "\n"
+            "        def do_POST(self):\n"
+            '            return "posted"\n'
+            "\n"
+            "    return Handler\n",
+        )
+        self.assertIn('                return "ok-2"', content)
+        self.assertEqual(
+            qualified_def_names(content),
+            qualified_def_names(self.MODULE_SOURCE),
+        )
+
+    def test_replace_decorated_multiline_definition_reindented(self) -> None:
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        content = self._content(
+            self.module_path,
+            "greet",
+            "replace",
+            "    @_wrap\n"
+            "    def greet(\n"
+            "        name: str,\n"
+            "    ) -> str:\n"
+            '        return "hi " + name\n',
+        )
+        self.assertIn('"hi " + name', content)
+        self.assertNotIn('"hello " + name', content)
+        self.assertEqual(
+            qualified_def_names(content),
+            qualified_def_names(self.MODULE_SOURCE),
+        )
+
+    # --- Re-indentation: what stays rejected ---
+
+    def test_non_uniform_delta_still_rejected(self) -> None:
+        # The def is dedented to column 0 but a body line sits at
+        # 2 spaces — below the def's own body indent, above the
+        # base: no single shift describes this delta.
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "replace",
+                        'def do_GET(self):\n    return "ok"\n  x = 1\n',
+                    )
+                ]
+            )
+        )
+        self.assertIn("starts at 0 spaces of indentation", message)
+        self.assertIn("sits at 12 spaces in the file", message)
+        self.assertNotIn("placeholder content only", message)
+
+    def test_incoherent_uniform_delta_still_rejected_at_the_gate(self) -> None:
+        # A uniformly shifted FRAGMENT is not a uniform copy of
+        # the anchored definition: the gate fires (before the
+        # replace shape check, as it always has) rather than the
+        # shape error.
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "replace",
+                        "if True:\n    return 1\n",
+                    )
+                ]
+            )
+        )
+        self.assertIn("starts at 0 spaces of indentation", message)
+        self.assertIn("sits at 12 spaces in the file", message)
+        self.assertNotIn("defines no definition at its top level", message)
+
+    # --- Re-indentation: after/before ---
+
+    def test_after_uniform_dedent_absorbed(self) -> None:
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        content = self._content(
+            self.module_path,
+            "Server.start.Handler.do_GET",
+            "after",
+            'def do_PUT(self):\n    return "put"\n',
+        )
+        expected = qualified_def_names(self.MODULE_SOURCE)
+        expected.insert(
+            expected.index("Server.start.Handler.do_GET") + 1,
+            "Server.start.Handler.do_PUT",
+        )
+        self.assertEqual(qualified_def_names(content), expected)
+        self.assertLess(content.index("def do_GET"), content.index("def do_PUT"))
+        self.assertLess(content.index("def do_PUT"), content.index("def do_POST"))
+
+    def test_before_uniform_overindent_absorbed(self) -> None:
+        content = self._content(
+            self.module_path,
+            "greet",
+            "before",
+            '    def farewell(name: str) -> str:\n'
+            '        return "bye " + name\n',
+        )
+        self.assertIn("farewell", content)
+        # Inserted before the anchor's DECORATOR line, at the
+        # anchor's own (zero) indentation.
+        self.assertLess(content.index("def farewell"), content.index("@_wrap"))
+        self.assertLess(content.index("@_wrap"), content.index("def greet"))
+
+    def test_after_incoherent_delta_still_rejected_at_the_gate(self) -> None:
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "after",
+                        "def broken(:\n    pass\n",
+                    )
+                ]
+            )
+        )
+        self.assertIn("starts at 0 spaces of indentation", message)
+        self.assertIn("sits at 12 spaces in the file", message)
+
+    # --- Retry-#32 output 3 fixture ---
+
+    def _step1_only_raw(self) -> str:
+        import json
+
+        payload = json.loads(self.RETRY32_OUTPUT3_RAW)
+        return json.dumps({"nodes": payload["nodes"][:1], "metadata": {}})
+
+    def test_retry32_output3_step1_materializes(self) -> None:
+        import ast
+
+        from freetalon.orchestrator import planner
+        from freetalon.orchestrator.repo_index import (
+            build_repo_index,
+            qualified_def_names,
+        )
+        from freetalon.orchestrator.tool_registry import (
+            is_placeholder_content,
+        )
+
+        api_source = Path(self.api_path).read_text(encoding="utf-8")
+        for root in (None, str(self.repo_root)):
+            nodes, _meta = parse_planner_response(
+                self._step1_only_raw(),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            content = nodes[0].inputs["content"]
+            # Materialized at the anchor's file indentation.
+            self.assertIn("            def do_GET(self) -> None:", content)
+            # Parses, and every one of api.py's definitions survives.
+            ast.parse(content)
+            self.assertEqual(
+                qualified_def_names(content), qualified_def_names(api_source)
+            )
+            # The sketch's '...' payload values survive verbatim
+            # into the materialized module — by design no planning
+            # check judges them; the plan's own tests assert the
+            # fields' types (which Ellipsis fails), so substance is
+            # judged at execution by the judge/replan loop.
+            self.assertIn('payload["service_status"] = ...', content)
+            self.assertIn('payload["ollama_reachable"] = ...', content)
+            self.assertIn('payload["gpu_temperature"] = ...', content)
+            # The content checks the audit measured, run directly:
+            # overwrite guard, placeholder/stub rules, framework
+            # guard — all silent on the materialized module.
+            self.assertEqual(planner._scaffold_overwrite_errors(nodes, root), [])
+            self.assertEqual(
+                planner._placeholder_scaffold_errors(nodes, root), []
+            )
+            self.assertEqual(
+                planner._framework_errors(
+                    nodes, build_repo_index(root), self.HEALTH_GOAL
+                ),
+                [],
+            )
+            self.assertFalse(is_placeholder_content(content))
+            self.assertFalse(planner._is_placeholder_stub(content))
+
+    def test_retry32_output3_full_plan_profile(self) -> None:
+        from freetalon.orchestrator.planner import CheapRejectionError
+
+        # Step-1 now materializes, so the full plan reaches the
+        # ordinary checks — which reject it with exactly ONE error,
+        # on step-2: its test heredoc does not parse
+        # (unittest.main() at column 0 under the __main__ guard).
+        # In the live run this defect was masked: materialization
+        # raised on step-1 before the full-plan checks ran. The
+        # rejection is full-price (not the placeholder cheap path)
+        # and the indentation gate no longer fires.
+        for root in (None, str(self.repo_root)):
+            with self.assertRaises(LLMResponseError) as caught:
+                parse_planner_response(
+                    self.RETRY32_OUTPUT3_RAW,
+                    goal_text=self.HEALTH_GOAL,
+                    workspace=self.WS,
+                    repo_root=root,
+                )
+            self.assertNotIsInstance(caught.exception, CheapRejectionError)
+            message = str(caught.exception)
+            self.assertIn("was rejected with 1 error", message)
+            self.assertIn("step-2", message)
+            self.assertIn("does not parse as Python", message)
+            self.assertIn("expected an indented block", message)
+            self.assertNotIn("spaces of indentation", message)
+
+    # --- Repair steering for materialization rejections ---
+
+    def _non_uniform_raw(self) -> str:
+        return self._dag(
+            [
+                self._edit_node(
+                    self.module_path,
+                    "Server.start.Handler.do_GET",
+                    "replace",
+                    'def do_GET(self):\n    return "ok"\n  x = 1\n',
+                )
+            ]
+        )
+
+    def test_steering_blocks_on_materialization_rejection(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _extension_steering_block,
+            _materialization_steering_block,
+            _shape_steering_block,
+        )
+
+        raw = self._non_uniform_raw()
+        message = self._rejection(raw)
+        self.assertIn("spaces of indentation", message)
+        # The retry-#28 misfire, one level down, is closed: the
+        # shape block no longer tells the repair round none of its
+        # code was rejected.
+        self.assertEqual(_shape_steering_block(raw, message), "")
+        # The extension block stays guard-only, as before.
+        self.assertEqual(_extension_steering_block(raw, message, None), "")
+        # The materialization block fires with the concrete
+        # pattern: the module's full definition list, the anchor's
+        # own indentation, and the module's skeleton.
+        block = _materialization_steering_block(raw, message, None)
+        self.assertIn("ANCHORED-EDIT REPAIR", block)
+        self.assertIn("KEEP the anchored-edit form", block)
+        self.assertIn("The module's full definition list is:", block)
+        self.assertIn("Server.start.Handler.do_GET", block)
+        self.assertIn("12 spaces for 'Server.start.Handler.do_GET'", block)
+        self.assertIn("def do_GET", block)
+
+    def test_materialization_block_silent_off_its_trigger(self) -> None:
+        from freetalon.orchestrator.planner import (
+            CheapRejectionError,
+            _materialization_steering_block,
+        )
+
+        raw = self._non_uniform_raw()
+        # An overwrite-guard rejection carries no materialization
+        # stem: the extension block's territory, not this one's.
+        guard_message = (
+            "Planner output was rejected with 1 error — fix ALL of them:\n"
+            "1. Planner node 'step-1' scaffold for 'fixture_module.py' "
+            "drops 8 of the existing module's 9 definitions — ..."
+        )
+        self.assertEqual(
+            _materialization_steering_block(raw, guard_message, None), ""
+        )
+        # The placeholder-delta cheap rejection DOES carry a stem
+        # ("an anchored edit") but is excluded: its repair round
+        # already answers with the grounded skeleton.
+        placeholder_raw = self._dag(
+            [
+                self._edit_node(
+                    self.api_path,
+                    "HiveAPIServer.start.Handler.do_GET",
+                    "replace",
+                    TestPlannerDeltaBlankFix.OLD_DELTA_BLANK,
+                )
+            ]
+        )
+        with self.assertRaises(CheapRejectionError) as caught:
+            parse_planner_response(
+                placeholder_raw,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+            )
+        message = str(caught.exception)
+        self.assertIn("placeholder content only", message)
+        self.assertEqual(
+            _materialization_steering_block(placeholder_raw, message, None),
+            "",
+        )
+
+    def test_materialization_repair_prompt_carries_the_block(self) -> None:
+        from freetalon.orchestrator.planner import plan_task_intent
+
+        intent = TaskIntent(
+            goal="Extend the fixture module in place", project_type="api"
+        )
+        settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434", model="test"
+        )
+        good = self._dag(
+            [
+                self._edit_node(
+                    self.module_path,
+                    "Server.start.Handler.do_GET",
+                    "replace",
+                    '            def do_GET(self):\n'
+                    '                return "ok-extended"\n',
+                )
+            ]
+        )
+        with patch(
+            "freetalon.orchestrator.planner.call_llm",
+            side_effect=[self._non_uniform_raw(), good],
+        ) as call_mock:
+            plan = plan_task_intent(intent, settings=settings)
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(len(plan.nodes), 1)
+        repair_prompt = call_mock.call_args_list[1][0][1]
+        self.assertIn("REJECTED", repair_prompt)
+        self.assertIn("ANCHORED-EDIT REPAIR", repair_prompt)
+        self.assertIn("The module's full definition list is:", repair_prompt)
+        # The misfiring shape-steering text is gone.
+        self.assertNotIn("SHAPE was right", repair_prompt)
+        self.assertNotIn("none of its code was rejected", repair_prompt)

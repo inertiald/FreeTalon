@@ -1374,6 +1374,21 @@ def _normalize_plan_interpreters(nodes_raw: list[Any]) -> None:
 # detects comment/prose-only deltas (_delta_carries_code) at the
 # placeholder check, BEFORE the indentation gate, so an echoed
 # blank is named placeholder content and stays a cheap rejection.
+#
+# Retry #33: retry #32's model used the edit form with the
+# real-code sketch but DEDENTED its copy — the uniform 12-space
+# file indentation stripped (def at column 0, body at 4) — and
+# the gate rejected it. The model's copy normalizes whatever it
+# carries (#31 dropped the '#' markers re-wrapping prose; #32
+# dropped the uniform indent): the same mechanical variance the
+# interpreter normalization absorbs for command strings.
+# Materialization now re-indents a delta that differs from the
+# anchor's indentation ONLY by a uniform shift — dedented by its
+# own base indent it is coherent (for "replace", exactly the one
+# anchored definition; for "after"/"before", it parses as
+# sibling code) — and judges the re-indented materialized module
+# exactly as before. Non-uniform or incoherent deltas keep the
+# indentation error, both indents stated.
 
 _EDIT_POSITIONS = ("replace", "after", "before")
 
@@ -1556,6 +1571,49 @@ def _delta_carries_code(content: str) -> bool:
     return False
 
 
+def _dedent_delta_lines(
+    delta_lines: list[str], base_indent: int
+) -> list[str] | None:
+    """The delta with its own base indent removed, or None.
+
+    The dedent a uniform copy survives: every non-blank line
+    carries at least ``base_indent`` leading spaces (the first
+    line is genuinely the least-indented line — a line dedented
+    below the base, like a string-literal content line at
+    column 0 under an indented def, breaks uniformity) and no
+    line's leading whitespace mixes in a tab. Blank lines pass
+    through untouched. None when the delta is not a uniform
+    shift of anything — the caller keeps the indentation error.
+    """
+    dedented: list[str] = []
+    for line in delta_lines:
+        if not line.strip():
+            dedented.append(line)
+            continue
+        whitespace = line[: len(line) - len(line.lstrip())]
+        if "\t" in whitespace or len(whitespace) < base_indent:
+            return None
+        dedented.append(line[base_indent:])
+    return dedented
+
+
+def _delta_parses_as_code(lines: list[str]) -> bool:
+    """True when the joined lines parse as Python code.
+
+    The coherence bar for an "after"/"before" delta on the
+    re-indent path: dedented by its own base indent, sibling
+    code must parse as module-level code. ("replace" has the
+    stricter bar — _delta_top_level_def_names must name exactly
+    the anchored definition — applied by the shape check the
+    gate already runs.)
+    """
+    try:
+        ast.parse("\n".join(lines))
+    except SyntaxError:
+        return False
+    return True
+
+
 def _materialize_scaffold_edit(
     label: str,
     inputs: dict[str, Any],
@@ -1569,6 +1627,10 @@ def _materialize_scaffold_edit(
     returned. On failure an (error, placeholder_delta) pair is
     returned and the inputs are left untouched: every error names
     the defect and the fix, so the repair round can steer.
+    A delta whose indentation differs from the anchor's only by a
+    uniform shift is re-indented to the anchor's indentation
+    before splicing (retry #33); every other check judges the
+    materialized module exactly as before.
     ``sources`` carries the current text per resolved target path
     across the nodes of one plan, seeded from disk: a second edit
     of the same module materializes against the first edit's
@@ -1700,7 +1762,7 @@ def _materialize_scaffold_edit(
         delta_lines.pop()
     delta_indent = len(delta_lines[0]) - len(delta_lines[0].lstrip())
     if delta_indent != indent:
-        return (
+        indentation_error = (
             f"Planner node '{label}' anchors an edit on {anchor!r} in "
             f"{target!r}, but the edit's content starts at "
             f"{delta_indent} spaces of indentation while {anchor!r} "
@@ -1710,6 +1772,33 @@ def _materialize_scaffold_edit(
             f"def/class line at {indent} spaces).",
             False,
         )
+        # Retry #33: absorb a UNIFORM shift — the model's copy
+        # stripped (or added) the same columns on every line, the
+        # mechanical variance the interpreter normalization
+        # absorbs for command strings. The shift is uniform when
+        # the delta dedents by its own base indent (the first
+        # line's — the measure this gate has always used) and the
+        # dedented form is coherent: for 'replace', exactly the
+        # one anchored definition (the shape check below, applied
+        # here to the dedented form); for 'after'/'before', it
+        # parses as sibling code. Anything else — a line dedented
+        # below the base, a tab-led line, a fragment, the wrong
+        # definition — is not a uniform copy of the anchored code
+        # and keeps the indentation error, both indents stated.
+        dedented = _dedent_delta_lines(delta_lines, delta_indent)
+        if dedented is None:
+            return indentation_error
+        if position == "replace":
+            leaf = anchor.rsplit(".", 1)[-1]
+            if _delta_top_level_def_names("\n".join(dedented)) != [leaf]:
+                return indentation_error
+        elif not _delta_parses_as_code(dedented):
+            return indentation_error
+        prefix = " " * indent
+        delta_lines = [
+            prefix + line if line.strip() else line for line in dedented
+        ]
+        content = "\n".join(delta_lines)
     if position == "replace":
         leaf = anchor.rsplit(".", 1)[-1]
         top = _delta_top_level_def_names(content)
@@ -4658,6 +4747,21 @@ def _dropped_fields_note(prev_text: str | None, cur_text: str) -> str:
 # When a scaffold plan's rejection names no content defect, the repair
 # prompt says the shape was right, so the model fixes the named
 # strings instead of switching mechanism.
+#
+# The anchored-edit materialization errors' distinctive stems,
+# shared by the steering triggers below: every
+# _materialize_scaffold_edit rejection carries one ("anchors an
+# edit on ...", "anchors its edit on ...", "anchors a 'replace'
+# edit on ...", "... an anchored edit ..."), and none appears in
+# any other rejection, in model output, or in the node-shape
+# block.
+_MATERIALIZATION_MARKERS = (
+    "anchors an edit",
+    "anchors its edit",
+    "anchors a 'replace' edit",
+    "an anchored edit",
+)
+
 _CONTENT_DEFECT_MARKERS = (
     "does not parse as Python",
     "no longer parses as Python",
@@ -4673,6 +4777,16 @@ _CONTENT_DEFECT_MARKERS = (
     # the named strings", contradicting the rejection in the same
     # prompt. The guard's wording is a content defect like the others.
     "of the existing module's",
+    # Retry #33: the materialization stems. Retry #32's output 3
+    # was rejected ONLY for its delta's indentation — a defect in
+    # the code itself — yet no marker matched, so this block told
+    # the repair round the same "none of its code was rejected"
+    # line (measured: 489 chars on the real rejection) while the
+    # concrete extension block stayed silent (its trigger is the
+    # guard's phrase only): the repair prompt contradicted the
+    # rejection it carried, and output 4 abandoned the edit form
+    # for a Flask scaffold — the #28 misfire one level down.
+    *_MATERIALIZATION_MARKERS,
 )
 
 
@@ -4840,6 +4954,123 @@ def _extension_steering_block(
             "level, rename it, or drop it), plus your new code added "
             "— a scaffold that omits an existing definition is "
             "rejected again."
+            + structure_part
+            + "\n"
+        )
+    return "".join(blocks)
+
+
+def _materialization_steering_block(
+    response_text: str,
+    error_text: str,
+    repo_root: str | Path | None = None,
+) -> str:
+    """The concrete edit-form pattern for a repair after a materialization rejection.
+
+    Retry #33: after a materialization rejection (retry #32's
+    output 3: the anchored edit's delta dedented to column 0), the
+    repair prompt carried only the rejection text — whose tail is
+    the generic _EDIT_SHAPE_EXAMPLE — while the concrete steering
+    that fires after an overwrite-guard rejection
+    (_extension_steering_block: full lists, the skeleton, the
+    named pattern) stayed silent, because its trigger is the
+    guard's phrase alone; and the shape-steering block actively
+    misfired (its markers now include the materialization stems,
+    so it stays silent too). What was left was a prohibition-
+    shaped prompt, and the repair round abandoned the edit form
+    for a full-content Flask scaffold — the outputs 4 of retries
+    #30, #31, and #32 all end there. This block mirrors the
+    extension block for the edit-form failure: it recomputes the
+    failed edit against the module on disk and hands the repair
+    round the module's FULL definition list, the anchor's own
+    indentation, the module's skeleton (real indentation, bodies
+    elided), and the keep-the-edit-form pattern. Returns ""
+    unless the rejection is a materialization rejection (a
+    _MATERIALIZATION_MARKERS stem in the error text) and an
+    edit-form node in the failed output targets a module that
+    grounds (existing, parseable, at the guard's four-definition
+    floor). The placeholder-delta rejection is excluded: it is
+    cheap, and its repair round already answers with the grounded
+    skeleton.
+    """
+    if "placeholder content only" in error_text:
+        return ""
+    if not any(marker in error_text for marker in _MATERIALIZATION_MARKERS):
+        return ""
+    try:
+        payload = parse_json_object(sanitize_llm_output(response_text))
+    except Exception:
+        return ""
+    raw_nodes = payload.get("nodes")
+    if not isinstance(raw_nodes, list):
+        return ""
+    root = resolve_repo_root(repo_root)
+    blocks: list[str] = []
+    for raw in raw_nodes:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("assigned_claw") not in ("scaffold", "file_writer"):
+            continue
+        inputs = raw.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        if "anchor" not in inputs and "position" not in inputs:
+            continue
+        outputs = raw.get("outputs")
+        target = (
+            inputs.get("file_path")
+            or inputs.get("path")
+            or (outputs[0] if isinstance(outputs, list) and outputs else None)
+        )
+        if not isinstance(target, str) or not target:
+            continue
+        if Path(target).suffix.lower() != ".py":
+            continue
+        resolved = _resolve_plan_target(target, root)
+        existing_names = _existing_module_definitions(resolved)
+        if not existing_names:
+            continue
+        anchor = inputs.get("anchor")
+        indent_part = ""
+        if isinstance(anchor, str) and anchor.strip():
+            try:
+                source_text = resolved.read_text(encoding="utf-8")
+            except OSError:
+                source_text = ""
+            for span_name, _start, _end, span_indent in _definition_spans(
+                source_text
+            ):
+                if span_name == anchor:
+                    indent_part = (
+                        f" — {span_indent} spaces for {anchor!r}, "
+                        "the anchor you used"
+                    )
+                    break
+        skeleton = _existing_module_skeleton(resolved)
+        structure_part = ""
+        if skeleton:
+            structure_part = (
+                " The module's structure, with its real indentation "
+                "(a line containing only ... stands for a "
+                "definition's existing body), is:\n"
+                f"```python\n{skeleton}\n```"
+            )
+        blocks.append(
+            f"\nANCHORED-EDIT REPAIR — node '{raw.get('id')}' "
+            f"anchors an edit on {target}, which already exists, "
+            "and the edit was rejected for the defect named above. "
+            "KEEP the anchored-edit form and fix only that defect "
+            "in the edit's delta — do NOT replace the edit with a "
+            "whole-file scaffold, and do NOT rewrite the module "
+            "in a different framework. The edit's inputs are "
+            "\"anchor\" (the ONE definition from the module's "
+            "list the change belongs to), \"position\", and "
+            "\"content\" holding ONLY the new code for that "
+            "definition, at the indentation it has in the file"
+            f"{indent_part}. The module's full definition list "
+            f"is: {', '.join(existing_names)}. The system applies "
+            "the edit to the current file, so every other "
+            "definition is preserved by construction."
             + structure_part
             + "\n"
         )
@@ -5645,6 +5876,16 @@ def _call_llm_with_repair(
     guard's phrase is a content-defect marker
     (_extension_steering_block).
 
+    After a materialization rejection the repair prompt carries the
+    materialization block (retry #33): the failed edit recomputed
+    against the module on disk, the module's full definition list,
+    the anchor's own indentation, the module's skeleton, and the
+    keep-the-edit-form pattern — the extension block's trigger is
+    the guard's phrase alone, so before this the repair prompt
+    carried only the rejection text and the generic shape example,
+    and the repair round abandoned the edit form for a full-content
+    scaffold (_materialization_steering_block).
+
     The repair prompt only steers if the model receives it (retry
     #22): the prompts exceed Ollama's 4096-token context window,
     so planner/replan calls use _PLANNER_NUM_CTX instead. The
@@ -5768,6 +6009,9 @@ def _call_llm_with_repair(
             extension_block = _extension_steering_block(
                 response_text, str(exc), repo_root
             )
+            materialization_block = _materialization_steering_block(
+                response_text, str(exc), repo_root
+            )
             prompt = (
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
@@ -5777,6 +6021,7 @@ def _call_llm_with_repair(
                 f"{forbidden_block}"
                 f"{steering_block}"
                 f"{extension_block}"
+                f"{materialization_block}"
                 f"\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n"
                 f"{skeleton_block}\n"
                 "Return ONLY a corrected JSON object with a \"nodes\" array that "
