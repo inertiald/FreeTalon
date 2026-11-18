@@ -2047,3 +2047,90 @@ Deliberately left out:
   here): live /health runs on the cycle-2 planner with temperature
   raised for distinct samples, and the formatter A/B with
   seeker88's llama3 as the formatter node.
+
+## Update - 2026-11-18 (Live measurement matrix: cycle-2 planner, Arms A/B; Arm C not run)
+
+- Live matrix on 925d12c under full discipline. Pre-flight: GPU
+  57C idle, power limit exactly 300.00W, link x16, 0 Xid 79/154,
+  Ollama tags list gemma-3-abliterated:latest, head 925d12c
+  clean; baseline suite 1014/1014 green (Ran 1014 in 426.9s,
+  OK). Fans manual 85% during each arm, auto after,
+  GPUFanControlState=0 verified after each arm. Log:
+  logs/health-matrix-2026-11-17.log.
+- ARM A (production defaults; formatter OFF, temperature as
+  shipped): driver exit 0, ~5 min wall. Output 1 {"nodes":[]} ->
+  empty_plan@schema. Output 2 ACCEPTED (plan-7885a4ef9d99,
+  5 nodes): the PAYLOAD CHANNEL fired live -- step-2's bash
+  heredoc test write (the same unittest.main() dedent that
+  killed CP2) was materialized and rerouted bash -> scaffold,
+  and the plan parsed. The envelope held: both outputs were
+  schema-shaped; the only schema-stage rejection was
+  empty_plan. No repair sequence occurred, so no stuck-detection
+  or scope_widening events. BUT the run never executed: the
+  loop's experiment-memory judge escalated before node-1 --
+  "plan repeats a measured-failed approach for this goal:
+  'bash' / 'Verify /health live' (node node-5)". All nodes
+  stayed draft, verdict FAIL (escalated), zero files changed
+  (porcelain 0), live /health never reached. Substance caveat:
+  the accepted step-1 delta assigns literal ... placeholders
+  to service_status / ollama_reachable / gpu_temperature --
+  retention-sound by the corpus definition, but the endpoint
+  would not have answered correctly had it run; the plan's own
+  step-3 test would have caught it.
+- ARM B (formatter ON: seeker88 llama3:latest via
+  FREETALON_FORMATTER_OLLAMA_BASE_URL=http://100.87.140.12:11434
+  and FREETALON_FORMATTER_OLLAMA_MODEL=llama3:latest): driver
+  exit 1, FAILED at planning. seeker88 pre-checks: /api/tags
+  lists llama3:latest; site /health HTTP 200 before AND after
+  the arm; nothing on seeker88 restarted or reconfigured. All
+  3 judged outputs (the post-formatter text is what is parsed
+  and printed) rejected at validate: output 1, 5 errors
+  (criteria x4 + route_engagement -- a stand-in plan with
+  invented criterion types); output 2, 7 errors (framework x2
+  -- a FastAPI rewrite -- scaffold_overwrite x2, criteria,
+  command, tmp_write); output 3, 4 errors (criteria x3 --
+  'exists' / 'contains' -- + route_engagement). No
+  schema-stage rejections (the envelope held under the
+  formatter too); no stuck detection (signatures differed
+  every attempt); no scope_widening (no repair parsed); no
+  payload materialization (no heredoc plan survived to it).
+  Zero files changed. Observability limit: the driver log
+  prints only the post-formatter text, so Gemma's original vs
+  llama3's re-emission cannot be separated from this trace --
+  the judged plans were consistently stand-in-shaped with
+  invented criterion types (the "clean shape, hollow content"
+  failure mode), but which pass introduced it is not provable
+  from the log.
+- ARM C (temperature sample): NOT RUN, on two independent
+  grounds. (1) The arm's gate was "only if A and B both failed
+  at planning" -- Arm A did not fail at planning (its plan was
+  accepted; the run died at the judge's memory escalation), so
+  the gate is not met. (2) Planner temperature is not
+  env-configurable: LLMSettings carries no temperature field,
+  from_env reads none, and _call_ollama /
+  _call_openai_compatible hardcode temperature 0
+  (freetalon/orchestrator/intake.py). Per the matrix brief, no
+  code was changed to force it.
+- Scoreboard vs CP2 (3 runs on c334196): live planning
+  acceptance 0/3 -> Arm A accepted its plan (the first live
+  acceptance on the sound planner that was not an elision
+  fragment), but accepted-sound end-to-end remains 0 and
+  end-to-end success remains 0. The blocker has moved again:
+  planning is no longer the wall -- the experiment-memory
+  escalation is. The memory's approach signature ('bash' +
+  the node's objective text) matches node-5's "Verify /health
+  live" against a historical failed attempt and refuses the
+  whole plan before any node executes; any future plan that
+  verifies /health with a bash node of that name hits the
+  same wall regardless of planner quality. Closing it is a
+  loop/judge-side fix (the memory is doing its M2 job with too
+  coarse a signature), not a planner fix.
+- Determinism: Arm A's trace differs from CP2's byte-identical
+  trace (2 outputs vs 4, different plan and content) -- the
+  envelope constraint and the payload channel changed
+  generation, as intended. Within-arm replication was not
+  tested (one run per arm by design).
+- GPU across the matrix: poll-sample peaks 73C (Arm A), 69C
+  (Arm B), all under the 85C pause threshold, no thermal
+  intervention; 0 Xid 79/154 across the matrix; fans left on
+  auto (GPUFanControlState=0 verified after each arm).
