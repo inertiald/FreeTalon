@@ -25,6 +25,7 @@ from enum import Enum
 from typing import Any
 
 from .measure import VERDICT_UNMEASURABLE
+from .memory import approach_signature, describe_signature
 from .models import ExecutionPlan, GoalContract, PlanNode, PlanStatus, RunBudget
 
 
@@ -90,11 +91,6 @@ def _is_timeout(node: PlanNode) -> bool:
 
 def _is_unmeasurable(node: PlanNode) -> bool:
     return (node.measurement or {}).get("verdict") == VERDICT_UNMEASURABLE
-
-
-def approach_key(node: PlanNode) -> tuple[str, str]:
-    """Identity of a node's approach: what it did and what it tested."""
-    return (node.assigned_claw, node.hypothesis or node.objective)
 
 
 class Judge:
@@ -240,6 +236,13 @@ class Judge:
                     "objective": n.objective,
                     "hypothesis": n.hypothesis,
                     "assigned_claw": n.assigned_claw,
+                    # The node's inputs ride along so repeat detection
+                    # (validate_delta_plan) can compute the failed
+                    # approach's substance signature from what the
+                    # node actually did, not from its wording. The
+                    # planner's brief prompt reads only the prose
+                    # fields above; inputs are for the judge.
+                    "inputs": dict(n.inputs or {}),
                     "measurement": n.measurement,
                     "error": n.error,
                 }
@@ -260,36 +263,48 @@ class Judge:
         self,
         brief: dict[str, Any],
         new_nodes: list[PlanNode],
-        known_failures: set[tuple[str, str]] | None = None,
+        known_failures: set[tuple[Any, ...]] | None = None,
     ) -> str | None:
         """Reject a re-plan that repeats a failed approach without a reason.
 
         Returns an error string when the delta plan is rejected, else None.
-        A node repeats a failed approach when its (capability, hypothesis)
-        matches a failed node's and it states no ``differs_by``.
-        ``known_failures`` adds approaches recorded in experiment memory
-        (M2) to the current run's failures.
+        A node repeats a failed approach when its approach signature
+        (memory.approach_signature — mechanism and targets, never the
+        node's wording) matches a failed node's and it states no
+        ``differs_by``. Plumbing nodes (test runs, live checks, server
+        starts) have no signature and can never repeat. The brief's
+        failed nodes all executed in this run, so their failures are
+        executed-stage by construction. ``known_failures`` adds the
+        signatures recorded in experiment memory (M2) — executed-stage
+        measured failures only (see ExperimentStore.failed_approaches).
         """
-        failed_approaches = {
-            approach_key(
+        failed_signatures: set[tuple[Any, ...]] = set()
+        for f in brief.get("failed_nodes", []):
+            signature = approach_signature(
                 PlanNode(
                     id=f["id"],
                     objective=f["objective"],
                     assigned_claw=f.get("assigned_claw", ""),
                     hypothesis=f.get("hypothesis", ""),
+                    inputs=f.get("inputs") or {},
                 )
             )
-            for f in brief.get("failed_nodes", [])
-        }
+            if signature is not None:
+                failed_signatures.add(signature)
         if known_failures:
-            failed_approaches |= set(known_failures)
-        if not failed_approaches:
+            failed_signatures |= set(known_failures)
+        if not failed_signatures:
             return None
         for node in new_nodes:
-            if approach_key(node) in failed_approaches and not node.differs_by:
+            signature = approach_signature(node)
+            if (
+                signature is not None
+                and signature in failed_signatures
+                and not node.differs_by
+            ):
                 return (
                     f"re-plan repeats failed approach "
-                    f"({node.assigned_claw!r}, hypothesis {node.hypothesis!r}) "
+                    f"({describe_signature(signature)}) "
                     f"without a stated differs_by"
                 )
         return None

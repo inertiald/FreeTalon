@@ -168,6 +168,52 @@ class TestValidateDeltaPlan(unittest.TestCase):
         different = _node(hypothesis="a new idea", assigned_claw="file_writer")
         self.assertIsNone(judge.validate_delta_plan(brief, [different]))
 
+    def _brief_for(self, failed_node):
+        judge = Judge(RunBudget())
+        plan = _plan([failed_node])
+        from freetalon.orchestrator.models import GoalContract
+
+        return judge.build_replan_brief(
+            GoalContract(objective="g"), plan, [_measurement()], [], 1
+        )
+
+    def test_plumbing_failure_does_not_reject_its_repeat(self):
+        # Cycle 3: a failed verification step is plumbing — it has no
+        # approach signature, so a delta plan may run the same check
+        # again (the check was never the approach that failed).
+        judge = Judge(RunBudget())
+        brief = self._brief_for(_node(
+            measurement=_measurement(),
+            inputs={"command": "curl -s http://localhost:8765/health"},
+        ))
+        repeat = _node(inputs={"command": "curl -s http://localhost:8765/health"})
+        self.assertIsNone(judge.validate_delta_plan(brief, [repeat]))
+
+    def test_write_failure_rejects_repeat_write(self):
+        # Cycle 3: same write mechanism on the same file — different
+        # content and wording — is a repeat of the failed approach.
+        judge = Judge(RunBudget())
+        brief = self._brief_for(_node(
+            measurement=_measurement(),
+            assigned_claw="scaffold",
+            inputs={"file_path": "/repo/api.py", "content": "# v1\n"},
+        ))
+        repeat = _node(
+            hypothesis="entirely new wording",
+            assigned_claw="scaffold",
+            inputs={"file_path": "/repo/api.py", "content": "# v2\n"},
+        )
+        error = judge.validate_delta_plan(brief, [repeat])
+        self.assertIsNotNone(error)
+        self.assertIn("repeats failed approach", error)
+        self.assertIn("/repo/api.py", error)
+        changed = _node(
+            assigned_claw="scaffold",
+            inputs={"file_path": "/repo/api.py", "content": "# v2\n"},
+            differs_by="rewrites the handler instead of appending",
+        )
+        self.assertIsNone(judge.validate_delta_plan(brief, [changed]))
+
     def test_brief_contains_goal_and_failures(self):
         brief = self._brief()
         self.assertEqual(brief["goal"]["objective"], "g")

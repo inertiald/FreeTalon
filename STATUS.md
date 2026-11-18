@@ -2134,3 +2134,82 @@ Deliberately left out:
   (Arm B), all under the 85C pause threshold, no thermal
   intervention; 0 Xid 79/154 across the matrix; fans left on
   auto (GPUFanControlState=0 verified after each arm).
+
+## Update - 2026-11-18 (Cycle 3: approach-shaped memory signature + temperature knob)
+
+- The matrix's blocker is closed. The experiment memory's
+  approach identity was (claw, hypothesis-or-objective text);
+  it is now a substance signature computed from the node's
+  inputs by one conversion used for both stored records and
+  live candidates (freetalon/orchestrator/memory.py):
+  scaffold/file_writer nodes key on (claw, "write", target
+  paths) -- content and wording deliberately excluded, since
+  content is what a repair varies; bash nodes that write files
+  key on their write targets the same way; other bash nodes
+  key on their exact command text; other claws key on their
+  scalar parameters (executor-merged outputs like exit_code /
+  stdout excluded, so a recorded attempt and a fresh candidate
+  produce the identical signature).
+- Universal plumbing has NO signature and can neither create
+  a failed-approach entry nor match one: test runs (unittest /
+  pytest / test scripts), HTTP fetches (curl/wget), and server
+  starts (the cli start/stop family, uvicorn, http.server) --
+  every plan for a goal shares those steps, and their failures
+  are symptoms of the substantive steps, not approaches that
+  were tried. Read-only filters (grep/head/tail and friends)
+  are neutral inside compound commands; a command containing a
+  substantive segment keys on its full text.
+- Failure stage is now part of matching: record() stamps a
+  stage derived from the measurement, and failed_approaches
+  counts only "executed" failures -- a criterion was actually
+  measured, or the node reached its approval gate and was
+  refused there (the gate path records a verdict with no
+  criterion results; the M4 never-re-ask-a-denial contract is
+  preserved and pinned). Planning-stage failures (results
+  present, nothing measured) no longer block anything. Legacy
+  records derive the same stage from their stored criteria;
+  the historical data itself is unchanged.
+- judge.validate_delta_plan matches on the same signatures
+  (its re-plan brief now carries the failed nodes' inputs);
+  the judge's old (claw, hypothesis) approach_key is gone.
+  loop._find_repeated_approach likewise; the differs_by escape
+  is unchanged, as is the escalation text.
+- Acceptance, against COPIES of the real state DB (the live
+  DB was never written; tools/verify_cycle3_acceptance.py):
+  the /health goal's failed set under the new signature is
+  exactly 3 entries, all substantive bash commands (a head|grep
+  compound check, the garbled edit-spec-as-command, a mangled
+  unittest-as-command) -- the curl verifies, test runs, server
+  starts and scaffold writes behind the old text-matched set
+  contribute nothing. The real Arm A plan (plan-7885a4ef9d99)
+  no longer escalates (repeat check: None). Seeding one
+  EXECUTED scaffold-write failure for the same api.py makes
+  the same plan escalate on node-1 -- the protective property
+  holds on substance, not wording.
+- One existing pin changed, reason recorded in the test:
+  test_memory.test_failed_approaches expected the old
+  (capability, hypothesis) pair {("bash", "h-fail")}; it now
+  expects the substance signature {("bash", "command",
+  "exit 1")} -- the fixture node's identity is its command,
+  not its hypothesis text. The M2/M4 loop contracts (repeat
+  escalates; a denied gate is never re-asked) keep their
+  behavior. New tests: 24 (signature forms + the plumbing set,
+  stage rules incl. the gate shape, the matrix scenario as a
+  loop fixture, judge delta matching, temperature plumbing).
+- Temperature: LLMSettings gains temperature (default 0.0),
+  read from FREETALON_LLM_TEMPERATURE and threaded to both
+  _call_ollama (options) and _call_openai_compatible; the
+  formatter path inherits it via the planner's settings copy.
+  An invalid or negative value falls back to 0.0 rather than
+  raising: a mistyped sampling knob must not brick intake, and
+  0.0 is the behavior every run shipped with. (The neighboring
+  timeout knob raises on bad input; temperature deliberately
+  differs, per the cycle-3 brief.)
+- Measurement: suite 1038/1038 green (1014 baseline + 24
+  new); framework guard ALL CHECKS PASSED; corpus replay
+  CYCLE3 identical to cycle 2 (accepted 2/28, accepted-sound
+  2/28, accepted-unsound 0) -- expected: the fix is loop-side
+  and the replay path never imports the memory module. No
+  live driver runs in this cycle; the Arm A re-run is the
+  next step, now unblocked. Log:
+  /home/seeker/freetalon-workspace/logs/memory-signature-2026-11-17.log.

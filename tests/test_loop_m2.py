@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from freetalon.orchestrator.loop import LoopRunner
-from freetalon.orchestrator.memory import ExperimentStore
+from freetalon.orchestrator.memory import ExperimentStore, goal_key_for
 from freetalon.orchestrator.models import (
     ExecutionPlan,
     GoalContract,
@@ -168,6 +168,192 @@ class TestLoopMemory(unittest.TestCase):
             # does not block it.
             self.assertEqual(len(result2.measurements), 1)
             self.assertEqual(memory.count(), 2)
+
+
+def _measured(verdict="FAIL", exit_code=1):
+    return {
+        "node_id": "n",
+        "verdict": verdict,
+        "results": [
+            {"criterion": {"type": "exit_code", "equals": 0},
+             "passed": verdict == "PASS", "measured": True,
+             "detail": f"exit_code {exit_code} != 0" if verdict == "FAIL" else "ok"}
+        ],
+        "metrics": {},
+        "exit_code": exit_code,
+        "duration_s": 0.1,
+    }
+
+
+def _seed(memory, node, verdict="FAIL", decision="REPLAN"):
+    return memory.record(
+        run_id="run-history",
+        goal_key=goal_key_for("test goal"),
+        domain="general",
+        node=node,
+        measurement=_measured(verdict),
+        decision=decision,
+    )
+
+
+class TestLoopMemorySignature(unittest.TestCase):
+    """Cycle 3: repeat detection matches substance, not wording.
+
+    The fixture mirrors the 2026-11-17 live matrix run: Arm A's plan
+    (plan-7885a4ef9d99) was accepted, then blocked before node-1
+    because its generic verification node text-matched a historical
+    curl failure. The historical records below mirror the real memory
+    state for that goal (executed curl/test/server failures whose
+    causes were upstream; scaffold writes that passed).
+    """
+
+    def _matrix_history(self, memory):
+        _seed(memory, PlanNode(
+            id="node-4", objective="Verify /health live", assigned_claw="bash",
+            inputs={"command": "curl -s http://localhost:8765/health"},
+            criteria=[{"type": "exit_code", "equals": 0}],
+        ), verdict="FAIL")
+        _seed(memory, PlanNode(
+            id="node-2", objective="Run tests after modifying api.py",
+            assigned_claw="bash",
+            inputs={"command": "cd /repo && ./.venv/bin/python -m unittest discover -s tests"},
+            criteria=[{"type": "exit_code", "equals": 0}],
+        ), verdict="FAIL")
+        _seed(memory, PlanNode(
+            id="node-3", objective="Start the FreeTalon API server",
+            assigned_claw="bash",
+            inputs={"command": "cd /repo && ./venv/bin/python -m freetalon.cli start"},
+            criteria=[{"type": "exit_code", "equals": 0}],
+        ), verdict="FAIL")
+        _seed(memory, PlanNode(
+            id="node-1", objective="Extend the API module",
+            assigned_claw="scaffold",
+            inputs={"file_path": "/repo/freetalon/api.py", "content": "# code\n"},
+            criteria=[{"type": "file_exists", "path": "/repo/freetalon/api.py"}],
+        ), verdict="PASS", decision="CONTINUE")
+
+    def _matrix_plan(self):
+        # The Arm A plan's shape: two substantive writes, then the
+        # universal plumbing tail (run tests, start server, verify).
+        return _plan("plan-matrix", [
+            PlanNode(
+                id="node-1",
+                objective="Extend /repo/freetalon/api.py in place",
+                assigned_claw="scaffold",
+                inputs={"file_path": "/repo/freetalon/api.py",
+                        "content": "# extended module\n"},
+                criteria=[{"type": "file_exists", "path": "/repo/freetalon/api.py"}],
+            ),
+            PlanNode(
+                id="node-2", objective="Write the tests for /health",
+                assigned_claw="scaffold",
+                inputs={"file_path": "/ws/test_health.py",
+                        "content": "# tests\n"},
+                criteria=[{"type": "file_exists", "path": "/ws/test_health.py"}],
+                depends_on=["node-1"],
+            ),
+            PlanNode(
+                id="node-3", objective="Run the tests for /health",
+                assigned_claw="bash",
+                inputs={"command": "./.venv/bin/python /ws/test_health.py"},
+                criteria=[{"type": "exit_code", "equals": 0}],
+                depends_on=["node-2"],
+            ),
+            PlanNode(
+                id="node-4", objective="Start the API server for /health",
+                assigned_claw="bash",
+                inputs={"command": "cd /repo && ./.venv/bin/python -m freetalon.cli stop; "
+                                   "./.venv/bin/python -m freetalon.cli start"},
+                criteria=[{"type": "exit_code", "equals": 0}],
+                depends_on=["node-3"],
+            ),
+            PlanNode(
+                id="node-5", objective="Verify /health live",
+                assigned_claw="bash",
+                inputs={"command": "curl -s http://localhost:8765/health"},
+                criteria=[{"type": "exit_code", "equals": 0}],
+                depends_on=["node-4"],
+            ),
+        ])
+
+    def test_matrix_plan_is_not_a_repeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, _, _, memory = _make_runner(tmp)
+            self._matrix_history(memory)
+            plan = self._matrix_plan()
+            repeat = runner._find_repeated_approach(
+                plan, goal_key_for("test goal"), "general"
+            )
+            self.assertIsNone(repeat)
+
+    def test_executed_write_repeat_still_escalates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, store, _, memory = _make_runner(tmp)
+            _seed(memory, PlanNode(
+                id="node-1", objective="Write the module the first way",
+                assigned_claw="scaffold",
+                inputs={"file_path": "/ws/api.py", "content": "# v1\n"},
+                criteria=[{"type": "file_exists", "path": "/ws/api.py"}],
+            ), verdict="FAIL")
+            self.assertEqual(memory.count(), 1)
+            # Same mechanism on the same file — different content and
+            # completely different wording. Still a repeat.
+            plan = _plan("plan-repeat", [PlanNode(
+                id="node-1", objective="Completely reworded objective",
+                assigned_claw="scaffold",
+                inputs={"file_path": "/ws/api.py", "content": "# v2, new code\n"},
+                criteria=[{"type": "file_exists", "path": "/ws/api.py"}],
+            )])
+            store.save(plan)
+            contract = GoalContract(
+                objective="test goal", budget=RunBudget(max_replans=0)
+            )
+            result = runner.run_plan(plan, contract, replan_fn=_no_replanner)
+            self.assertIsNotNone(result.escalation)
+            self.assertIn("repeats a measured-failed approach", result.escalation)
+            self.assertIn("/ws/api.py", result.escalation)
+            self.assertEqual(result.measurements, [])  # nothing executed
+            self.assertEqual(memory.count(), 1)  # nothing new recorded
+
+    def test_same_wording_different_mechanism_is_not_a_repeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, _, _, memory = _make_runner(tmp)
+            _seed(memory, PlanNode(
+                id="node-1", objective="Verify /health live",
+                assigned_claw="bash", inputs={"command": "exit 1"},
+                criteria=[{"type": "exit_code", "equals": 0}],
+                hypothesis="Verify /health live",
+            ), verdict="FAIL")
+            plan = _plan("plan-wording", [PlanNode(
+                id="node-1", objective="Verify /health live",
+                assigned_claw="scaffold",
+                inputs={"file_path": "/ws/api.py", "content": "# code\n"},
+                criteria=[{"type": "file_exists", "path": "/ws/api.py"}],
+                hypothesis="Verify /health live",
+            )])
+            repeat = runner._find_repeated_approach(
+                plan, goal_key_for("test goal"), "general"
+            )
+            self.assertIsNone(repeat)
+
+    def test_plumbing_history_does_not_block_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, store, _, memory = _make_runner(tmp)
+            self._matrix_history(memory)
+            plan = _plan("plan-runs", [PlanNode(
+                id="node-1", objective="a trivially passing command",
+                assigned_claw="bash", inputs={"command": "true"},
+                criteria=[{"type": "exit_code", "equals": 0}],
+                hypothesis="true exits zero",
+            )])
+            store.save(plan)
+            contract = GoalContract(
+                objective="test goal", budget=RunBudget(max_replans=0)
+            )
+            result = runner.run_plan(plan, contract, replan_fn=_no_replanner)
+            self.assertIsNone(result.escalation)
+            self.assertEqual(result.goal_verdict, "PASS")
+            self.assertEqual(len(result.measurements), 1)
 
 
 if __name__ == "__main__":

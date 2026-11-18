@@ -21,7 +21,12 @@ from .executor import Executor
 from .gates import GateStatus, GateStore, build_packet, compute_packet_hash
 from .judge import Decision, Judge
 from .measure import VERDICT_FAIL, VERDICT_PASS, VERDICT_UNMEASURABLE, _compare
-from .memory import ExperimentStore, goal_key_for
+from .memory import (
+    ExperimentStore,
+    approach_signature,
+    describe_signature,
+    goal_key_for,
+)
 from .models import (
     ExecutionPlan,
     GoalContract,
@@ -636,17 +641,22 @@ class LoopRunner:
     ) -> str | None:
         """A node that repeats a recorded failed approach for this goal.
 
-        Returns a human description of the repeat, or None. A node with a
-        stated ``differs_by`` is not a repeat — the change is acknowledged.
+        Returns a human description of the repeat, or None. Matching is
+        by approach signature (memory.approach_signature): the node's
+        mechanism and targets, never its objective/hypothesis wording —
+        and only against approaches that were actually tried (executed
+        and measured FAIL; see ExperimentStore.failed_approaches).
+        Plumbing nodes (test runs, live checks, server starts) have no
+        signature and can never be a repeat. A node with a stated
+        ``differs_by`` is not a repeat — the change is acknowledged.
         """
         known = self._memory_store.failed_approaches(goal_key, domain)
+        if not known:
+            return None
         for node in plan.nodes:
-            key = (node.assigned_claw, node.hypothesis or node.objective)
-            if key in known and not node.differs_by:
-                return (
-                    f"{node.assigned_claw!r} / "
-                    f"{node.hypothesis or node.objective!r} (node {node.id})"
-                )
+            signature = approach_signature(node)
+            if signature is not None and signature in known and not node.differs_by:
+                return f"{describe_signature(signature)} (node {node.id})"
         return None
 
     def _record_experiments(

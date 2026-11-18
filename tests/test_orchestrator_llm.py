@@ -276,6 +276,72 @@ class TestIntake(unittest.TestCase):
             settings = LLMSettings.from_env()
         self.assertEqual(settings.api_key, "")
 
+    def test_llm_settings_temperature_defaults_to_zero(self) -> None:
+        # Cycle 3: temperature is a settings field, 0.0 unless the env
+        # knob says otherwise -- zero behavior change at default.
+        self.assertEqual(LLMSettings().temperature, 0.0)
+        env = {k: v for k, v in os.environ.items()
+               if k != "FREETALON_LLM_TEMPERATURE"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(LLMSettings.from_env().temperature, 0.0)
+
+    def test_llm_settings_temperature_from_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"FREETALON_LLM_BACKEND": "ollama",
+             "FREETALON_LLM_TEMPERATURE": "0.7"},
+            clear=False,
+        ):
+            self.assertEqual(LLMSettings.from_env().temperature, 0.7)
+        with patch.dict(
+            os.environ,
+            {"FREETALON_LLM_BACKEND": "openai_compatible",
+             "FREETALON_LLM_TEMPERATURE": "0.35"},
+            clear=False,
+        ):
+            self.assertEqual(LLMSettings.from_env().temperature, 0.35)
+
+    def test_llm_settings_temperature_invalid_env_falls_back(self) -> None:
+        # A mistyped or negative knob falls back to the deterministic
+        # default instead of raising: 0.0 is always safe.
+        for bad in ("banana", "", "-1"):
+            with patch.dict(
+                os.environ,
+                {"FREETALON_LLM_TEMPERATURE": bad},
+                clear=False,
+            ):
+                self.assertEqual(LLMSettings.from_env().temperature, 0.0)
+
+    def test_ollama_payload_carries_settings_temperature(self) -> None:
+        from freetalon.orchestrator.intake import _call_ollama
+
+        settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434",
+            model="test", temperature=0.7,
+        )
+        with patch(
+            "freetalon.orchestrator.intake._post_json",
+            return_value={"message": {"content": "ok"}},
+        ) as post_mock:
+            _call_ollama(settings, "sys", "user")
+        self.assertEqual(
+            post_mock.call_args[0][1]["options"]["temperature"], 0.7
+        )
+
+    def test_openai_payload_carries_settings_temperature(self) -> None:
+        from freetalon.orchestrator.intake import _call_openai_compatible
+
+        settings = LLMSettings(
+            backend="openai_compatible", base_url="http://localhost:8000/v1",
+            model="test", temperature=0.7,
+        )
+        with patch(
+            "freetalon.orchestrator.intake._post_json",
+            return_value={"choices": [{"message": {"content": "ok"}}]},
+        ) as post_mock:
+            _call_openai_compatible(settings, "sys", "user")
+        self.assertEqual(post_mock.call_args[0][1]["temperature"], 0.7)
+
     def test_intake_request_uses_structured_llm_output(self) -> None:
         response = """
         {"goal":"Automate CI triage","project_type":"devops","capabilities":["logs"],"constraints":{},"missing_inputs":["repo name"]}

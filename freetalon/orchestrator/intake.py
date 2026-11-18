@@ -38,6 +38,13 @@ class LLMSettings:
     model: str = _OLLAMA_MODEL
     api_key: str | None = None
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS
+    # Sampling temperature for every call made with these settings
+    # (intake, planner, and the formatter pass, which derives its
+    # settings from the planner's). The default 0.0 keeps generation
+    # deterministic — the loop's live A/B measurements replicate
+    # exactly at temperature 0 (CP2). FREETALON_LLM_TEMPERATURE raises
+    # it when a run needs distinct samples instead of replicas.
+    temperature: float = 0.0
     # Ollama context window for this call (num_ctx). None means the
     # backend default (4096). The planner sets it explicitly: its
     # prompts do not fit in 4096 (retry #22).
@@ -61,12 +68,25 @@ class LLMSettings:
         if timeout_seconds <= 0:
             raise ValueError("FREETALON_LLM_TIMEOUT_SECONDS must be greater than zero.")
 
+        # Temperature is a tuning knob, not an operational limit: a
+        # mistyped or negative value falls back to the deterministic
+        # default instead of bricking intake (0.0 is always safe —
+        # it is the behavior every run shipped with).
+        temperature_text = os.environ.get("FREETALON_LLM_TEMPERATURE", "0")
+        try:
+            temperature = float(temperature_text)
+        except ValueError:
+            temperature = 0.0
+        if temperature < 0:
+            temperature = 0.0
+
         if backend == "ollama":
             return cls(
                 backend="ollama",
                 base_url=os.environ.get("FREETALON_OLLAMA_BASE_URL", _OLLAMA_BASE_URL).strip(),
                 model=os.environ.get("FREETALON_OLLAMA_MODEL", _OLLAMA_MODEL).strip(),
                 timeout_seconds=timeout_seconds,
+                temperature=temperature,
             )
         if backend == "openai_compatible":
             api_key = os.environ.get("FREETALON_OPENAI_API_KEY")
@@ -79,6 +99,7 @@ class LLMSettings:
                 model=os.environ.get("FREETALON_OPENAI_MODEL", _OPENAI_MODEL).strip(),
                 api_key=api_key,
                 timeout_seconds=timeout_seconds,
+                temperature=temperature,
             )
         raise ValueError(
             "Unsupported FREETALON_LLM_BACKEND. Expected 'ollama' or 'openai_compatible'."
@@ -220,7 +241,7 @@ def _call_ollama(settings: LLMSettings, system_prompt: str, user_prompt: str) ->
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "options": {"temperature": 0,
+        "options": {"temperature": settings.temperature,
         	"num_ctx": settings.num_ctx if settings.num_ctx else 4096},
     }
     response = _post_json(
@@ -244,7 +265,7 @@ def _call_openai_compatible(
         headers["Authorization"] = "Bearer " + settings.api_key
     payload = {
         "model": settings.model,
-        "temperature": 0,
+        "temperature": settings.temperature,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
