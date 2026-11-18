@@ -3184,3 +3184,111 @@ Deliberately left out:
   and read whether llama3's verdicts separate the
   Ellipsis shape from the filled-slots shape on the
   real goal before trusting it with the loop.
+
+## Update - 2026-11-18 (Track B live test: the critic's first enable run — machinery verified live, llama3's verdicts do not discriminate on this evidence)
+
+- What ran: the Track B critic enabled live for the
+  first time, in this worktree only (the main
+  checkout, holding the banked /health success at
+  7abb936, was not touched). The stock driver
+  hard-points at the main checkout, so the run used
+  a variant (tools/llm_end_to_end_critic.py in the
+  workspace) identical except sys.path resolves to
+  this worktree and LoopRunner gets an AuditLogger
+  (the stock driver injects none, and loop.critic.*
+  events are only recorded with one). All three
+  critic envs set explicitly:
+  FREETALON_CRITIC_ENABLED=1,
+  FREETALON_CRITIC_OLLAMA_BASE_URL=http://100.87.140.12:11434,
+  FREETALON_CRITIC_OLLAMA_MODEL=llama3:latest.
+  Goal: the /health goal, verbatim as in the driver.
+  Log: logs/critic-live-2026-11-18.log in the
+  workspace; audit trail in
+  logs/critic-live-audit.jsonl.
+- Gates before any GPU work: CI for the parent's
+  7abb936 push (GPU tests run 44422786969) completed
+  SUCCESS (10m47s). Pre-flight: seeker88
+  /api/tags answered with llama3:latest present;
+  GPU idle 47C, limit 300.00W, link x16, Xid count
+  0; worktree clean at 94d32ce; critic tests
+  re-confirmed 15/15 OK.
+- Arm 1 (generator gemma-3-abliterated:latest, the
+  hollow producer): PLANNING FAILURE — the critic
+  never saw a plan. Driver exit 1: after 3 raw
+  planner outputs, plan_task_intent raised
+  LLMResponseError; the final output was rejected
+  with 2 errors (step_1 scaffolds freetalon/api.py
+  dropping 12 of its 12 definitions; step_1 writes
+  a FastAPI app). No plan reached LoopRunner, so
+  the hollow side of the discrimination question
+  is UNTESTED live. No files changed; GPU peak
+  observed 63C.
+- Arm 2 (positive control, generator
+  qwen2.5-coder:14b): plan-237682b2adf9, run
+  run-20261118T235130Z-c37b01, driver exit 0, plan
+  FAILED in 79.2s without executing. The critic
+  reviewed version 1's two write nodes and flagged
+  BOTH hollow. Verbatim reasons (also the
+  critic_review measurements, measured=false,
+  passed=false, nodes marked FAIL):
+  node-1: "critic review (hollow): it assigns an
+  invented constant for a value that exists only by
+  measuring it — a service's reachability, a
+  temperature, any reading of the live world —
+  instead of probing, running, or computing it."
+  node-2: "critic review (hollow): it assigns an
+  invented constant for a value that exists only by
+  measuring it — the GPU temperature, instead of
+  probing or computing it"
+  The judge replanned, its decision carrying both
+  reasons verbatim ("informative failure: node-1:
+  critic review (hollow): ...; node-2: critic
+  review (hollow): ..."); the re-plan delta was
+  then rejected by the approach-signature guard
+  ("re-plan repeats failed approach ('scaffold'
+  write of .../freetalon/api.py) without a stated
+  differs_by") and the run escalated. Audit:
+  loop.critic.reviewed (reviewed=2, hollow=2) and
+  two loop.critic.hollow events; ZERO
+  loop.critic.degraded events — seeker88 answered
+  both calls, so this is a judgment result, not a
+  degraded no-result. GPU peak observed 75C.
+- The verdicts are FALSE POSITIVES, from the run's
+  own plan snapshot (plan-v001.json): node-1's
+  /health branch computes ollama_reachable via
+  socket.create_connection(('localhost', 11434),
+  timeout=1) and gpu_temperature via
+  subprocess.run(['nvidia-smi',
+  '--query-gpu=temperature.gpu', ...]) parsed to
+  int — the same probe code the banked success
+  runs. The critic's content window
+  (_CONTENT_MAX_CHARS=10000) covered the whole
+  branch (content 10574 chars, branch at
+  ~1400-3600). Node-2's test asserts only that the
+  response is 200 and the keys exist; it assigns
+  no constant of any kind. The node-1 reason
+  reproduces the CRITIC_SYSTEM_PROMPT rubric line
+  for this goal's shape ("a service's
+  reachability, a temperature, any reading of the
+  live world") almost verbatim — llama3 matched
+  the rubric to the goal instead of grounding in
+  the content it was shown.
+- Discrimination verdict: NOT demonstrated. The
+  machinery is verified live end-to-end (review
+  fires pre-execution per version, hollow verdicts
+  land as measured=false failures, the brief and
+  the judge carry the reasons, budget behavior as
+  designed), but llama3:latest as configured
+  FAILED the positive control 2/2 and the hollow
+  arm never produced a reviewable plan. Do not
+  trust this critic with the loop as configured;
+  the open questions are critic-side (model,
+  prompt, or what content slice it judges), not
+  seam-side.
+- State: neither arm executed a node; worktree
+  clean after both arms, nothing to restore. Fans
+  restored to auto (GPUFanControlState=0
+  verified); models unloaded (VRAM 80 MiB); main
+  checkout verified untouched at 7abb936, clean.
+  This entry is committed locally on
+  dev/critic-experiment, NOT pushed.
