@@ -47,7 +47,10 @@ class LLMSettings:
     temperature: float = 0.0
     # Ollama context window for this call (num_ctx). None means the
     # backend default (4096). The planner sets it explicitly: its
-    # prompts do not fit in 4096 (retry #22).
+    # prompts do not fit in 4096 (retry #22). FREETALON_LLM_NUM_CTX
+    # sets it from the environment; when set, the planner respects
+    # it instead of substituting its own default (cycle 14:
+    # qwen3.8's plan verbosity overflows the 12288 planner window).
     num_ctx: int | None = None
     format_schema: dict[str, Any] | None = None
     # Ollama thinking control (the top-level "think" chat field).
@@ -100,6 +103,20 @@ class LLMSettings:
         elif think_text in ("0", "false", "no", "off"):
             think = False
 
+        # Num_ctx is a tuning knob like temperature: an unset,
+        # unparsable, or non-positive value leaves it None — the
+        # field unsent, the planner's own default in force (today's
+        # behavior) — never an error that bricks intake.
+        num_ctx_text = os.environ.get("FREETALON_LLM_NUM_CTX", "").strip()
+        num_ctx: int | None = None
+        if num_ctx_text:
+            try:
+                parsed_num_ctx = int(num_ctx_text)
+            except ValueError:
+                parsed_num_ctx = 0
+            if parsed_num_ctx > 0:
+                num_ctx = parsed_num_ctx
+
         if backend == "ollama":
             return cls(
                 backend="ollama",
@@ -108,6 +125,7 @@ class LLMSettings:
                 timeout_seconds=timeout_seconds,
                 temperature=temperature,
                 think=think,
+                num_ctx=num_ctx,
             )
         if backend == "openai_compatible":
             api_key = os.environ.get("FREETALON_OPENAI_API_KEY")
@@ -122,6 +140,7 @@ class LLMSettings:
                 timeout_seconds=timeout_seconds,
                 temperature=temperature,
                 think=think,
+                num_ctx=num_ctx,
             )
         raise ValueError(
             "Unsupported FREETALON_LLM_BACKEND. Expected 'ollama' or 'openai_compatible'."

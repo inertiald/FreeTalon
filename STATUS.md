@@ -4486,3 +4486,78 @@ Deliberately left out:
   dying on anchored-edit discipline
   before a second version can execute.
   Log: logs/health-rerun10-2026-11-18.log.
+
+## Update - 2026-11-18 (Cycle 14: sibling-test grounding for test-writing, the two residual fixture decouplings, an instructive anchored_edit rejection, num_ctx plumbing)
+
+- Target 1 — grounding: `_route_goal_shape` now appends, per
+  serving module, an EXISTING TESTS block carrying the sibling
+  test module (`test_<stem>.py`): whole when it fits the same
+  10,000-char full-source budget as the serving module
+  (tests/test_api.py is 9,846 chars — shown whole), else its
+  construction excerpt (imports, module-level helpers, and each
+  class's setUp/tearDown verbatim, capped at the 8,000-char
+  skeleton cap). Framing: node 2's tests copy these tests'
+  construction; a construction they do not use does not run.
+  No prompt-wording change (0 of the 2 permitted iterations
+  spent). Diags (production intake + plan_task_intent, fans
+  85%): qwen2.5-coder:14b plan ACCEPTED in 47.0s — its test
+  file's setUp is the grounded pattern verbatim (HiveConfig
+  kwargs -> HiveController -> HiveAPIServer -> ephemeral port
+  via server_address[1]); the extracted tests still FAIL
+  (exit 1) on non-construction defects (tempfile/Path/json
+  used but never imported, a requests/urllib conflation, a
+  gpu_temp key expectation, an auth expectation /health does
+  not enforce) — recorded, stopped on qwen. Devstral planning
+  FAILED (3x invalid JSON, StuckRepairError, 156.4s): its
+  verbose scaffolds break mid-string at ~8.3K chars — the
+  grounded prompt (+~2.6K tokens) leaves them no room in the
+  12288 window; its broken outputs still begin the test file
+  with test_api.py's exact import block. Recorded, stopped on
+  devstral; the construction-excerpt presentation (~1.1K
+  tokens) is the identified lever for a future cycle. Bonus:
+  qwen3.8's extracted tests (Target 4 diag) PASS, exit 0, 3/3,
+  with the grounded construction and every import present.
+- Target 2 — decoupling: `_health_branch_span` now skips
+  returns inside definitions nested in the branch, and
+  TestPlannerSignalLossFix's sed fixture derives its pattern
+  from the live file (the full '"status": "ready"' literal on
+  flat shapes, the bare '"status":' key on computed shapes).
+  Suite green in all three tree states: 1143/1143 baseline,
+  1146/1146 flat reference, 1146/1146 nested reference
+  (in-branch helper defs + computed status, Devstral-style).
+  No pins changed.
+- Target 3 — instructive anchored_edit: the brief's premise
+  needed one correction. Gemma4's arm-3 content was NOT a
+  fragment: probed with the production functions, it is a
+  complete def do_GET carrying a bracket mismatch in the
+  retyped body (')' does not match '{'), and the
+  unparseable-delta branch — which fires only on SyntaxError —
+  never named it, so the model was told to fix a defect it
+  did not have and repeated the content 3x. The rejection now
+  names the parser's defect first (message + the content's
+  own line number and text, via a new `_delta_syntax_detail`
+  helper), keeping the complete-definition rule as the frame;
+  same code, same stage, no new machinery. All 3 recorded
+  arm-3 outputs still reject with codes=['anchored_edit'].
+  (The arm-3 entry above repeats the fragment reading; the
+  probe evidence is in the cycle-14 log.)
+- Target 4 — num_ctx: `FREETALON_LLM_NUM_CTX` is parsed in
+  `LLMSettings.from_env` (the temperature rule: unset,
+  unparsable, or non-positive leaves None — today's behavior)
+  and passed for both backends; the planner already respected
+  an explicit value. Default payload pinned byte-identical
+  (options {"temperature": 0.0, "num_ctx": 4096}; 24576 when
+  configured). Diag: qwen3.8:27b with FREETALON_LLM_THINK=0 at
+  24576 — plan ACCEPTED in 48.6s (planning output 10,853
+  chars, complete), the model's first complete planning
+  output of the campaign (cycle 13 at 12288: 0 complete).
+  VRAM peak 19,571 MiB, temp peak 78C, no spill; 32768 not
+  attempted — 24576 completed.
+- Measurement: suite 1132 -> 1143 (+11 tests,
+  TestPlannerCycle14GroundingAndKnobs). Corpus replays
+  before/after identical except per-row wall time (original
+  0/28 accepted, mean 1.32; model-ab gemma3 1.50, qwen 2.00).
+  demo-framework-guard ALL CHECKS PASSED. Pins changed: none.
+  Thermal peaks across diags 80C/78C, fans restored to auto,
+  0 Xid. Log: logs/cycle14-test-grounding-2026-11-18.log.
+  Committed locally, NOT pushed.

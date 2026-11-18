@@ -153,7 +153,10 @@ def _health_branch_span(do_get: str) -> tuple[int, int]:
     """(start, end) line indexes of the /health branch in a do_GET text.
 
     The branch runs from its `if path == "/health":` line through the
-    branch's own return line (the first return at a deeper indent).
+    branch's own return line (the first return at a deeper indent
+    that is not inside a definition nested in the branch — a
+    computed branch may define helpers first, whose returns precede
+    its own; cycle 14, re-run #10 arm 2).
     Cycle 10: fixtures find the branch in whatever form the current
     module carries it — the one-line return today, a computed
     multi-line branch once /health is really implemented — instead of
@@ -167,9 +170,21 @@ def _health_branch_span(do_get: str) -> tuple[int, int]:
         i for i, line in enumerate(lines) if 'if path == "/health":' in line
     )
     indent = len(lines[start]) - len(lines[start].lstrip())
+    nested_indent: int | None = None
     for i in range(start + 1, len(lines)):
         stripped = lines[i].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
         line_indent = len(lines[i]) - len(lines[i].lstrip())
+        if nested_indent is not None:
+            if line_indent > nested_indent:
+                # Inside a definition nested in the branch: its
+                # returns are the helper's, not the branch's own.
+                continue
+            nested_indent = None
+        if stripped.startswith(("def ", "class ", "async def ")):
+            nested_indent = line_indent
+            continue
         if (
             stripped == "return"
             or stripped.startswith("return ")
@@ -8419,6 +8434,29 @@ class TestPlannerSignalLossFix(unittest.TestCase):
 
     def test_sed_against_existing_pattern_and_write_to_existing_dir_pass(self) -> None:
         test_path = str(self.repo_root / "tests" / "test_health_check.py")
+        # Cycle 14: the sed pattern is derived from the live file,
+        # the way _expected_retry16_error_line derives its line —
+        # the recorded literal '"status": "ready"' is the PRE-goal
+        # branch's text, and a computed status (re-run #10 arm 2's
+        # nested dict) removes it, so the passing fixture became
+        # the no-op rejection it exists to contrast with. The
+        # branch's status fragment as it stands today — the full
+        # '"status": "ready"' literal on the flat form, the bare
+        # '"status":' key on a computed form — is the pattern a
+        # real sed would target.
+        import re
+
+        source = Path(self.api_path).read_text(encoding="utf-8")
+        status_match = re.search(r'"status": "[^"]*"', source) or re.search(
+            r'"status":', source
+        )
+        self.assertIsNotNone(status_match)
+        assert status_match is not None
+        status_pattern = status_match.group(0)
+        if status_pattern.endswith('"'):
+            status_replacement = status_pattern + ', "ollama": "reachable"'
+        else:
+            status_replacement = status_pattern
         nodes = [
             {
                 "id": "step_1",
@@ -8427,8 +8465,8 @@ class TestPlannerSignalLossFix(unittest.TestCase):
                 "assigned_claw": "bash",
                 "inputs": {
                     "command": (
-                        "sed -i 's/\"status\": \"ready\"/\"status\": \"ready\", "
-                        f"\"ollama\": \"reachable\"/' {self.api_path}"
+                        f"sed -i 's/{status_pattern}/{status_replacement}/' "
+                        f"{self.api_path}"
                     )
                 },
                 "outputs": [self.api_path],
@@ -21007,3 +21045,303 @@ class TestPlannerCycle13ThinkAndSteeringFix(unittest.TestCase):
             self.assertIn("scoped", prompt)
             self.assertIn("60-second", prompt)
             self.assertIn("its own node", prompt)
+
+
+class TestPlannerCycle14GroundingAndKnobs(unittest.TestCase):
+    """Cycle 14: sibling-test grounding, the instructive
+    anchored_edit rejection, and the num_ctx knob (re-run #10).
+
+    Re-run #10's terminal defect was singular: both executing arms
+    wrote correct, computing /health code, and both died on the
+    TEST they wrote for it — qwen's setUp called
+    self.server._httpd.Handler() (AttributeError), Devstral's
+    called RequestHandlerClass(...) without its server argument.
+    Across re-runs #9-#10 the models produced four distinct wrong
+    constructions of the API handler, while tests/test_api.py —
+    never shown to them — constructs the server correctly
+    (HiveConfig -> HiveController -> HiveAPIServer -> start on an
+    ephemeral port, the port read back from the server). The route
+    grounding now carries the sibling test module alongside the
+    serving module (Target 1). The same run's replans died
+    repeating an anchored_edit rejection whose text named a
+    fragment defect the model's content did not have — gemma4's
+    outputs were COMPLETE definitions carrying a bracket mismatch,
+    misdiagnosed because the unparseable-delta branch never asked
+    the parser what was wrong; the rejection now names the
+    parser's own defect (Target 3). And qwen3.8's plans overflow
+    the 12288 planner window on verbosity alone (cycle 13), so
+    FREETALON_LLM_NUM_CTX plumbs an explicit window into
+    LLMSettings, which the planner already respects when set
+    (Target 4). Target 2's span fix is pinned here hermetically;
+    its sed-fixture fix is exercised by TestPlannerSignalLossFix
+    itself in the three tree states of the cycle-14 acceptance.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    def _repo_root(self) -> Path:
+        return Path(__file__).resolve().parent.parent
+
+    # --- Target 4: the num_ctx knob ---
+
+    def test_llm_settings_num_ctx_defaults_to_none(self) -> None:
+        # The default sends nothing new: the field is None on a
+        # hand-built settings object and from the environment
+        # without the knob — the planner's own default rules.
+        self.assertIsNone(LLMSettings().num_ctx)
+        env = {k: v for k, v in os.environ.items()
+               if k != "FREETALON_LLM_NUM_CTX"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(LLMSettings.from_env().num_ctx)
+
+    def test_llm_settings_num_ctx_from_env(self) -> None:
+        # Parsed once, for either backend (like think and
+        # temperature); only the Ollama payload sends it.
+        for backend in ("ollama", "openai_compatible"):
+            with patch.dict(
+                os.environ,
+                {"FREETALON_LLM_BACKEND": backend,
+                 "FREETALON_LLM_NUM_CTX": "24576"},
+                clear=False,
+            ):
+                self.assertEqual(
+                    LLMSettings.from_env().num_ctx, 24576, backend
+                )
+
+    def test_llm_settings_num_ctx_unparsable_falls_back_to_none(self) -> None:
+        # A mistyped knob must not brick intake (the temperature
+        # rule): unparsable, empty, or non-positive leaves the
+        # field unsent — today's behavior.
+        for bad in ("banana", "", "0", "-4096", "12.5"):
+            with patch.dict(
+                os.environ,
+                {"FREETALON_LLM_NUM_CTX": bad},
+                clear=False,
+            ):
+                self.assertIsNone(LLMSettings.from_env().num_ctx, bad)
+
+    def test_ollama_payload_num_ctx_default_and_configured(self) -> None:
+        from dataclasses import replace as dataclass_replace
+
+        from freetalon.orchestrator.intake import _call_ollama
+
+        base = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434",
+            model="test",
+        )
+        # Default: the payload's options block is exactly the
+        # pre-cycle-14 one (the backend default 4096 stands in for
+        # the unset field, as before).
+        with patch(
+            "freetalon.orchestrator.intake._post_json",
+            return_value={"message": {"content": "ok"}},
+        ) as post_mock:
+            _call_ollama(base, "sys", "user")
+        self.assertEqual(
+            post_mock.call_args[0][1]["options"],
+            {"temperature": 0.0, "num_ctx": 4096},
+        )
+        settings = dataclass_replace(base, num_ctx=24576)
+        with patch(
+            "freetalon.orchestrator.intake._post_json",
+            return_value={"message": {"content": "ok"}},
+        ) as post_mock:
+            _call_ollama(settings, "sys", "user")
+        self.assertEqual(
+            post_mock.call_args[0][1]["options"]["num_ctx"], 24576
+        )
+
+    # --- Target 3: the rejection names the parser's defect ---
+
+    def test_delta_syntax_detail_names_defect_and_line(self) -> None:
+        from freetalon.orchestrator.planner import _delta_syntax_detail
+
+        content = (
+            "            def do_GET(self) -> None:\n"
+            "                return self._send(200, {\"ok\": True)\n"
+        )
+        detail = _delta_syntax_detail(content)
+        self.assertIn("does not match", detail)
+        self.assertIn("on line 2", detail)
+        self.assertIn("return self._send", detail)
+        # A parseable delta has no syntax defect to name.
+        self.assertEqual(
+            _delta_syntax_detail(
+                "            def do_GET(self) -> None:\n"
+                "                return self._send(200, {\"ok\": True})\n"
+            ),
+            "",
+        )
+
+    def _anchored_plan(self, content: str) -> str:
+        import json
+
+        api_path = str(self._repo_root() / "freetalon" / "api.py")
+        nodes = [
+            {
+                "id": "step_1",
+                "objective": "Extend the /health branch in freetalon/api.py",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {
+                    "file_path": api_path,
+                    "anchor": "HiveAPIServer.start.Handler.do_GET",
+                    "position": "replace",
+                    "content": content,
+                },
+                "outputs": [api_path],
+                "acceptance": ["The /health branch is extended."],
+                "criteria": [{"type": "file_exists", "path": api_path}],
+            }
+        ]
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def test_replace_delta_syntax_error_rejection_teaches(self) -> None:
+        # Gemma4's re-run #10 shape in miniature: a COMPLETE
+        # definition whose only defect is a bracket mismatch. The
+        # old text called this a fragment; the rejection must now
+        # name the parser's defect, keep the anchored_edit code,
+        # and keep the complete-definition rule as the frame.
+        raw = self._anchored_plan(
+            "            def do_GET(self) -> None:\n"
+            "                return self._send(200, {\"ok\": True)\n"
+        )
+        with self.assertRaises(Exception) as caught:
+            parse_planner_response(
+                raw, goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        anchored = [
+            e for e in caught.exception.plan_errors
+            if e.code == "anchored_edit"
+        ]
+        self.assertEqual(len(anchored), 1)
+        message = anchored[0].message
+        self.assertIn("does not parse as Python", message)
+        self.assertIn("does not match", message)
+        self.assertIn("on line 2", message)
+        self.assertIn("complete new version", message)
+        self.assertNotIn("does not parse as a definition on its own", message)
+
+    def test_replace_delta_fragment_still_rejected(self) -> None:
+        # A parseable fragment (a bare statement at the def's
+        # indentation, no definition) keeps its own rejection —
+        # same code, the complete-definition rule stated.
+        raw = self._anchored_plan("            _health = {}\n")
+        with self.assertRaises(Exception) as caught:
+            parse_planner_response(
+                raw, goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        anchored = [
+            e for e in caught.exception.plan_errors
+            if e.code == "anchored_edit"
+        ]
+        self.assertEqual(len(anchored), 1)
+        self.assertIn("complete new version", anchored[0].message)
+
+    # --- Target 1: sibling-test grounding ---
+
+    def test_route_goal_shape_carries_sibling_test_module(self) -> None:
+        from freetalon.orchestrator.planner import _route_goal_shape
+
+        shape = _route_goal_shape(self.HEALTH_GOAL, self._repo_root())
+        self.assertIn("EXISTING TESTS", shape)
+        # The sibling is named, and its construction pattern is in
+        # the prompt verbatim: the controller -> server build and
+        # the ephemeral-port read from tests/test_api.py.
+        self.assertIn("tests/test_api.py", shape)
+        self.assertIn("HiveAPIServer(self.controller", shape)
+        self.assertIn("server_address[1]", shape)
+        # The block rides inside the module's grounding: after the
+        # module block, before the COMMANDS block.
+        self.assertLess(
+            shape.index("EXISTING MODULE"), shape.index("EXISTING TESTS")
+        )
+        self.assertLess(
+            shape.index("EXISTING TESTS"), shape.index("COMMANDS")
+        )
+
+    def test_sibling_test_module_resolution(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _sibling_test_module,
+            build_repo_index,
+        )
+
+        index = build_repo_index(self._repo_root())
+        sibling = _sibling_test_module(index, "freetalon/api.py")
+        self.assertIsNotNone(sibling)
+        assert sibling is not None
+        self.assertEqual(sibling.name, "test_api.py")
+        self.assertEqual(sibling.parent.name, "tests")
+        # A module with no sibling test module resolves to None —
+        # no block, no error.
+        self.assertIsNone(
+            _sibling_test_module(index, "freetalon/orchestrator/planner.py")
+        )
+
+    def test_test_module_construction_excerpt_keeps_setup_only(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _test_module_construction,
+        )
+
+        pad = "\n".join(
+            f"def helper_{i}():\n    return {i}\n" for i in range(400)
+        )
+        source = (
+            "import unittest\n\n\n"
+            "class TestBig(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.subject = build_the_subject()\n"
+            "    def test_something(self):\n"
+            "        self.assertTrue(ASSERTION_ONLY_MARKER)\n\n\n"
+            + pad
+        )
+        self.assertGreater(len(source), 10_000)
+        excerpt = _test_module_construction(source)
+        # Construction survives; assertion bodies do not — the
+        # excerpt teaches how the subject is built, not what the
+        # existing tests assert.
+        self.assertIn("build_the_subject()", excerpt)
+        self.assertIn("class TestBig:", excerpt)
+        self.assertNotIn("ASSERTION_ONLY_MARKER", excerpt)
+        self.assertLessEqual(len(excerpt), 8_100)
+
+    # --- Target 2: the branch span skips nested helpers ---
+
+    def test_health_branch_span_skips_nested_helper_returns(self) -> None:
+        # Devstral's executed shape (re-run #10 arm 2): helpers
+        # defined inside the branch return before the branch's own
+        # return. The span must end at the branch's own return.
+        nested = (
+            "            def do_GET(self) -> None:\n"
+            "                parsed = urlparse(self.path)\n"
+            "                path = parsed.path\n"
+            "\n"
+            "                if path == \"/health\":\n"
+            "                    import socket\n"
+            "\n"
+            "                    def check_ollama():\n"
+            "                        try:\n"
+            "                            return True\n"
+            "                        except Exception:\n"
+            "                            return False\n"
+            "\n"
+            "                    status = {\"service\": \"running\"}\n"
+            "                    return self._send(200, {\"ok\": True, \"status\": status})\n"
+            "\n"
+            "                if path == \"/status\":\n"
+            "                    return self._send(200, {})\n"
+        )
+        start, end = _health_branch_span(nested)
+        lines = nested.splitlines()
+        self.assertIn('if path == "/health":', lines[start])
+        self.assertIn("return self._send", lines[end])
+        self.assertIn('"status": status', lines[end])
+        # The flat shape keeps its cycle-10 answer.
+        flat = (
+            "            def do_GET(self) -> None:\n"
+            "                if path == \"/health\":\n"
+            "                    return self._send(200, {\"ok\": True})\n"
+        )
+        start, end = _health_branch_span(flat)
+        self.assertIn("return self._send", flat.splitlines()[end])

@@ -1931,6 +1931,29 @@ def _delta_top_level_def_names(content: str) -> list[str] | None:
     ]
 
 
+def _delta_syntax_detail(content: str) -> str:
+    """The dedented delta's syntax error, or "" when it parses.
+
+    Form: "<parser message> on line <n>: '<the line's text>'" — the
+    line number and text are the content's own (dedent preserves
+    both), so the model can find the exact line it wrote. The
+    materialize rejection for an unparseable 'replace' delta names
+    this defect: without it the rejection can only say "not a
+    definition", which misdiagnoses a complete definition carrying
+    a typo as a fragment (re-run #10 arm 3: gemma4's bracket
+    mismatch, repeated verbatim 3x under the fragment text).
+    """
+    try:
+        ast.parse(textwrap.dedent(content))
+    except SyntaxError as exc:
+        detail = _syntax_error_detail(exc)
+        lines = content.splitlines()
+        if exc.lineno is not None and 1 <= exc.lineno <= len(lines):
+            return f"{detail}: {lines[exc.lineno - 1].strip()!r}"
+        return detail
+    return ""
+
+
 # First-token shapes of a line of Python code, for the code-presence
 # test below: a keyword-led statement, a decorator, a name-led
 # assignment / call / subscript / operator expression, or a line
@@ -2228,14 +2251,27 @@ def _materialize_scaffold_edit(
         leaf = anchor.rsplit(".", 1)[-1]
         top = _delta_top_level_def_names(content)
         if top is None:
+            # Cycle 14: the dedented content does not parse at all,
+            # and the old text named only the fragment defect — but
+            # the recorded failure (re-run #10 arm 3) was a COMPLETE
+            # definition carrying a bracket mismatch: told to fix a
+            # defect it did not have, the model repeated the content
+            # verbatim 3x. Name the parser's own defect (detail +
+            # the content line it lands on) first; the complete-
+            # definition rule stays, as the frame the fix lands in.
+            detail = _delta_syntax_detail(content)
+            detail_part = f" ({detail})" if detail else ""
             return (
                 f"Planner node '{label}' anchors a 'replace' edit on "
                 f"{anchor!r} in {target!r}, but the content does not "
-                "parse as a definition on its own — for 'replace' the "
+                f"parse as Python{detail_part} — for 'replace' the "
                 f"content is the complete new version of {anchor!r} "
                 "(decorators if any, the def/class line, and the whole "
-                "body), at its indentation in the file — not a fragment "
-                "of its body and not a comment about it.",
+                "body), at its indentation in the file, parsing exactly "
+                "as written: find the defect named above (a bracket, "
+                "quote, or indentation slip is the usual cause) and "
+                "fix that line — not a fragment of its body and not a "
+                "comment about it.",
                 False,
             )
         if top != [leaf]:
@@ -6114,6 +6150,137 @@ def _existing_module_skeleton(path: str | Path) -> str:
     return _cap_skeleton(_module_skeleton(source))
 
 
+def _sibling_test_module(index: Any, module: str) -> Path | None:
+    """The repo's existing test module for a module, or None.
+
+    The repo's own convention: freetalon/api.py is tested by
+    tests/test_api.py — test_<stem>.py in a tests/ directory at
+    the repo root. The repo index walks only the package, so the
+    sibling is resolved on disk: the conventional location first,
+    then a bounded walk for the same name elsewhere in the tree
+    (the package itself, VCS internals, the venv, and the model
+    store pruned). Existence is all that is claimed here; the
+    caller reads and parses the file.
+    """
+    wanted = f"test_{Path(module).stem}.py"
+    root = Path(index.root)
+    conventional = root / "tests" / wanted
+    if conventional.is_file():
+        return conventional
+    pruned = {".git", ".venv", "models", "__pycache__", Path(module).parts[0]}
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in pruned)
+        if wanted in filenames:
+            found.append(Path(dirpath) / wanted)
+    if not found:
+        return None
+    found.sort(key=lambda p: (len(p.parts), p.as_posix()))
+    return found[0]
+
+
+def _test_module_construction(source: str) -> str:
+    """The construction excerpt of a test module too big to show whole.
+
+    Imports, module-level statements and helpers, and every test
+    class's setUp/tearDown, verbatim — the parts that show how the
+    subject is built and reached. The test methods themselves are
+    omitted: the pattern being taught is construction, not
+    assertion. Capped like the structure skeleton.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ""
+    pieces: list[str] = []
+    for node in tree.body:
+        if isinstance(
+            node,
+            (
+                ast.Import,
+                ast.ImportFrom,
+                ast.Assign,
+                ast.AnnAssign,
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+            ),
+        ):
+            segment = ast.get_source_segment(source, node)
+            if segment:
+                pieces.append(segment)
+        elif isinstance(node, ast.ClassDef):
+            methods = [
+                child
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and child.name
+                in ("setUp", "tearDown", "setUpClass", "tearDownClass")
+            ]
+            segments = [
+                segment
+                for segment in (
+                    ast.get_source_segment(source, method) for method in methods
+                )
+                if segment
+            ]
+            if segments:
+                pieces.append(
+                    f"class {node.name}:\n" + "\n\n".join(segments)
+                )
+    excerpt = "\n\n".join(pieces)
+    if len(excerpt) <= _STRUCTURE_SKELETON_MAX_CHARS:
+        return excerpt
+    cut = excerpt.rfind("\n", 0, _STRUCTURE_SKELETON_MAX_CHARS)
+    if cut <= 0:
+        cut = _STRUCTURE_SKELETON_MAX_CHARS
+    return excerpt[:cut] + "\n# ... (construction excerpt truncated here)"
+
+
+def _sibling_test_grounding(index: Any, module: str) -> str:
+    """Grounding: how the repo's own tests construct the module's subject.
+
+    The route grounding shows the model the serving module's
+    source but never its tests, so the model invents the subject's
+    construction — and invents it wrong: across re-runs #9-#10 the
+    models produced four distinct broken constructions of the API
+    handler (a bare RequestHandlerClass(), a MagicMock spec,
+    _httpd.Handler(), RequestHandlerClass missing its server
+    argument) while tests/test_api.py, never shown, constructs the
+    server correctly. The sibling test module rides along in the
+    shape: whole, when it fits the same full-source budget as the
+    serving module itself; as its construction excerpt when it
+    does not. "" when the module has no sibling test module.
+    """
+    path = _sibling_test_module(index, module)
+    if path is None:
+        return ""
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    try:
+        ast.parse(source)
+    except SyntaxError:
+        return ""
+    if len(source) <= _STRUCTURE_FULL_SOURCE_MAX_CHARS:
+        body, form = source.rstrip(), "full current source"
+    else:
+        body, form = _test_module_construction(source), "construction excerpt"
+    if not body:
+        return ""
+    return (
+        f"EXISTING TESTS — {path} already tests this module. Node "
+        "2's tests must construct the subject the way these tests "
+        "do: copy their construction — what they build, in what "
+        "order, and how they reach the running subject — instead "
+        "of inventing a construction of your own (a construction "
+        "these tests do not use, like instantiating an inner "
+        "class of the subject directly, does not run). The test "
+        f"module's {form} is below."
+        f"\n```python\n{body}\n```"
+    )
+
+
 def _route_goal_shape(
     goal_text: str | None,
     repo_root: str | Path | None = None,
@@ -6277,6 +6444,14 @@ def _route_goal_shape(
                     "B, which is defined inside A)."
                     f"\n```python\n{text}\n```"
                 )
+        # Cycle 14: the module's tests ride along with its source —
+        # the model has always been shown how the endpoint is
+        # served, never how the repo constructs it in a test, and
+        # the invented constructions are the campaign's terminal
+        # defect (see _sibling_test_grounding).
+        tests_block = _sibling_test_grounding(index, module)
+        if tests_block:
+            lines.append(tests_block)
     # Retry #25: attempt 1's scaffold plan was good code and failed
     # ONLY on two interpreter strings the model composed from prose —
     # a bare `python` in a step-2 criterion command and
