@@ -4244,3 +4244,83 @@ Deliberately left out:
   rows identical — zero rows moved by
   any of the three targets.
   Log: logs/cycle13-think-and-fixtures-2026-11-18.log.
+
+## Update - 2026-11-18 (Live re-run #10, Arm 1: qwen2.5-coder:14b control on cycle 13 — the closest arm of the campaign: with-changes suite fails on exactly ONE error, the model's own test setUp; cycle-13 fixture decoupling verified live)
+
+- Run (FREETALON_OLLAMA_MODEL=qwen2.5-coder:14b,
+  FREETALON_LLM_TEMPERATURE=0.0, timeout 900,
+  FREETALON_LLM_THINK unset, formatter OFF,
+  critic OFF; driver exit 0; run
+  run-20261118T205839Z-97d8c5; loop elapsed
+  535.2s; plan plan-237682b2adf9 accepted
+  round one (1 initial raw output; 4 total
+  incl. the replan sequence); GPU peak
+  observed 57C, no thermal pause, 0 Xid;
+  fans manual 85% during, auto after,
+  verified GPUFanControlState=0): node-1
+  PASS (anchored /health replacement
+  +21/-1, computes ollama_reachable via a
+  subprocess curl probe and gpu_temperature
+  via nvidia-smi; keys ok / status /
+  ollama_reachable / gpu_temperature);
+  node-2 PASS (tests/test_health.py new,
+  with import json); node-3 FAIL exit_code
+  1 after 467.9s; nodes 4-5 never ran.
+- With-changes suite (the run's node-3):
+  Ran 1133 tests, FAILED (errors=1) — the
+  ONLY failure is the model's own test:
+  test_health.TestHealthEndpoint
+  .test_health_endpoint errors in setUp,
+  self.server._httpd.Handler() ->
+  AttributeError: '_ThreadingHTTPServer'
+  object has no attribute 'Handler'. All
+  thirteen re-run #9 couplings are gone —
+  no cycle-12/13 fixture errors, no
+  retry16 line pins, no anchored-edit
+  fixture failures: cycle 13's decoupling
+  holds live. Zero API-behavior failures.
+- The endpoint itself was right: a live
+  check with the changes in place
+  returned 200 {"ok": true, "status":
+  "ready", "ollama_reachable": true,
+  "gpu_temperature": 49} against a
+  concurrent nvidia-smi reading of 49,
+  with Ollama answering on 11434 —
+  extended checks (1) and (2) pass on
+  the values (computed via subprocess
+  probes, not literals). Checks (3)
+  and (4) fail on the single setUp
+  error: the run's one new test errors
+  instead of passing, and the suite is
+  not green with the changes in place.
+- Scoped-run steering uptake: none.
+  plan-237682b2adf9 keeps its pre-cycle-13
+  shape; node-2's only criterion is
+  file_exists, so the broken setUp
+  surfaced inside the full suite rather
+  than at the test node.
+- Judge: replan (informative); the
+  replan's repair loop stuck on the same
+  anchored_edit rejection 3x — its
+  node-1 'replace' content defined
+  do_GET plus _check_ollama and
+  _check_gpu_temperature at top level
+  (a 'replace' carries exactly one
+  definition); escalate; plan FAILED,
+  1 version.
+- Verdict: FAIL at execution (suite
+  node); NOT a verified success. The
+  remaining wall for this model is a
+  single point: three arms in a row
+  (re-run #9 arms 1 and 3, this arm)
+  wrote computing /health code whose
+  only suite failure is the model's own
+  test construction in setUp — three
+  different wrong ways to build a
+  handler. Files changed:
+  freetalon/api.py (M),
+  tests/test_health.py (new); restored
+  (porcelain 0); post-restore suite
+  re-run 1132/1132 OK in 474.1s
+  (logs/rerun10-arm1-suite-post-restore.out).
+  Log: logs/health-rerun10-2026-11-18.log.
