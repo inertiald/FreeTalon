@@ -2337,3 +2337,70 @@ Deliberately left out:
   on the written tests) should reach the tests themselves next
   live run — where the Ellipsis substance defect is waiting for
   exactly that judgment.
+
+## Update - 2026-11-18 (Live re-run #2 on cycle 4: node-3 unblocked — the feedback loop engages, and the judge brief is the bottleneck)
+
+- Pre-flight (log logs/health-rerun2-2026-11-17.log): GPU 53C
+  idle, power limit 300.00W, link x16 gen4, 0 Xid 79/154,
+  gemma-3-abliterated:latest present, head b00dc18 clean,
+  baseline suite 1044/1044 (436.1s). The push-triggered CI GPU
+  suite ran concurrently in the actions-runner checkout for the
+  first minutes — separate tree, CPU contention only.
+- RUN 1 (defaults; run-20261118T075328Z-4c44d6; driver exit 0;
+  loop elapsed 363.0s plus one thermal pause): plan
+  plan-7885a4ef9d99 accepted; metadata repo_root stamped in all
+  3 versions. THE CYCLE-4 FIX VERIFIED LIVE: node-3
+  (./.venv/bin/python on the written tests) now executes from
+  the repo root — exit 127 is gone in every version of both
+  runs. v1: node-1 PASS (api.py extended), node-2 PASS
+  (scaffold test -> workspace root), node-3 FAIL exit 1 in
+  0.77s — the plan's own test caught the substance exactly as
+  predicted: AssertionError: 'Ellipsis' is not an instance of
+  bool (test_health.py:48, ollama_reachable). Judge: re-plan —
+  "informative failure: node-3: failed criterion: exit_code 1
+  != 0". v2: node-2's test moved to repo tests/ (bash heredoc),
+  node-3 FAIL with the IDENTICAL Ellipsis assertion. v3: same
+  again; escalated — re-plan budget spent (2). Nodes 4-5 never
+  left draft; no live /health. The node-1 delta was
+  byte-identical across v1/v2/v3 (payload[service_status] =
+  ..., payload[ollama_reachable] = ..., payload[gpu_temperature]
+  = ...); the re-plans changed only node-2's form/location.
+  The judge's brief carries the failed CRITERION, not the
+  test's stderr — the assertion text is preserved in the run's
+  memory records but never reaches the re-plan in usable form,
+  so the loop detects the defect precisely and aims the repair
+  blind.
+- RUN 2 (FREETALON_LLM_TEMPERATURE=0.4;
+  run-20261118T081134Z-625d60; driver exit 0; elapsed 256.2s;
+  peak 84C, no pause needed): temperature bought divergence,
+  not progress. v1 was a different 4-node plan (same plan id):
+  test-first with NO api-edit node — node-2 ran the test
+  against the unextended API and failed honestly:
+  'service_status' not found in {'ok': True, 'status':
+  'ready'}. v2 restored the 5-node shape, but the substance
+  changed failure mode: the delta's /health branch returns
+  only {ok, status} — the three fields omitted entirely (no
+  Ellipsis) inside a shortened do_GET. Node-3 failed on the
+  omission assertion (test line 46); v3 reproduced the same
+  omission; escalated on budget.
+- Memory: both runs recorded every executed node's
+  measurement (stage='executed', full stderr preserved on the
+  FAILs, final decision ESCALATE); escalations were
+  budget-spent, NOT memory locks — the cycle-3 signature fix
+  held live again.
+- Files/restore: each run modified freetalon/api.py and wrote
+  tests/test_health.py (plus a workspace-root test_health.py
+  in v1 of each run); all restored/removed after each run;
+  post-run suites 1044/1044 (429.1s after run 1, 431.9s after
+  run 2); tree clean at b00dc18. Thermal: run 1 peaked 86C
+  during the v3 re-plan generation — SIGSTOP pause, resumed
+  at 70C; run 2 peaked 84C; fans manual 85% during runs,
+  auto after (GPUFanControlState=0 verified); 0 Xid
+  throughout.
+- Net: execution-environment coherence is proven live and the
+  loop's feedback cycle (real test -> measurement -> judge)
+  engaged for the first time — and its limit is now precise.
+  Both runs spent both re-plans reproducing the same defect
+  because the re-plan brief is criterion-shaped. The next
+  lever is brief substance (carry the failing assertion /
+  stderr into replan_from_brief), not more re-plan budget.
