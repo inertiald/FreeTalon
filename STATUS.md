@@ -2468,3 +2468,96 @@ Deliberately left out:
   at the same failure again. Next live re-run will show whether
   Gemma uses the substance to change the delta instead of
   re-emitting it.
+
+## Update - 2026-11-18 (Live re-run #3 on cycle 5: the brief carries the failure — the delta does not change)
+
+- Pre-flight (log logs/health-rerun3-2026-11-18.log): GPU 52C
+  idle, power limit 300.00W, link x16 gen4, 0 Xid 79/154,
+  gemma-3-abliterated:latest present, head d49f656 clean,
+  baseline suite 1051/1051 (443.5s).
+- RUN 1 (defaults; run-20261118T085736Z-52cd3a; driver exit 0;
+  loop elapsed 402.5s plus one thermal pause): plan
+  plan-7885a4ef9d99 accepted; repo_root stamped in all 3
+  versions. v1: node-1 PASS (api.py extended), node-2 PASS
+  (scaffold test -> workspace root), node-3 FAIL exit 1 in
+  0.773s — AssertionError: 'Ellipsis' is not an instance of
+  bool (test_health.py:48, ollama_reachable). Judge re-planned
+  x2; v2 (tests moved to repo tests/) and v3 failed node-3 with
+  the identical assertion; escalated — re-plan budget spent.
+  Nodes 4-5 never left draft. THE CYCLE-5 MECHANISM VERIFIED
+  LIVE: briefs are not persisted, so they were reconstructed
+  from the run artifacts through the repo's own Judge +
+  renderer (tools/reconstruct-rerun3-briefs.py) — the brief
+  after v1 carried the bounded diagnostics excerpt (the full
+  failure block: traceback frame test_health.py line 48,
+  "AssertionError: 'Ellipsis' is not an instance of
+  <class 'bool'>", FAILED (failures=1)); the brief after v2
+  carried the same excerpt PLUS the repeat line: "Repeated
+  failure: node node-3 produced the same failure already
+  briefed for plan version 1: AssertionError: 'Ellipsis' is
+  not an instance of <class 'bool'>. The previous delta plan
+  did not remove it; change what produces this result, not
+  just the steps around it." SUBSTANCE: unchanged — the
+  /health branch was byte-identical across v1/v2/v3
+  (payload[service_status] = ..., payload[ollama_reachable] =
+  ..., payload[gpu_temperature] = ...); the only node-1
+  content change v1->v2 was an em-dash in an unrelated M4
+  comment normalized to a space, and v2->v3 was
+  byte-identical. Told exactly what failed, and told it was a
+  repeat, the planner re-emitted the same delta.
+- RUN 2 (FREETALON_LLM_TEMPERATURE=0.4;
+  run-20261118T091913Z-c59c6f; driver exit 0; elapsed 638.7s
+  plus two thermal pauses): divergence, no progress. v1:
+  node-1 FAIL before measuring (exit None) — a scaffold node
+  whose only input was a bash heredoc `command`, writing a
+  standalone workspace api.py whose do_GET set real-typed
+  constants (service_status "running", ollama_reachable True,
+  gpu_temperature 25.0); the claw raised "scaffold claw
+  requires 'file_path' or 'path' in inputs." The brief after
+  v1 carried that error and no diagnostics (no captured
+  output). The re-plan produced a well-formed v2 — with the
+  Ellipsis delta again: node-1 PASS, node-2 PASS (tests ->
+  repo tests/), node-3 FAIL exit 1 in 0.771s, identical
+  Ellipsis assertion. The brief after v2 carried the full
+  diagnostics excerpt (no repeat line — first in-run briefing
+  of that fingerprint). The re-plan it informed degraded
+  below the planning bar: step-1's anchored-edit content
+  arrived with all indentation stripped (and a "mertics"
+  typo) and was rejected (content at 0 spaces, anchor sits at
+  12); the re-planner's repair attempts failed the same way —
+  escalation "re-planner failed", not budget. Only 2 versions
+  executed. The run's one real-valued implementation existed
+  only inside v1's structurally broken node; every well-formed
+  anchored edit in both runs used the Ellipsis form.
+- Memory: both runs recorded every executed node's
+  measurement (stage='executed', full stderr on the FAILs);
+  run 1's escalation was budget-spent, run 2's a re-planner
+  rejection — neither was a memory lock, and every delta plan
+  that reached validate_delta_plan passed it.
+- Files/restore: run 1 modified freetalon/api.py (+21/-25)
+  and wrote tests/test_health.py plus a workspace-root
+  test_health.py; run 2 modified freetalon/api.py (+23/-27)
+  and wrote tests/test_health.py only (the workspace api.py
+  stray dated Nov 17 22:44 predates these runs — run 2 v1's
+  heredoc targeted it but the scaffold node never executed).
+  All restored/removed after each run; post-run suites
+  1051/1051 (433.1s after run 1, 429.1s after run 2); tree
+  clean at d49f656. Thermal: run 1 peaked 87C (SIGSTOP at
+  85C, in-flight generation completed while frozen, SIGCONT
+  at 64C); run 2 peaked 86C with two SIGSTOP pauses (at 85C
+  and 86C, resumed at 65C and 64C); fans manual 85% during
+  runs, auto after (GPUFanControlState=0 verified after each
+  run); 0 Xid throughout; GPU left at 53C idle, 300.00W
+  limit intact.
+- Net: cycle 5's mechanism is proven live — the re-plan brief
+  now carries the failure's substance and names a repeat —
+  and the cycle-5 question is answered no at both
+  temperatures: informed re-plans did not change the delta.
+  The binding limit has moved off the harness's information
+  path (envelope, memory signature, execution base, brief
+  substance all verified live in cycles 2-5) and onto the
+  planner itself: Gemma re-emits the Ellipsis form even when
+  the brief quotes the assertion it causes. Real-typed values
+  appeared exactly once, as hardcoded constants inside a
+  malformed node — the model can produce values, but not yet
+  inside a well-formed edit in response to feedback.
