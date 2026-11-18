@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, replace as dataclass_replace
 import json
+import os
 import re
 import shlex
 import hashlib
@@ -15,7 +16,13 @@ from typing import Any, Collection
 
 from pydantic import ValidationError
 
-from .intake import LLMResponseError, LLMSettings, call_llm, parse_json_object
+from .intake import (
+    LLMBackendError,
+    LLMResponseError,
+    LLMSettings,
+    call_llm,
+    parse_json_object,
+)
 from .repo_index import (
     build_repo_index,
     resolve_repo_root,
@@ -35,7 +42,11 @@ from .measure import (
     measurement_failed_detail,
 )
 from .models import ExecutionPlan, PlanNode, PlanStatus, TaskIntent
-from .prompts import PLANNER_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT
+from .prompts import (
+    FORMATTER_SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT,
+    REPLAN_SYSTEM_PROMPT,
+)
 from .tool_registry import (
     CODE_FILE_SUFFIXES,
     KNOWN_CLAW_NAMES,
@@ -143,6 +154,23 @@ class EmptyPlanError(CheapRejectionError):
     with a concrete grounded skeleton instead of the same rejection again.
     A subclass of CheapRejectionError, so the free re-prompt accounting
     and every caller that catches CheapRejectionError are unaffected.
+    """
+
+
+class StuckRepairError(LLMResponseError):
+    """The repair loop stopped: the same rejection kept recurring.
+
+    Cycle 2 (steal #5, OpenHands' StuckDetector): when one planning
+    call rejects the model's output with the identical structured
+    error signature (same codes on the same nodes) for the third
+    time, further repair prompts are not steering — they are the
+    loop ping-ponging on a defect it cannot fix by re-asking. The
+    repair loop raises this instead of spending the remaining
+    attempts, so the failure escalates to the loop's judge / re-plan
+    path with the repeated defect named. A subclass of
+    LLMResponseError, so every caller that treats a planning failure
+    as an escalation is unaffected; the repeated rejection's
+    PlanError records ride along on ``plan_errors``.
     """
 
 
@@ -989,6 +1017,13 @@ def parse_planner_response(
     # every content check, and the executor see the full-content
     # nodes they see today.
     _materialize_plan_edits(nodes_raw, repo_root)
+
+    # Payload channel (cycle 2): a sole heredoc .py write whose
+    # payload fails to parse but is deterministically repairable is
+    # rerouted to the scaffold form here, at the same raw-dict seam,
+    # so validation judges the repaired content as a file write
+    # instead of rejecting the plan on heredoc fidelity (CP2).
+    _materialize_heredoc_writes(nodes_raw)
 
     # Normalize: topologically order the DAG and assign deterministic
     # node-1, node-2, ... ids, remapping depends_on. Without this the raw
@@ -2092,6 +2127,214 @@ def _materialize_plan_edits(
         cheap=all(placeholder for _error, placeholder in errors),
         suffix=f"\n{_EDIT_SHAPE_EXAMPLE}",
     )
+
+
+def _sole_heredoc_write(command: str) -> tuple[str, str] | None:
+    """The (target, payload) of a bash command whose ONLY effect is one
+    plain ``cat > target <<marker`` heredoc write, else None.
+
+    The payload channel (cycle 2, steal #1b) may only reroute a write
+    it can judge whole: exactly one extracted write, not an append,
+    and nothing else in the command — no second write, no command
+    chained after the closing marker, no ``cd`` prefix. Tee and echo
+    writes are not this shape (their extraction differs) and keep the
+    validator path they have today. The stripped shell (heredoc
+    bodies removed) of a sole write is exactly two non-blank lines:
+    the cat head and the closing marker.
+    """
+    writes = _bash_code_writes(command)
+    if len(writes) != 1:
+        return None
+    target, content, is_append = writes[0]
+    if is_append:
+        return None
+    shell = _strip_heredoc_bodies(command)
+    lines = [line.strip() for line in shell.splitlines() if line.strip()]
+    if len(lines) != 2:
+        return None
+    head, marker_line = lines
+    match = _HEREDOC_RE.fullmatch(head)
+    if match is None or marker_line != match.group("marker"):
+        return None
+    return target, content
+
+
+def _indent_block_body(lines: list[str], header_index: int) -> list[str] | None:
+    """Indent the body a compound header is missing, or None.
+
+    The repair for the payload defect of CP2 / retry #33: a header
+    line (``if __name__ == "__main__":``) whose body statement sits
+    at the header's own indent (``unittest.main()`` at column 0), so
+    the payload cannot parse at all. The un-indented statement has
+    exactly one parseable reading — it is the header's body — so
+    indenting it (and the lines that belong to it: the following
+    lines indented deeper than it) by one level is a deterministic
+    repair, verified by the caller re-parsing the result. None when
+    the shape is anything else: no following statement, a body that
+    is already indented (the error is elsewhere), or tabs in the
+    indentation being shifted.
+    """
+    if header_index < 0 or header_index >= len(lines):
+        return None
+    header = lines[header_index]
+    if not header.strip():
+        return None
+    header_indent = len(header) - len(header.lstrip(" "))
+    body_index: int | None = None
+    for index in range(header_index + 1, len(lines)):
+        if lines[index].strip():
+            body_index = index
+            break
+    if body_index is None:
+        return None
+    body_line = lines[body_index]
+    body_whitespace = body_line[: len(body_line) - len(body_line.lstrip())]
+    if "\t" in body_whitespace:
+        return None
+    body_indent = len(body_whitespace)
+    if body_indent > header_indent:
+        return None
+    shift = " " * 4
+    repaired = list(lines)
+    repaired[body_index] = shift + body_line
+    for index in range(body_index + 1, len(lines)):
+        line = lines[index]
+        if not line.strip():
+            continue
+        whitespace = line[: len(line) - len(line.lstrip())]
+        if "\t" in whitespace or len(whitespace) <= body_indent:
+            break
+        repaired[index] = shift + line
+    return repaired
+
+
+def _repair_indented_blocks(lines: list[str]) -> list[str] | None:
+    """The lines with every missing-indented-block defect repaired.
+
+    Iterates the deterministic repair of _indent_block_body: parse,
+    and while the failure is an "expected an indented block" error,
+    indent that header's body and parse again (a payload can carry
+    the defect more than once). Returns the lines once they parse,
+    or None when any other syntax error stands in the way — that
+    payload is the heredoc_parse validator's to reject, unchanged.
+    """
+    current = list(lines)
+    for _ in range(4):
+        try:
+            ast.parse("\n".join(current))
+            return current
+        except SyntaxError as exc:
+            message = exc.msg or ""
+            if "expected an indented block" not in message:
+                return None
+            match = re.search(r"on line (\d+)", message)
+            if match is None:
+                return None
+            repaired = _indent_block_body(current, int(match.group(1)) - 1)
+            if repaired is None:
+                return None
+            current = repaired
+    try:
+        ast.parse("\n".join(current))
+    except SyntaxError:
+        return None
+    return current
+
+
+def _repair_python_payload(content: str) -> str | None:
+    """A parseable repair of a Python payload, or None.
+
+    The two deterministic normalizations the harness owns, in order:
+    a uniform dedent (the payload copied with one extra indent
+    level throughout — the anchored-edit delta rule, applied to a
+    whole payload) and the missing-indented-block repair of
+    _repair_indented_blocks. None when the payload already parses
+    (nothing to repair) or when neither normalization makes it
+    parse (the defect is the model's to fix, and the heredoc_parse
+    rejection names it as before).
+    """
+    try:
+        ast.parse(content)
+        return None
+    except SyntaxError:
+        pass
+    lines = content.split("\n")
+    candidates = [lines]
+    indents = [
+        len(line) - len(line.lstrip(" ")) for line in lines if line.strip()
+    ]
+    base = min(indents) if indents else 0
+    if base > 0:
+        dedented = _dedent_delta_lines(lines, base)
+        if dedented is not None:
+            candidates.insert(0, dedented)
+    for candidate in candidates:
+        fixed = _repair_indented_blocks(candidate)
+        if fixed is not None:
+            return "\n".join(fixed)
+    return None
+
+
+def _materialize_heredoc_writes(nodes_raw: list[Any]) -> None:
+    """Reroute repairable sole heredoc .py writes to the scaffold claw.
+
+    Cycle 2 (steal #1b — the two-channel payload fix). The CP2
+    binding defect: the model's real plan wrote its test file as a
+    bash heredoc whose payload dedented ``unittest.main()`` out of
+    its ``__main__`` guard — one indentation slip inside a shell
+    string, and the whole plan died at validation while its repair
+    regressed in form. The harness's own grounded skeleton teaches
+    the heredoc form for test files, so rejecting the form (the
+    alternative) would fight the harness's own steering. Instead the
+    materialize stage owns the payload: when a bash node's ONLY
+    effect is one plain heredoc write of a .py file and the payload
+    fails to parse but a deterministic normalization repairs it
+    (verified by re-parsing), the node is rewritten in place to the
+    scaffold form — file_path + the repaired content — so the file
+    travels the payload channel (node data, judged by the scaffold
+    validators: parse, placeholder, retention, elision) instead of
+    depending on heredoc fidelity at execution time.
+
+    Deliberately narrow, so nothing that works today changes shape:
+    a payload that already parses stays a bash heredoc; a payload no
+    normalization repairs stays a bash heredoc too, and the
+    heredoc_parse validator rejects it with the same teaching error
+    as before; appends, tee/echo writes, multi-write commands, and
+    non-.py targets are untouched; a hardcoded-answer literal stays
+    the stand-in rule's, and a placeholder payload stays the
+    placeholder rules'.
+    """
+    for raw in nodes_raw:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("assigned_claw") not in ("bash", "shell_exec"):
+            continue
+        inputs = raw.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        if set(inputs) - {"command", "cmd"}:
+            continue
+        command = inputs.get("command") or inputs.get("cmd")
+        if not isinstance(command, str) or not command:
+            continue
+        sole = _sole_heredoc_write(command)
+        if sole is None:
+            continue
+        target, content = sole
+        target = target.strip().strip("'\"")
+        if not target or Path(target).suffix.lower() != ".py":
+            continue
+        if not is_code_path(target):
+            continue
+        if _literal_is_answer(content):
+            continue
+        repaired = _repair_python_payload(content)
+        if repaired is None:
+            continue
+        if is_placeholder_content(repaired):
+            continue
+        raw["assigned_claw"] = "scaffold"
+        raw["inputs"] = {"file_path": target, "content": repaired}
 
 
 def _bash_interpreter_errors(
@@ -5349,6 +5592,7 @@ _CONTENT_DEFECT_CODES = frozenset(
         "scaffold_overwrite",  # retention guard: drops existing definitions
         "elision",  # elided module content
         "anchored_edit",  # materialization defects (bad anchor/indent/shape)
+        "scope_widening",  # repair left the rejected plan's scope (cycle 2)
     }
 )
 
@@ -6237,6 +6481,17 @@ _APPROACH_MARKERS: tuple[tuple[str, str], ...] = (
         "updated module: every existing definition, kept in the same "
         "place with the same nesting, plus the new code.",
     ),
+    (
+        # Cycle 2: the scope lock's own key. A repair rejected for
+        # leaving the rejected plan's file/dependency scope forbids
+        # the approach in later repair prompts of the same call, the
+        # same way the guard's rejection forbids module replacement.
+        "scope",
+        "Do NOT widen the plan's scope in a repair — no new files, "
+        "no new dependencies. Instead, keep the rejected plan's "
+        "file set and approach and fix the named defect; a wider "
+        "plan must come from a re-plan, not a repair.",
+    ),
 )
 
 
@@ -6258,6 +6513,7 @@ _CODE_TO_APPROACH_KEY = {
     "static_standin": "hardcoded answer",
     "sed_noop": "sed -i",
     "scaffold_overwrite": "of the existing module's",
+    "scope_widening": "scope",
 }
 
 
@@ -6397,6 +6653,386 @@ def _seed_forbidden_block(
 _PLANNER_NUM_CTX = 12288
 
 
+# --- Cycle 2 (2026-11-17): constrained envelope, repair discipline,
+# formatter plumbing ---
+#
+# Built from the prior-art survey's steal list (aider / OpenHands /
+# SWE-agent / Goose), as solutions fitted to FreeTalon's purpose —
+# not as a redesign: the staged loop, the validators, and the gates
+# are unchanged in shape. Three mechanisms land here:
+#
+# 1. The plan ENVELOPE is grammar-constrained at decode time
+#    (steal #1): planner/replan calls to Ollama carry a JSON Schema
+#    in the `format` parameter, so the envelope's shape — a 'nodes'
+#    array of node objects with typed fields and the claw name as an
+#    enum — is guaranteed by the decoder instead of being repaired
+#    after the fact. Code payloads stay inside node inputs as they
+#    do today (the survey's warning is about escaping corrupting
+#    code in JSON; the envelope constraint does not change payload
+#    handling, and the payload channel of _materialize_heredoc_writes
+#    is where payload fidelity is owned). The semantic validators
+#    remain the second layer: schema-stage codes that the grammar
+#    makes unreachable (missing_nodes_array, duplicate keys) simply
+#    stop occurring on the live path; the validators still guard
+#    every other entry point and every semantic rule.
+#
+# 2. The repair loop gains discipline (steal #5): stuck detection
+#    (the same structured error signature three times in one call
+#    stops repairs and escalates), an explicit task restatement in
+#    every repair prompt (re-grounding), and a scope lock (a repair
+#    that writes files the rejected plan did not write — and the
+#    repair prompt did not name — or that installs dependencies the
+#    rejected plan did not, is rejected as 'scope_widening' instead
+#    of being accepted; widening belongs to a re-plan). No new human
+#    gate appears anywhere: escalation goes to the loop's judge /
+#    re-plan path, exactly where planning failures already go.
+#
+# 3. Formatter plumbing (steal #7): an optional second pass that
+#    re-emits a planner response under the envelope schema before
+#    parsing — the architect/editor split, as two prompts over one
+#    local model by default. The endpoint/model are configurable
+#    (FREETALON_FORMATTER_OLLAMA_BASE_URL / _MODEL) so the pass can
+#    later run on another node (e.g. seeker88's Ollama) with no code
+#    change. Off unless configured: with no formatter env set, the
+#    planning path is byte-for-byte the one the suite pins today.
+
+
+def plan_envelope_schema() -> dict[str, Any]:
+    """The plan envelope as a JSON Schema for Ollama's ``format``.
+
+    Derived from the PlanNode contract, kept shallow on purpose
+    (the survey's caveat: deeply nested schemas degrade on small
+    models): the top level requires only the 'nodes' array; each
+    node requires 'id' and 'objective' (PlanNode's two required
+    fields) and types the remaining model-facing fields, with the
+    claw name as an enum over the registry (plus "" — PlanNode's
+    default, whose absence the claw validator names). 'inputs' and
+    each criterion stay free-form objects: their shape is semantic,
+    and the validators own it. Extra keys are not forbidden here —
+    the schema guarantees the envelope, the validators judge the
+    rest, and an over-tight grammar would only trade repairable
+    rejections for degenerate compliance.
+    """
+    node_properties: dict[str, Any] = {
+        "id": {"type": "string"},
+        "objective": {"type": "string"},
+        "depends_on": {"type": "array", "items": {"type": "string"}},
+        "assigned_claw": {
+            "type": "string",
+            "enum": sorted(KNOWN_CLAW_NAMES) + [""],
+        },
+        "inputs": {"type": "object"},
+        "outputs": {"type": "array", "items": {"type": "string"}},
+        "acceptance": {"type": "array", "items": {"type": "string"}},
+        "criteria": {"type": "array", "items": {"type": "object"}},
+        "status": {"type": "string"},
+        "reversible": {"type": "boolean"},
+        "timeout_s": {"type": "number"},
+        "max_retries": {"type": "integer"},
+        "hypothesis": {"type": "string"},
+        "responds_to": {"type": "string"},
+        "differs_by": {"type": "string"},
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "nodes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": node_properties,
+                    "required": ["id", "objective"],
+                },
+            },
+            "metadata": {"type": "object"},
+        },
+        "required": ["nodes"],
+    }
+
+
+@dataclass(frozen=True)
+class FormatterSettings:
+    """Endpoint/model override for the optional formatter pass.
+
+    None fields fall back to the planner call's own settings, so the
+    default formatter is the same local Ollama/Gemma the planner
+    uses — a local two-pass, per the steal-#7 plumbing brief.
+    """
+
+    base_url: str | None = None
+    model: str | None = None
+
+
+def formatter_settings_from_env() -> FormatterSettings | None:
+    """The configured formatter pass, or None when not configured.
+
+    The pass is enabled by FREETALON_FORMATTER_ENABLED (truthy) or
+    by setting either endpoint variable; FREETALON_FORMATTER_OLLAMA_
+    BASE_URL / FREETALON_FORMATTER_OLLAMA_MODEL then select where
+    the formatter call goes (another node's Ollama needs no code
+    change). With none of the three set, planning is single-pass,
+    exactly as before this plumbing existed.
+    """
+    enabled = os.environ.get(
+        "FREETALON_FORMATTER_ENABLED", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+    base_url = (
+        os.environ.get("FREETALON_FORMATTER_OLLAMA_BASE_URL", "").strip()
+        or None
+    )
+    model = (
+        os.environ.get("FREETALON_FORMATTER_OLLAMA_MODEL", "").strip()
+        or None
+    )
+    if not enabled and base_url is None and model is None:
+        return None
+    return FormatterSettings(base_url=base_url, model=model)
+
+
+def reformat_plan_output(
+    response_text: str,
+    settings: LLMSettings,
+    formatter: FormatterSettings,
+) -> str:
+    """Re-emit a planner response under the envelope schema (steal #7).
+
+    The formatter call's only job is form: same plan, same content,
+    exact envelope shape — enforced by passing the envelope schema
+    as the call's format constraint. A formatter backend failure
+    degrades to the planner's original text: the plumbing must never
+    make planning more fragile than the single pass it assists, and
+    the original text's own parse verdict is the honest fallback.
+    """
+    formatter_settings = dataclass_replace(
+        settings,
+        base_url=formatter.base_url or settings.base_url,
+        model=formatter.model or settings.model,
+        format_schema=plan_envelope_schema(),
+    )
+    prompt = (
+        "Re-emit the plan below as ONE JSON object with a \"nodes\" "
+        "array. Keep every node's id, objective, depends_on, "
+        "assigned_claw, inputs, outputs, acceptance and criteria "
+        "exactly as given — change only the form, never the content "
+        "or the meaning.\n\n"
+        f"NODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n\n"
+        f"Plan to re-emit:\n{response_text}\n\n"
+        "JSON Output:"
+    )
+    try:
+        return call_llm(
+            FORMATTER_SYSTEM_PROMPT, prompt, settings=formatter_settings
+        )
+    except LLMBackendError:
+        return response_text
+
+
+# A shell command that installs dependencies: a scope change, never
+# a repair of the plan that was rejected (its commands are pinned by
+# the human-owned shape, per the survey's scope-lock rule).
+_INSTALL_COMMAND_RE = re.compile(
+    r"\b(?:pip3?|apt-get|apt|npm|yarn|pnpm)\s+install\b"
+)
+
+
+def _scope_key(path: str, repo_root: str | Path | None) -> str:
+    """A write path's comparison key: resolved, so the same file
+    spelled absolute in one attempt and relative in another is one
+    scope entry."""
+    return str(_resolve_target_path(path, repo_root))
+
+
+def _response_write_scope(
+    response_text: str,
+) -> tuple[set[str], bool]:
+    """The (write paths, installs-dependencies) scope of a raw output.
+
+    Read leniently (the output may be too malformed for PlanNode
+    validation — that is why it was rejected): the lenient node view
+    feeds the same written-path extraction the validators use. An
+    unparseable output has no scope: it defines no baseline, and its
+    own schema rejection is the signal that matters.
+    """
+    try:
+        payload = parse_json_object(sanitize_llm_output(response_text))
+    except LLMResponseError:
+        return set(), False
+    nodes_raw = payload.get("nodes") if isinstance(payload, dict) else None
+    if not isinstance(nodes_raw, list):
+        return set(), False
+    paths: set[str] = set()
+    installs = False
+    for position, raw in enumerate(nodes_raw, start=1):
+        view = _lenient_node_view(raw, position)
+        if view is None:
+            continue
+        paths.update(_node_written_paths(view))
+        if (view.assigned_claw or "") in ("bash", "shell_exec"):
+            command = view.inputs.get("command") or view.inputs.get("cmd")
+            if isinstance(command, str) and _INSTALL_COMMAND_RE.search(
+                _strip_heredoc_bodies(command)
+            ):
+                installs = True
+    return paths, installs
+
+
+def _prompt_named_paths(prompt: str) -> set[str]:
+    """Absolute paths a prompt names — the harness's own steering is
+    an endorsed scope: a repair that writes a file the repair prompt
+    itself put in front of the model (the grounded skeleton's test
+    file, the extension block's module) is following guidance, not
+    widening the plan."""
+    return {
+        match.group(0).rstrip("),.")
+        for match in _ABS_PATH_RE.finditer(prompt)
+    }
+
+
+def _is_test_file_path(path: str) -> bool:
+    """True for a Python test file: a test_*.py / *_test.py /
+    conftest.py basename, or any .py file under a tests/ directory."""
+    parts = [part for part in re.split(r"[/\\]", str(path)) if part]
+    if not parts or not parts[-1].endswith(".py"):
+        return False
+    name = parts[-1]
+    return (
+        name.startswith("test_")
+        or name.endswith("_test.py")
+        or name == "conftest.py"
+        or "tests" in parts[:-1]
+    )
+
+
+def _scope_widening_error(
+    nodes: list[PlanNode],
+    baseline_paths: set[str],
+    baseline_installs: bool,
+    exempt_paths: set[str],
+    repo_root: str | Path | None,
+    workspace: str | Path | None = None,
+) -> LLMResponseError | None:
+    """A 'scope_widening' rejection when a repair leaves the scope of
+    the plan it repairs, else None.
+
+    Cycle 2 (steal #5, scope lock): a repair round exists to fix the
+    rejected plan, not to redesign it. A would-be-accepted repair
+    that writes a file outside the endorsed scope — or that installs
+    dependencies the rejected plan did not — is rejected with the
+    named code and the original scope spelled out, so the model can
+    either return to the plan's files or let the call escalate to a
+    re-plan, where widening is legitimate. (The framework instance
+    of this rule — a repair swapping the stack — is older: the
+    'framework' validator owns it. This is the generalization to
+    the plan's file set and dependency set.)
+
+    The endorsed scope is the task's own territory rather than the
+    model's invention: the rejected plan's files (the baseline);
+    any path the harness's prompts have named in this call (its
+    steering is guidance the repair is supposed to follow — the
+    grounded move names the serving module and the repo test file);
+    the task's workspace subtree (the scratch area the goal itself
+    assigns); and test files anywhere — the canonical grounded
+    shape always writes a test file for the goal (the skeleton puts
+    it in the workspace, or the repo's tests/ when no workspace is
+    known, as in a re-plan whose brief carries none), so which test
+    file the rejected plan happened to pick does not bind the
+    repair. The historical sequences pin the last two: retry #19's
+    grounded repairs — in the initial call and in the re-plan —
+    write the workspace test file the rejected plans never wrote.
+    A test file's content is judged by the full validator stack
+    like any other write; only its novelty is not held against it.
+    """
+    baseline_keys = {_scope_key(path, repo_root) for path in baseline_paths}
+    exempt_keys = {_scope_key(path, repo_root) for path in exempt_paths}
+    workspace_key = (
+        _scope_key(str(workspace), repo_root) if workspace else None
+    )
+    records: list[PlanError] = []
+    for node in nodes:
+        for path in sorted(_node_written_paths(node)):
+            if _is_test_file_path(path):
+                continue
+            key = _scope_key(path, repo_root)
+            if key in baseline_keys | exempt_keys:
+                continue
+            if workspace_key and (
+                key == workspace_key or key.startswith(workspace_key + "/")
+            ):
+                continue
+            records.append(
+                PlanError(
+                    code="scope_widening",
+                    message=(
+                        f"Planner node '{node.id}' widens the plan's "
+                        f"scope: it writes {path!r}, which the rejected "
+                        "plan did not write and the repair guidance did "
+                        "not name. A repair must stay within the "
+                        "rejected plan's files "
+                        f"({', '.join(sorted(baseline_paths))}) — "
+                        "changing the plan's file set is a re-plan, not "
+                        "a repair. Return a corrected plan that writes "
+                        "only the original files."
+                    ),
+                    node_id=node.id,
+                )
+            )
+        if (
+            (node.assigned_claw or "") in ("bash", "shell_exec")
+            and not baseline_installs
+        ):
+            command = node.inputs.get("command") or node.inputs.get("cmd")
+            if isinstance(command, str) and _INSTALL_COMMAND_RE.search(
+                _strip_heredoc_bodies(command)
+            ):
+                records.append(
+                    PlanError(
+                        code="scope_widening",
+                        message=(
+                            f"Planner node '{node.id}' widens the "
+                            "plan's scope: it installs dependencies, "
+                            "which the rejected plan did not do. A "
+                            "repair must not add dependencies — that is "
+                            "a re-plan, not a repair. Return a corrected "
+                            "plan that stays within the rejected plan's "
+                            "approach."
+                        ),
+                        node_id=node.id,
+                    )
+                )
+    if not records:
+        return None
+    return _numbered_rejection(records)
+
+
+# OpenHands' StuckDetector fires on the same error three times;
+# three identical structured signatures in one planning call is the
+# same signal here (the default budget — 1 + 2 free + 2 repairs —
+# makes three the largest count a stuck loop can reach before the
+# budget ends anyway, so the detector converts a silent budget burn
+# into a named escalation whenever it can fire at all).
+_STUCK_REPEAT_LIMIT = 3
+
+
+def _stuck_repair_error(
+    exc: LLMResponseError,
+    signature: frozenset,
+    count: int,
+) -> StuckRepairError:
+    """The escalation raised when a repair loop is stuck (steal #5)."""
+    codes = sorted({code for code, _node_id in signature})
+    stuck = StuckRepairError(
+        "Repair loop stuck: the same rejection "
+        f"({', '.join(codes)}) has now occurred {count} times in "
+        "a row in this planning call — the model is repeating the "
+        "same defect instead of fixing it, so repairs stop here "
+        "and the failure escalates to re-planning. "
+        f"Last rejection: {exc}"
+    )
+    return _attach_plan_errors(
+        stuck, getattr(exc, "plan_errors", None) or []
+    )
+
+
 def _call_llm_with_repair(
     system_prompt: str,
     user_prompt: str,
@@ -6408,6 +7044,7 @@ def _call_llm_with_repair(
     workspace: str | None = None,
     repo_root: str | Path | None = None,
     seed_forbidden: list[str] | None = None,
+    formatter: FormatterSettings | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
 
@@ -6497,6 +7134,20 @@ def _call_llm_with_repair(
     wider window is applied here, not in the driver or intake, so
     the intake path keeps the 4096 default. An explicit num_ctx on
     the caller's settings is respected, never overridden.
+
+    Cycle 2: every call on the Ollama path carries the plan
+    envelope schema as its format constraint (steal #1 — a
+    caller-supplied schema is respected, like num_ctx); every
+    repair prompt restates the task verbatim (steal #5
+    re-grounding — the full original prompt already rides along,
+    and the restatement puts the unchanged goal directly over the
+    rejection, where a drifting repair cannot miss it); a repair
+    that widens the first rejected plan's write/dependency scope
+    is rejected as 'scope_widening' (steal #5 scope lock); the
+    identical rejection signature three times in a row raises
+    StuckRepairError and escalates (steal #5 stuck detection);
+    and when ``formatter`` is configured, each response first
+    passes through the formatter re-emission (steal #7 plumbing).
     """
     # Retry #22: derive the effective settings once, before the loop,
     # so every call in this planning call (initial + repairs) gets
@@ -6510,6 +7161,18 @@ def _call_llm_with_repair(
         effective_settings = dataclass_replace(
             effective_settings, num_ctx=_PLANNER_NUM_CTX
         )
+    # Cycle 2 (steal #1): the plan envelope is grammar-constrained at
+    # decode time on the Ollama path, so the envelope's shape is
+    # guaranteed by the decoder instead of repaired after the fact.
+    # A caller-supplied schema is respected, never overridden — the
+    # same rule as num_ctx above.
+    if (
+        effective_settings.format_schema is None
+        and effective_settings.backend == "ollama"
+    ):
+        effective_settings = dataclass_replace(
+            effective_settings, format_schema=plan_envelope_schema()
+        )
     prompt = user_prompt
     last_error: LLMResponseError | None = None
     prev_response_text: str | None = None
@@ -6517,6 +7180,18 @@ def _call_llm_with_repair(
     free_used = 0
     empty_streak = 0
     empty_count = 0
+    # Cycle 2 (steal #5): repair-discipline state — the write scope
+    # of the first rejected plan in this call (the scope lock's
+    # baseline) and the current run of identical rejection
+    # signatures (the stuck detector's input).
+    baseline_paths: set[str] | None = None
+    baseline_installs = False
+    # Paths any prompt in this call has named — accumulated, since
+    # the harness's steering across rounds is all endorsed scope for
+    # the scope lock (see _scope_widening_error).
+    endorsed_paths: set[str] = set()
+    last_signature: frozenset | None = None
+    signature_streak = 0
     # Seed with approaches rejected in an earlier planning call, in
     # order, deduplicated — the first repair prompt of this call already
     # names them (retry #20).
@@ -6526,9 +7201,19 @@ def _call_llm_with_repair(
             rejected_approaches.append(seeded)
     spent_repair = False
     while True:
+        endorsed_paths |= _prompt_named_paths(prompt)
         response_text = call_llm(
             system_prompt, prompt, settings=effective_settings
         )
+        if formatter is not None:
+            # Steal #7 plumbing: the configured formatter pass
+            # re-emits the response under the envelope schema before
+            # parsing. What is parsed — and described back to the
+            # model on a rejection — is the formatted text: it is the
+            # plan being judged.
+            response_text = reformat_plan_output(
+                response_text, effective_settings, formatter
+            )
         try:
             nodes, metadata = parse_planner_response(
                 response_text,
@@ -6536,6 +7221,25 @@ def _call_llm_with_repair(
                 workspace=workspace,
                 repo_root=repo_root,
             )
+            if baseline_paths is not None:
+                # Steal #5 scope lock: a repair that parses is still
+                # a rejection when it leaves the endorsed scope —
+                # the rejected plan's files, the paths the harness's
+                # prompts have named in this call, and the task's
+                # workspace (see _scope_widening_error). The widening
+                # plan is converted into a named rejection and
+                # repaired like any other; when the budget ends it
+                # escalates like any other.
+                scope_error = _scope_widening_error(
+                    nodes,
+                    baseline_paths,
+                    baseline_installs,
+                    endorsed_paths,
+                    repo_root,
+                    workspace=workspace,
+                )
+                if scope_error is not None:
+                    raise scope_error
             metadata = dict(metadata)
             metadata["rejected_approaches"] = list(rejected_approaches)
             return nodes, metadata
@@ -6550,6 +7254,37 @@ def _call_llm_with_repair(
             for approach in _rejected_approaches(error_codes):
                 if approach not in rejected_approaches:
                     rejected_approaches.append(approach)
+            # Cycle 2 (steal #5): the first rejected output that
+            # writes anything sets this call's scope baseline; later
+            # would-be-accepted repairs are locked to it (above).
+            if baseline_paths is None:
+                found_paths, found_installs = _response_write_scope(
+                    response_text
+                )
+                if found_paths:
+                    baseline_paths = found_paths
+                    baseline_installs = found_installs
+            # Cycle 2 (steal #5): stuck detection — the identical
+            # structured signature three times in a row stops the
+            # loop and escalates to re-planning, instead of spending
+            # the remaining attempts re-asking for a fix the model
+            # is not producing. Empty plans are exempt: they carry
+            # their own grounded escalation below.
+            if not isinstance(exc, EmptyPlanError):
+                signature = frozenset(
+                    (record.code, record.node_id)
+                    for record in getattr(exc, "plan_errors", None)
+                    or []
+                ) or frozenset({(type(exc).__name__, None)})
+                if signature == last_signature:
+                    signature_streak += 1
+                else:
+                    last_signature = signature
+                    signature_streak = 1
+                if signature_streak >= _STUCK_REPEAT_LIMIT:
+                    raise _stuck_repair_error(
+                        exc, signature, signature_streak
+                    ) from exc
             if isinstance(exc, EmptyPlanError):
                 empty_streak += 1
                 empty_count += 1
@@ -6623,9 +7358,19 @@ def _call_llm_with_repair(
             materialization_block = _materialization_steering_block(
                 response_text, error_codes, repo_root
             )
+            # Cycle 2 (steal #5 re-grounding): the repair prompt
+            # re-injects the original task verbatim, directly over
+            # the rejection — the full original prompt rides along
+            # above, but a repair that is drifting (a new stack, a
+            # new file set) needs the unchanged goal stated where
+            # the failure is named, not only at the top of the call.
+            task_block = (
+                f"THE TASK IS UNCHANGED: {goal_text}\n" if goal_text else ""
+            )
             prompt = (
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
+                f"{task_block}"
                 f"Rejection reason: {exc}\n"
                 f"Previous output: {_describe_failed_output(response_text)}\n"
                 f"{_dropped_fields_note(prev_response_text, response_text)}"
@@ -6725,6 +7470,7 @@ def plan_task_intent(
         goal_text=intent.goal,
         workspace=workspace,
         repo_root=repo_root,
+        formatter=formatter_settings_from_env(),
     )
     return build_execution_plan(intent, nodes, metadata, plan_id=plan_id)
 
@@ -6803,6 +7549,7 @@ def replan_from_brief(
         workspace=brief.get("workspace"),
         repo_root=repo_root,
         seed_forbidden=merged_seed or None,
+        formatter=formatter_settings_from_env(),
     )
     brief["rejected_approaches"] = metadata.get("rejected_approaches", seed or [])
     return nodes

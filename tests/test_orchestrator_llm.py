@@ -8052,7 +8052,7 @@ class TestPlannerSignalLossFix(unittest.TestCase):
 
     # --- (a) Verbatim retry-#18 attempt-2: parse + framework + missing dir + /tmp ---
 
-    def test_retry18_attempt2_names_all_five_defects(self) -> None:
+    def test_retry18_attempt2_names_all_four_defects(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag(self._retry18_attempt2_nodes()),
@@ -8070,12 +8070,16 @@ class TestPlannerSignalLossFix(unittest.TestCase):
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         self.assertIn("hardcoded answer", message)
         self.assertIn('"ollama_reachable": True', message)
         self.assertIn('"gpu_temperature": 0', message)
         self.assertNotIn("bare `python`", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("Repo tests live at", message)
@@ -8100,10 +8104,14 @@ class TestPlannerSignalLossFix(unittest.TestCase):
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         self.assertNotIn("bare `python`", message)
         self.assertIn("response_content", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("sed -i", message)
         self.assertIn("def health(self):", message)
@@ -8979,14 +8987,18 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
         self.assertNotIn("bare `python`", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("do NOT write a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
@@ -9166,7 +9178,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
 
     # --- (e) Regression guards: retry #18 still holds, then every earlier fix ---
 
-    def test_retry18_attempt2_names_all_five_defects(self) -> None:
+    def test_retry18_attempt2_names_all_four_defects(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag(self._retry18_attempt2_nodes()),
@@ -9184,12 +9196,16 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         self.assertIn("hardcoded answer", message)
         self.assertIn('"ollama_reachable": True', message)
         self.assertIn('"gpu_temperature": 0', message)
         self.assertNotIn("bare `python`", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("Repo tests live at", message)
@@ -9214,10 +9230,14 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         self.assertNotIn("bare `python`", message)
         self.assertIn("response_content", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("sed -i", message)
         self.assertIn("def health(self):", message)
@@ -10050,14 +10070,18 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
         self.assertNotIn("bare `python`", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
@@ -10095,14 +10119,18 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
         self.assertNotIn("bare `python`", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
@@ -10116,7 +10144,12 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         # Framework-guard fix (retry #23): was 5 errors. Now 6 — the rejection also names step-3's bare `python`.
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
@@ -10877,14 +10910,18 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
         self.assertNotIn("bare `python`", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
@@ -10921,14 +10958,18 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
         self.assertNotIn("bare `python`", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
@@ -10942,14 +10983,18 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         # Framework-guard fix (retry #23): was 5 errors. Now 6 — the rejection also names step-3's bare `python`.
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
         self.assertNotIn("bare `python`", message)
         self.assertIn("response_content", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("sed -i", message)
         self.assertIn("freetalon/tests/test_api.py", message)
@@ -11708,14 +11753,18 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
         self.assertNotIn("bare `python`", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
@@ -11752,14 +11801,18 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         # Framework-guard fix (retry #23): was 4 errors. Now 5 — the rejection also names step-3's bare `python`.
         # Interpreter-grounding fix (retry #25): was 5 errors. Now 6 -- stand-in shape 3 also names step-1's heredoc payload binding "ollama_reachable": True / "gpu_temperature": 0 as constants.
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
         self.assertNotIn("bare `python`", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
@@ -11773,14 +11826,18 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 5 errors", message)
+        self.assertIn("was rejected with 4 errors", message)
+        # Planner cycle 2 (payload channel): now 4 -- step-2's
+        # heredoc payload is repaired and rerouted to the scaffold
+        # form at materialization, so its parse error no longer
+        # fires; the remaining defects are unchanged and still
+        # reject the plan.
         # Framework-guard fix (retry #23): was 5 errors. Now 6 — the rejection also names step-3's bare `python`.
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
         self.assertNotIn("bare `python`", message)
         self.assertIn("response_content", message)
-        self.assertIn("does not parse as Python", message)
         self.assertIn("writes a Flask app", message)
         self.assertIn("sed -i", message)
         self.assertIn("freetalon/tests/test_api.py", message)
@@ -16134,7 +16191,13 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
                 workspace=self.WS,
                 repo_root=root,
             )
-            self.assertIn("was rejected with 2 errors", message4)
+            # Planner cycle 2 (payload channel): was 2 errors --
+            # output 4's second error was its step-2 test heredoc
+            # (the __main__ dedent); the payload channel repairs the
+            # payload and reroutes the write to the scaffold form,
+            # leaving the placeholder scaffold as the only defect.
+            # The plan still rejects, on the placeholder alone.
+            self.assertIn("was rejected with 1 error", message4)
             self.assertIn("placeholder content only", message4)
             message5 = self._rejection(
                 self.RETRY30_OUTPUT5_RAW,
@@ -16908,31 +16971,41 @@ class TestPlannerReindentFix(unittest.TestCase):
             self.assertFalse(planner._is_placeholder_stub(content))
 
     def test_retry32_output3_full_plan_profile(self) -> None:
-        from freetalon.orchestrator.planner import CheapRejectionError
+        # Planner cycle 2 (payload channel) — this pin flips, and
+        # the flip is the point. The pin used to encode the CP2
+        # binding defect exactly: step-1 materializes, the full
+        # plan reaches the ordinary checks, and they reject it with
+        # exactly ONE error, on step-2 — its test heredoc does not
+        # parse (unittest.main() at column 0 under the __main__
+        # guard). Cycle 2 closes that defect class: the harness
+        # repairs the payload and reroutes the write to the
+        # scaffold form at materialization (see TestPlannerCycle2),
+        # so the plan — the real 5-node plan — is now ACCEPTED,
+        # with step-2 in scaffold form carrying the repaired
+        # payload. The same flip is pinned on the CP2 trace itself
+        # in TestPlannerABRefactor /
+        # TestPlannerCycle2.test_cp2_output3_accepted_via_payload_channel.
+        import ast
 
-        # Step-1 now materializes, so the full plan reaches the
-        # ordinary checks — which reject it with exactly ONE error,
-        # on step-2: its test heredoc does not parse
-        # (unittest.main() at column 0 under the __main__ guard).
-        # In the live run this defect was masked: materialization
-        # raised on step-1 before the full-plan checks ran. The
-        # rejection is full-price (not the placeholder cheap path)
-        # and the indentation gate no longer fires.
         for root in (None, str(self.repo_root)):
-            with self.assertRaises(LLMResponseError) as caught:
-                parse_planner_response(
-                    self.RETRY32_OUTPUT3_RAW,
-                    goal_text=self.HEALTH_GOAL,
-                    workspace=self.WS,
-                    repo_root=root,
+            nodes, _meta = parse_planner_response(
+                self.RETRY32_OUTPUT3_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertEqual(len(nodes), 5)
+            test_write = next(
+                node
+                for node in nodes
+                if (node.inputs.get("file_path") or "").endswith(
+                    "test_health.py"
                 )
-            self.assertNotIsInstance(caught.exception, CheapRejectionError)
-            message = str(caught.exception)
-            self.assertIn("was rejected with 1 error", message)
-            self.assertIn("step-2", message)
-            self.assertIn("does not parse as Python", message)
-            self.assertIn("expected an indented block", message)
-            self.assertNotIn("spaces of indentation", message)
+            )
+            self.assertEqual(test_write.assigned_claw, "scaffold")
+            content = test_write.inputs["content"]
+            self.assertIn("\n    unittest.main()\n", content)
+            ast.parse(content)
 
     # --- Repair steering for materialization rejections ---
 
@@ -17241,19 +17314,37 @@ class TestPlannerABRefactor(unittest.TestCase):
             "criteria": [{"type": "exit_code", "equals": 0}],
         }
 
-    def test_heredoc_main_guard_defect_is_one_heredoc_parse_error(self) -> None:
-        # The retry-#33 output-3 shape through a plain redirect: the
-        # payload's unindented unittest.main() under the __main__
-        # guard is the rejection, and it is the ONLY error.
+    def test_heredoc_main_guard_defect_is_materialized_to_scaffold(self) -> None:
+        # PIN CHANGED by planner cycle 2 (steal #1b, the payload
+        # channel): this test used to pin the retry-#33 output-3
+        # shape — the payload's unindented unittest.main() under the
+        # __main__ guard — as a one-error heredoc_parse rejection.
+        # That rejection WAS the CP2 binding defect: the model's real
+        # plan died on one indentation slip inside a shell string.
+        # The materialize stage now owns the payload: a sole plain
+        # heredoc write of a .py file whose payload is repaired by
+        # the deterministic indented-block normalization (verified by
+        # re-parsing) is rerouted to the scaffold form and accepted,
+        # and the scaffold validators judge the content. The tee
+        # shapes in the sibling test below are NOT this shape and
+        # keep their heredoc_parse rejection; an unrepairable payload
+        # keeps it too (TestPlannerCycle2).
         target = str(self.tmp_root / "test_health.py")
         command = (
             f"cat > {target} <<'PYEOF'\n" + self.BROKEN_PAYLOAD + "PYEOF"
         )
-        exc = self._caught(self._dag([self._bash_node(command)]))
-        self.assertEqual(
-            {record.code for record in exc.plan_errors}, {"heredoc_parse"}
+        nodes, _meta = parse_planner_response(
+            self._dag([self._bash_node(command)]), goal_text=self.GOAL
         )
-        self.assertIn("does not parse as Python", str(exc))
+        self.assertEqual(len(nodes), 1)
+        node = nodes[0]
+        self.assertEqual(node.assigned_claw, "scaffold")
+        self.assertEqual(node.inputs.get("file_path"), target)
+        content = node.inputs.get("content") or ""
+        self.assertIn("    unittest.main()\n", content)
+        import ast
+
+        ast.parse(content)
 
     def test_tee_heredoc_payloads_are_parse_checked(self) -> None:
         # Both tee shapes were invisible to the payload check before
@@ -17280,3 +17371,603 @@ class TestPlannerABRefactor(unittest.TestCase):
             self._dag([self._bash_node(command)]), goal_text=self.GOAL
         )
         self.assertEqual(len(nodes), 1)
+
+
+class TestPlannerCycle2(unittest.TestCase):
+    """Planner cycle 2 (2026-11-17): the prior-art steal list built
+    as solutions inside FreeTalon's design — (1) the plan envelope
+    grammar-constrained at decode time (Ollama format schema) plus
+    the payload channel: a sole heredoc .py write whose payload is
+    deterministically repairable is rerouted to the scaffold form
+    at materialization; (5) repair discipline: stuck detection
+    (the same structured rejection three times in a row escalates
+    to re-planning), the task restated in every repair prompt
+    (re-grounding), and the scope lock (a repair may not widen the
+    rejected plan's file/dependency scope); (7) formatter plumbing:
+    an optional second pass that re-emits a response under the
+    envelope schema, endpoint/model configurable by env vars.
+    """
+
+    GOAL = (
+        "Add a GET /health endpoint to FreeTalon's API that returns JSON "
+        "reporting the service status, whether Ollama at localhost:11434 "
+        "is reachable, and the GPU temperature when nvidia-smi is "
+        "available. Add unit tests for the endpoint, keep the full test "
+        "suite green, and verify the endpoint live."
+    )
+
+    # The CP2 live run's output 3, byte-exact from
+    # logs/cp2-run1.out (md5 a6bf39ec4d62859086e482a3eb82d09d): the
+    # real 5-node plan whose only defect was step-2's heredoc
+    # payload dedenting unittest.main() out of its __main__ guard.
+    CP2_OUTPUT_3 = '{\n"nodes":[\n{"id":"step-1",\n"objective":"Extend /home/seeker/projects/FreeTalon/freetalon/api.py in place\\u2014add a /health branch to the do_GET method of the Handler class (defined inside HiveAPIServer.start)",\n"depends_on":[],\n"assigned_claw":"scaffold",\n"inputs":{\n"file_path":"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"anchor":"HiveAPIServer.start.Handler.do_GET",\n"position":"replace",\n"content":"\\ndef do_GET(self) -> None:\\n    parsed = urlparse(self.path)\\n    path = parsed.path\\n    qs = parse_qs(parsed.query)\\n\\n    if path == \\"/health\\":\\n        payload ={\\"ok\\":True, \\"status\\":\\"ready\\"}\\n        payload[\\"service_status\\"] = ...\\n        payload[\\"ollama_reachable\\"] = ...\\n        payload[\\"gpu_temperature\\"] = ...\\n        return self._send(200, payload)\\n\\n    if path == \\"/status\\":\\n        if not self._authorized():\\n            return\\n        return self._send(200,{\\"ok\\":True, \\"status\\":api.controller.status()})\\n\\n    if path == \\"/metrics\\":\\n        if not self._authorized():\\n            return\\n        status = api.controller.status()\\n        metrics ={\\n            \\"workers_healthy\\": status[\\"workers\\"][\\"healthy\\"],\\n            \\"workers_configured\\": status[\\"workers\\"][\\"configured\\"],\\n            \\"tasks_running\\": status[\\"queue\\"][\\"running\\"],\\n            \\"tasks_queued\\": status[\\"queue\\"][\\"queued\\"],\\n            \\"queue_max\\": status[\\"queue\\"][\\"max\\"]\\n        }\\n        return self._send(200,{\\"ok\\":True, \\"metrics\\": metrics})\\n\\n    if path.startswith(\\"/tasks/\\") and len(path.split(\\"/\\")) == 3:\\n        if not self._authorized():\\n            return\\n        task_id = path.split(\\"/\\")[2]\\n        task = api.controller.get_task(task_id)\\n        if task is None:\\n            return self._send(404,{\\"ok\\":False, \\"error\\":\\"Task not found\\"})\\n        return self._send(200,{\\"ok\\":True, \\"task\\": task})\\n\\n    if path == \\"/resources\\":\\n        if not self._authorized():\\n            return\\n        return self._send(200,{\\"ok\\":True, \\"resources\\": resource_summary_safe()})\\n\\n    #M4: approval gates\\u2014list packets, optionally filtered.\\n    if path == \\"/gates\\":\\n        if not self._authorized():\\n            return\\n        status_filter = qs.get(\\"status\\", [None])[0]\\n        run_filter = qs.get(\\"run_id\\", [None])[0]\\n        if run_filter:\\n            packets = api.gate_store.list_for_run(run_filter)\\n        elif status_filter == \\"pending\\":\\n            packets = api.gate_store.pending()\\n        else:\\n            packets = api.gate_store.all()\\n        return self._send(\\n            200,\\n            {\\"ok\\":True,\\n             \\"gates\\": [pkt.model_dump(mode=\\"json\\") for pkt in packets],\\n             \\"count\\": len(packets),\\n            }\\n        )\\n\\n    if path.startswith(\\"/gates/\\") and len(path.split(\\"/\\")) == 3:\\n        if not self._authorized():\\n            return\\n        packet_id = path.split(\\"/\\")[2]\\n        packet = api.gate_store.get(packet_id)\\n        if packet is None:\\n            return self._send(404,{\\"ok\\":False, \\"error\\":\\"Gate not found\\"})\\n        return self._send(200,{\\"ok\\":True, \\"gate\\": packet.model_dump(mode=\\"json\\")})\\n\\n    return self._send(404,{\\"ok\\":False, \\"error\\":\\"Not Found\\"})"\n},\n"outputs":[\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n],\n"acceptance":[\n"The /health endpoint is implemented in /home/seeker/projects/FreeTalon/freetalon/api.py."\n],\n"criteria":[\n{"type":"file_exists",\n"path":"/home/seeker/projects/FreeTalon/freetalon/api.py"\n}\n]\n},\n{"id":"step-2",\n"objective":"Write the tests for /health",\n"depends_on":[\n"step-1"\n],\n"assigned_claw":"bash",\n"inputs":{\n"command":"cat > /home/seeker/freetalon-workspace/test_health.py <<\'EOF\'\\nimport json\\nimport sys\\nimport tempfile\\nimport unittest\\nimport urllib.request\\nfrom pathlib import Path\\n\\nsys.path.insert(0, \\"/home/seeker/projects/FreeTalon\\")\\n\\nfrom freetalon.api import HiveAPIServer\\nfrom freetalon.config import HiveConfig\\nfrom freetalon.hive import HiveController\\n\\n\\nclass RouteEndpointTests(unittest.TestCase):\\n    def setUp(self):\\n        self.tmpdir = tempfile.TemporaryDirectory()\\n        base = Path(self.tmpdir.name)\\n        config = HiveConfig(\\n            workspace=base,\\n            state_path=base / \\"state.json\\",\\n            audit_log_path=base / \\"audit.log\\",\\n            worker_cap=2,\\n            queue_multiplier=3,\\n            poll_interval_seconds=0.02,\\n        )\\n        self.controller = HiveController(config)\\n        self.controller.start()\\n        self.server = HiveAPIServer(self.controller, \\"test-token\\")\\n        self.server.start(\\"127.0.0.1\\", 0)\\n        port = self.server._httpd.server_address[1]\\n        self.base = f\\"http://127.0.0.1:{port}\\"\\n\\n    def tearDown(self):\\n        self.server.stop()\\n        self.controller.stop()\\n        self.tmpdir.cleanup()\\n\\n    def test_route_answers(self):\\n        with urllib.request.urlopen(f\\"{self.base}/health\\", timeout=3) as resp:\\n            status = resp.status\\n            data = json.loads(resp.read())\\n            self.assertEqual(status, 200)\\n            self.assertTrue(data[\\"ok\\"])\\n            self.assertIn(\\"status\\", data)\\n            self.assertIn(\\"service_status\\", data)\\n            self.assertIn(\\"ollama_reachable\\", data)\\n            self.assertIsInstance(data[\\"ollama_reachable\\"], bool)\\n            self.assertIn(\\"gpu_temperature\\", data)\\n            self.assertIsInstance(data[\\"gpu_temperature\\"], (int, float))\\n\\n\\nif __name__ == \\"__main__\\":\\nunittest.main()\\nEOF"\n},\n"outputs":[\n"/home/seeker/freetalon-workspace/test_health.py"\n],\n"acceptance":[\n"The tests for /health exist."\n],\n"criteria":[\n{"type":"file_exists",\n"path":"/home/seeker/freetalon-workspace/test_health.py"\n}\n]\n},\n{"id":"step-3",\n"objective":"Run the tests for /health",\n"depends_on":[\n"step-2"\n],\n"assigned_claw":"bash",\n"inputs":{\n"command":"python3 /home/seeker/freetalon-workspace/test_health.py"\n},\n"outputs":[\n"test results"\n],\n"acceptance":[\n"The tests for /health pass."\n],\n"criteria":[\n{"type":"exit_code",\n"equals":0\n}\n]\n},\n{"id":"step-4",\n"objective":"Start the API server for /health",\n"depends_on":[\n"step-3"\n],\n"assigned_claw":"bash",\n"inputs":{\n"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli stop; ./venv/bin/python -m freetalon.cli start && for i in $(seq 1 30); do curl -sf http://localhost:8765/health && break; sleep 1; done; curl -sf http://localhost:8765/health"\n},\n"outputs":[\n"API server running"\n],\n"acceptance":[\n"The API server answers /health."\n],\n"criteria":[\n{"type":"exit_code",\n"equals":0\n}\n]\n},\n{"id":"step-5",\n"objective":"Verify /health live",\n"depends_on":[\n"step-4"\n],\n"assigned_claw":"bash",\n"inputs":{\n"command":"curl -s http://localhost:8765/health"\n},\n"outputs":[\n"verification"\n],\n"acceptance":[\n"/health returns its JSON live."\n],\n"criteria":[\n{"type":"exit_code",\n"equals":0\n}\n]\n}\n]\n}'
+
+    BROKEN_PAYLOAD = (
+        "import unittest\n"
+        "\n"
+        "\n"
+        "class TestHealth(unittest.TestCase):\n"
+        "    def test_ok(self):\n"
+        "        self.assertTrue(True)\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "unittest.main()\n"
+    )
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    @staticmethod
+    def _settings(**kwargs) -> LLMSettings:
+        return LLMSettings(
+            backend="ollama",
+            base_url="http://localhost:11434",
+            model="test",
+            **kwargs,
+        )
+
+    def _bash_node(self, command: str, node_id: str = "step-1") -> dict:
+        return {
+            "id": node_id,
+            "objective": "Write the test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": command},
+            "outputs": [],
+            "acceptance": ["The step is done."],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+
+    def _scaffold_node(
+        self,
+        path: str,
+        content: str = "VALUE = 1\n",
+        node_id: str = "step-1",
+        with_criteria: bool = True,
+    ) -> dict:
+        node = {
+            "id": node_id,
+            "objective": "Write the file",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {"file_path": path, "content": content},
+            "outputs": [path],
+            "acceptance": ["The file is written."],
+        }
+        if with_criteria:
+            node["criteria"] = [{"type": "file_exists", "path": path}]
+        return node
+
+    def _caught(self, raw: str) -> LLMResponseError:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw, goal_text="Extend the fixture module in place")
+        return caught.exception
+
+    # --- (1) The grammar-constrained envelope ---
+
+    def test_envelope_schema_matches_plan_contract(self) -> None:
+        from freetalon.orchestrator import planner as planner_module
+        from freetalon.orchestrator.models import PlanNode
+        from freetalon.orchestrator.tool_registry import KNOWN_CLAW_NAMES
+
+        schema = planner_module.plan_envelope_schema()
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(schema["required"], ["nodes"])
+        node_schema = schema["properties"]["nodes"]["items"]
+        self.assertEqual(node_schema["required"], ["id", "objective"])
+        properties = node_schema["properties"]
+        # Every field the schema names is a real PlanNode field, and
+        # the claw enum is exactly the registry (plus PlanNode's ""
+        # default, whose misuse the claw validator names).
+        self.assertLessEqual(set(properties), set(PlanNode.model_fields))
+        self.assertEqual(
+            set(properties["assigned_claw"]["enum"]),
+            set(KNOWN_CLAW_NAMES) | {""},
+        )
+        # Payloads stay free-form: inputs and criteria are semantic,
+        # and the validators own their shape.
+        self.assertEqual(properties["inputs"], {"type": "object"})
+        self.assertEqual(
+            properties["criteria"],
+            {"type": "array", "items": {"type": "object"}},
+        )
+
+    def test_planner_call_constrains_the_envelope(self) -> None:
+        from freetalon.orchestrator import planner as planner_module
+
+        captured: dict = {}
+
+        def fake_call(system, user, settings=None):
+            captured["settings"] = settings
+            return self._dag([self._bash_node("ls inputs")])
+
+        intent = TaskIntent(goal="Deploy a service", project_type="ops")
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=fake_call
+        ):
+            plan_task_intent(intent, settings=self._settings())
+        # The Ollama path carries the envelope schema (and the
+        # planner context window, as before).
+        self.assertEqual(
+            captured["settings"].format_schema,
+            planner_module.plan_envelope_schema(),
+        )
+        self.assertEqual(
+            captured["settings"].num_ctx, planner_module._PLANNER_NUM_CTX
+        )
+
+        # A caller-supplied schema is respected, never overridden.
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=fake_call
+        ):
+            plan_task_intent(
+                intent,
+                settings=self._settings(format_schema={"type": "object"}),
+            )
+        self.assertEqual(captured["settings"].format_schema, {"type": "object"})
+
+        # The openai-compatible path takes no Ollama format schema.
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=fake_call
+        ):
+            plan_task_intent(
+                intent,
+                settings=LLMSettings(
+                    backend="openai_compatible",
+                    base_url="http://localhost:8000/v1",
+                    model="test",
+                ),
+            )
+        self.assertIsNone(captured["settings"].format_schema)
+
+    # --- (1b) The payload channel ---
+
+    def test_cp2_output3_accepted_via_payload_channel(self) -> None:
+        # The dedicated CP2 fixture (byte-exact, above): before
+        # cycle 2 this output was rejected with exactly one error —
+        # heredoc_parse on step-2 — and the live run died at
+        # planning. The plan is the real 5-node plan; it must now be
+        # accepted, with step-2 rerouted to the scaffold form
+        # carrying the repaired payload, and both written modules
+        # parsing as Python.
+        import ast
+
+        nodes, _meta = parse_planner_response(
+            self.CP2_OUTPUT_3,
+            goal_text=self.GOAL,
+            workspace="/home/seeker/freetalon-workspace",
+        )
+        self.assertEqual(len(nodes), 5)
+        test_write = next(
+            node
+            for node in nodes
+            if (node.inputs.get("file_path") or "").endswith("test_health.py")
+        )
+        self.assertEqual(test_write.assigned_claw, "scaffold")
+        content = test_write.inputs["content"]
+        self.assertIn("\n    unittest.main()\n", content)
+        ast.parse(content)
+        api_write = next(
+            node
+            for node in nodes
+            if (node.inputs.get("file_path") or "").endswith("freetalon/api.py")
+        )
+        ast.parse(api_write.inputs["content"])
+
+    def test_valid_heredoc_write_stays_bash(self) -> None:
+        # Nothing that works today changes shape: a sole heredoc
+        # write whose payload already parses keeps the bash form
+        # and its exact command.
+        target = str(self.tmp_root / "test_ok.py")
+        payload = (
+            "VALUE = 1\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    return VALUE\n"
+            "\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+        command = f"cat > {target} <<'PYEOF'\n{payload}PYEOF"
+        nodes, _meta = parse_planner_response(
+            self._dag([self._bash_node(command)]),
+            goal_text="Extend the fixture module in place",
+        )
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].assigned_claw, "bash")
+        self.assertEqual(nodes[0].inputs.get("command"), command)
+
+    def test_unrepairable_heredoc_payload_still_rejected(self) -> None:
+        # A payload no deterministic normalization repairs keeps the
+        # heredoc_parse rejection, exactly one error, as before.
+        target = str(self.tmp_root / "test_broken.py")
+        command = f"cat > {target} <<'PYEOF'\ndef broken(:\n    pass\nPYEOF"
+        exc = self._caught(self._dag([self._bash_node(command)]))
+        self.assertEqual(
+            {record.code for record in exc.plan_errors}, {"heredoc_parse"}
+        )
+
+    def test_uniformly_indented_payload_is_repaired_and_converted(self) -> None:
+        # The whole payload copied one indent level deep: the
+        # uniform-dedent normalization (the anchored-edit delta
+        # rule, applied to a whole payload) repairs it, and the
+        # write is rerouted to the scaffold form.
+        target = str(self.tmp_root / "test_shifted.py")
+        payload = "    VALUE = 1\n\n    def main():\n        return VALUE\n"
+        command = f"cat > {target} <<'PYEOF'\n{payload}PYEOF"
+        nodes, _meta = parse_planner_response(
+            self._dag([self._bash_node(command)]),
+            goal_text="Extend the fixture module in place",
+        )
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].assigned_claw, "scaffold")
+        self.assertEqual(
+            nodes[0].inputs.get("content"),
+            "VALUE = 1\n\ndef main():\n    return VALUE\n",
+        )
+
+    def test_chained_command_heredoc_is_not_converted(self) -> None:
+        # The write is not the node's only effect (a py_compile runs
+        # after the marker), so the payload channel does not touch
+        # it and the broken payload is the validator's, as before.
+        target = str(self.tmp_root / "test_health.py")
+        command = (
+            f"cat > {target} <<'PYEOF'\n"
+            + self.BROKEN_PAYLOAD
+            + f"PYEOF\npython3 -m py_compile {target}"
+        )
+        exc = self._caught(self._dag([self._bash_node(command)]))
+        self.assertIn(
+            "heredoc_parse", {record.code for record in exc.plan_errors}
+        )
+
+    def test_append_heredoc_is_not_converted(self) -> None:
+        target = str(self.tmp_root / "test_health.py")
+        command = (
+            f"cat >> {target} <<'PYEOF'\n" + self.BROKEN_PAYLOAD + "PYEOF"
+        )
+        exc = self._caught(self._dag([self._bash_node(command)]))
+        self.assertIn(
+            "heredoc_parse", {record.code for record in exc.plan_errors}
+        )
+
+    def test_sole_heredoc_write_shapes(self) -> None:
+        from freetalon.orchestrator import planner as planner_module
+
+        target = str(self.tmp_root / "test_health.py")
+        sole = f"cat > {target} <<'PYEOF'\nVALUE = 1\nPYEOF"
+        self.assertEqual(
+            planner_module._sole_heredoc_write(sole), (target, "VALUE = 1\n")
+        )
+        # A trailing command, an append, and a tee write are not
+        # the sole plain shape.
+        self.assertIsNone(
+            planner_module._sole_heredoc_write(sole + "\npython3 -m py_compile " + target)
+        )
+        self.assertIsNone(
+            planner_module._sole_heredoc_write(
+                f"cat >> {target} <<'PYEOF'\nVALUE = 1\nPYEOF"
+            )
+        )
+        self.assertIsNone(
+            planner_module._sole_heredoc_write(
+                f"tee {target} <<'PYEOF'\nVALUE = 1\nPYEOF"
+            )
+        )
+
+    # --- (5) Repair discipline ---
+
+    def _bad_claw_dag(self, node_id: str, path: str) -> str:
+        return self._dag(
+            [
+                {
+                    "id": node_id,
+                    "objective": "Write the file",
+                    "depends_on": [],
+                    "assigned_claw": "write_file",
+                    "inputs": {"file_path": path, "content": "VALUE = 1\n"},
+                    "outputs": [path],
+                    "acceptance": ["The file is written."],
+                    "criteria": [{"type": "file_exists", "path": path}],
+                }
+            ]
+        )
+
+    def _drive_plan(self, responses, intent, **kwargs):
+        calls: list = []
+
+        def fake_call(system, user, settings=None):
+            calls.append(user)
+            return responses[len(calls) - 1]
+
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=fake_call
+        ):
+            plan = plan_task_intent(
+                intent, settings=self._settings(), **kwargs
+            )
+        return plan, calls
+
+    def test_stuck_detection_escalates_after_three_identical_rejections(
+        self,
+    ) -> None:
+        from freetalon.orchestrator import planner as planner_module
+
+        target = str(self.tmp_root / "report.py")
+        bad = self._bad_claw_dag("step-1", target)
+        calls: list = []
+
+        def fake_call(system, user, settings=None):
+            calls.append(user)
+            return bad
+
+        intent = TaskIntent(goal="Write the report file", project_type="general")
+        with patch(
+            "freetalon.orchestrator.planner.call_llm", side_effect=fake_call
+        ):
+            with self.assertRaises(planner_module.StuckRepairError) as caught:
+                plan_task_intent(intent, settings=self._settings())
+        # Three identical rejections, then the loop stops and
+        # escalates — it does not spend the remaining budget
+        # re-asking. The error is an LLMResponseError (the loop's
+        # re-plan path treats it as a planning failure) and carries
+        # the repeated rejection's structured records.
+        self.assertEqual(len(calls), 3)
+        self.assertIsInstance(caught.exception, LLMResponseError)
+        self.assertIn("stuck", str(caught.exception).lower())
+        self.assertIn(
+            "unknown_claw",
+            {record.code for record in caught.exception.plan_errors},
+        )
+
+    def test_stuck_detection_requires_three_in_a_row(self) -> None:
+        # A, B, A, A, good: the identical signature never occurs
+        # three times consecutively, so no stuck escalation — the
+        # good plan is accepted on the last repair.
+        target = str(self.tmp_root / "report.py")
+        bad_a = self._bad_claw_dag("step-1", target)
+        bad_b = self._bad_claw_dag("step-9", target)
+        good = self._dag([self._bash_node("ls inputs")])
+        intent = TaskIntent(goal="Write the report file", project_type="general")
+        plan, calls = self._drive_plan(
+            [bad_a, bad_b, bad_a, bad_a, good], intent, max_repairs=4
+        )
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(plan.nodes), 1)
+
+    def test_scope_lock_rejects_a_widening_repair(self) -> None:
+        path_a = str(self.tmp_root / "a.py")
+        path_b = str(self.tmp_root / "b.py")
+        # Attempt 1 writes A but has no criteria: a repairable
+        # rejection that sets the scope baseline {A}.
+        attempt1 = self._dag(
+            [self._scaffold_node(path_a, with_criteria=False)]
+        )
+        # Attempt 2 fixes the criteria — and quietly adds a second
+        # file the rejected plan never wrote. It parses clean, so
+        # only the scope lock can catch it.
+        attempt2 = self._dag(
+            [
+                self._scaffold_node(path_a),
+                self._scaffold_node(path_b, content="VALUE = 2\n", node_id="step-2"),
+            ]
+        )
+        # Attempt 3 stays within the original file and is accepted.
+        attempt3 = self._dag([self._scaffold_node(path_a)])
+        intent = TaskIntent(goal="Write the report file", project_type="general")
+        plan, calls = self._drive_plan(
+            [attempt1, attempt2, attempt3], intent
+        )
+        self.assertEqual(len(plan.nodes), 1)
+        self.assertEqual(plan.nodes[0].inputs.get("file_path"), path_a)
+        # The widening rejection reached the model by name in the
+        # prompt that produced attempt 3.
+        self.assertIn("widens the plan's scope", calls[2])
+
+    def test_scope_widening_error_unit(self) -> None:
+        from freetalon.orchestrator import planner as planner_module
+        from freetalon.orchestrator.models import PlanNode
+
+        def scaffold(nid: str, path: str) -> PlanNode:
+            return PlanNode(
+                id=nid,
+                objective="Write the file",
+                assigned_claw="scaffold",
+                inputs={"file_path": path, "content": "VALUE = 1\n"},
+                criteria=[{"type": "file_exists", "path": path}],
+            )
+
+        nodes = [scaffold("n1", "/tmp/a.py"), scaffold("n2", "/tmp/b.py")]
+        err = planner_module._scope_widening_error(
+            nodes, {"/tmp/a.py"}, False, set(), None
+        )
+        self.assertIsNotNone(err)
+        self.assertEqual(
+            {record.code for record in err.plan_errors}, {"scope_widening"}
+        )
+        # A path the repair prompt itself named is endorsed scope.
+        self.assertIsNone(
+            planner_module._scope_widening_error(
+                nodes, {"/tmp/a.py"}, False, {"/tmp/b.py"}, None
+            )
+        )
+        # The task's workspace subtree is endorsed scope too: the
+        # grounded skeleton writes the test file there, so a repair
+        # doing the same is grounded, not widening (retry #19's
+        # grounded repair is the historical pin for this).
+        self.assertIsNone(
+            planner_module._scope_widening_error(
+                [scaffold("n4", "/tmp/ws/test_health.py")],
+                {"/tmp/a.py"},
+                False,
+                set(),
+                None,
+                workspace="/tmp/ws",
+            )
+        )
+        # And a test file is standing verification scope even with
+        # no workspace known (a re-plan's brief carries none): the
+        # grounded shape always writes one, and which test file the
+        # rejected plan picked does not bind the repair.
+        self.assertIsNone(
+            planner_module._scope_widening_error(
+                [scaffold("n5", "/tmp/elsewhere/test_health.py")],
+                {"/tmp/a.py"},
+                False,
+                set(),
+                None,
+            )
+        )
+        # A dependency install widens a plan that installed nothing;
+        # a plan that already installed may be repaired in kind.
+        install = PlanNode(
+            id="n3",
+            objective="Install the dependency",
+            assigned_claw="bash",
+            inputs={"command": "pip install flask"},
+            criteria=[{"type": "exit_code", "equals": 0}],
+        )
+        err = planner_module._scope_widening_error(
+            [install], {"/tmp/a.py"}, False, set(), None
+        )
+        self.assertIsNotNone(err)
+        self.assertIsNone(
+            planner_module._scope_widening_error(
+                [install], {"/tmp/a.py"}, True, set(), None
+            )
+        )
+
+    def test_repair_prompt_restates_the_task(self) -> None:
+        path_a = str(self.tmp_root / "a.py")
+        attempt1 = self._dag(
+            [self._scaffold_node(path_a, with_criteria=False)]
+        )
+        attempt2 = self._dag([self._scaffold_node(path_a)])
+        intent = TaskIntent(goal="Write the report file", project_type="general")
+        _plan, calls = self._drive_plan([attempt1, attempt2], intent)
+        self.assertIn(
+            "THE TASK IS UNCHANGED: Write the report file", calls[1]
+        )
+
+    # --- (7) Formatter plumbing ---
+
+    def test_formatter_settings_from_env(self) -> None:
+        from freetalon.orchestrator import planner as planner_module
+
+        clean = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("FREETALON_FORMATTER")
+        }
+        with patch.dict(os.environ, clean, clear=True):
+            self.assertIsNone(planner_module.formatter_settings_from_env())
+        with patch.dict(
+            os.environ, {"FREETALON_FORMATTER_OLLAMA_MODEL": "llama3:latest"}
+        ):
+            settings = planner_module.formatter_settings_from_env()
+            self.assertIsNotNone(settings)
+            self.assertEqual(settings.model, "llama3:latest")
+            self.assertIsNone(settings.base_url)
+        with patch.dict(os.environ, {"FREETALON_FORMATTER_ENABLED": "1"}):
+            settings = planner_module.formatter_settings_from_env()
+            self.assertIsNotNone(settings)
+            self.assertIsNone(settings.base_url)
+            self.assertIsNone(settings.model)
+
+    def test_formatter_pass_reemits_under_the_envelope(self) -> None:
+        from freetalon.orchestrator import planner as planner_module
+        from freetalon.orchestrator.prompts import FORMATTER_SYSTEM_PROMPT
+
+        good = self._dag([self._bash_node("ls inputs")])
+        calls: list = []
+
+        def fake_call(system, user, settings=None):
+            calls.append((system, settings))
+            if system == FORMATTER_SYSTEM_PROMPT:
+                return good
+            return "The plan is to list the inputs and check the result."
+
+        intent = TaskIntent(goal="Deploy a service", project_type="ops")
+        env = {
+            "FREETALON_FORMATTER_OLLAMA_BASE_URL": "http://formatter.invalid:11434",
+            "FREETALON_FORMATTER_OLLAMA_MODEL": "fmt-model",
+        }
+        with patch.dict(os.environ, env):
+            with patch(
+                "freetalon.orchestrator.planner.call_llm",
+                side_effect=fake_call,
+            ):
+                plan = plan_task_intent(intent, settings=self._settings())
+        # Two calls: the planner's prose (unparseable on its own)
+        # and the formatter's re-emission, which is what got parsed.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(plan.nodes), 1)
+        formatter_settings = calls[1][1]
+        self.assertEqual(
+            formatter_settings.base_url, "http://formatter.invalid:11434"
+        )
+        self.assertEqual(formatter_settings.model, "fmt-model")
+        self.assertEqual(
+            formatter_settings.format_schema,
+            planner_module.plan_envelope_schema(),
+        )
+
+    def test_formatter_backend_failure_degrades_to_the_original(self) -> None:
+        from freetalon.orchestrator.intake import LLMBackendError
+        from freetalon.orchestrator.prompts import FORMATTER_SYSTEM_PROMPT
+
+        good = self._dag([self._bash_node("ls inputs")])
+        calls: list = []
+
+        def fake_call(system, user, settings=None):
+            calls.append(system)
+            if system == FORMATTER_SYSTEM_PROMPT:
+                raise LLMBackendError("formatter backend is down")
+            return good
+
+        intent = TaskIntent(goal="Deploy a service", project_type="ops")
+        with patch.dict(os.environ, {"FREETALON_FORMATTER_ENABLED": "1"}):
+            with patch(
+                "freetalon.orchestrator.planner.call_llm",
+                side_effect=fake_call,
+            ):
+                plan = plan_task_intent(intent, settings=self._settings())
+        # The formatter was attempted, failed, and planning fell
+        # back to the planner's own (valid) output.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(plan.nodes), 1)

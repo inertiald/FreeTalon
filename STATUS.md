@@ -1955,3 +1955,95 @@ Deliberately left out:
   CP2 complete; unsound-accepts are closed, accepted-sound still
   0 -- the remaining gap is model-side plan substance, not
   planner soundness).
+
+## Update - 2026-11-18 (Planner cycle 2: two-channel envelope, payload channel, repair discipline, formatter plumbing)
+
+- Built from the prior-art steal list (#1/#5/#7) as solutions inside
+  FreeTalon's design; no new human approval gates anywhere.
+  (1) Grammar-constrained envelope: planner calls on the Ollama path
+  now pass a JSON Schema via the `format` parameter, derived from
+  PlanNode (plan_envelope_schema): nodes array required, per-node
+  id+objective required, assigned_claw enum = the claw registry,
+  inputs/criteria free-form. Shape is guaranteed at decode time; the
+  validators remain the semantic layer. The schema is deliberately
+  NOT echoed into the prompt (house echo hazard — the model copies
+  prompt JSON). Intake already constrained its TaskIntent the same
+  way and is unchanged. Constrained-decoding cost (probe on
+  gemma-3-abliterated, short sequential generations): ~13.0 tok/s
+  schema-constrained vs ~14.4 tok/s format:"json" (~10% per-token
+  overhead); the schema permits an empty nodes array by design —
+  shape, not substance; the empty-plan escalation owns that case.
+  (2) Payload channel — option B, harness-owned materialization,
+  chosen over A (a validator ban on heredoc file writes) because
+  the harness's own grounded skeleton teaches the heredoc test
+  write, so A would fight the harness's own steering: a bash node
+  whose ONLY effect is one plain heredoc write of a .py file,
+  whose payload does not parse but is deterministically repairable
+  (the anchored-edit uniform re-indent rule, then indented-block
+  repair of single-statement dedents — the exact CP2 defect shape),
+  is rerouted at materialization to the scaffold form carrying the
+  repaired payload and judged by the full scaffold validator stack.
+  Unrepairable payloads keep the heredoc_parse rejection; valid
+  payloads keep the bash form untouched; appends, tees, and chained
+  commands are not converted.
+  (3) Repair discipline: stuck detection — the same structured
+  rejection signature (code, node) three times in a row raises
+  StuckRepairError (an LLMResponseError carrying the records) and
+  escalates to the loop's re-plan/judge path instead of burning the
+  budget (OpenHands' same-error pattern); every repair prompt now
+  restates the task ("THE TASK IS UNCHANGED: ...") on top of the
+  grounding it already re-included; scope lock — a would-be-accepted
+  repair outside the endorsed scope is rejected with the new code
+  scope_widening (35 codes total). Endorsed scope = the rejected
+  plan's files + paths named in any prompt so far in the call + the
+  task's workspace subtree + test files (the canonical grounded
+  shape always writes one; re-plan briefs carry no workspace —
+  judge.build_replan_brief — so the re-plan sequences depend on the
+  test-file rule); a dependency install widens a plan that installed
+  none. Framework/stack widening stays with the older framework
+  validator.
+  (4) Formatter plumbing (steal #7, plumbing only): an optional
+  second pass re-emits the planner's response under the envelope
+  schema before parsing; endpoint/model via
+  FREETALON_FORMATTER_OLLAMA_BASE_URL / FREETALON_FORMATTER_OLLAMA_MODEL
+  (or FREETALON_FORMATTER_ENABLED for a local two-pass on the
+  planner's own endpoint); default OFF, zero behavior change; a
+  formatter backend failure degrades to the original text. Pointing
+  it at seeker88's llama3 later is an env change, not a code change.
+  No live cross-box calls were made.
+- CP2-fixture invariant, demonstrated three ways: the CP2 trace's
+  output 3 (byte-exact fixture, md5 a6bf39ec4d62859086e482a3eb82d09d)
+  is now ACCEPTED — 5 nodes, step-2 converted with its payload
+  repaired, both written modules parse; retry-32's output 3 (the
+  same defect) flips its pin from "rejected with 1 error" to
+  accepted; retry-33's output 3 accepts and is sound (the full
+  12-definition api.py, retention-judged — the fragment output,
+  retry33-4, still rejects by name: elision).
+- Corpus replay vs CP1 (28 outputs x 2 roots; wall 17.18s): OLD
+  (2869fe7) accepted 4/28, accepted-sound 0/28, mean errors 1.21;
+  refactor (c334196) accepted 0/28, accepted-sound 0/28, mean 1.36;
+  cycle 2 accepted 2/28 (retry32-3, retry33-3 — both scored SOUND),
+  accepted-sound 2/28, mean errors 1.25. accepted-unsound remains 0
+  (the CP1 invariant holds), and accepted-sound moves off zero for
+  the first time, on the payload channel alone.
+- Pins changed, each documented in place with its reason: the A/B
+  heredoc pin and the retry-32 profile pin flip to acceptance (the
+  defect class they encoded is closed); retry-18 attempts 2/3 and
+  retry-19 attempt 2 drop 5 -> 4 errors across 14 tests in 5 classes
+  (step-2's heredoc parse error no longer fires; every other defect
+  unchanged, plans still rejected; two "names_all_five_defects"
+  tests renamed "..._four_defects"); retry-30 output 4 drops
+  2 -> 1 error (the placeholder scaffold remains and still rejects).
+  The first full-suite run with the naive scope lock produced 20
+  errors in the historical repair sequences — the lock rejected the
+  grounded repairs themselves (they write the workspace test file
+  the rejected plans never wrote); the endorsed-scope definition
+  above is the fix, and the final run is clean.
+- Suite: 1014/1014 green (997 + 17 new TestPlannerCycle2 tests).
+  Ran 1014 in 420.1s, OK. demo-framework-guard.py: ALL CHECKS
+  PASSED (46 checks). Build log:
+  logs/planner-cycle2-2026-11-17.log.
+- Next: the live measurement matrix (a separate step; not run
+  here): live /health runs on the cycle-2 planner with temperature
+  raised for distinct samples, and the formatter A/B with
+  seeker88's llama3 as the formatter node.
