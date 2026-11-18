@@ -4421,3 +4421,68 @@ Deliberately left out:
   re-run 1132/1132 OK in 466.2s
   (logs/rerun10-arm2-suite-post-restore.out).
   Log: logs/health-rerun10-2026-11-18.log.
+
+## Update - 2026-11-18 (Live re-run #10, Arm 3: gemma4:31b with FREETALON_LLM_THINK=0 on cycle 13 — generation unblocked live, 3 complete outputs; planning still fails on the same repeated anchored_edit rejection; re-run #10 closes with no verified success)
+
+- Run (FREETALON_OLLAMA_MODEL=gemma4:31b,
+  FREETALON_LLM_TEMPERATURE=0.0, timeout 900,
+  FREETALON_LLM_THINK=0, formatter OFF,
+  critic OFF; driver exit 1; intake OK;
+  planning FAILED with StuckRepairError;
+  no plan, no run directory, no file
+  changes, tree porcelain 0, no restore
+  needed; GPU peak observed 76C, no
+  thermal pause, 0 Xid; fans manual 85%
+  during, auto after, verified
+  GPUFanControlState=0): 3 raw planner
+  outputs (8448 / 8345 / 8444 chars),
+  ALL COMPLETE (the JSON closes).
+  Cycle 13's think control works live:
+  where re-run #9 arm 4 got an empty
+  first planning call and zero outputs,
+  this arm generated three full outputs
+  of content. Gemma 4's generation wall
+  is gone.
+- The wall is discipline, exactly as
+  the cycle-13 diagnostic found: all
+  three outputs carry the same
+  anchored_edit rejection — step_1
+  anchors a 'replace' edit on
+  HiveAPIServer.start.Handler.do_GET
+  whose content does not parse as a
+  definition on its own (a fragment of
+  the body, not the complete definition
+  at its indentation in the file). The
+  repair loop returned the rejection
+  verbatim each time; the model
+  repeated the defect unchanged 3x and
+  repairs stopped. The error text names
+  the exact requirement, so this reads
+  as a model-side repetition failure,
+  not a harness ambiguity.
+- Re-run #10 closes: no verified
+  success in three arms, and the
+  campaign's picture sharpened. The
+  control arm (arm 1) produced the
+  closest run ever — the with-changes
+  suite failed on exactly one error,
+  the model's own test setUp, with
+  cycle 13's fixture decoupling
+  verified live and the endpoint
+  itself live-verified correct.
+  Devstral's arm (arm 2) proved the
+  scoped-run steering (its broken
+  tests caught at their own node in
+  1.3s) and exposed two residual
+  fixture couplings that only a
+  computed-status, nested-helper
+  payload shape fires. This arm proves
+  think control live. Across re-runs
+  #9-#10 the recurring terminal defect
+  is now singular: the models' own
+  test code cannot construct the API
+  handler (four distinct wrong
+  constructions), and re-plans keep
+  dying on anchored-edit discipline
+  before a second version can execute.
+  Log: logs/health-rerun10-2026-11-18.log.
