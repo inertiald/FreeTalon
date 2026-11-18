@@ -7378,7 +7378,6 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
         from freetalon.orchestrator.tool_registry import is_placeholder_content
 
         skeleton = _grounded_skeleton(self.HEALTH_GOAL, workspace=self.WS)
-        self.assertIn("Do NOT write a TODO comment", skeleton)
         # Anchored-edit fix (retry #30): step-1 is no longer a
         # full-module scaffold — the "Write the FULL module"
         # instruction this test used to pin IS the retry-#30 defect
@@ -7386,13 +7385,19 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
         # stub), so the phrase must be GONE from the skeleton, and
         # step-1 is an anchored edit of the handler definition.
         self.assertNotIn("Write the FULL module", skeleton)
-        # The step-1 delta is still placeholder-only (all comment
-        # lines), so a verbatim copy of the sketch is rejected cheaply
-        # instead of slipping through as a plan — now by anchored-edit
-        # materialization (a comment-only delta), not the scaffold
-        # placeholder check. The branch lines carry quotes, which the
-        # JSON dump escapes, so they are asserted on the parsed
-        # content, not the raw skeleton string.
+        # Delta-blank fix (retry #32): the step-1 delta used to be
+        # instruction prose ("Write the COMPLETE new version ...",
+        # "Do NOT write a TODO comment") with the branch riding as
+        # comment lines, and this test pinned those phrases plus
+        # is_placeholder_content(content) == True. Retry #31's model
+        # copied the prose into its edit verbatim, so both pins
+        # invert: the phrases are GONE from the content slot (the
+        # instructions live in the skeleton's guidance text around
+        # it), and the content is the definition's real code — the
+        # branch in code form, at its true indentation — which is
+        # NOT placeholder content. The branch lines carry quotes,
+        # which the JSON dump escapes, so they are asserted on the
+        # parsed content, not the raw skeleton string.
         parsed = json.loads(skeleton.split("\n", 1)[1])
         inputs = parsed["nodes"][0]["inputs"]
         self.assertEqual(
@@ -7400,9 +7405,13 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
         )
         self.assertEqual(inputs["position"], "replace")
         content = inputs["content"]
-        self.assertIn('if path == "/health"', content)
+        self.assertIn('if path == "/health":', content)
         self.assertIn("self._send", content)
-        self.assertTrue(is_placeholder_content(content))
+        self.assertNotIn("Write the COMPLETE new version", content)
+        self.assertNotIn("Do NOT write a TODO comment", content)
+        self.assertFalse(is_placeholder_content(content))
+        first_line = content.splitlines()[0]
+        self.assertTrue(first_line.startswith("            def do_GET"))
 
     # --- (e) Regression guards: every earlier fix still holds ---
 
@@ -15078,6 +15087,14 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
     are untouched. The retry-#30 outputs still reject with exactly
     the same profiles under both repo roots, and the retry-#28/#29
     fixtures keep theirs (pinned by their own classes).
+
+    Retry #32 addendum: the delta blank itself turned out to be
+    the next echo surface (retry #31 copied its instruction
+    prose into the edit), so the blank is now the definition's
+    real code with the branch extended in code form, and
+    test_verbatim_skeleton_rejected_as_placeholder_delta became
+    test_verbatim_skeleton_materializes_as_a_real_plan — see
+    TestPlannerDeltaBlankFix.
     """
 
     HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
@@ -15789,26 +15806,41 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
             qualified_def_names(content), qualified_def_names(source)
         )
 
-    def test_verbatim_skeleton_rejected_as_placeholder_delta(self) -> None:
+    def test_verbatim_skeleton_materializes_as_a_real_plan(self) -> None:
+        # Retry #32 changed this pin: it used to assert the
+        # verbatim skeleton is rejected as a placeholder delta,
+        # because step-1's delta blank was instruction prose and a
+        # verbatim copy was a comment-only delta. The delta is now
+        # the definition's real code (the branch extended in code
+        # form), so a verbatim copy is judged on content like any
+        # other delta: it materializes and the plan validates —
+        # the run's own tests judge the "..." sketch values. What
+        # must not come back is a placeholder rejection for real
+        # code (see TestPlannerDeltaBlankFix for the prose side).
         import json
 
-        from freetalon.orchestrator.planner import (
-            CheapRejectionError,
-            _grounded_skeleton,
-        )
+        from freetalon.orchestrator.planner import _grounded_skeleton
+        from freetalon.orchestrator.repo_index import qualified_def_names
 
         skeleton = _grounded_skeleton(
             self.HEALTH_GOAL, str(self.repo_root), self.WS
         )
         raw = skeleton.split("\n", 1)[1]
-        with self.assertRaises(CheapRejectionError) as caught:
-            parse_planner_response(
-                raw, goal_text=self.HEALTH_GOAL, workspace=self.WS
-            )
-        message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
-        self.assertIn("placeholder content only", message)
-        self.assertIn("anchored edit", message)
+        nodes, _meta = parse_planner_response(
+            raw, goal_text=self.HEALTH_GOAL, workspace=self.WS
+        )
+        self.assertEqual(len(nodes), 5)
+        inputs = nodes[0].inputs
+        # Materialized to the legacy full-content form, like any
+        # accepted anchored edit.
+        self.assertNotIn("anchor", inputs)
+        self.assertNotIn("position", inputs)
+        content = inputs["content"]
+        source = Path(self.api_path).read_text(encoding="utf-8")
+        self.assertEqual(
+            qualified_def_names(content), qualified_def_names(source)
+        )
+        self.assertIn('payload["gpu_temperature"] = ...', content)
         # Silence the unused-import lint pattern used elsewhere.
         self.assertIsInstance(json.loads(raw), dict)
 
@@ -15863,3 +15895,367 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
             )
             self.assertIn("was rejected with 1 error", message5)
             self.assertIn("placeholder content only", message5)
+
+
+class TestPlannerDeltaBlankFix(unittest.TestCase):
+    """Delta blank as real code + prose-delta detection (retry #31).
+
+    Retry #31 (log llm-end-to-end-health-retry31-2026-11-17.log,
+    DRIVER_EXIT 1) was the first run with anchored edits live:
+    output 3 used the form CORRECTLY — anchor
+    HiveAPIServer.start.Handler.do_GET, position "replace", the
+    steering's named anchor — but filled the content slot with the
+    grounded skeleton's delta-blank instruction text ("# Write the
+    COMPLETE new version of ... here — real code only ... Do NOT
+    write a TODO comment") instead of writing the method. Worse,
+    the model's re-wrap dropped the '#' markers from the prose
+    lines, so is_placeholder_content (comment-stripping, then not a
+    lone string) and _is_placeholder_stub (needs a self-labeling
+    comment) both missed it, and materialization rejected the
+    delta at the INDENTATION gate (0 spaces vs the anchor's 12) —
+    a true fact naming the wrong defect, at full price: the repair
+    never got the grounded skeleton, and output 4 regressed to a
+    garbled Flask full-content scaffold. This is the second
+    consecutive echo failure (retry #30: the skeleton's step-1
+    text; #31: the delta blank): the model copies whatever prose
+    occupies an example's content slot.
+
+    Fix (planner.py only; the guard, the placeholder check on
+    materialized content, interpreter normalization, and the
+    executor untouched):
+    1. The grounded skeleton's anchored step-1 delta is REAL CODE
+       (_anchored_delta_sketch): the anchored definition's current
+       source sliced verbatim from the module (real signature,
+       real body, true file indentation), with the route branch
+       extended in code form — the branch's real response dict
+       bound to a payload name, one payload["<field>"] = ... line
+       per derived response field (_SKELETON_ROUTE_FIELDS, the
+       same table step-2's assertions are generated from), and
+       the branch's real return with the dict replaced by the
+       payload. No instruction prose inside the content slot; the
+       instructions live in the step-1 guidance around it. A
+       verbatim copy now copies plausible code at the right
+       indentation, and materialization judges it on content.
+    2. Materialization detects comment/prose-only deltas at the
+       placeholder check — which already sat BEFORE the
+       indentation gate; the defect was detection, not position —
+       via _delta_carries_code: a delta carries code when its
+       dedented text parses with a real statement, or when a
+       non-comment line is code-shaped. An echoed blank is named
+       placeholder content (cheap rejection -> grounded skeleton
+       repair); real code at the wrong indentation still hits the
+       indentation gate with both indents stated.
+
+    The retry-#31 fixtures below keep their profiles under both
+    repo roots modulo ONE renamed error: output 3's single error
+    is now the placeholder rejection instead of the indentation
+    rejection (the correct name for the defect, and cheap).
+    Output 4 (the Flask repair regression) is unchanged at 5
+    errors. The retry-#28/#29/#30 fixtures keep theirs (pinned by
+    their own classes).
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#31 outputs 3 and 4, verbatim from the RAW
+    # PLANNER OUTPUT blocks of the retry-#31 driver section of
+    # logs/llm-end-to-end-health-retry31-2026-11-17.log (the same
+    # extraction tools/probe-retry31-rejections.py performs).
+    # Embedded (not read from the log) so the tests stay hermetic
+    # in CI.
+    RETRY31_OUTPUT3_RAW = '{\n"nodes":[\n{"id":"step-1","objective":"Extend /home/seeker/projects/FreeTalon/freetalon/api.py in place  \\u2014 add a /health branch to the do_GET method of the Handler class (defined inside HiveAPIServer.start)","depends_on":[],"assigned_claw":"scaffold","inputs":{"file_path":"/home/seeker/projects/FreeTalon/freetalon/api.py","anchor":"HiveAPIServer.start.Handler.do_GET","position":"replace","content":"# Write the COMPLETE new version of HiveAPIServer.start.Handler.do_GET here  \\u2014 real code only, starting with its def line at the indentation it has in the module (12 spaces), with the existing /health branch extended with the fields the goal asks for.\\nThe branch as it exists today:\\n#  if path == \\"/health\\":\\n#      return self._send(200,{\\"ok\\":True,\\"status\\":\\"ready\\"})\\nThe system inserts your code into the current file in place of the old definition  \\u2014 every other definition is preserved.\\nDo NOT write the whole module.\\nDo NOT write a TODO comment  \\u2014 comment-only content is rejected."},"outputs":["/home/seeker/projects/FreeTalon/freetalon/api.py"],"acceptance":["The /health endpoint is implemented in /home/seeker/projects/FreeTalon/freetalon/api.py."],"criteria":[{"type":"file_exists","path":"/home/seeker/projects/FreeTalon/freetalon/api.py"}]},{"id":"step-2","objective":"Write the tests for /health","depends_on":["step-1"],"assigned_claw":"bash","inputs":{"command":"cat > /home/seeker/freetalon-workspace/test_health.py <<\'EOF\'\\nimport json\\nimport sys\\nimport tempfile\\nimport unittest\\nimport urllib.request\\nfrom pathlib import Path\\n\\nsys.path.insert(0, \\"/home/seeker/projects/FreeTalon\\")\\n\\nfrom freetalon.api import HiveAPIServer\\nfrom freetalon.config import HiveConfig\\nfrom freetalon.hive import HiveController\\n\\n\\nclass RouteEndpointTests(unittest.TestCase):\\n    def setUp(self):\\n        self.tmpdir = tempfile.TemporaryDirectory()\\n        base = Path(self.tmpdir.name)\\n        config = HiveConfig(\\n            workspace=base,\\n            state_path=base / \\"state.json\\",\\n            audit_log_path=base / \\"audit.log\\",\\n            worker_cap=2,\\n            queue_multiplier=3,\\n            poll_interval_seconds=0.02,\\n        )\\n        self.controller = HiveController(config)\\n        self.controller.start()\\n        self.server = HiveAPIServer(self.controller, \\"test-token\\")\\n        self.server.start(\\"127.0.0.1\\", 0)\\n        port = self.server._httpd.server_address[1]\\n        self.base = f\\"http://127.0.0.1:{port}\\"\\n\\n    def tearDown(self):\\n        self.server.stop()\\n        self.controller.stop()\\n        self.tmpdir.cleanup()\\n\\n    def test_route_answers(self):\\n        with urllib.request.urlopen(f\\"{self.base}/health\\", timeout=3) as resp:\\n            status = resp.status\\n            data = json.loads(resp.read())\\n        self.assertEqual(status, 200)\\n        self.assertTrue(data[\\"ok\\"])\\n        self.assertIn(\\"status\\", data)\\n        self.assertIn(\\"service_status\\", data)\\n        self.assertIn(\\"ollama_reachable\\", data)\\n        self.assertIsInstance(data[\\"ollama_reachable\\"], bool)\\n        self.assertIn(\\"gpu_temperature\\", data)\\n        self.assertIsInstance(data[\\"gpu_temperature\\"], (int, float))\\n\\n\\nif __name__ == \\"__main__\\":\\n    unittest.main()\\nEOF"},"outputs":["/home/seeker/freetalon-workspace/test_health.py"],"acceptance":["The tests for /health exist."],"criteria":[{"type":"file_exists","path":"/home/seeker/freetalon-workspace/test_health.py"}]},{"id":"step-3","objective":"Run the tests for /health","depends_on":["step-2"],"assigned_claw":"bash","inputs":{"command":"python3 /home/seeker/freetalon-workspace/test_health.py"},"outputs":["test results"],"acceptance":["The tests for /health pass."],"criteria":[{"type":"exit_code","equals":0}]},{"id":"step-4","objective":"Start the API server for /health","depends_on":["step-3"],"assigned_claw":"bash","inputs":{"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli stop; ./venv/bin/python -m freetalon.cli start && for i in $(seq 1 30); do curl -sf http://localhost:8765/health && break; sleep 1; done; curl -sf http://localhost:8765/health"},"outputs":["API server running"],"acceptance":["The API server answers /health."],"criteria":[{"type":"exit_code","equals":0}]},{"id":"step-5","objective":"Verify /health live","depends_on":["step-4"],"assigned_claw":"bash","inputs":{"command":"curl -s http://localhost:8765/health"},"outputs":["verification"],"acceptance":["/health returns its JSON live."],"criteria":[{"type":"exit_code","equals":0}]}]\n}'
+
+    RETRY31_OUTPUT4_RAW = '{"nodes":\n[\n{\n"id":\n"step-1",\n"objective":\n"Modify HiveAPIServer.start.Handler.do_GET to include logging.",\n"depends_on":\n[],\n"assigned_claw":\n"scaffold",\n"inputs":\n{\n"file_path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":\n"from flask import Flask, request\\nimport logging\\n\\napp = Flask(__name__)\\nlogging.basicConfig(level=logging.INFO)\\n\\ndef start():\\n    Handler = app\\n    @Handler.route(\'/health\', methods=[\'GET\'])\\ndef do_GET():\\n        logging.info(\'Received health check request\')\\n        return \'OK\'\\n\\nif __name__ == \'__main__\':\\n    start()\\n    app.run(debug=True)"\n}\n},\n{\n"id":\n"step-2",\n"objective":\n"Run tests to verify the changes.",\n"depends_on":\n[\n"step-1"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m unittest discover -s tests"\n}\n},\n{\n"id":\n"step-3",\n"objective":\n"Verify that the tests pass.",\n"depends_on":\n[\n"step-2"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"echo \'Tests passed\'"\n}\n}\n]\n}'
+
+    # The pre-fix skeleton's step-1 delta blank for the /health
+    # goal, byte-exact as _grounded_skeleton emitted it before
+    # this fix (generated from the pre-fix code): pure instruction
+    # prose plus the branch as comment lines.
+    OLD_DELTA_BLANK = '# Write the COMPLETE new version of HiveAPIServer.start.Handler.do_GET here — real code only, starting with its def line at the indentation it has in the module (12 spaces), with the existing /health branch extended with the fields the goal asks for. The branch as it exists today:\n#     if path == "/health":\n#                         return self._send(200, {"ok": True, "status": "ready"})\n# The system inserts your code into the current file in place of the old definition — every other definition is preserved. Do NOT write the whole module.\n# Do NOT write a TODO comment — comment-only content is rejected.'
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _edit_node(self, target: str, anchor: str, content: str) -> dict:
+        return {
+            "id": "step-1",
+            "objective": "Extend the module in place",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": target,
+                "anchor": anchor,
+                "position": "replace",
+                "content": content,
+            },
+            "outputs": [target],
+            "acceptance": ["The module is edited."],
+            "criteria": [{"type": "file_exists", "path": target}],
+        }
+
+    def _rejection(self, raw: str, **kwargs: object) -> str:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw, **kwargs)
+        return str(caught.exception)
+
+    # --- The delta blank is real code now ---
+
+    def test_skeleton_step1_delta_is_real_code(self) -> None:
+        import ast
+        import json
+        import textwrap
+
+        from freetalon.orchestrator.planner import (
+            _delta_carries_code,
+            _delta_top_level_def_names,
+            _grounded_skeleton,
+        )
+        from freetalon.orchestrator.tool_registry import (
+            is_placeholder_content,
+        )
+
+        skeleton = _grounded_skeleton(
+            self.HEALTH_GOAL, str(self.repo_root), self.WS
+        )
+        parsed = json.loads(skeleton.split("\n", 1)[1])
+        inputs = parsed["nodes"][0]["inputs"]
+        self.assertEqual(
+            inputs["anchor"], "HiveAPIServer.start.Handler.do_GET"
+        )
+        self.assertEqual(inputs["position"], "replace")
+        content = inputs["content"]
+        # Real code: parses as the anchored definition, at the
+        # anchor's true file indentation (12 spaces), carrying the
+        # branch in code form — not as comment lines.
+        self.assertEqual(_delta_top_level_def_names(content), ["do_GET"])
+        first_line = content.splitlines()[0]
+        self.assertEqual(
+            len(first_line) - len(first_line.lstrip()), 12
+        )
+        self.assertTrue(first_line.lstrip().startswith("def do_GET"))
+        branch_lines = [
+            line for line in content.splitlines()
+            if 'if path == "/health":' in line
+        ]
+        self.assertEqual(len(branch_lines), 1)
+        self.assertFalse(branch_lines[0].lstrip().startswith("#"))
+        ast.parse(textwrap.dedent(content))
+        # The branch is extended in code form: the real response
+        # dict bound to payload, the goal's fields as sketch
+        # values, the real return sending the payload.
+        self.assertIn('payload = {"ok": True, "status": "ready"}', content)
+        self.assertIn('payload["service_status"] = ...', content)
+        self.assertIn('payload["ollama_reachable"] = ...', content)
+        self.assertIn('payload["gpu_temperature"] = ...', content)
+        self.assertIn("return self._send(200, payload)", content)
+        # No instruction prose inside the content slot: every
+        # phrase of the old blank is gone from it.
+        for phrase in (
+            "Write the COMPLETE new version",
+            "The branch as it exists today",
+            "The system inserts your code",
+            "Do NOT write the whole module",
+            "Do NOT write a TODO comment",
+            "comment-only content is rejected",
+        ):
+            self.assertNotIn(phrase, content)
+        # And it is not placeholder content by either measure.
+        self.assertFalse(is_placeholder_content(content))
+        self.assertTrue(_delta_carries_code(content))
+
+    def test_skeleton_step2_assertions_unchanged(self) -> None:
+        # The step-2 test code is now generated from the shared
+        # _SKELETON_ROUTE_FIELDS table; its assertions must stay
+        # byte-identical to the hand-written block they replace.
+        import json
+
+        from freetalon.orchestrator.planner import _grounded_skeleton
+
+        skeleton = _grounded_skeleton(
+            self.HEALTH_GOAL, str(self.repo_root), self.WS
+        )
+        parsed = json.loads(skeleton.split("\n", 1)[1])
+        command = parsed["nodes"][1]["inputs"]["command"]
+        for line in (
+            '        self.assertIn("service_status", data)\n',
+            '        self.assertIn("ollama_reachable", data)\n',
+            '        self.assertIsInstance(data["ollama_reachable"], bool)\n',
+            '        self.assertIn("gpu_temperature", data)\n',
+            '        self.assertIsInstance(data["gpu_temperature"], (int, float))\n',
+        ):
+            self.assertIn(line, command)
+
+    def test_anchored_delta_sketch_generic_shapes(self) -> None:
+        from freetalon.orchestrator.planner import _anchored_delta_sketch
+
+        source = (
+            "class Server:\n"
+            "    def start(self):\n"
+            "        class Handler:\n"
+            "            def do_GET(self):\n"
+            '                path = "/health"\n'
+            '                if path == "/health":\n'
+            '                    return self._send(200, {"ok": True})\n'
+            '                return self._send(404, {"ok": False})\n'
+        )
+        anchor = "Server.start.Handler.do_GET"
+        sketch = _anchored_delta_sketch(source, anchor, "/health")
+        self.assertIsNotNone(sketch)
+        assert sketch is not None
+        self.assertIn('payload = {"ok": True}', sketch)
+        self.assertIn('payload["gpu_temperature"] = ...', sketch)
+        self.assertIn("return self._send(200, payload)", sketch)
+        # The other branch is untouched real code.
+        self.assertIn('return self._send(404, {"ok": False})', sketch)
+        # A route with no derived fields: the definition verbatim.
+        verbatim = _anchored_delta_sketch(source, anchor, "/status")
+        self.assertIsNotNone(verbatim)
+        assert verbatim is not None
+        self.assertNotIn("payload", verbatim)
+        self.assertIn('return self._send(200, {"ok": True})', verbatim)
+        # A branch whose body is not a single dict-return: the
+        # definition verbatim (extension is an enhancement, never
+        # a requirement).
+        two_step = source.replace(
+            'return self._send(200, {"ok": True})',
+            'data = {"ok": True}\n'
+            "                    return self._send(200, data)",
+        )
+        sketch2 = _anchored_delta_sketch(two_step, anchor, "/health")
+        self.assertIsNotNone(sketch2)
+        assert sketch2 is not None
+        self.assertNotIn("payload", sketch2)
+        # No span for the anchor: None.
+        self.assertIsNone(
+            _anchored_delta_sketch(source, "Server.nope", "/health")
+        )
+
+    # --- Prose deltas are named placeholder BEFORE indentation ---
+
+    def test_delta_carries_code_cases(self) -> None:
+        from freetalon.orchestrator.planner import _delta_carries_code
+
+        # The retry-#31 echo shape: instruction prose with the
+        # comment markers dropped carries no code.
+        self.assertFalse(
+            _delta_carries_code(
+                "# Write the COMPLETE new version here — real code only.\n"
+                "The branch as it exists today:\n"
+                '#  if path == "/health":\n'
+                "The system inserts your code into the current file.\n"
+                "Do NOT write the whole module.\n"
+                "Do NOT write a TODO comment — comment-only content "
+                "is rejected."
+            )
+        )
+        self.assertFalse(_delta_carries_code("# TODO: write it\n"))
+        self.assertFalse(_delta_carries_code(""))
+        self.assertFalse(_delta_carries_code('"""Only a docstring."""\n'))
+        # Real code carries code — whole, fragmented, or broken.
+        self.assertTrue(
+            _delta_carries_code('def do_GET(self):\n    return "ok"\n')
+        )
+        self.assertTrue(
+            _delta_carries_code(
+                "            if True:\n                return 1\n"
+            )
+        )
+        self.assertTrue(
+            _delta_carries_code(
+                "            def do_PUT(self)\n"
+                '                return "put"\n'
+            )
+        )
+        self.assertTrue(_delta_carries_code("import subprocess\n"))
+        self.assertTrue(_delta_carries_code("payload = {}\n"))
+
+    def test_old_blank_verbatim_is_a_cheap_placeholder_rejection(self) -> None:
+        from freetalon.orchestrator.planner import CheapRejectionError
+
+        raw = self._dag(
+            [
+                self._edit_node(
+                    self.api_path,
+                    "HiveAPIServer.start.Handler.do_GET",
+                    self.OLD_DELTA_BLANK,
+                )
+            ]
+        )
+        with self.assertRaises(CheapRejectionError) as caught:
+            parse_planner_response(
+                raw, goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("placeholder content only", message)
+        self.assertIn("anchored edit", message)
+        # Named as the placeholder it is — never as indentation.
+        self.assertNotIn("spaces of indentation", message)
+
+    def test_real_code_at_wrong_indentation_still_hits_the_gate(self) -> None:
+        # The ordering contrast: a REAL definition at the wrong
+        # indentation is not a placeholder — it reaches the
+        # indentation gate, with both indents stated.
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.api_path,
+                        "HiveAPIServer.start.Handler.do_GET",
+                        'def do_GET(self):\n    return "ok"\n',
+                    )
+                ]
+            ),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+        )
+        self.assertIn("starts at 0 spaces of indentation", message)
+        self.assertIn("sits at 12 spaces in the file", message)
+        self.assertNotIn("placeholder content only", message)
+
+    # --- Retry-#31 fixtures ---
+
+    def test_retry31_output3_now_a_cheap_placeholder_rejection(self) -> None:
+        from freetalon.orchestrator.planner import CheapRejectionError
+
+        for root in (None, str(self.repo_root)):
+            with self.assertRaises(CheapRejectionError) as caught:
+                parse_planner_response(
+                    self.RETRY31_OUTPUT3_RAW,
+                    goal_text=self.HEALTH_GOAL,
+                    workspace=self.WS,
+                    repo_root=root,
+                )
+            message = str(caught.exception)
+            self.assertIn("was rejected with 1 error", message)
+            self.assertIn("placeholder content only", message)
+            self.assertIn("anchored edit", message)
+            # The one renamed error: before this fix, output 3's
+            # single error was the indentation rejection ("starts
+            # at 0 spaces of indentation ... sits at 12 spaces").
+            # The defect was never indentation — the delta is the
+            # echoed prose blank — so the placeholder name is the
+            # correct one, and being cheap it routes the repair to
+            # the grounded skeleton.
+            self.assertNotIn("spaces of indentation", message)
+
+    def test_retry31_output4_profile_unchanged(self) -> None:
+        for root in (None, str(self.repo_root)):
+            message = self._rejection(
+                self.RETRY31_OUTPUT4_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertIn("was rejected with 5 errors", message)
+            self.assertIn("has no 'criteria'", message)
+            self.assertIn("does not parse as Python", message)
+            self.assertIn("Flask", message)

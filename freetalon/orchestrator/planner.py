@@ -1362,6 +1362,18 @@ def _normalize_plan_interpreters(nodes_raw: list[Any]) -> None:
 # the materialized module), and the executor see exactly the
 # full-content nodes they see today. The executor cannot tell the
 # difference and is not touched.
+#
+# Retry #32: the grounded skeleton's step-1 delta blank was
+# instruction prose, and retry #31's model copied it into the
+# edit's content (its re-wrap dropping the '#' markers, so the
+# placeholder checks missed the echo and the indentation gate
+# named the wrong defect at full price). Two fixes: the blank is
+# now real code (_anchored_delta_sketch — the definition's current
+# source with the branch extended in code form; instructions live
+# in the steering text around the slot), and materialization
+# detects comment/prose-only deltas (_delta_carries_code) at the
+# placeholder check, BEFORE the indentation gate, so an echoed
+# blank is named placeholder content and stays a cheap rejection.
 
 _EDIT_POSITIONS = ("replace", "after", "before")
 
@@ -1479,6 +1491,71 @@ def _delta_top_level_def_names(content: str) -> list[str] | None:
     ]
 
 
+# First-token shapes of a line of Python code, for the code-presence
+# test below: a keyword-led statement, a decorator, a name-led
+# assignment / call / subscript / operator expression, or a line
+# opening a bracket, string, or number. Prose lines — sentences —
+# match none of these: they open with a capitalized word followed
+# by another word, not by an operator or a bracket.
+_CODE_LINE_RE = re.compile(
+    r"^(?:"
+    r"(?:def|class|if|elif|else|for|while|try|except|finally|with|"
+    r"return|import|from|pass|raise|assert|yield|await|async|lambda|"
+    r"global|nonlocal|del|break|continue)\b"
+    r"|@\w"
+    r"|[A-Za-z_][\w.]*\s*(?:\(|\[|[+\-*/%@&|^]?=|//=|\*\*=|<<=|>>=|"
+    r"==|!=|<=|>=)"
+    r"|[\[{(]"
+    r"|[\"']"
+    r"|\d"
+    r")"
+)
+
+
+def _delta_carries_code(content: str) -> bool:
+    """True when an anchored edit's delta contains at least one real code line.
+
+    Retry #32: retry #31's model echoed the grounded skeleton's
+    delta blank — instruction prose — into the edit's content, but
+    its re-wrap dropped the '#' markers from the prose lines, so
+    is_placeholder_content (which strips comment lines and then
+    finds prose, not a lone string) said False and
+    _is_placeholder_stub (which needs a self-labeling comment)
+    said False too: the delta fell through to the indentation
+    gate and was rejected for starting at 0 spaces — a true fact
+    naming the wrong defect, and a full-price rejection for what
+    is a placeholder echo. A delta carries code when its dedented
+    text parses with at least one real statement (anything but a
+    lone docstring), or — when it does not parse, as with a body
+    fragment or a typo'd def line — when at least one non-comment
+    line is code-shaped (_CODE_LINE_RE). Comment/prose-only deltas
+    carry no code, so the placeholder check in
+    _materialize_scaffold_edit names them BEFORE indentation is
+    judged and the rejection stays cheap; real code at the wrong
+    indentation still reaches the indentation gate untouched.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(content))
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        return any(
+            not (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            )
+            for stmt in tree.body
+        )
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "//")):
+            continue
+        if _CODE_LINE_RE.match(stripped):
+            return True
+    return False
+
+
 def _materialize_scaffold_edit(
     label: str,
     inputs: dict[str, Any],
@@ -1583,15 +1660,18 @@ def _materialize_scaffold_edit(
         not content.strip()
         or is_placeholder_content(content)
         or _is_placeholder_stub(content)
+        or not _delta_carries_code(content)
     ):
         return (
             f"Planner node '{label}' scaffolds {target!r} with an "
             "anchored edit whose content is placeholder content only "
-            "(comments and/or a docstring, no code) — the edit's "
-            f"content must be the real new code for {anchor!r}: the "
-            "complete definition (def line included) for 'replace', "
-            "or the complete new sibling for 'after'/'before', at its "
-            "indentation in the file — not a comment about it.",
+            "(comments, prose, and/or a docstring — no code) — the "
+            f"edit's content must be the real new code for {anchor!r}: "
+            "the complete definition (def line included) for "
+            "'replace', or the complete new sibling for "
+            "'after'/'before', at its indentation in the file — not "
+            "a comment about it, and not instructions copied from "
+            "the prompt.",
             True,
         )
     spans = _definition_spans(source)
@@ -4783,6 +4863,151 @@ def _grounded_move_for_goal(goal_text: str | None, repo_root: str | Path | None)
     return _grounded_move_text(index, goal_text)
 
 
+# The response fields the grounded skeleton works with for a route,
+# as (field name, isinstance types for the step-2 assertion or
+# None): for /health the goal's three reported items (service
+# status, Ollama reachable, GPU temperature) under the established
+# HEREDOC_TEST fixture's key names; any other route has none, so
+# step-2 keeps only its generic ok/status assertions and step-1's
+# sketch keeps the branch as it exists. ONE table for both steps
+# (retry #32): step-1's delta sketch extends the branch with
+# exactly the fields step-2's test asserts, so the two can never
+# drift apart.
+_SKELETON_ROUTE_FIELDS: dict[str, tuple[tuple[str, str | None], ...]] = {
+    "/health": (
+        ("service_status", None),
+        ("ollama_reachable", "bool"),
+        ("gpu_temperature", "(int, float)"),
+    ),
+}
+
+
+def _route_branch_if(source: str, route: str) -> ast.If | None:
+    """The ast.If dispatching on ``route`` in a module, or None.
+
+    The branch shape _route_branch_anchor and repo_index._route_branch
+    both read: a Compare whose single Eq comparator is the route
+    literal. Assumes the source parses (callers check); returns the
+    first match in walk order, like _route_branch_anchor.
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value == route
+        ):
+            return node
+    return None
+
+
+def _anchored_delta_sketch(
+    module_source: str, anchor: str, route: str
+) -> str | None:
+    """The grounded skeleton's step-1 delta: real code, never prose.
+
+    Retry #32: the delta blank used to be instruction prose ("#
+    Write the COMPLETE new version of ... here ... Do NOT write a
+    TODO comment") with the branch riding as commented lines, and
+    retry #31's model copied it into the edit's content verbatim —
+    the second consecutive echo of whatever prose occupied an
+    example's content slot (retry #30 echoed the old step-1 the
+    same way). The blank is now the anchored definition's REAL
+    current source — signature and full body sliced verbatim from
+    the module at the anchor's span (decorators included), at its
+    true file indentation — with the route branch extended in code
+    form: when the branch's body is a single ``return <call>(...,
+    {dict})`` and the route has derived response fields
+    (_SKELETON_ROUTE_FIELDS), the branch is rebuilt as
+
+        payload = {<the branch's real dict>}
+        payload["<field>"] = ...      (per field not already a key)
+        return <the real call, its dict argument now ``payload``>
+
+    at the branch body's real indentation, every expression taken
+    from the source segments, so nothing is invented but the field
+    names the shape code already derives. The ``...`` values are
+    the sketch's open slots — the steering text AROUND the slot
+    (the skeleton's step-1 guidance) tells the model to replace
+    them with real computations; no instruction text lives inside
+    the content slot anymore. Any other branch shape, no derived
+    fields, or every field already present leaves the definition
+    source unchanged: still real code at true indentation. Returns
+    None when the anchor has no span in the source.
+    """
+    span: tuple[int, int] | None = None
+    for span_name, span_start, span_end, _span_indent in _definition_spans(
+        module_source
+    ):
+        if span_name == anchor:
+            span = (span_start, span_end)
+            break
+    if span is None:
+        return None
+    start, end = span
+    lines = module_source.splitlines()
+    definition_lines = lines[start - 1 : end]
+    fields = [
+        field for field, _types in _SKELETON_ROUTE_FIELDS.get(route, ())
+    ]
+    if not fields:
+        return "\n".join(definition_lines)
+    branch = _route_branch_if(module_source, route)
+    if branch is None or not (start <= branch.lineno <= end):
+        return "\n".join(definition_lines)
+    if len(branch.body) != 1 or not isinstance(branch.body[0], ast.Return):
+        return "\n".join(definition_lines)
+    ret = branch.body[0]
+    if not isinstance(ret.value, ast.Call):
+        return "\n".join(definition_lines)
+    dict_node = next(
+        (arg for arg in ret.value.args if isinstance(arg, ast.Dict)), None
+    )
+    if dict_node is None:
+        return "\n".join(definition_lines)
+    existing_keys = {
+        key.value
+        for key in dict_node.keys
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    new_fields = [field for field in fields if field not in existing_keys]
+    if not new_fields:
+        return "\n".join(definition_lines)
+    dict_segment = ast.get_source_segment(module_source, dict_node)
+    call_segment = ast.get_source_segment(module_source, ret.value)
+    if dict_segment is None or call_segment is None:
+        return "\n".join(definition_lines)
+    definition_text = "\n".join(definition_lines)
+    payload_name = next(
+        (
+            candidate
+            for candidate in ("payload", "response_payload", "route_payload")
+            if not re.search(rf"\b{candidate}\b", definition_text)
+        ),
+        None,
+    )
+    if payload_name is None:
+        return "\n".join(definition_lines)
+    body_indent = " " * ret.col_offset
+    rebuilt = [f"{body_indent}{payload_name} = {dict_segment}"]
+    rebuilt += [
+        f'{body_indent}{payload_name}["{field}"] = ...'
+        for field in new_fields
+    ]
+    rebuilt.append(
+        f"{body_indent}return "
+        + call_segment.replace(dict_segment, payload_name, 1)
+    )
+    definition_lines[ret.lineno - start : ret.end_lineno - start + 1] = rebuilt
+    return "\n".join(definition_lines)
+
+
 def _grounded_skeleton(
     goal_text: str | None,
     repo_root: str | Path | None = None,
@@ -4817,7 +5042,19 @@ def _grounded_skeleton(
     handler definition the route lives in, named by its qualified
     anchor, with the sketch riding as the delta's comment blank; a
     verbatim copy is a comment-only delta, which materialization
-    rejects as placeholder content.
+    rejects as placeholder content. Retry #31: the model copied
+    THAT blank too — it used the anchored edit correctly (the named
+    anchor, position "replace") but filled the content with the
+    blank's instruction prose, its re-wrap dropping the '#'
+    markers from the prose lines so the placeholder checks missed
+    it and materialization rejected it at the indentation gate,
+    naming the wrong defect at full price. Retry #32: the delta is
+    no longer prose at all — it is the anchored definition's real
+    current code with the route branch extended in code form
+    (_anchored_delta_sketch), and the instructions live in the
+    step-1 guidance AROUND the slot. A verbatim copy now copies
+    plausible code at the right indentation, which materialization
+    judges on content like any other delta.
     Step-2's test is runnable real code, not a stub (retry #21): the old
     skeleton showed a "# TODO: replace this comment with the real test
     code" heredoc, and the model copied the TODO verbatim into its plan
@@ -4871,13 +5108,18 @@ def _grounded_skeleton(
         # old blank meant retyping a 219-line module. The blank is
         # now the ONE definition the change belongs to — the route
         # handler's qualified name, derived from the branch's
-        # position in the real module — and a verbatim copy of the
-        # sketch is a comment-only delta, which materialization
-        # rejects as placeholder content. When no anchor is
-        # derivable (module unreadable or unparseable, branch
-        # outside any definition), step-1 keeps the legacy
-        # full-content form below.
+        # position in the real module. Retry #32: the blank itself
+        # is no longer instruction prose with the sketch riding as
+        # comments — retry #31's model copied that prose into the
+        # edit's content — it is the definition's real code with
+        # the branch extended in code form
+        # (_anchored_delta_sketch); the instructions live in the
+        # step-1 guidance below, around the slot, never in it.
+        # When no anchor is derivable (module unreadable or
+        # unparseable, branch outside any definition), step-1
+        # keeps the legacy full-content form below.
         anchor_indent = 0
+        delta_sketch: str | None = None
         try:
             module_source: str | None = Path(module_path).read_text(
                 encoding="utf-8"
@@ -4893,23 +5135,15 @@ def _grounded_skeleton(
                     if span_name == anchor:
                         anchor_indent = span_indent
                         break
-        if anchor is not None:
-            content = (
-                f"# Write the COMPLETE new version of {anchor} here — "
-                f"real code only, starting with its def line at the "
-                f"indentation it has in the module ({anchor_indent} "
-                f"spaces), with the existing {route} branch extended "
-                f"with the fields the goal asks for. The branch as it "
-                f"exists today:\n"
-                f"{sketch}\n"
-                "# The system inserts your code into the current file "
-                "in place of the old definition — every other "
-                "definition is preserved. Do NOT write the whole "
-                "module.\n"
-                "# Do NOT write a TODO comment — comment-only content "
-                "is rejected."
-            )
+                delta_sketch = _anchored_delta_sketch(
+                    module_source, anchor, route
+                )
+                if delta_sketch is None:
+                    anchor = None
+        if anchor is not None and delta_sketch is not None:
+            content = delta_sketch
         else:
+            anchor = None
             content = (
                 f"# Extend {module_path} in place — add the fields the goal asks "
                 f"for to the existing {route} branch in {handler}:\n"
@@ -4929,12 +5163,20 @@ def _grounded_skeleton(
         }
         step1_guidance = (
             "Step-1 is an anchored edit of the serving module: its "
-            "\"content\" shows the existing branch as a commented sketch "
-            "— replace the sketch with the complete new version of the "
-            "anchored definition (real code, def line included, at its "
-            "indentation in the file); the system inserts it into the "
-            "current module, so do not write the whole module, and do "
-            "not copy the sketch's comment lines as the content."
+            "\"content\" is the anchored definition's current code, "
+            f"with the {route} branch already extended in code form "
+            "— the fields the goal asks the endpoint to report are "
+            "present with \"...\" sketch values. Return the complete "
+            "new version of the anchored definition (def line "
+            "included, at its indentation in the file — "
+            f"{anchor_indent} spaces) with every \"...\" value "
+            "replaced by the real computation of what the goal asks "
+            "the endpoint to report, keeping the rest of the "
+            "definition's code as it is; the system inserts it into "
+            "the current module, so do not write the whole module. "
+            "The content is code to complete, not text to copy back "
+            "unchanged — a definition still carrying \"...\" sketch "
+            "values does not implement the goal."
         )
     else:
         step1_inputs = {"file_path": module_path, "content": content}
@@ -4945,21 +5187,21 @@ def _grounded_skeleton(
         )
     # Step-2's test is runnable real code (see the docstring): the old
     # skeleton's TODO heredoc was copied verbatim into the model's plan
-    # twice in retry #21. For /health the field assertions follow the
-    # goal's three reported items (service status, Ollama reachable, GPU
-    # temperature) and the established HEREDOC_TEST fixture's key names;
-    # any other route gets the generic ok/status assertions, so the test
-    # stays correct for routes whose fields the goal does not name.
-    if route == "/health":
-        field_assertions = (
-            '        self.assertIn("service_status", data)\n'
-            '        self.assertIn("ollama_reachable", data)\n'
-            '        self.assertIsInstance(data["ollama_reachable"], bool)\n'
-            '        self.assertIn("gpu_temperature", data)\n'
-            '        self.assertIsInstance(data["gpu_temperature"], (int, float))\n'
+    # twice in retry #21. The field assertions follow the route's
+    # derived response fields (_SKELETON_ROUTE_FIELDS — for /health
+    # the goal's three reported items under the established
+    # HEREDOC_TEST fixture's key names); any other route gets the
+    # generic ok/status assertions, so the test stays correct for
+    # routes whose fields the goal does not name.
+    field_assertions = "".join(
+        f'        self.assertIn("{field}", data)\n'
+        + (
+            f'        self.assertIsInstance(data["{field}"], {types})\n'
+            if types is not None
+            else ""
         )
-    else:
-        field_assertions = ""
+        for field, types in _SKELETON_ROUTE_FIELDS.get(route, ())
+    )
     test_code = (
         "import json\n"
         "import sys\n"
