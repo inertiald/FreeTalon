@@ -3838,3 +3838,88 @@ Deliberately left out:
   Suite: 1126/1126 OK (1117 baseline + 9
   new). Framework guard: ALL CHECKS PASSED.
   No live runs, no GPU. NOT pushed.
+## Update - 2026-11-18 (Live re-run #9, Arm 1: qwen2.5-coder:14b control on cycle 12 — cycle-12 steering lands (the suite runs as a node, not a criterion), the endpoint code is clean, and the suite itself is what fails: the model's tests cannot run, and ten fixtures are coupled to the pre-goal tree)
+
+- Step 0 (this re-run's preamble): seeker7's
+  Ollama container upgraded 0.31.1 -> 0.40.16
+  (image ollama/ollama@sha256:910d0d8107b5,
+  compose override in the workspace, repo tree
+  untouched; old image kept as
+  ollama/ollama:rollback-0.31.1) after the GPU
+  CI run for addf407 completed SUCCESS.
+  Verified: /api/version 0.40.16, all five
+  models listed, short generations on
+  qwen2.5-coder:14b and gemma3:27b return
+  content. qwen3.8:27b then pulled (17.74 GB)
+  and probed (decode 84.1 tok/s); gemma4:31b
+  re-probed (72.4 tok/s) — production-shape
+  diagnostics for both live in the re-run log.
+- Run (FREETALON_OLLAMA_MODEL=qwen2.5-coder:14b,
+  FREETALON_LLM_TEMPERATURE=0.0, timeout 900,
+  formatter OFF, critic OFF; driver exit 0;
+  run-20261118T181000Z-7949a2, loop elapsed
+  554.5s; GPU peak observed 57C, no thermal
+  pause; fans manual 85% during, auto after,
+  verified GPUFanControlState=0): initial plan
+  accepted round one from ONE raw output as
+  plan-237682b2adf9 — re-run #8's plan id, but
+  the criterion placement is fixed: node-3 now
+  carries the full suite as its own bash
+  command with a command-less exit_code
+  criterion, exactly the placement cycle 12
+  publishes. Four raw planner outputs total
+  (1 initial + 3 in the replan sequence).
+- Execution: node-1 PASS — an anchored /health
+  branch replacement (+21/-1, every sibling
+  route preserved) that COMPUTES both fields:
+  ollama_reachable from a subprocess curl probe
+  of localhost:11434, gpu_temperature from a
+  subprocess nvidia-smi query with exception
+  fallbacks, returning {"ok", "status": "ready",
+  "ollama_reachable", "gpu_temperature"}.
+  Node-2 PASS — tests/test_health.py written
+  as a NEW file, this time WITH import json.
+  Node-3 FAIL — the full suite exited 1 after
+  478.9s; nodes 4-5 never ran.
+- The with-changes suite, re-run by hand
+  (logs/rerun9-arm1-suite-with-changes.out):
+  1129 tests, FAILED (failures=6, errors=7) —
+  exactly 13, none of them API behavior:
+  (a) 3 errors are the model's own tests:
+  test_health.py's setUp instantiates
+  RequestHandlerClass() bare, TypeError
+  (BaseRequestHandler.__init__ missing its 3
+  arguments) — the tests cannot run as written;
+  (b) 4 errors are cycle 12's own fixtures
+  (TestPlannerCycle12CriterionCommandFix):
+  they replay recorded outputs that scaffold
+  tests/test_health.py, and with the goal's
+  file present the scaffold_overwrite check
+  fires ('drops 5 of the existing module's 6
+  definitions') where the fixtures expect
+  acceptance — they are coupled to the file's
+  NON-existence, the exact file the goal
+  creates; (c) 6 failures are
+  test_retry16_v1_rejected_by_name pins (six
+  classes) asserting 'line 221' in a rejection
+  message computed from live api.py — the
+  edit moved the cited line to 241.
+- Judge: replan on the informative node-3
+  failure; the replan sequence produced 3 raw
+  outputs and failed — the surfaced rejection
+  is its node-1 anchored replacement written
+  at 0 spaces of indentation against do_GET's
+  12 — so the run escalated with one version
+  attempted. Verdict: FAIL at execution, one
+  stage further than re-run #8 (which died at
+  node-1's measurement): not a verified
+  success — extended check (4) fails (suite
+  not green with changes in place) and the
+  new tests error rather than pass. Files
+  changed: freetalon/api.py (M),
+  tests/test_health.py (new); restored
+  (porcelain 0); post-restore suite re-run
+  1126/1126 OK in 475.2s
+  (logs/rerun9-arm1-suite-post-restore.out).
+  Log: logs/health-rerun9-2026-11-18.log.
+
