@@ -3694,3 +3694,59 @@ Deliberately left out:
   two outputs lost to malformed JSON before
   validation could judge their substance. Log:
   logs/health-rerun8-2026-11-18.log.
+
+## Update - 2026-11-18 (Live re-run #8, Arm 3: qwen2.5-coder:14b at temperature 0.4 on cycle 11 — the cleanest /health code of the campaign, stopped by the same 60s criterion cap on node-1)
+
+- Run (FREETALON_OLLAMA_MODEL=qwen2.5-coder:14b,
+  FREETALON_LLM_TEMPERATURE=0.4, timeout 900,
+  formatter OFF, critic OFF; driver exit 0;
+  run-20261118T163914Z-37efba, loop elapsed 60.0s;
+  GPU peak observed 54C, no thermal pause; fans
+  manual 85% during, auto after, verified
+  GPUFanControlState=0): ONE raw output, accepted
+  round one as plan-237682b2adf9 — Arm 1's plan id
+  with the criteria rearranged: node-1 now carries
+  file_exists(api.py) plus an exit_code criterion
+  whose command is the full suite; node-2 pairs
+  file_exists(tests/test_health.py) with a proper
+  tests_pass criterion; nodes 3-4 as Arm 1.
+- Steering accounting: file criteria name written
+  targets only; tests_pass used for exactly what
+  it is for; the exit_code + curl live-verify
+  pattern on node-3; no metric criteria; the new
+  tests planned as a NEW file. The hoist never
+  fired; placeholder_value and missing_target
+  fired 0 times.
+- The executed edit is the best /health code any
+  live arm has produced: an anchored branch
+  replacement (+13/-1, every sibling route
+  preserved) that COMPUTES both fields —
+  ollama_reachable from a subprocess curl -sf
+  probe of localhost:11434 (False on
+  CalledProcessError), gpu_temperature from a
+  subprocess nvidia-smi query (string, "N/A"
+  fallback) — returning {"ok", "status": "ready",
+  "ollama_reachable", "gpu_temperature"}. It was
+  never exercised: node-1's measurement failed on
+  its own exit_code criterion ("criterion command
+  timed out after 60s" — the ~477s suite against
+  the 60s criterion-command cap), the judge
+  escalated on the timeout, and nodes 2-4 never
+  ran. Local repair never engaged (timeout path).
+  Memory: one record (168, node-1 executed
+  FAIL/ESCALATE).
+- Verdict: FAIL at execution — the same stopping
+  stage as Arm 1, one node earlier. Across both
+  Qwen arms the plan attaches the full suite to
+  an exit_code criterion command exactly once,
+  and that attachment is where the run dies; in
+  this arm the model ALSO used tests_pass
+  correctly on the test node, one node too late.
+  Re-run #8 closes with no verified end-to-end
+  success: Qwen's remaining wall is criterion-
+  command placement (a harness fact it cannot
+  see: criterion commands cap at 60s), the 27B's
+  is generation stability at planning. Files
+  changed: freetalon/api.py only; restored
+  (porcelain 0); post-arm suite re-run 1117/1117
+  OK. Log: logs/health-rerun8-2026-11-18.log.
