@@ -3301,3 +3301,71 @@ Deliberately left out:
   file and the substance now arrive in round one,
   but repair-round criteria discipline is still
   what stops this model.
+
+## Update - 2026-11-18 (Live re-run #7, Arm 2: gemma3:27b on cycle 9 — the hoist carries a plan into execution; the rewrite breaks the grounding fixtures)
+
+- Run (FREETALON_OLLAMA_MODEL=gemma3:27b, timeout
+  900, temperature 0, formatter OFF, critic OFF;
+  driver exit 0; run-20261118T144900Z-79239e; GPU
+  peak observed 82C, no thermal pause, 0 Xid; fans
+  manual 85% during, auto after, verified): 6 raw
+  outputs. Planning: output 1 rejected with exactly
+  [scaffold_overwrite] — step_2's fresh
+  tests/test_api.py drops 27/27 definitions, the
+  defect cycle 9's replay predicted the hoist
+  would surface; output 2 was not valid JSON;
+  output 3 was ACCEPTED: step_1 nested outputs/
+  acceptance/criteria inside inputs and the
+  cycle-9 hoist lifted them, so the first 27B plan
+  ever accepted went to execution
+  (plan-b1f1b32b87de, 4 nodes).
+- Execution v1: node-1 PASS — a full-module
+  scaffold of api.py whose /health branch COMPUTES
+  both measured fields (subprocess curl probe of
+  localhost:11434 for ollama_reachable;
+  nvidia-smi parse for gpu_temperature, None on
+  failure; payload keys ok / status /
+  ollama_reachable / gpu_temperature — no
+  service_status key). node-2 (run the full suite)
+  FAIL exit 1 in 468.8s: 1096 ran, 13 failures,
+  ALL in test_orchestrator_llm planner-grounding
+  classes (skeleton, anchored-edit, retry16
+  fixtures) and none in API behavior tests — the
+  retyped module grew past the full-source
+  grounding budget, flipping the planner's module
+  presentation from full source to structure, and
+  the skeleton fixtures drifted with it. node-3
+  and node-4 never ran. No test file was written
+  this arm (the 27B's only test-writing attempt
+  was output 1's overwrite).
+- Judge REPLAN: the local-repair seam did not
+  serve (no loop.replan.local_repair event; a
+  13-test suite failure has no single culprit
+  edit node to map). The whole-task re-plan
+  produced 3 candidates, all rejected — a
+  file_matches without sha256/json_keys, then
+  file_exists criteria naming files no node
+  writes (/tmp/api_server_running, then
+  .freetalon.pid) — the re-planner failed and the
+  loop escalated. Goal verdict FAIL. Memory
+  recorded the run (node-2 executed FAIL, record
+  id 164, decision REPLAN).
+- Cycle-9 accounting: the hoist fired once and
+  was decisive — without it output 3 is a
+  missing-criteria rejection, with it the plan
+  executed. placeholder_value, missing_target
+  and custom_check fired 0 times; no output
+  attempted a custom_check, so the registry text
+  stayed out of play in this arm too.
+- Files: api.py restored via git checkout
+  (porcelain 0; no untracked files in the repo or
+  the workspace root); post-restore suite re-run
+  green (see log). Open note: the suite-green
+  criterion is coupled to api.py's grounding
+  properties — a full retype trips 13 planner
+  fixtures without breaking one API behavior
+  test. Whether a faithful anchored edit
+  (byte-preserving elsewhere, near-original size)
+  keeps those fixtures green is untested; it is
+  the question the next success-shaped run
+  answers.
