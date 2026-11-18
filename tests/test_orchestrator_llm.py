@@ -218,24 +218,33 @@ def _health_branch_block_span(do_get: str) -> tuple[int, int]:
 
 
 def _with_extended_health_return(do_get: str) -> str:
-    """``do_get`` with its /health branch return replaced by the extended one.
+    """``do_get`` whose /health branch returns the extended payload.
 
     The extended return is the fixtures' canonical completed branch
-    (the extra fields as literals the planning checks judge); the
-    line it replaces is derived from the source via
-    _health_branch_span, so the completion works on the branch in
-    whatever form the module currently carries it.
+    (the extra fields as literals the planning checks judge).
+    Cycle 13: the replacement covers the branch's WHOLE block (via
+    _health_branch_block_span), not only its first return line —
+    the line-wise form worked only while the branch's return was a
+    single line, and silently produced an unparseable definition
+    once a real implementation's branch grew statements and a
+    multi-line return (re-run #9 arm 3: the orphaned tail of
+    Devstral's return dict broke both fixtures that complete a
+    delta from the live source). The branch's own computations
+    are the module's business; the fixture needs a complete
+    do_GET whose /health branch returns the extended payload, in
+    whatever form the module currently carries the branch.
     """
     lines = do_get.splitlines()
-    _start, end = _health_branch_span(do_get)
-    return_line = lines[end]
-    indent = return_line[: len(return_line) - len(return_line.lstrip())]
-    lines[end] = (
+    start, end = _health_branch_block_span(do_get)
+    branch_line = lines[start]
+    indent = branch_line[: len(branch_line) - len(branch_line.lstrip())]
+    lines[start : end + 1] = [
+        branch_line,
         indent
-        + 'return self._send(200, {"ok": True, "status": "ready", '
+        + '    return self._send(200, {"ok": True, "status": "ready", '
         + '"service_status": "ready", "ollama_reachable": True, '
-        + '"gpu_temperature": 42})'
-    )
+        + '"gpu_temperature": 42})',
+    ]
     return "\n".join(lines)
 
 
@@ -302,16 +311,34 @@ def _fill_health_slots(raw: str) -> str:
 # (RETRY10_API_PATH). The code-append parse check simulates the write
 # against the file on disk when it exists and against the appended
 # content alone when it does not, so the reported line of the
-# IndentationError is disk-dependent too: on seeker7 the existing
-# api.py has 219 lines, the appended def lands on line 220 and the
-# missing indented block is reported on line 221; in CI the path
-# does not exist, the content alone is parsed (def on line 1, return
-# on line 2) and the error is reported on line 2. Tests asserting
-# the line must use _expected_retry16_error_line() instead of a
-# hard-coded number.
+# IndentationError is disk-dependent: against an existing file the
+# appended def lands on the line after the file's last and the
+# missing indented block is reported one line later again — a number
+# that moves whenever the module legitimately grows (it was 221 when
+# api.py had 219 lines; re-run #9's two /health trees, 239 and 252
+# lines, reported 241 and 254). In CI the path does not exist, the
+# content alone is parsed (def on line 1, return on line 2) and the
+# error is reported on line 2. Tests asserting the line must use
+# _expected_retry16_error_line(), which derives it from the file,
+# instead of a hard-coded number.
 def _expected_retry16_error_line() -> int:
-    """221 on a checkout where the fixture's api.py exists, 2 elsewhere."""
-    return 221 if os.path.exists(RETRY10_API_PATH) else 2
+    """The composed parse's error line, derived from the live file.
+
+    (Lines in the api.py on disk, newline-normalized) + 2: the
+    production simulation appends the fixture's payload to whatever
+    the module currently holds, the def lands on the first new line
+    and the unindented return — the line the IndentationError names —
+    on the one after. 221 at 219 lines; the number is the file's,
+    not the fixture's, so it is derived, never hard-coded (cycle
+    13). Where the path does not exist (CI) the content alone is
+    parsed and the error is on line 2.
+    """
+    if not os.path.exists(RETRY10_API_PATH):
+        return 2
+    existing = Path(RETRY10_API_PATH).read_text(encoding="utf-8")
+    if not existing.endswith("\n"):
+        existing += "\n"
+    return existing.count("\n") + 2
 
 
 def _assert_code_append_parse_error(
@@ -7711,7 +7738,12 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
         branch = index.route_branches["/health"]
         self.assertIn('if path == "/health"', branch)
         self.assertIn("self._send", branch)
-        self.assertIn('"ok": True', branch)
+        # Cycle 13: the payload's "ok" KEY is the pin, not its
+        # literal value — a real /health implementation computes
+        # the value (re-run #9's Devstral branch returns
+        # "ok": service_ok), and the extraction under test
+        # carries the branch text either way.
+        self.assertIn('"ok":', branch)
 
     def test_grounded_skeleton_shows_the_branch_sketch(self) -> None:
         import json
@@ -10964,6 +10996,14 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         that passed here would prove nothing -- the skeleton would be
         steering the model toward a test that cannot catch a missing
         endpoint.
+
+        Cycle 13: the outcome that is CORRECT depends on the live
+        tree, and the fixture must pass in both states (see the
+        branch read below) — while the endpoint is unextended the
+        skeleton test must fail exactly as described above; once a
+        real run extends it, the same test must pass. Re-run #9
+        never fired this coupling (both arms' payloads were still
+        incomplete); a complete reference tree did.
         """
         import json
         import subprocess
@@ -10995,13 +11035,48 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
             )
         finally:
             os.unlink(tmp_path)
-        # The test runs (the server starts, /health answers 200) and
-        # fails on the first missing goal field -- nothing else.
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("service_status", proc.stderr)
-        self.assertIn("AssertionError", proc.stderr)
+        # Cycle 13: read the live /health branch through the repo
+        # index (the production reader) and assert the outcome the
+        # branch's state makes correct. A controlled unextended
+        # endpoint cannot be substituted for the live one: the
+        # skeleton body inserts the grounded repo root into
+        # sys.path itself, so it always exercises the live module.
+        from freetalon.orchestrator.repo_index import build_repo_index
+
+        branch = build_repo_index(self.repo_root).route_branches.get(
+            "/health", ""
+        )
+        goal_fields = (
+            "service_status",
+            "ollama_reachable",
+            "gpu_temperature",
+        )
+        extended = all(name in branch for name in goal_fields)
+        # In either state the test must RUN — the server starts and
+        # /health answers; an import or construction failure is a
+        # broken skeleton, not enforcement.
         self.assertNotIn("ImportError", proc.stderr)
         self.assertNotIn("ModuleNotFoundError", proc.stderr)
+        if not extended:
+            # The test runs (the server starts, /health answers
+            # 200) and fails on the first missing goal field --
+            # nothing else.
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("service_status", proc.stderr)
+            self.assertIn("AssertionError", proc.stderr)
+        else:
+            # Extended tree: the test passes, or fails only on a
+            # goal field's VALUE (e.g. a temperature of None where
+            # no GPU answers) — never on a missing field or an
+            # unrelated assertion.
+            self.assertTrue(
+                proc.returncode == 0
+                or (
+                    "AssertionError" in proc.stderr
+                    and any(name in proc.stderr for name in goal_fields)
+                ),
+                proc.stderr[-2000:],
+            )
 
     # --- (4) The server-start shape names the exact venv path ---
 
@@ -20439,6 +20514,36 @@ class TestPlannerCycle12CriterionCommandFix(unittest.TestCase):
     constant.
     """
 
+    def setUp(self) -> None:
+        # Cycle 13: pin tests/test_health.py ABSENT for every parse
+        # in this class. The recorded arm outputs scaffold that path
+        # as a NEW file, and the scaffold retention guard reads the
+        # live file through _ModuleSourceCache — so once a real run
+        # creates the file (it is the goal's own deliverable), the
+        # recorded scaffold suddenly "drops" most of its definitions
+        # and four of these fixtures fail although the recorded
+        # outputs did not change (re-run #9, arms 1 and 3). The
+        # verdicts under test were recorded with the file absent;
+        # pin that fact, the cycle-10 way (cf. _source_presentation
+        # in TestPlannerAnchoredEditFix's neighbors).
+        from unittest.mock import patch
+
+        from freetalon.orchestrator import planner
+
+        real_source = planner._ModuleSourceCache.source
+        health_path = self.REPO_ROOT / "tests" / "test_health.py"
+
+        def source(cache, path):
+            if Path(path) == health_path:
+                return None
+            return real_source(cache, path)
+
+        self._cache_source_patch = patch.object(
+            planner._ModuleSourceCache, "source", source
+        )
+        self._cache_source_patch.start()
+        self.addCleanup(self._cache_source_patch.stop)
+
     HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
 
     REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -20781,3 +20886,124 @@ class TestPlannerCycle12CriterionCommandFix(unittest.TestCase):
                 "    # M4: approval gates — list packets, optionally"
                 " filtered.\n"
                 "    pass\n"))
+
+
+class TestPlannerCycle13ThinkAndSteeringFix(unittest.TestCase):
+    """Cycle 13: env-gated think control for Ollama calls, and the
+    scoped test-module run steering (re-run #9).
+
+    Re-run #9's two new models are thinking models, and both died on
+    the thinking spend, not on planning: qwen3.8:27b's three outputs
+    all truncated mid-string inside differs_by (thinking + prompt +
+    verbose plan exceeded the 12288 context), and gemma4:31b's first
+    planning call returned empty message.content (the whole budget
+    went to its thinking field). The backend now carries an env-gated
+    think switch: unset (the default) sends no field at all, so every
+    existing model's payload is byte-identical to before; set, it
+    asks a thinking model to answer directly.
+
+    The same run's executing arms (qwen2.5-coder, Devstral) both
+    verified their test-writing node by file existence; the tests'
+    own setUp errors surfaced only inside the full suite, where the
+    failure is most expensive to repair. The prompts now steer the
+    writing node to run its one module scoped, so broken test code
+    fails at its own node.
+    """
+
+    # --- Target 1: the think setting ---
+
+    def test_llm_settings_think_defaults_to_none(self) -> None:
+        # The default sends nothing: no field on a hand-built settings
+        # object, and none from the environment without the knob.
+        self.assertIsNone(LLMSettings().think)
+        env = {k: v for k, v in os.environ.items()
+               if k != "FREETALON_LLM_THINK"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(LLMSettings.from_env().think)
+
+    def test_llm_settings_think_from_env(self) -> None:
+        for text, expected in (
+            ("0", False), ("false", False), ("no", False),
+            ("off", False), ("1", True), ("true", True),
+            ("yes", True), ("on", True), ("FALSE", False),
+            (" True ", True),
+        ):
+            with patch.dict(
+                os.environ,
+                {"FREETALON_LLM_BACKEND": "ollama",
+                 "FREETALON_LLM_THINK": text},
+                clear=False,
+            ):
+                self.assertIs(LLMSettings.from_env().think, expected, text)
+        # The knob is parsed once, for either backend (like
+        # temperature); only the Ollama payload sends it.
+        with patch.dict(
+            os.environ,
+            {"FREETALON_LLM_BACKEND": "openai_compatible",
+             "FREETALON_LLM_THINK": "0"},
+            clear=False,
+        ):
+            self.assertIs(LLMSettings.from_env().think, False)
+
+    def test_llm_settings_think_unrecognized_falls_back_to_none(self) -> None:
+        # A mistyped knob must not brick intake (the temperature
+        # rule): unrecognized or empty leaves the field unsent —
+        # today's behavior.
+        for bad in ("banana", "", "2", "-1"):
+            with patch.dict(
+                os.environ,
+                {"FREETALON_LLM_THINK": bad},
+                clear=False,
+            ):
+                self.assertIsNone(LLMSettings.from_env().think, bad)
+
+    def test_ollama_payload_omits_think_by_default(self) -> None:
+        from freetalon.orchestrator.intake import _call_ollama
+
+        settings = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434",
+            model="test",
+        )
+        with patch(
+            "freetalon.orchestrator.intake._post_json",
+            return_value={"message": {"content": "ok"}},
+        ) as post_mock:
+            _call_ollama(settings, "sys", "user")
+        self.assertNotIn("think", post_mock.call_args[0][1])
+
+    def test_ollama_payload_carries_think_when_configured(self) -> None:
+        from dataclasses import replace as dataclass_replace
+
+        from freetalon.orchestrator.intake import _call_ollama
+
+        base = LLMSettings(
+            backend="ollama", base_url="http://localhost:11434",
+            model="test",
+        )
+        for value in (False, True):
+            settings = dataclass_replace(base, think=value)
+            with patch(
+                "freetalon.orchestrator.intake._post_json",
+                return_value={"message": {"content": "ok"}},
+            ) as post_mock:
+                _call_ollama(settings, "sys", "user")
+            self.assertIs(post_mock.call_args[0][1]["think"], value)
+
+    # --- Target 3: the scoped-run steering is in both prompts ---
+
+    def test_prompts_steer_scoped_test_module_runs(self) -> None:
+        from freetalon.orchestrator.prompts import (
+            planner_system_prompt,
+            replan_system_prompt,
+        )
+
+        for prompt in (planner_system_prompt(), replan_system_prompt()):
+            # The scoped shape itself, by example: one module named,
+            # never a discovery run.
+            self.assertIn("python -m unittest tests.test_health", prompt)
+            # The run belongs to the writing node (its own criterion
+            # command or a following node), inside the published
+            # criterion budget — a probe, not a suite run.
+            self.assertIn("scoped", prompt)
+            self.assertIn("60-second", prompt)
+            self.assertIn("its own node", prompt)

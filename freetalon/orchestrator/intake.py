@@ -50,6 +50,16 @@ class LLMSettings:
     # prompts do not fit in 4096 (retry #22).
     num_ctx: int | None = None
     format_schema: dict[str, Any] | None = None
+    # Ollama thinking control (the top-level "think" chat field).
+    # None — the default, and what an unset or unrecognized
+    # FREETALON_LLM_THINK yields — sends no field at all: the payload
+    # stays exactly what it was before cycle 13, and models without a
+    # thinking mode never see a field they cannot honor. False asks a
+    # thinking model (qwen3.8, gemma4) to answer directly: re-run #9
+    # showed both spending the whole generation thinking — qwen3.8's
+    # plan JSON truncated mid-string against the context window and
+    # gemma4's first planning call returned empty content.
+    think: bool | None = None
 
     @classmethod
     def from_env(cls) -> "LLMSettings":
@@ -80,6 +90,16 @@ class LLMSettings:
         if temperature < 0:
             temperature = 0.0
 
+        # Think is a tuning knob like temperature: an unset or
+        # unrecognized value leaves it None (the field is not sent —
+        # today's behavior), never an error that bricks intake.
+        think_text = os.environ.get("FREETALON_LLM_THINK", "").strip().lower()
+        think: bool | None = None
+        if think_text in ("1", "true", "yes", "on"):
+            think = True
+        elif think_text in ("0", "false", "no", "off"):
+            think = False
+
         if backend == "ollama":
             return cls(
                 backend="ollama",
@@ -87,6 +107,7 @@ class LLMSettings:
                 model=os.environ.get("FREETALON_OLLAMA_MODEL", _OLLAMA_MODEL).strip(),
                 timeout_seconds=timeout_seconds,
                 temperature=temperature,
+                think=think,
             )
         if backend == "openai_compatible":
             api_key = os.environ.get("FREETALON_OPENAI_API_KEY")
@@ -100,6 +121,7 @@ class LLMSettings:
                 api_key=api_key,
                 timeout_seconds=timeout_seconds,
                 temperature=temperature,
+                think=think,
             )
         raise ValueError(
             "Unsupported FREETALON_LLM_BACKEND. Expected 'ollama' or 'openai_compatible'."
@@ -244,6 +266,11 @@ def _call_ollama(settings: LLMSettings, system_prompt: str, user_prompt: str) ->
         "options": {"temperature": settings.temperature,
         	"num_ctx": settings.num_ctx if settings.num_ctx else 4096},
     }
+    if settings.think is not None:
+        # Ollama's think switch is a top-level chat field, not an
+        # "options" entry. Sent only when configured: at the default
+        # the payload is identical to the pre-cycle-13 one.
+        payload["think"] = settings.think
     response = _post_json(
         f"{_normalize_base_url(settings.base_url)}/api/chat",
         payload,

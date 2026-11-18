@@ -4097,3 +4097,150 @@ Deliberately left out:
   the tree the goal is supposed to change.
   Log: logs/health-rerun9-2026-11-18.log.
 
+
+## Update - 2026-11-18 (Cycle 13: think control for planner/intake calls, post-goal fixture decoupling, scoped test-run steering)
+
+- Target 1 — think control. LLMSettings
+  gains think: bool | None = None, read
+  from FREETALON_LLM_THINK in from_env
+  (forgiving parse, temperature-style);
+  _call_ollama adds the top-level
+  "think" field to the /api/chat
+  payload ONLY when set, so the default
+  payload is byte-identical to before
+  (pinned by tests). The
+  openai_compatible path does not send
+  it (an Ollama-specific field). 6 new
+  tests. Planning-only diagnostics
+  (production shape: intake_request +
+  plan_task_intent, no execution; fans
+  manual 85% during, auto after):
+  gemma4:31b with FREETALON_LLM_THINK=0
+  — intake OK 11.0s; 3 raw outputs
+  (8,382 / 8,347 / 8,040 chars), ALL
+  COMPLETE (the JSON closes) — re-run
+  #9's empty-content failure is gone;
+  planning still failed (112.9s) on an
+  ordinary repeated defect (the same
+  anchored_edit rejection 3x ->
+  StuckRepairError): generation no
+  longer blocks this model, plan
+  discipline now does. qwen3.8:27b with
+  think off — intake OK 8.3s; content
+  flows immediately (3 outputs of
+  23,379 / 21,601 / 21,601 chars vs
+  re-run #9's truncated 3,335 / 6,726 /
+  6,726), but 0 complete: output 1
+  opens as a well-formed plan and
+  contains no closing brace at all —
+  the wall moved from thinking spend
+  to plan verbosity against the same
+  12288 window. Stopped on qwen3.8 per
+  the cycle's rule; no further knobs.
+- Target 3 — scoped test-run steering
+  (prompt only), and the control that
+  reshaped it. The first wording (+103
+  prompt tokens) flipped the
+  qwen2.5-coder:14b control diagnostic
+  (think env unset) into a
+  NON-TERMINATING generation: 0 raw
+  outputs, client timeout at 901.2s;
+  the Ollama server log shows 55,504
+  tokens generated with a llama.cpp
+  context shift — under 0.40.16 a
+  generation that never emits EOS does
+  NOT stop at num_ctx. An A/B on the
+  pre-cycle tree restored the round-
+  one accept (47.3s, plan-237682b2adf9),
+  isolating the wording. The shorter
+  v2 wording (planner COVER paragraph
+  + replan tests bullet; both name the
+  scoped form "python -m unittest
+  tests.test_health", its seconds-long
+  cost, and the 60-second criterion
+  budget via the cycle-12 constant):
+  control healthy — intake 5.2s,
+  planning OK 42.1s, plan-237682b2adf9,
+  1 output 8,322 chars, JSON closes.
+  Target 1's control acceptance is met
+  on the shipped text: same plan id,
+  same acceptance class as re-run #9
+  arm 1 round one. Honest limit: the
+  v2 sample plan did not itself add a
+  scoped run — uptake is a live-run
+  question, not claimed here.
+- Target 2 — fixture decoupling (all
+  in tests/test_orchestrator_llm.py):
+  (a) TestPlannerCycle12CriterionCommandFix
+  gains a setUp pinning
+  tests/test_health.py absent through
+  _ModuleSourceCache — the recorded
+  scaffolds were captured with the
+  file absent; its live existence
+  flipped the retention guard against
+  them. (b) _expected_retry16_error_line
+  derives the line from the live
+  api.py (normalized line count + 2;
+  2 where the path is absent) instead
+  of hard-coding 221. (c)
+  _with_extended_health_return now
+  replaces the /health branch's WHOLE
+  block (_health_branch_block_span)
+  instead of only its first return
+  line — identical output on the
+  pre-goal form, parseable on computed
+  forms. (d) PIN CHANGED:
+  test_route_branches_read_from_the_real_module
+  pins the payload KEY '"ok":' instead
+  of the literal '"ok": True' — the
+  value may legitimately be computed
+  (arm 3 returns "ok": service_ok);
+  the extraction intent is unchanged.
+  (e) A fifth coupling the acceptance
+  run caught (re-run #9 never fired
+  it — both arms' payloads lacked
+  service_status):
+  test_skeleton_step2_test_runs_and_enforces_the_deliverable
+  asserted the skeleton's own test
+  FAILS against the live endpoint; a
+  complete post-goal tree makes it
+  pass. Decoupled conditionally on
+  the live branch (read via
+  build_repo_index): the original
+  assertions stand verbatim while the
+  branch lacks the goal fields; once
+  extended, the skeleton test must
+  pass — or fail only on a goal
+  field's value — and never on an
+  import error. A controlled
+  unextended endpoint cannot be
+  substituted: the skeleton body
+  inserts the grounded repo root into
+  sys.path itself.
+- Acceptance (Target 2): a reference
+  post-goal tree was built locally
+  and DISCARDED after (a computing
+  /health — socket probe + nvidia-smi,
+  branch statements + a multi-line
+  return, api.py 219 -> 248 lines;
+  plus tests/test_health.py modeled
+  on arm 1's executed file; the
+  reference tests pass, 22 OK with
+  test_api). Targeted selection 44/44
+  OK in BOTH tree states. Full suite
+  post-goal: 1135/1135 OK in 472.6s
+  (the first post-goal run was
+  1134/1135 — the fifth coupling
+  above). Baseline restored: full
+  suite 1132/1132 OK in 464.9s (1126
+  + 6 new cycle-13 tests; the post-goal
+  count adds the 3 reference tests).
+  demo-framework-guard: ALL CHECKS
+  PASSED. Corpus replay before/after:
+  original corpus 0/28 accepted, mean
+  1.32, all 56 rows identical;
+  model-ab corpus (27B mean 1.50,
+  Qwen mean 2.00, accepted 0), all 22
+  rows identical — zero rows moved by
+  any of the three targets.
+  Log: logs/cycle13-think-and-fixtures-2026-11-18.log.
