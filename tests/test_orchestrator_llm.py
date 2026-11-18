@@ -23,15 +23,113 @@ from freetalon.orchestrator.planner import (
 )
 from freetalon.orchestrator.prompts import INTAKE_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT
 
-# Real code for the grounded /health extension, used as scaffold content
-# wherever a fixture extends freetalon/api.py. Retry #14: a comment-only
-# scaffold to an existing code file is now rejected as a placeholder, so
-# the fixtures must carry real code — the do_GET branch fragment the
-# grounded move names.
+# Real code for the grounded /health extension: the do_GET branch
+# fragment the grounded move names. Retry #14: a comment-only
+# scaffold to an existing code file is now rejected as a placeholder,
+# so the fixtures must carry real code. Planner A/B refactor: as
+# FULL scaffold content for api.py this fragment is exactly the
+# retry-#28/#29 unsound shape (it drops all 12 of the module's
+# definitions), so fixtures now extend api.py with the anchored
+# edit below (GROUNDED_DO_GET_DELTA); this constant remains as the
+# fragment itself, for the tests that pin the fragment's verdicts.
 GROUNDED_API_CONTENT = (
     "# extended health endpoint\n"
     "if path == \"/health\":\n"
     "    self._send({\"ok\": True, \"status\": \"ready\"})"
+)
+
+# The grounded /health extension as an ANCHORED EDIT (planner A/B
+# refactor): the verbatim current body of
+# HiveAPIServer.start.Handler.do_GET — which already carries the
+# /health branch — offered as the replace-delta for that anchor.
+# Before the refactor the grounded fixtures scaffolded api.py
+# with GROUNDED_API_CONTENT, a three-line branch fragment, as
+# FULL file content: byte-identical in shape to the retry-#28/#29
+# fragments the corpus scores as unsound accepts (defect 1). The
+# retention guard no longer exempts fragment-scale scaffolds, so
+# the grounded plan takes the edit form the planner itself
+# teaches; materialization restores the full module by
+# construction and the fragment constant survives only as the
+# corpus-shaped counterexample in the guard tests.
+GROUNDED_DO_GET_DELTA = (
+    '            def do_GET(self) -> None:  # noqa: N802\n'
+    '                parsed = urlparse(self.path)\n'
+    '                path = parsed.path\n'
+    '                qs = parse_qs(parsed.query)\n'
+    '\n'
+    '                if path == "/health":\n'
+    '                    return self._send(200, {"ok": True, "status": "ready"})\n'
+    '\n'
+    '                if path == "/status":\n'
+    '                    if not self._authorized():\n'
+    '                        return\n'
+    '                    return self._send(200, {"ok": True, "status": api.controller.status()})\n'
+    '\n'
+    '                if path == "/metrics":\n'
+    '                    if not self._authorized():\n'
+    '                        return\n'
+    '                    status = api.controller.status()\n'
+    '                    metrics = {\n'
+    '                        "workers_healthy": status["workers"]["healthy"],\n'
+    '                        "workers_configured": status["workers"]["configured"],\n'
+    '                        "tasks_running": status["queue"]["running"],\n'
+    '                        "tasks_queued": status["queue"]["queued"],\n'
+    '                        "queue_max": status["queue"]["max"],\n'
+    '                    }\n'
+    '                    return self._send(200, {"ok": True, "metrics": metrics})\n'
+    '\n'
+    '                if path == "/tasks":\n'
+    '                    if not self._authorized():\n'
+    '                        return\n'
+    '                    status_filter = qs.get("status", [None])[0]\n'
+    '                    tasks = api.controller.list_tasks(status=status_filter)\n'
+    '                    return self._send(200, {"ok": True, "tasks": tasks, "count": len(tasks)})\n'
+    '\n'
+    '                if path.startswith("/tasks/") and len(path.split("/")) == 3:\n'
+    '                    if not self._authorized():\n'
+    '                        return\n'
+    '                    task_id = path.split("/")[2]\n'
+    '                    task = api.controller.get_task(task_id)\n'
+    '                    if task is None:\n'
+    '                        return self._send(404, {"ok": False, "error": "Task not found"})\n'
+    '                    return self._send(200, {"ok": True, "task": task})\n'
+    '\n'
+    '                if path == "/resources":\n'
+    '                    if not self._authorized():\n'
+    '                        return\n'
+    '                    return self._send(200, {"ok": True, "resources": resource_summary_safe()})\n'
+    '\n'
+    '                # M4: approval gates — list packets, optionally filtered.\n'
+    '                if path == "/gates":\n'
+    '                    if not self._authorized():\n'
+    '                        return\n'
+    '                    status_filter = qs.get("status", [None])[0]\n'
+    '                    run_filter = qs.get("run_id", [None])[0]\n'
+    '                    if run_filter:\n'
+    '                        packets = api.gate_store.list_for_run(run_filter)\n'
+    '                    elif status_filter == "pending":\n'
+    '                        packets = api.gate_store.pending()\n'
+    '                    else:\n'
+    '                        packets = api.gate_store.all()\n'
+    '                    return self._send(\n'
+    '                        200,\n'
+    '                        {\n'
+    '                            "ok": True,\n'
+    '                            "gates": [pkt.model_dump(mode="json") for pkt in packets],\n'
+    '                            "count": len(packets),\n'
+    '                        },\n'
+    '                    )\n'
+    '\n'
+    '                if path.startswith("/gates/") and len(path.split("/")) == 3:\n'
+    '                    if not self._authorized():\n'
+    '                        return\n'
+    '                    packet_id = path.split("/")[2]\n'
+    '                    packet = api.gate_store.get(packet_id)\n'
+    '                    if packet is None:\n'
+    '                        return self._send(404, {"ok": False, "error": "Gate not found"})\n'
+    '                    return self._send(200, {"ok": True, "gate": packet.model_dump(mode="json")})\n'
+    '\n'
+    '                return self._send(404, {"ok": False, "error": "Not Found"})\n'
 )
 
 # The retry-#10 attempt-3 fixture names the absolute seeker7 path
@@ -49,6 +147,22 @@ RETRY10_API_PATH = "/home/seeker/projects/FreeTalon/freetalon/api.py"
 def _expected_retry10_error_count() -> int:
     """7 on a checkout where the fixture's api.py exists, 9 elsewhere."""
     return 7 if os.path.exists(RETRY10_API_PATH) else 9
+
+
+def _rejection_codes(raw: str, **kwargs: object) -> set:
+    """The structured error codes of the rejection ``raw`` raises.
+
+    Repair steering keys off codes since the planner A/B refactor
+    (it used to key off substrings of the rejection message, and the
+    tests passed the message text); this helper re-derives the codes
+    from the same parse the test already asserted on, so call sites
+    keep asserting on the message text AND pass the codes.
+    """
+    try:
+        parse_planner_response(raw, **kwargs)
+    except LLMResponseError as exc:
+        return {record.code for record in getattr(exc, "plan_errors", [])}
+    raise AssertionError("expected the plan to be rejected")
 
 # The retry-#16 v1 fixture appends to the same absolute seeker7 path
 # (RETRY10_API_PATH). The code-append parse check simulates the write
@@ -585,7 +699,7 @@ class TestPlannerGroundingFixes(unittest.TestCase):
             "objective": "Extend the health endpoint",
             "depends_on": [],
             "assigned_claw": "scaffold",
-            "inputs": {"file_path": api_path, "content": GROUNDED_API_CONTENT},
+            "inputs": {"file_path": api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
             "outputs": [api_path],
             "criteria": [{"type": "file_exists", "path": api_path}],
         }
@@ -694,7 +808,7 @@ class TestPlannerGroundingFixes(unittest.TestCase):
             Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
         )
         node = TestPlannerHardening()._scaffold_node(
-            inputs={"file_path": api_path, "content": GROUNDED_API_CONTENT},
+            inputs={"file_path": api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
             outputs=[api_path],
             criteria=[{"type": "file_exists", "path": api_path}],
         )
@@ -872,7 +986,7 @@ class TestPlannerCollectsAllErrors(unittest.TestCase):
                     "objective": "Extend the health endpoint",
                     "depends_on": [],
                     "assigned_claw": "scaffold",
-                    "inputs": {"file_path": api_path, "content": GROUNDED_API_CONTENT},
+                    "inputs": {"file_path": api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
                     "outputs": [api_path],
                     "criteria": [{"type": "file_exists", "path": api_path}],
                 },
@@ -949,7 +1063,7 @@ class TestPlannerEchoFix(unittest.TestCase):
             "objective": "Extend the health endpoint",
             "depends_on": [],
             "assigned_claw": "scaffold",
-            "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+            "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
             "outputs": [self.api_path],
             "criteria": [{"type": "file_exists", "path": self.api_path}],
         }
@@ -1222,7 +1336,7 @@ class TestPlannerFakeAndMemoryFix(unittest.TestCase):
                 "objective": "Extend the health endpoint",
                 "depends_on": [],
                 "assigned_claw": "scaffold",
-                "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+                "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
                 "outputs": [self.api_path],
                 "criteria": [{"type": "file_exists", "path": self.api_path}],
             },
@@ -1252,7 +1366,7 @@ class TestPlannerFakeAndMemoryFix(unittest.TestCase):
             "objective": "Extend the health endpoint in freetalon/api.py",
             "depends_on": [],
             "assigned_claw": "scaffold",
-            "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+            "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
             "outputs": [self.api_path],
             "criteria": [{"type": "file_exists", "path": self.api_path}],
             "responds_to": "node-1",
@@ -1965,7 +2079,7 @@ class TestPlannerRouteEngagementFix(unittest.TestCase):
                 "objective": "Extend the health endpoint in freetalon/api.py",
                 "depends_on": [],
                 "assigned_claw": "scaffold",
-                "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+                "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
                 "outputs": [self.api_path],
                 "criteria": [{"type": "file_exists", "path": self.api_path}],
                 "responds_to": "node-1",
@@ -2225,7 +2339,7 @@ class TestPlannerRouteEngagementFix(unittest.TestCase):
                 "objective": "Extend the health endpoint in freetalon/api.py",
                 "depends_on": [],
                 "assigned_claw": "scaffold",
-                "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+                "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
                 "outputs": [self.api_path],
                 "criteria": [{"type": "file_exists", "path": self.api_path}],
             },
@@ -2387,7 +2501,7 @@ class TestPlannerGroundedShapeFix(unittest.TestCase):
                 "objective": "Extend the health endpoint in freetalon/api.py",
                 "depends_on": [],
                 "assigned_claw": "scaffold",
-                "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+                "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
                 "outputs": [self.api_path],
                 "criteria": [{"type": "file_exists", "path": self.api_path}],
             },
@@ -3053,14 +3167,29 @@ class TestPlannerNodeShapeFix(unittest.TestCase):
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(self._dag([node]), goal_text=self.HEALTH_GOAL)
         message = str(caught.exception)
-        self.assertIn("1 error", message)
+        # Planner A/B refactor (defect 1): now 2 errors -- the Flask
+        # fragment also faces the retention guard (as a full-content
+        # scaffold of api.py it drops all 12 of the module's
+        # definitions); the fragment-scale floor that exempted it is
+        # gone. The framework error itself is unchanged.
+        self.assertIn("2 errors", message)
         self.assertIn("Flask", message)
         self.assertIn("stdlib http.server", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("different web framework", message)
+        self.assertIn("drops 12 of the existing module's 12 definitions", message)
 
     def test_http_server_write_for_http_server_route_is_not_flagged(self) -> None:
         # The same shape in the serving module's own framework passes.
+        # Planner A/B refactor (defect 1): the content is the module's
+        # own current source -- the smallest full-content scaffold of
+        # api.py that retains every definition. The original fixture
+        # (a one-class http.server shell as the FULL content of
+        # api.py) is a defect-1 overwrite: executed, it would delete
+        # the module it claims to extend, and the retention guard now
+        # rejects it. The framework judgment this test pins -- an
+        # http.server write to the http.server module is not flagged
+        # -- is unchanged.
         node = {
             "id": "step_1",
             "objective": "Extend the health endpoint in freetalon/api.py",
@@ -3068,7 +3197,7 @@ class TestPlannerNodeShapeFix(unittest.TestCase):
             "assigned_claw": "scaffold",
             "inputs": {
                 "file_path": self.api_path,
-                "content": "from http.server import BaseHTTPRequestHandler\n\nclass Handler(BaseHTTPRequestHandler):\n    pass\n",
+                "content": Path(self.api_path).read_text(encoding="utf-8"),
             },
             "outputs": [self.api_path],
             "criteria": [{"type": "file_exists", "path": self.api_path}],
@@ -5332,6 +5461,12 @@ class TestPlannerFrameworkSteerFix(unittest.TestCase):
     def test_parse_accepts_scaffold_http_server_write(self) -> None:
         # A scaffold writing real http.server code to the serving module
         # is the grounded move, not a framework violation.
+        # Planner A/B refactor (defect 1): the content is the module's
+        # own current source -- a full-content scaffold that retains
+        # every definition. The original fixture (a two-definition
+        # http.server fragment as the FULL content of api.py) is a
+        # defect-1 overwrite and the retention guard now rejects it;
+        # the framework judgment this test pins is unchanged.
         node = {
             "id": "step_1",
             "objective": "Extend the health endpoint in freetalon/api.py",
@@ -5339,13 +5474,7 @@ class TestPlannerFrameworkSteerFix(unittest.TestCase):
             "assigned_claw": "scaffold",
             "inputs": {
                 "file_path": self.api_path,
-                "content": (
-                    "from http.server import BaseHTTPRequestHandler\n"
-                    "\n"
-                    "class Handler(BaseHTTPRequestHandler):\n"
-                    "    def do_GET(self):\n"
-                    "        pass\n"
-                ),
+                "content": Path(self.api_path).read_text(encoding="utf-8"),
             },
             "outputs": [self.api_path],
             "criteria": [{"type": "file_exists", "path": self.api_path}],
@@ -6232,7 +6361,7 @@ class TestPlannerDuplicateKeysFix(unittest.TestCase):
                 "objective": "Extend the health endpoint",
                 "depends_on": [],
                 "assigned_claw": "scaffold",
-                "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+                "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
                 "outputs": [self.api_path],
                 "criteria": [{"type": "file_exists", "path": self.api_path}],
             },
@@ -8865,7 +8994,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         self.assertIn("/tmp/health_response.json", message)
         self.assertIn("not a /tmp scratch file", message)
 
-    def test_retry19_attempt3_rejected_with_2_errors(self) -> None:
+    def test_retry19_attempt3_rejected_with_3_errors(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self.RETRY19_ATTEMPT3_RAW,
@@ -8873,10 +9002,14 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        self.assertIn("was rejected with 3 errors", message)
         # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
         # Interpreter normalization (retry #27 fix): now 2 -- step-3's bare
         # `python` is rewritten at parse time and no longer errors.
+        # Planner A/B refactor (defect 1): now 3 -- step-1's Flask
+        # fragment also faces the retention guard (it drops all 12
+        # of api.py's definitions); the fragment-scale floor that
+        # exempted sub-four-definition scaffolds is gone.
         self.assertIn("does not parse as Python", message)
         self.assertNotIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
@@ -8973,10 +9106,12 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         )
         self.assertEqual(len(parsed), 1)
 
-    # --- Marker coverage: every forbidden approach is detected from
-    #     its own rejection wording, whatever the rejection shape ---
+    # --- Code coverage: every forbidden approach is detected from
+    #     its own rejection's structured codes, whatever the
+    #     rejection shape (A/B refactor: this keyed off substrings
+    #     of the rejection wording before the codes existed) ---
 
-    def test_every_approach_marker_matches_its_rejection(self) -> None:
+    def test_every_approach_code_matches_its_rejection(self) -> None:
         from freetalon.orchestrator.planner import _rejected_approaches
 
         # Flask (heredoc, no import) and /tmp, from retry #19 attempt 2.
@@ -8986,7 +9121,9 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 goal_text=self.HEALTH_GOAL,
                 workspace=self.WS,
             )
-        approaches = _rejected_approaches(str(caught.exception))
+        approaches = _rejected_approaches(
+            {record.code for record in caught.exception.plan_errors}
+        )
         self.assertTrue(any("Flask app" in a for a in approaches))
         self.assertTrue(any("/tmp" in a for a in approaches))
         # Prose, from retry #19 attempt 1.
@@ -8996,7 +9133,9 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 goal_text=self.HEALTH_GOAL,
                 workspace=self.WS,
             )
-        approaches = _rejected_approaches(str(caught.exception))
+        approaches = _rejected_approaches(
+            {record.code for record in caught.exception.plan_errors}
+        )
         self.assertTrue(any("prose commands" in a for a in approaches))
         # Placeholder, from retry #17 attempt 4.
         placeholder = TestPlannerPlaceholderCheapFix()
@@ -9007,7 +9146,9 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 goal_text=self.HEALTH_GOAL,
                 workspace=self.WS,
             )
-        approaches = _rejected_approaches(str(caught.exception))
+        approaches = _rejected_approaches(
+            {record.code for record in caught.exception.plan_errors}
+        )
         self.assertTrue(any("placeholder" in a for a in approaches))
         # Hardcoded answer, from the retry-#2 fake (stand-in rule).
         fake = TestPlannerFakeAndMemoryFix()
@@ -9018,7 +9159,9 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
                 goal_text=self.HEALTH_GOAL,
                 workspace=self.WS,
             )
-        approaches = _rejected_approaches(str(caught.exception))
+        approaches = _rejected_approaches(
+            {record.code for record in caught.exception.plan_errors}
+        )
         self.assertTrue(any("hardcoded" in a for a in approaches))
 
     # --- (e) Regression guards: retry #18 still holds, then every earlier fix ---
@@ -9479,7 +9622,9 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 goal_text=self.HEALTH_GOAL,
                 workspace=self.WS,
             )
-        seed = _rejected_approaches(str(caught.exception))
+        seed = _rejected_approaches(
+            {record.code for record in caught.exception.plan_errors}
+        )
         self.assertTrue(any("Flask app" in a for a in seed))
         return seed
 
@@ -9917,7 +10062,7 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry19_attempt3_rejected_with_2_errors(self) -> None:
+    def test_retry19_attempt3_rejected_with_3_errors(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -9927,10 +10072,14 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        self.assertIn("was rejected with 3 errors", message)
         # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
         # Interpreter normalization (retry #27 fix): now 2 -- step-3's bare
         # `python` is rewritten at parse time and no longer errors.
+        # Planner A/B refactor (defect 1): now 3 -- step-1's Flask
+        # fragment also faces the retention guard (it drops all 12
+        # of api.py's definitions); the fragment-scale floor that
+        # exempted sub-four-definition scaffolds is gone.
         self.assertIn("does not parse as Python", message)
         self.assertNotIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
@@ -10740,7 +10889,7 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry19_attempt3_rejected_with_2_errors_naming_flask(self) -> None:
+    def test_retry19_attempt3_rejected_with_3_errors_naming_flask(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -10750,10 +10899,14 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        self.assertIn("was rejected with 3 errors", message)
         # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
         # Interpreter normalization (retry #27 fix): now 2 -- step-3's bare
         # `python` is rewritten at parse time and no longer errors.
+        # Planner A/B refactor (defect 1): now 3 -- step-1's Flask
+        # fragment also faces the retention guard (it drops all 12
+        # of api.py's definitions); the fragment-scale floor that
+        # exempted sub-four-definition scaffolds is gone.
         self.assertIn("does not parse as Python", message)
         self.assertNotIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
@@ -11567,7 +11720,7 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         self.assertIn("freetalon/tests/test_api.py", message)
         self.assertIn("/tmp/health_response.json", message)
 
-    def test_retry19_attempt3_rejected_with_2_errors_naming_flask(self) -> None:
+    def test_retry19_attempt3_rejected_with_3_errors_naming_flask(self) -> None:
         steer = TestPlannerForbiddenSteerFix()
         steer.setUp()
         with self.assertRaises(LLMResponseError) as caught:
@@ -11577,10 +11730,14 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 2 errors", message)
+        self.assertIn("was rejected with 3 errors", message)
         # Framework-guard fix (retry #23): was 1 error (Flask only). Now 3 — the rejection also names the unparseable step-2 scaffold and step-3's bare `python`.
         # Interpreter normalization (retry #27 fix): now 2 -- step-3's bare
         # `python` is rewritten at parse time and no longer errors.
+        # Planner A/B refactor (defect 1): now 3 -- step-1's Flask
+        # fragment also faces the retention guard (it drops all 12
+        # of api.py's definitions); the fragment-scale floor that
+        # exempted sub-four-definition scaffolds is gone.
         self.assertIn("does not parse as Python", message)
         self.assertNotIn("bare `python`", message)
         self.assertIn("writes a Flask app", message)
@@ -12698,7 +12855,7 @@ class TestPlannerFrameworkGuardFix(unittest.TestCase):
             "objective": "Extend the health endpoint in freetalon/api.py",
             "depends_on": [],
             "assigned_claw": "scaffold",
-            "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+            "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
             "outputs": [self.api_path],
             "criteria": [{"type": "file_exists", "path": self.api_path}],
         }
@@ -12849,12 +13006,18 @@ class TestPlannerSanitizeFix(unittest.TestCase):
         # before the fix the same plan was rejected for unparseable
         # scaffold code. ensure_ascii=False keeps the markers literal
         # in the raw text, exactly as the wire delivers them.
+        # Planner A/B refactor (defect 1): the target is a scratch
+        # module that does not exist yet -- the original fixture
+        # scaffolded this fragment as the FULL content of
+        # freetalon/api.py, which is a defect-1 overwrite (it drops
+        # all 12 of the module's definitions) and the retention guard
+        # now rejects it. The sanitize conversion this test pins is
+        # target-independent.
         import ast
         import json
+        import tempfile
 
-        api_path = str(
-            Path(__file__).resolve().parent.parent / "freetalon" / "api.py"
-        )
+        api_path = str(Path(tempfile.mkdtemp()) / "health_fragment.py")
         content = (
             "# extended health endpoint\n"
             "if path == \"/health\":\n"
@@ -13270,18 +13433,26 @@ null
 
     # --- (2b) Shape steering: a scaffold plan one fix away keeps its shape ---
 
-    def test_repair_prompt_steers_back_to_scaffold_shape(self) -> None:
+    def test_repair_prompt_no_shape_blessing_for_retry25_attempt1(self) -> None:
         # Repair steering: a scaffold plan rejected ONLY for
         # interpreter strings gets a repair prompt that says the
-        # shape was right; the grounded plan is then accepted. The
-        # verbatim retry-#25 attempt-1 output no longer reaches the
-        # repair loop -- interpreter normalization (retry #27 fix)
-        # rewrites its two spellings at parse time and it is accepted
-        # (pinned in TestPlannerInterpreterNormalizationFix) -- so
-        # this test drives the same path with both spellings swapped
-        # for ./bin/python, a nonexistent interpreter normalization
-        # does not cover: the rejection stays interpreter-only, via
-        # the validator backstop.
+        # shape was right; the grounded plan is then accepted. This
+        # test used to drive that path with the verbatim retry-#25
+        # attempt-1 output, its two interpreter spellings swapped
+        # for ./bin/python (a nonexistent interpreter normalization
+        # does not cover, so the rejection stayed interpreter-only
+        # via the validator backstop).
+        # Planner A/B refactor (defect 1): attempt 1's rejection is
+        # no longer interpreter-only -- its scaffold drops 11 of
+        # api.py's 12 definitions, and with the fragment-scale floor
+        # gone the retention guard names that loss alongside the two
+        # interpreter errors. Blessing the shape now would repeat
+        # the retry-#28 contradiction (the repair prompt praising a
+        # plan whose code was rejected), so the prompt must carry
+        # the extension block instead and must NOT claim the shape
+        # was right. The string-only steering case itself is pinned
+        # by TestPlannerExtensionSteeringFix's
+        # test_extension_block_silent_for_string_only_rejection.
         good = self._dag(self._grounded_health_nodes())
         attempt1 = self.RETRY25_ATTEMPT1_RAW.replace(
             "./venv/bin/python", "./bin/python"
@@ -13297,8 +13468,8 @@ null
         self.assertEqual(call_mock.call_count, 2)
         self.assertEqual(len(plan.nodes), 4)
         repair_prompt = call_mock.call_args_list[1][0][1]
-        self.assertIn("SHAPE was right", repair_prompt)
-        self.assertIn("scaffold claw", repair_prompt)
+        self.assertNotIn("SHAPE was right", repair_prompt)
+        self.assertIn("EXISTING-MODULE EXTENSION", repair_prompt)
         self.assertIn("./.venv/bin/python", repair_prompt)
 
     def test_repair_prompt_no_steering_when_code_was_rejected(self) -> None:
@@ -13846,7 +14017,7 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
             "objective": "Extend the health endpoint",
             "depends_on": [],
             "assigned_claw": "scaffold",
-            "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+            "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
             "outputs": [self.api_path],
             "criteria": [{"type": "file_exists", "path": self.api_path}],
         }
@@ -13924,37 +14095,37 @@ class TestPlannerInterpreterNormalizationFix(unittest.TestCase):
 
     # --- The retry-#27 pins ---
 
-    def test_retry27_output3_accepted_both_roots_commands_normalized(self) -> None:
-        # Before this fix: rejected with 2 errors under BOTH roots --
-        # the interpreter pair on step_2 / step_3, nothing else. The
-        # scaffold was parse-clean with real computed values.
+    def test_retry27_output3_rejected_by_retention_guard_both_roots(self) -> None:
+        # Before the interpreter-normalization fix: rejected with 2
+        # errors under BOTH roots -- the interpreter pair on step_2 /
+        # step_3, nothing else. The normalization fix made it
+        # ACCEPTED under both roots, and this test pinned that.
+        # Planner A/B refactor (defect 1): the acceptance was
+        # unsound. The scaffold replaces freetalon/api.py wholesale
+        # -- 2 definitions kept of the module's 12, deleting
+        # HiveAPIServer.start, its Handler's do_POST / _send /
+        # log_message, stop, and the controller wiring -- and the
+        # old retention guard exempted it for carrying fewer than
+        # four definitions of its own. With the fragment floor
+        # removed it is rejected under both roots for exactly that
+        # loss; and the single-error profile still proves the
+        # normalization this test was written for: no command error
+        # on step_2 / step_3 survives.
         for root in (None, str(self.repo_root)):
-            nodes, _meta = parse_planner_response(
-                self.RETRY27_OUTPUT3_RAW,
-                goal_text=self.HEALTH_GOAL,
-                workspace=self.WS,
-                repo_root=root,
-            )
-            self.assertEqual(len(nodes), 4)
-            commands = {
-                node.id: node.inputs.get("command")
-                for node in nodes
-                if node.assigned_claw == "bash"
-            }
-            # The parsed plan the executor receives carries the
-            # normalized commands.
+            with self.assertRaises(LLMResponseError) as caught:
+                parse_planner_response(
+                    self.RETRY27_OUTPUT3_RAW,
+                    goal_text=self.HEALTH_GOAL,
+                    workspace=self.WS,
+                    repo_root=root,
+                )
+            exc = caught.exception
             self.assertEqual(
-                commands["node-2"],
-                "cd /home/seeker/projects/FreeTalon"
-                " && ./.venv/bin/python -m unittest discover -s tests",
+                {record.code for record in exc.plan_errors},
+                {"scaffold_overwrite"},
             )
-            self.assertEqual(
-                commands["node-3"],
-                "cd /home/seeker/projects/FreeTalon"
-                " && ./.venv/bin/python -m freetalon.cli start",
-            )
-            self.assertEqual(
-                commands["node-4"], "curl -sf http://localhost:8765/health"
+            self.assertIn(
+                "drops 11 of the existing module's 12 definitions", str(exc)
             )
 
     def test_retry27_output1_only_scaffold_parse_error_remains(self) -> None:
@@ -14244,7 +14415,7 @@ class TestPlannerExtensionSteeringFix(unittest.TestCase):
                 "objective": "Extend the health endpoint in freetalon/api.py",
                 "depends_on": [],
                 "assigned_claw": "scaffold",
-                "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+                "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
                 "outputs": [self.api_path],
                 "criteria": [{"type": "file_exists", "path": self.api_path}],
             },
@@ -14408,11 +14579,17 @@ class TestPlannerExtensionSteeringFix(unittest.TestCase):
                 workspace=self.WS,
                 repo_root=None,
             )
+            codes = _rejection_codes(
+                raw,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=None,
+            )
             # The shape block no longer blesses a wholesale
-            # replacement: the guard's phrase is a content defect.
-            self.assertEqual(_shape_steering_block(raw, message), "")
+            # replacement: the guard's code is a content defect.
+            self.assertEqual(_shape_steering_block(raw, codes), "")
             # The extension block fires with the full dropped list.
-            block = _extension_steering_block(raw, message, None)
+            block = _extension_steering_block(raw, codes, None)
             self.assertIn("EXISTING-MODULE EXTENSION", block)
             self.assertIn(
                 f"dropped these {dropped_count} existing definitions", block
@@ -14428,7 +14605,13 @@ class TestPlannerExtensionSteeringFix(unittest.TestCase):
             workspace=self.WS,
             repo_root=None,
         )
-        block2 = _extension_steering_block(self.RETRY28_OUTPUT2_RAW, message2, None)
+        codes2 = _rejection_codes(
+            self.RETRY28_OUTPUT2_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        block2 = _extension_steering_block(self.RETRY28_OUTPUT2_RAW, codes2, None)
         dropped_segment = block2.split("The module's full definition list")[0]
         self.assertIn("HiveAPIServer.start.Handler._send", dropped_segment)
         self.assertIn("HiveAPIServer.start.Handler.log_message", dropped_segment)
@@ -14455,8 +14638,14 @@ class TestPlannerExtensionSteeringFix(unittest.TestCase):
         )
         self.assertIn("./bin/python", message)
         self.assertNotIn("existing module's", message)
-        self.assertIn("SHAPE was right", _shape_steering_block(raw, message))
-        self.assertEqual(_extension_steering_block(raw, message, None), "")
+        codes = _rejection_codes(
+            raw,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        self.assertIn("SHAPE was right", _shape_steering_block(raw, codes))
+        self.assertEqual(_extension_steering_block(raw, codes, None), "")
 
     def test_retry28_attempt2_repair_prompt_carries_extension_block(self) -> None:
         from freetalon.orchestrator.planner import plan_task_intent
@@ -14606,7 +14795,7 @@ class TestPlannerSkeletonGroundingFix(unittest.TestCase):
                 "objective": "Extend the health endpoint in freetalon/api.py",
                 "depends_on": [],
                 "assigned_claw": "scaffold",
-                "inputs": {"file_path": self.api_path, "content": GROUNDED_API_CONTENT},
+                "inputs": {"file_path": self.api_path, "anchor": "HiveAPIServer.start.Handler.do_GET", "position": "replace", "content": GROUNDED_DO_GET_DELTA},
                 "outputs": [self.api_path],
                 "criteria": [{"type": "file_exists", "path": self.api_path}],
             },
@@ -14947,7 +15136,13 @@ class TestPlannerSkeletonGroundingFix(unittest.TestCase):
             repo_root=None,
         )
         self.assertIn("drops 8 of the existing module's 12 definitions", message)
-        block = _extension_steering_block(self.RETRY29_OUTPUT2_RAW, message, None)
+        codes = _rejection_codes(
+            self.RETRY29_OUTPUT2_RAW,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        block = _extension_steering_block(self.RETRY29_OUTPUT2_RAW, codes, None)
         self.assertIn("EXISTING-MODULE EXTENSION", block)
         self.assertIn("dropped these 8 existing definitions", block)
         self.assertIn("The module's structure, with its real indentation", block)
@@ -15786,7 +15981,13 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
             workspace=self.WS,
             repo_root=None,
         )
-        block = _extension_steering_block(raw, message, None)
+        codes = _rejection_codes(
+            raw,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        block = _extension_steering_block(raw, codes, None)
         self.assertIn("EXISTING-MODULE EXTENSION", block)
         self.assertIn("ANCHORED EDIT", block)
         self.assertIn('"anchor"', block)
@@ -16756,17 +16957,18 @@ class TestPlannerReindentFix(unittest.TestCase):
 
         raw = self._non_uniform_raw()
         message = self._rejection(raw)
+        codes = _rejection_codes(raw)
         self.assertIn("spaces of indentation", message)
         # The retry-#28 misfire, one level down, is closed: the
         # shape block no longer tells the repair round none of its
         # code was rejected.
-        self.assertEqual(_shape_steering_block(raw, message), "")
+        self.assertEqual(_shape_steering_block(raw, codes), "")
         # The extension block stays guard-only, as before.
-        self.assertEqual(_extension_steering_block(raw, message, None), "")
+        self.assertEqual(_extension_steering_block(raw, codes, None), "")
         # The materialization block fires with the concrete
         # pattern: the module's full definition list, the anchor's
         # own indentation, and the module's skeleton.
-        block = _materialization_steering_block(raw, message, None)
+        block = _materialization_steering_block(raw, codes, None)
         self.assertIn("ANCHORED-EDIT REPAIR", block)
         self.assertIn("KEEP the anchored-edit form", block)
         self.assertIn("The module's full definition list is:", block)
@@ -16782,18 +16984,18 @@ class TestPlannerReindentFix(unittest.TestCase):
 
         raw = self._non_uniform_raw()
         # An overwrite-guard rejection carries no materialization
-        # stem: the extension block's territory, not this one's.
-        guard_message = (
-            "Planner output was rejected with 1 error — fix ALL of them:\n"
-            "1. Planner node 'step-1' scaffold for 'fixture_module.py' "
-            "drops 8 of the existing module's 9 definitions — ..."
-        )
+        # code: the extension block's territory, not this one's.
+        # (A/B refactor: this case used to hand the block a
+        # hand-written guard message; it now hands it the guard's
+        # code set, which is what the trigger reads.)
+        guard_codes = {"scaffold_overwrite"}
         self.assertEqual(
-            _materialization_steering_block(raw, guard_message, None), ""
+            _materialization_steering_block(raw, guard_codes, None), ""
         )
-        # The placeholder-delta cheap rejection DOES carry a stem
-        # ("an anchored edit") but is excluded: its repair round
-        # already answers with the grounded skeleton.
+        # The placeholder-delta cheap rejection DOES carry the
+        # materialization-adjacent code family but is excluded by
+        # its own code: its repair round already answers with the
+        # grounded skeleton.
         placeholder_raw = self._dag(
             [
                 self._edit_node(
@@ -16812,8 +17014,9 @@ class TestPlannerReindentFix(unittest.TestCase):
             )
         message = str(caught.exception)
         self.assertIn("placeholder content only", message)
+        codes = {record.code for record in caught.exception.plan_errors}
         self.assertEqual(
-            _materialization_steering_block(placeholder_raw, message, None),
+            _materialization_steering_block(placeholder_raw, codes, None),
             "",
         )
 
@@ -16851,3 +17054,229 @@ class TestPlannerReindentFix(unittest.TestCase):
         # The misfiring shape-steering text is gone.
         self.assertNotIn("SHAPE was right", repair_prompt)
         self.assertNotIn("none of its code was rejected", repair_prompt)
+
+
+class TestPlannerABRefactor(unittest.TestCase):
+    """Planner A/B refactor: structured PlanError records on every
+    rejection, repair steering keyed off codes, and the three
+    retry-#33 defect closures — (1) the elision hole (a full-content
+    scaffold of an existing module faces definition-retention
+    judgment, and elision markers are a named rejection), (3) the
+    heredoc Python parse check as a first-class validator including
+    tee writes. (Defect 2, the suite-node timeout, is executor-side
+    and pinned in tests/test_executor.py.)
+    """
+
+    GOAL = "Extend the fixture module in place"
+
+    MODULE_SOURCE = (
+        "VALUE = 1\n"
+        "\n"
+        "\n"
+        "def alpha():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def beta():\n"
+        "    return 2\n"
+        "\n"
+        "\n"
+        "def gamma():\n"
+        "    return 3\n"
+        "\n"
+        "\n"
+        "def delta():\n"
+        "    return 4\n"
+        "\n"
+        "\n"
+        "def epsilon():\n"
+        "    return 5\n"
+        "\n"
+        "\n"
+        "def zeta():\n"
+        "    return 6\n"
+    )
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_root = Path(self._tmp.name)
+        self.module_path = str(self.tmp_root / "fixture_module.py")
+        Path(self.module_path).write_text(self.MODULE_SOURCE, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _scaffold_node(self, content: str, node_id: str = "step-1") -> dict:
+        return {
+            "id": node_id,
+            "objective": "Rewrite the fixture module",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {"file_path": self.module_path, "content": content},
+            "outputs": [self.module_path],
+            "acceptance": ["The module is rewritten."],
+            "criteria": [{"type": "file_exists", "path": self.module_path}],
+        }
+
+    def _caught(self, raw: str) -> LLMResponseError:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw, goal_text=self.GOAL)
+        return caught.exception
+
+    # --- Defect 1: the retention judgment has no fragment floor ---
+
+    def test_fragment_scaffold_faces_retention_guard(self) -> None:
+        # The retry-#28/#29 shape: a branch fragment (zero definitions)
+        # offered as the full content of an existing six-definition
+        # module. Before the refactor the guard skipped any scaffold
+        # with fewer than four definitions of its own, so this passed.
+        raw = self._dag(
+            [self._scaffold_node("if VALUE:\n    print('health branch')\n")]
+        )
+        exc = self._caught(raw)
+        self.assertIn(
+            "drops 6 of the existing module's 6 definitions", str(exc)
+        )
+        self.assertEqual(
+            {record.code for record in exc.plan_errors}, {"scaffold_overwrite"}
+        )
+
+    def test_elision_marker_rejected_even_when_definitions_retained(self) -> None:
+        # Every definition is present and the content parses — only
+        # the elision comment stands in for code. Retention alone
+        # cannot see it; the elision rule names it.
+        content = self.MODULE_SOURCE.replace(
+            "def gamma():\n    return 3\n",
+            "def gamma():\n    # ... existing code ...\n    return 3\n",
+        )
+        exc = self._caught(self._dag([self._scaffold_node(content)]))
+        self.assertIn("elides the existing module", str(exc))
+        self.assertEqual(
+            {record.code for record in exc.plan_errors}, {"elision"}
+        )
+
+    def test_elision_owns_its_rejection_when_definitions_also_drop(self) -> None:
+        # The retry-#33 output-4 shape: a fragment carrying elision
+        # markers that also drops definitions earns exactly ONE
+        # error — the elision rejection (the guard defers to it).
+        content = (
+            "def alpha():\n"
+            "    # ... existing code ...\n"
+            "    return 1\n"
+        )
+        exc = self._caught(self._dag([self._scaffold_node(content)]))
+        self.assertEqual(
+            {record.code for record in exc.plan_errors}, {"elision"}
+        )
+        self.assertTrue(str(exc).startswith("Planner output was rejected with 1 error"))
+
+    # --- Structured records: code + stage + node id per rejection ---
+
+    def test_records_carry_code_stage_and_node_id(self) -> None:
+        raw = self._dag(
+            [self._scaffold_node("if VALUE:\n    print('health branch')\n")]
+        )
+        exc = self._caught(raw)
+        (record,) = exc.plan_errors
+        self.assertEqual(record.code, "scaffold_overwrite")
+        self.assertEqual(record.stage, "validate")
+        self.assertEqual(record.node_id, "step-1")
+        # The record's message is the validator's own text, unchanged.
+        self.assertIn(record.message, str(exc))
+
+    def test_schema_stage_records(self) -> None:
+        node = self._scaffold_node("VALUE = 2\n")
+        raw = self._dag([node, dict(node)])
+        exc = self._caught(raw)
+        codes = {record.code for record in exc.plan_errors}
+        self.assertIn("duplicate_node_ids", codes)
+        for record in exc.plan_errors:
+            if record.code == "duplicate_node_ids":
+                self.assertEqual(record.stage, "schema")
+
+    def test_materialize_stage_records(self) -> None:
+        node = self._scaffold_node("return 1\n")
+        node["inputs"]["anchor"] = "NoSuchDefinition"
+        node["inputs"]["position"] = "replace"
+        exc = self._caught(self._dag([node]))
+        self.assertTrue(exc.plan_errors)
+        for record in exc.plan_errors:
+            self.assertEqual(record.stage, "materialize")
+        self.assertIn(
+            "anchored_edit", {record.code for record in exc.plan_errors}
+        )
+
+    # --- Defect 3: heredoc payloads are parse-checked, tee included ---
+
+    BROKEN_PAYLOAD = (
+        "import unittest\n"
+        "\n"
+        "\n"
+        "class TestHealth(unittest.TestCase):\n"
+        "    def test_ok(self):\n"
+        "        self.assertTrue(True)\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "unittest.main()\n"
+    )
+
+    def _bash_node(self, command: str) -> dict:
+        return {
+            "id": "step-1",
+            "objective": "Write the test file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": command},
+            "outputs": [],
+            "acceptance": ["The test file is written."],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+
+    def test_heredoc_main_guard_defect_is_one_heredoc_parse_error(self) -> None:
+        # The retry-#33 output-3 shape through a plain redirect: the
+        # payload's unindented unittest.main() under the __main__
+        # guard is the rejection, and it is the ONLY error.
+        target = str(self.tmp_root / "test_health.py")
+        command = (
+            f"cat > {target} <<'PYEOF'\n" + self.BROKEN_PAYLOAD + "PYEOF"
+        )
+        exc = self._caught(self._dag([self._bash_node(command)]))
+        self.assertEqual(
+            {record.code for record in exc.plan_errors}, {"heredoc_parse"}
+        )
+        self.assertIn("does not parse as Python", str(exc))
+
+    def test_tee_heredoc_payloads_are_parse_checked(self) -> None:
+        # Both tee shapes were invisible to the payload check before
+        # the refactor: no 'cat > target' head exists for either.
+        target = str(self.tmp_root / "test_health.py")
+        for command in (
+            f"cat <<'PYEOF' | tee {target}\n" + self.BROKEN_PAYLOAD + "PYEOF",
+            f"tee {target} <<'PYEOF'\n" + self.BROKEN_PAYLOAD + "PYEOF",
+        ):
+            exc = self._caught(self._dag([self._bash_node(command)]))
+            self.assertIn(
+                "heredoc_parse",
+                {record.code for record in exc.plan_errors},
+                command.split("\n", 1)[0],
+            )
+
+    def test_valid_tee_heredoc_payload_accepted(self) -> None:
+        target = str(self.tmp_root / "test_health.py")
+        payload = self.BROKEN_PAYLOAD.replace(
+            "unittest.main()\n", "    unittest.main()\n"
+        )
+        command = f"cat <<'PYEOF' | tee {target}\n" + payload + "PYEOF"
+        nodes, _meta = parse_planner_response(
+            self._dag([self._bash_node(command)]), goal_text=self.GOAL
+        )
+        self.assertEqual(len(nodes), 1)

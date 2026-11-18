@@ -1837,3 +1837,71 @@ Deliberately left out:
 - /health retry #33 (2026-11-17, ~18:20 PST; head c736d31, re-indent fix -- materialization absorbs a uniform re-indentation of a real-code delta + materialization steering block in repair prompts) -- FAILED at EXECUTION, a first (goal verdict FAIL, escalated: timed-out nodes exhausted their retries; DRIVER_EXIT:0 -- the driver exits 0 once a run completes; planning failures are what raise exit 1. Run run-20261118T022058Z-04bf5c created, elapsed 300.0s, plan plan-7885a4ef9d99 accepted on the 4th planner output). HEADLINE: the re-indent fix WORKS live. Output 3's step_1 was the anchored edit (anchor HiveAPIServer.start.Handler.do_GET, position 'replace') carrying the full do_GET DEDENTED to column 0 -- the exact uniform 12-space strip that killed retry #32 at the indentation gate -- and materialization ABSORBED it: probe replay (tools/probe-retry33.py, logs/retry33-probe.log; profiles identical under repo_root=None and the explicit root) shows step_1 produced NO error, and the plan's ONLY rejection was 1 error on step_2, the test heredoc's unindented unittest.main() under the __main__ guard ('expected an indented block after if statement on line 54') -- precisely the defect the re-indent fix audit predicted the live run would unmask once materialization stopped raising first. The materialization steering block was NOT exercised (output 3's rejection was a step_2 parse error, not a materialization rejection, so output 4's repair prompt was the ordinary one). Output 4 (repair) did NOT regress to Flask -- the first non-Flask repair in four retries -- but it abandoned the edit form for a simplified 2-node legacy full-content plan whose step_1 content is a 5-line placeholder fragment (a bare def do_GET, '# ... existing code ...', one /health branch returning {"ok":True, "status":"healthy"}, '# ... remaining code ...'), and that plan was ACCEPTED (probe: ACCEPTED, 2 nodes, both roots): the placeholder check did not fire (the fragment carries a real def + branch, so it is not comment-only) and the overwrite guard did not fire (no anchored edit to materialize, and the fragment retains none of the module's qualified definitions to count). The run EXECUTED: node-1 PASS (exit 0, 0.0s) and CLOBBERED freetalon/api.py 219 -> 5 lines (fragment preserved at logs/retry33-api-clobbered-fragment.py; restored via git checkout; post-run suite 982/982 green). Node-2 ran the full suite as a single bash node and TIMED OUT at the 300s node timeout (the suite takes ~360-385s) -- FAIL; the orphaned suite process finished on its own afterward. No live /health was ever served (the accepted plan had no server step; post-run curl to localhost:8765/health: connection refused), so no live evidence exists. Output 3's delta also still carried the sketch's '...' Ellipsis values for service_status/ollama_reachable/gpu_temperature -- never judged; execution of that plan never happened, and its own step_2 type assertions (bool, (int, float)) would have failed them. Intake clean (valid TaskIntent, goal verbatim). Four planner outputs: (1) schema rejection -- {"ok":true,"status":"ready"} echo. (2) schema rejection -- {"nodes":[]}. (3) 1 error -- step_2 heredoc parse only; step_1 absorbed by the re-indent path (its other nodes were well-formed: the grounded ephemeral-port test, CLI start with a curl wait loop -- though step_4 wrote ./venv/bin/python without the leading dot in two commands, and step_3 ran the workspace test with bare python3). (4) ACCEPTED -- the 2-node placeholder-fragment plan above. Pre-flight fully recorded (logs/health-retry-33-2026-11-17.log): 48C idle, power limit exactly 300.00W, PCIe width x16, zero Xid 79/154, Ollama tags list gemma-3-abliterated:latest, head c736d31 clean, baseline suite 982/982 green (Ran 982 in 384.7s, OK). GPU peak 77C / 251W during planning, 0 Xid for the run; fans manual 85% during the driver, auto after (GPUFanControlState=0 verified). Post-run suite 982/982 (Ran 982 in 361.2s, OK) after the api.py restore. No sed anywhere in the run.
   Weaknesses for the next fix, in priority order: (1) The full-content placeholder/elision hole -- now the top defect, with an executed clobber as evidence: a legacy full-content scaffold for an EXISTING module whose body is elision comments around one real branch passes the placeholder check (not comment-only) and the overwrite guard (nothing to count) and executes as a module overwrite. A scaffold targeting an existing module should face the same definition-retention judgment whether or not it uses the edit form, and elision markers ('# ... existing code ...' / '# ... remaining code ...') in scaffold content for an existing file should be a named rejection. (2) The suite-as-a-node timeout mismatch: a bash node running the full suite can never pass a 300s node timeout when the suite takes ~360-385s -- either planner steering should stop proposing the full suite as one bash node for this goal, or test-node timeouts must exceed suite duration; as-is, even a perfect endpoint plan ending in a suite node fails at execution. (3) The heredoc __main__-guard defect (output 3's step_2): test heredocs keep emitting unittest.main() at column 0 under the guard; the parse rejection names it precisely, but the model has now produced it in the audit fixture and live -- a heredoc-shape steering line or a targeted repair hint is the lever. (4) The '...' completion gap remains unjudged for the third consecutive retry -- the intended judgment path (the run's own tests) is still unreached, now blocked by (1)-(3) rather than by materialization.
 - Next: fix the full-content placeholder/definition-retention hole, then /health retry #34.
+
+## Update - 2026-11-17 (planner A/B refactor + Checkpoint 1 rescore)
+
+- Planner parse/validate path refactored into composable stages
+  (sanitize -> interpreter-normalize -> materialize -> validate)
+  with structured errors: every rejection now carries PlanError
+  records (stable code + message + node id + stage) on
+  exc.plan_errors, collected by one aggregator; every existing
+  message text is byte-identical. Repair steering (shape /
+  extension / materialization blocks, rejected-approach seeding,
+  the placeholder-skeleton branch) keys off error CODES, not
+  message substrings -- the mechanism behind both historical
+  steering contradictions (retries #28 and #33). Validators read
+  each module file once per parse via a shared source cache.
+- Defect closures (the three retry-#33 weaknesses):
+  (1) Elision hole CLOSED. New 'elision' rejection: a full-content
+  scaffold of an existing module carrying elision markers
+  ('... existing code ...' style) is rejected by name; the
+  retention guard lost its scaffold-scale floor, so fragment
+  scaffolds face definition-retention judgment like everything
+  else (the guard defers to the elision rule when both apply --
+  one error per defect).
+  (2) Suite-node timeout CLOSED executor-side: a bash node that
+  runs the full suite (unittest discover / bare unittest / bare or
+  tests-dir pytest) gets a 900s timeout floor in the executor
+  (max of declared and floor); validator steering cannot create
+  executability, and the executor guarantee covers any plan
+  source.
+  (3) The heredoc Python parse check is now a first-class
+  validator ('heredoc_parse'), and _bash_code_writes extracts tee
+  heredoc writes (cat <<M | tee T and tee T <<M) that were
+  previously invisible to every payload check.
+- Checkpoint 1 rescore (tools/replay-planner-corpus.py, 28 captured
+  outputs x 2 repo-root variants, offline): OLD planner accepted
+  4/28 (14.3%), accepted-sound 0/28, mean errors/output 1.21, wall
+  16.69s. NEW: accepted 0/28, accepted-sound 0/28, mean
+  errors/output 1.36 overall and 1.36 per REJECTED output (old:
+  1.42). The only changed rows are the 4 unsound accepts
+  (retry28-1, retry29-1, retry33-4, llama3-2), each now rejected
+  with exactly 1 error (scaffold_overwrite x3, elision x1); the
+  other 48 rows are identical in verdict and error count. Wall
+  16.24s. Accepted-sound stays 0 because the corpus holds no
+  acceptable plan (all 28 are historical failures) -- CP2 live
+  runs are where sound accepts can appear. Logs:
+  logs/planner-ab-replay-new.log (+ .json) vs
+  logs/planner-ab-replay-old.log (+ .json).
+- Pins changed (each encodes one of the three defects):
+  GROUNDED_API_CONTENT fixtures (14 sites) now extend api.py via
+  the anchored-edit form (GROUNDED_DO_GET_DELTA) instead of a
+  fragment full-content scaffold -- the fragment is the
+  retry28-1 shape; retry27 output 3 pin flipped from accepted to
+  rejected-by-guard (its scaffold deletes 11 of api.py's 12
+  definitions; the single-error profile still proves interpreter
+  normalization); retry19 attempt 3 counts 2 -> 3 in four tests
+  (step-1's Flask fragment now also faces retention); the retry25
+  attempt-1 repair-prompt test flipped (its rejection is no
+  longer interpreter-only, so no shape blessing -- the extension
+  block fires instead); two http.server acceptance fixtures now
+  scaffold api.py's own current source (the fragment form is a
+  defect-1 overwrite); the Flask-isolation test counts 1 -> 2
+  errors; the U+2581 sanitize fixture retargeted to a scratch
+  module; steering/approach tests now pass error codes instead of
+  message text; demo-framework-guard.py's GROUNDED_PLAN converted
+  to the same anchored edit (46 checks, ALL CHECKS PASSED).
+- Suite: 997/997 green (982 + 15 new: 9 planner refactor/closure
+  tests, 6 executor suite-timeout tests). Ran 997 in 378.1s, OK.
+- Next: CP2 -- 3 live /health runs on the refactored planner;
+  reassess with Pat if no improvement after refactor + 2 cycles.

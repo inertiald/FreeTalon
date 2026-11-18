@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import shlex
 import time
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING, TypedDict
@@ -40,6 +42,110 @@ class DependencyRequest(_DependencyRequestRequired, total=False):
 
 def _is_dependency_missing(result: Any) -> bool:
     return isinstance(result, dict) and DEPENDENCY_MISSING_KEY in result
+
+
+# Floor under the timeout of a node that runs the full test suite
+# (planner A/B refactor, defect 2). The suite takes ~385s end to end;
+# the default per-node timeout is 300s, so a suite node at the
+# default can never pass — retry #33's accepted plan died exactly
+# here, its suite node killed at 300.0s with the suite still running.
+_SUITE_NODE_TIMEOUT_S = 900.0
+
+_UNITTEST_VALUE_FLAGS = frozenset(
+    {"-s", "-p", "-t", "--start-directory", "--pattern", "--top-level-directory"}
+)
+_PYTEST_VALUE_FLAGS = frozenset(
+    {
+        "-k",
+        "-m",
+        "-p",
+        "-o",
+        "--maxfail",
+        "--timeout",
+        "--rootdir",
+        "--basetemp",
+        "--deselect",
+        "--ignore",
+        "--override-ini",
+        "--log-level",
+    }
+)
+_PYTEST_SUITE_TARGETS = frozenset({"tests", "tests/", "./tests", ".", "./"})
+
+
+def _positional_args(args: list[str], value_flags: frozenset) -> list[str]:
+    """Non-flag tokens in ``args``, skipping the values of known flags."""
+    positional: list[str] = []
+    skip_next = False
+    for token in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in value_flags:
+            skip_next = True
+            continue
+        if token.startswith("-"):
+            continue
+        positional.append(token)
+    return positional
+
+
+def _command_runs_full_suite(command: str) -> bool:
+    """True when a bash command runs the repo's whole test suite in one go.
+
+    Recognizes the shapes plans actually use: unittest discovery
+    (``python -m unittest discover ...``), a bare unittest module run
+    (``python -m unittest`` naming no test module — discovery by
+    another name), and pytest with no scoped target (or only the
+    tests directory). A scoped run — one test module, one test file,
+    one node id — is fast and keeps the node's own timeout. The scan
+    is per shell segment (``&&``/``||``/``;``), token-based, and only
+    ever RAISES a timeout ceiling, so a false positive costs a longer
+    leash on one node, never a wrong verdict.
+    """
+    for segment in re.split(r"&&|\|\||;", command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        for position, token in enumerate(tokens):
+            if token == "unittest" and position >= 1 and tokens[position - 1] == "-m":
+                args = tokens[position + 1 :]
+                if "discover" in args or not _positional_args(
+                    args, _UNITTEST_VALUE_FLAGS
+                ):
+                    return True
+            if token.rsplit("/", 1)[-1] == "pytest":
+                positional = _positional_args(
+                    tokens[position + 1 :], _PYTEST_VALUE_FLAGS
+                )
+                if not positional or all(
+                    target in _PYTEST_SUITE_TARGETS for target in positional
+                ):
+                    return True
+    return False
+
+
+def _effective_node_timeout(node: PlanNode) -> float:
+    """The timeout a node actually runs under.
+
+    A bash node that runs the full test suite gets a floor of
+    _SUITE_NODE_TIMEOUT_S under its timeout (defect 2): the
+    derivation lives here, not in the planner, because validator
+    steering cannot create executability — it would spend repair
+    budget making the model split a run the goal explicitly demands
+    whole ("keep the full test suite green"), and each fragment's
+    cost is unknowable at plan time. The executor-side floor
+    guarantees the invariant — a plan that runs the suite is
+    executable within its timeout — by construction, for LLM plans
+    and hand-built plans alike. A node that declares a larger
+    timeout keeps it; every other node keeps exactly its own.
+    """
+    if (node.assigned_claw or "") in ("bash", "shell_exec"):
+        command = node.inputs.get("command") or node.inputs.get("cmd")
+        if isinstance(command, str) and _command_runs_full_suite(command):
+            return max(node.timeout_s, _SUITE_NODE_TIMEOUT_S)
+    return node.timeout_s
 
 
 class ExecutorError(RuntimeError):
@@ -177,11 +283,20 @@ class Executor:
                     resolved_inputs.setdefault(
                         "run_dir", str(self._run_store.run_dir(self._run_id))
                     )
-                resolved_inputs.setdefault("timeout_s", target.timeout_s)
+                effective_timeout = _effective_node_timeout(target)
+                if effective_timeout != target.timeout_s:
+                    logger.info(
+                        "Node %s runs the full test suite: timeout floor "
+                        "%.0fs applies (node declares %.0fs).",
+                        node.id,
+                        effective_timeout,
+                        target.timeout_s,
+                    )
+                resolved_inputs.setdefault("timeout_s", effective_timeout)
 
                 try:
                     result = await asyncio.wait_for(
-                        handler(resolved_inputs), timeout=target.timeout_s
+                        handler(resolved_inputs), timeout=effective_timeout
                     )
                 except asyncio.TimeoutError:
                     duration_s = time.monotonic() - started
@@ -192,7 +307,7 @@ class Executor:
                     self._record_failure(
                         plan_id,
                         node.id,
-                        f"Node timed out after {target.timeout_s}s.",
+                        f"Node timed out after {effective_timeout}s.",
                         measurement,
                     )
                     return

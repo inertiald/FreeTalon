@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import ast
-from dataclasses import replace as dataclass_replace
+from dataclasses import dataclass, replace as dataclass_replace
 import json
 import re
 import shlex
@@ -11,7 +11,7 @@ import heapq
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Collection
 
 from pydantic import ValidationError
 
@@ -146,6 +146,148 @@ class EmptyPlanError(CheapRejectionError):
     """
 
 
+# --- Composable pipeline stages with structured errors (planner A/B
+# refactor, 2026-11-17) ---
+#
+# parse_planner_response is a pipeline of small stages over the raw
+# output: sanitize -> schema (JSON shape, node schema, DAG structure)
+# -> interpreter-normalize -> materialize (anchored edits) -> validate
+# (the content rules). Every rejection the pipeline raises carries a
+# list of PlanError records on the exception's ``plan_errors``
+# attribute: a stable machine CODE, the human message (byte-identical
+# to the text the numbered rejection has always carried), the node the
+# error belongs to, and the stage that produced it. The repair loop
+# steers off the CODES — never off substrings of the message. (Both
+# historical steering contradictions, retries #28 and #33, came from
+# steering blocks pattern-matching rejection wording: the shape block
+# blessed a wholesale replacement because the guard's phrase was not
+# yet in its marker list, then blessed a dedented delta the same way.
+# A code cannot drift out of a list when a message is reworded.)
+
+STAGE_SCHEMA = "schema"
+STAGE_MATERIALIZE = "materialize"
+STAGE_VALIDATE = "validate"
+
+
+@dataclass(frozen=True)
+class PlanError:
+    """One structured planner rejection error."""
+
+    code: str
+    message: str
+    node_id: str | None = None
+    stage: str = STAGE_VALIDATE
+
+    def __str__(self) -> str:
+        return self.message
+
+
+_NODE_ID_PREFIX_RE = re.compile(r"^Planner node '([^']+)'")
+
+
+def _node_id_from_message(message: str) -> str | None:
+    """The node a validator message belongs to, from its own prefix.
+
+    Every per-node validator message opens with "Planner node '<id>'"
+    — the convention is ours and total, so the aggregator can attribute
+    records without changing any validator's return shape.
+    """
+    match = _NODE_ID_PREFIX_RE.match(message)
+    return match.group(1) if match else None
+
+
+def _error_records(
+    code: str, messages: Collection[str], stage: str = STAGE_VALIDATE
+) -> list[PlanError]:
+    """Wrap one validator's messages as PlanError records with its code."""
+    return [
+        PlanError(
+            code=code,
+            message=message,
+            node_id=_node_id_from_message(message),
+            stage=stage,
+        )
+        for message in messages
+    ]
+
+
+def _attach_plan_errors(
+    exc: LLMResponseError, records: Collection[PlanError]
+) -> LLMResponseError:
+    """Attach structured error records to a rejection about to be raised."""
+    exc.plan_errors = list(records)  # type: ignore[attr-defined]
+    return exc
+
+
+def _single_error_rejection(code: str, message: str, stage: str) -> LLMResponseError:
+    """An LLMResponseError carrying exactly one structured record."""
+    return _attach_plan_errors(
+        LLMResponseError(message),
+        [PlanError(code=code, message=message, stage=stage)],
+    )
+
+
+def _numbered_rejection(
+    records: Collection[PlanError], *, cheap: bool = False, suffix: str = ""
+) -> LLMResponseError:
+    """The house numbered rejection, built from structured records.
+
+    The message format is the one the repair loop has always received
+    ("rejected with N errors — fix ALL of them:" + numbered lines +
+    an optional shape suffix); the records ride along on the exception
+    so the repair loop can steer off their codes.
+    """
+    records = list(records)
+    noun = "error" if len(records) == 1 else "errors"
+    lines = "\n".join(
+        f"{index}. {record.message}"
+        for index, record in enumerate(records, start=1)
+    )
+    message = (
+        f"Planner output was rejected with {len(records)} {noun} — "
+        f"fix ALL of them:\n{lines}{suffix}"
+    )
+    exc: LLMResponseError = (
+        CheapRejectionError(message) if cheap else LLMResponseError(message)
+    )
+    return _attach_plan_errors(exc, records)
+
+
+class _ModuleSourceCache:
+    """Per-parse cache of existing-module sources and definition names.
+
+    The validators each used to re-read and re-parse the same module
+    files (api.py was parsed by the repo index, the overwrite guard,
+    and the code-append check on every parse_planner_response call).
+    One cache is created per call and threaded through the aggregator,
+    so each module file is read and parsed at most once per parse;
+    validators called directly (tests) pass no cache and get a fresh
+    one, with identical results.
+    """
+
+    def __init__(self) -> None:
+        self._sources: dict[Path, str | None] = {}
+        self._def_names: dict[Path, list[str]] = {}
+
+    def source(self, path: Path) -> str | None:
+        """The file's text, or None when it cannot be read (missing)."""
+        if path not in self._sources:
+            try:
+                self._sources[path] = path.read_text(encoding="utf-8")
+            except OSError:
+                self._sources[path] = None
+        return self._sources[path]
+
+    def def_names(self, path: Path) -> list[str]:
+        """The file's qualified definition names ([] when unreadable)."""
+        if path not in self._def_names:
+            source = self.source(path)
+            self._def_names[path] = (
+                qualified_def_names(source) if source is not None else []
+            )
+        return self._def_names[path]
+
+
 def _lenient_node_view(raw: Any, position: int) -> SimpleNamespace | None:
     """A duck-typed view of a raw node dict for checks that only read
     claw/inputs/criteria/id — usable before PlanNode validation passes.
@@ -248,6 +390,7 @@ def _validate_raw_nodes(
             index=repo_index,
             goal_text=goal_text,
         )
+        standin_records = _error_records("static_standin", standin_errors)
         # Retry #21: the same masking as the stand-in check, one fix
         # later — attempt 2 carried BOTH a placeholder heredoc (step-1)
         # and a typo (step-4 "assigned_claws"), and the schema-error path
@@ -264,27 +407,26 @@ def _validate_raw_nodes(
         # counts for the retry-#7/#11 invented-schema fixtures — the
         # placeholder/stand-in checks are the fake-naming checks that
         # belong in the schema path.
-        placeholder_errors = _placeholder_scaffold_errors(
+        placeholder_records = _placeholder_scaffold_error_records(
             views, repo_root, index=repo_index, goal_text=goal_text
         )
-        if not placeholder_errors:
-            placeholder_errors.extend(
+        if not placeholder_records:
+            placeholder_records = _error_records(
+                "placeholder_bash",
                 _placeholder_bash_errors(
                     views, repo_root, index=repo_index, goal_text=goal_text
-                )
+                ),
             )
-        all_errors = placeholder_errors + standin_errors + errors
-        noun = "error" if len(all_errors) == 1 else "errors"
-        lines = "\n".join(
-            f"{index}. {error}" for index, error in enumerate(all_errors, start=1)
+        all_records = (
+            placeholder_records
+            + standin_records
+            + _error_records("node_schema", errors, stage=STAGE_SCHEMA)
         )
-        message = (
-            f"Planner output was rejected with {len(all_errors)} {noun} — "
-            f"fix ALL of them:\n{lines}\n{_NODE_SHAPE_EXAMPLE}"
+        raise _numbered_rejection(
+            all_records,
+            cheap=bool(standin_records or placeholder_records),
+            suffix=f"\n{_NODE_SHAPE_EXAMPLE}",
         )
-        if standin_errors or placeholder_errors:
-            raise CheapRejectionError(message)
-        raise LLMResponseError(message)
     return nodes
 
 
@@ -360,11 +502,24 @@ def normalize_plan_nodes(
     if not nodes:
         # Cheap rejection (retry #12): an empty plan is a degenerate
         # output, not a plan that needs a repair round to fix.
-        raise EmptyPlanError("Planner response must include at least one plan node.")
+        raise _attach_plan_errors(
+            EmptyPlanError("Planner response must include at least one plan node."),
+            [
+                PlanError(
+                    code="empty_plan",
+                    message="Planner response must include at least one plan node.",
+                    stage=STAGE_SCHEMA,
+                )
+            ],
+        )
 
     node_map = {node.id: node for node in nodes}
     if len(node_map) != len(nodes):
-        raise LLMResponseError("Planner response contained duplicate node ids.")
+        raise _single_error_rejection(
+            "duplicate_node_ids",
+            "Planner response contained duplicate node ids.",
+            STAGE_SCHEMA,
+        )
 
     # Unknown dependencies are a repairable rejection, not a structural
     # raise: retry #10 attempt 3 put output names ("endpoint_implemented",
@@ -378,7 +533,19 @@ def normalize_plan_nodes(
     for node in nodes:
         for dependency in node.depends_on:
             if dependency == node.id:
-                raise LLMResponseError(f"Planner node '{node.id}' cannot depend on itself.")
+                raise _attach_plan_errors(
+                    LLMResponseError(
+                        f"Planner node '{node.id}' cannot depend on itself."
+                    ),
+                    [
+                        PlanError(
+                            code="self_dependency",
+                            message=f"Planner node '{node.id}' cannot depend on itself.",
+                            node_id=node.id,
+                            stage=STAGE_SCHEMA,
+                        )
+                    ],
+                )
             if dependency not in node_map:
                 unknown_dep_errors.append(
                     _unknown_dependency_error(node, node_map, dependency)
@@ -392,17 +559,14 @@ def normalize_plan_nodes(
         # stand-in, ...) so the repair round sees the real defects in the
         # same rejection. Duplicate ids, cycles, and self-dependency still
         # raise first, as before.
-        extra_errors, _cheap = _collect_plan_errors(
+        extra_records, _cheap = _collect_plan_error_records(
             nodes, repo_root, goal_text, workspace, index=repo_index
         )
-        all_errors = unknown_dep_errors + extra_errors
-        noun = "error" if len(all_errors) == 1 else "errors"
-        lines = "\n".join(
-            f"{index}. {error}" for index, error in enumerate(all_errors, start=1)
-        )
-        raise LLMResponseError(
-            f"Planner output was rejected with {len(all_errors)} {noun} — "
-            f"fix ALL of them:\n{lines}\n{_DEPENDS_ON_SHAPE}"
+        all_records = _error_records(
+            "unknown_dependency", unknown_dep_errors, stage=STAGE_SCHEMA
+        ) + extra_records
+        raise _numbered_rejection(
+            all_records, suffix=f"\n{_DEPENDS_ON_SHAPE}"
         )
 
     original_order = {node.id: index for index, node in enumerate(nodes)}
@@ -432,7 +596,11 @@ def normalize_plan_nodes(
                 heapq.heappush(ready, (original_order[downstream], downstream))
 
     if len(ordered_ids) != len(nodes):
-        raise LLMResponseError("Planner response contained a dependency cycle.")
+        raise _single_error_rejection(
+            "dependency_cycle",
+            "Planner response contained a dependency cycle.",
+            STAGE_SCHEMA,
+        )
 
     original_to_normalized_id = {
         original_id: f"node-{index}" for index, original_id in enumerate(ordered_ids, start=1)
@@ -723,21 +891,22 @@ def parse_planner_response(
             )
             if view is not None
         ]
-        extra_errors, _cheap = _collect_plan_errors(
+        extra_records, _cheap = _collect_plan_error_records(
             views, repo_root, goal_text, workspace, index=repo_index
         )
-        all_errors = dup_errors + extra_errors
-        noun = "error" if len(all_errors) == 1 else "errors"
-        lines = "\n".join(
-            f"{index}. {error}" for index, error in enumerate(all_errors, start=1)
-        )
-        raise LLMResponseError(
-            f"Planner output was rejected with {len(all_errors)} {noun} — "
-            f"fix ALL of them:\n{lines}\n{_NODE_SHAPE_EXAMPLE}"
+        all_records = _error_records(
+            "duplicate_keys", dup_errors, stage=STAGE_SCHEMA
+        ) + extra_records
+        raise _numbered_rejection(
+            all_records, suffix=f"\n{_NODE_SHAPE_EXAMPLE}"
         )
     payload = parse_json_object(raw_text)
     if not isinstance(payload, dict):
-        raise LLMResponseError("Planner response must be a JSON object.")
+        raise _single_error_rejection(
+            "not_json_object",
+            "Planner response must be a JSON object.",
+            STAGE_SCHEMA,
+        )
 
     nodes_raw = payload.get("nodes")
     if not isinstance(nodes_raw, list):
@@ -747,16 +916,19 @@ def parse_planner_response(
         # verbatim, so the model learns the brief is input, not output.
         brief_keys = {"instruction", "delta_plan", "steps", "failed_nodes", "remaining_budget"}
         if brief_keys & set(payload):
-            raise LLMResponseError(
+            raise _single_error_rejection(
+                "brief_echo",
                 "Planner output copied the re-plan brief instead of a plan DAG — "
                 "it has an 'instruction'/'delta_plan'/'steps' object and no 'nodes' "
                 "array. Output ONLY a JSON object with a NEW 'nodes' array of "
                 "PlanNodes (id, objective, depends_on, assigned_claw, inputs, "
                 "outputs, acceptance, criteria, error) — never re-serialize the "
-                "brief, its instruction, or its failed steps."
+                "brief, its instruction, or its failed steps.",
+                STAGE_SCHEMA,
             )
         if _looks_like_prose_reserialization(payload):
-            raise LLMResponseError(
+            raise _single_error_rejection(
+                "prose_reserialization",
                 "Planner output re-serialized the prompt's instructions as JSON "
                 "instead of a plan DAG — it turned guidance prose (for example "
                 "the ROUTE GOAL shape) into a JSON object whose keys are words "
@@ -765,9 +937,14 @@ def parse_planner_response(
                 "with a NEW 'nodes' array of PlanNodes (id, objective, "
                 "depends_on, assigned_claw, inputs, outputs, acceptance, "
                 "criteria, error) — never turn any sentence from the prompt "
-                "into JSON keys or values."
+                "into JSON keys or values.",
+                STAGE_SCHEMA,
             )
-        raise LLMResponseError("Planner output must contain a 'nodes' array.")
+        raise _single_error_rejection(
+            "missing_nodes_array",
+            "Planner output must contain a 'nodes' array.",
+            STAGE_SCHEMA,
+        )
 
     # Defensive normalization: coerce plain strings into single-element
     # lists, and a bare-dict "criteria" into a one-element list (retry #6).
@@ -844,25 +1021,16 @@ def parse_planner_response(
     # placeholder error named 'node-1' while the plan's id was
     # 'step-1'). Error collection runs on relabeled copies; the
     # returned nodes keep their normalized ids.
-    errors, cheap = _collect_plan_errors(
+    records, cheap = _collect_plan_error_records(
         _relabel_nodes_for_errors(nodes, id_labels),
         repo_root,
         goal_text,
         workspace,
         index=index,
+        modules=_ModuleSourceCache(),
     )
-    if errors:
-        noun = "error" if len(errors) == 1 else "errors"
-        lines = "\n".join(
-            f"{index}. {error}" for index, error in enumerate(errors, start=1)
-        )
-        message = (
-            f"Planner output was rejected with {len(errors)} {noun} — "
-            f"fix ALL of them:\n{lines}"
-        )
-        if cheap:
-            raise CheapRejectionError(message)
-        raise LLMResponseError(message)
+    if records:
+        raise _numbered_rejection(records, cheap=cheap)
 
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
@@ -1885,7 +2053,7 @@ def _materialize_plan_edits(
     is a placeholder delta, the rejection is cheap (the retry-#17
     placeholder rule: a comment stub costs the model nothing to
     replace with real code, so the re-prompt is free) — and its
-    text carries the "placeholder content only" phrase, so the
+    records carry the 'placeholder_delta' code, so the
     repair loop answers it with the grounded skeleton.
     """
     errors: list[tuple[str, bool]] = []
@@ -1907,17 +2075,23 @@ def _materialize_plan_edits(
             errors.append(outcome)
     if not errors:
         return
-    lines = "\n".join(
-        f"{index}. {error}" for index, (error, _placeholder) in enumerate(errors, start=1)
+    # Structured records (A/B refactor): a placeholder delta carries
+    # its own code — it is cheap, and its repair round answers with
+    # the grounded skeleton, not the materialization steering block.
+    records = [
+        PlanError(
+            code="placeholder_delta" if placeholder else "anchored_edit",
+            message=error,
+            node_id=_node_id_from_message(error),
+            stage=STAGE_MATERIALIZE,
+        )
+        for error, placeholder in errors
+    ]
+    raise _numbered_rejection(
+        records,
+        cheap=all(placeholder for _error, placeholder in errors),
+        suffix=f"\n{_EDIT_SHAPE_EXAMPLE}",
     )
-    noun = "error" if len(errors) == 1 else "errors"
-    message = (
-        f"Planner output was rejected with {len(errors)} {noun} — "
-        f"fix ALL of them:\n{lines}\n{_EDIT_SHAPE_EXAMPLE}"
-    )
-    if all(placeholder for _error, placeholder in errors):
-        raise CheapRejectionError(message)
-    raise LLMResponseError(message)
 
 
 def _bash_interpreter_errors(
@@ -2290,6 +2464,7 @@ def _sed_noop_errors(
     repo_root: str | Path | None,
     goal_text: str | None = None,
     index: Any | None = None,
+    modules: _ModuleSourceCache | None = None,
 ) -> list[str]:
     """Reject sed -i edits whose search pattern never occurs in the file.
 
@@ -2306,6 +2481,8 @@ def _sed_noop_errors(
     parsed is skipped (the command would fail at runtime, not
     silently). `perl -pi -e` and other in-place editors are not covered.
     """
+    if modules is None:
+        modules = _ModuleSourceCache()
     errors: list[str] = []
     root = index.root if index is not None else resolve_repo_root(repo_root)
     grounded = _grounded_move_text(index, goal_text)
@@ -2318,9 +2495,8 @@ def _sed_noop_errors(
         shell = _strip_heredoc_bodies(command)
         for script, target in _sed_in_place_edits(shell):
             path = _resolve_plan_target(target, root)
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
+            text = modules.source(path)
+            if text is None:
                 continue
             patterns = _sed_script_patterns(script)
             if not patterns:
@@ -2842,6 +3018,27 @@ def _placeholder_scaffold_errors(
 ) -> list[str]:
     """Reject scaffolds that overwrite an existing code file with placeholder content.
 
+    String view of _placeholder_scaffold_error_records (kept for the
+    callers that compose message lists); the records carry the codes
+    (placeholder_scaffold vs placeholder_stub — the repair loop treats
+    them differently, see _call_llm_with_repair).
+    """
+    return [
+        record.message
+        for record in _placeholder_scaffold_error_records(
+            nodes, repo_root, index=index, goal_text=goal_text
+        )
+    ]
+
+
+def _placeholder_scaffold_error_records(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    index: Any | None = None,
+    goal_text: str | None = None,
+) -> list[PlanError]:
+    """Reject scaffolds that overwrite an existing code file with placeholder content.
+
     A scaffold whose content is comments and/or a docstring — no code —
     must never overwrite a module that already exists: retry #14's v3
     replan scaffolded freetalon/api.py with "# Placeholder for health
@@ -2860,7 +3057,7 @@ def _placeholder_scaffold_errors(
     round is pointed TOWARD the real work, not just away from the
     placeholder.
     """
-    errors: list[str] = []
+    records: list[PlanError] = []
     grounded = ""
     if index is not None and goal_text:
         named = _routes_named_in_goal(goal_text, index)
@@ -2908,26 +3105,38 @@ def _placeholder_scaffold_errors(
         if not _resolve_plan_target(target, resolve_repo_root(repo_root)).exists():
             continue
         if stub:
-            errors.append(
-                f"Planner node '{node.id}' scaffolds {target!r} with a "
-                "placeholder stub (a 'placeholder' comment saying to "
-                "replace it, plus only a trivial stub function — no real "
-                "implementation) — that would overwrite the existing "
-                "module with a stub instead of implementing it. Write "
-                "real code in the module (scaffold claw with real code, "
-                "or a bash heredoc) and verify it by running the tests "
-                f"and curling the live service.{grounded}"
+            records.append(
+                PlanError(
+                    code="placeholder_stub",
+                    message=(
+                        f"Planner node '{node.id}' scaffolds {target!r} with a "
+                        "placeholder stub (a 'placeholder' comment saying to "
+                        "replace it, plus only a trivial stub function — no real "
+                        "implementation) — that would overwrite the existing "
+                        "module with a stub instead of implementing it. Write "
+                        "real code in the module (scaffold claw with real code, "
+                        "or a bash heredoc) and verify it by running the tests "
+                        f"and curling the live service.{grounded}"
+                    ),
+                    node_id=node.id,
+                )
             )
             continue
-        errors.append(
-            f"Planner node '{node.id}' scaffolds {target!r} with placeholder "
-            "content only (comments and/or a docstring, no code) — that would "
-            "overwrite the existing module with a comment stub instead of "
-            "implementing it. Write real code in the module (scaffold claw "
-            "with real code, or a bash heredoc) and verify it by running the "
-            f"tests and curling the live service.{grounded}"
+        records.append(
+            PlanError(
+                code="placeholder_scaffold",
+                message=(
+                    f"Planner node '{node.id}' scaffolds {target!r} with placeholder "
+                    "content only (comments and/or a docstring, no code) — that would "
+                    "overwrite the existing module with a comment stub instead of "
+                    "implementing it. Write real code in the module (scaffold claw "
+                    "with real code, or a bash heredoc) and verify it by running the "
+                    f"tests and curling the live service.{grounded}"
+                ),
+                node_id=node.id,
+            )
         )
-    return errors
+    return records
 
 
 _ECHO_ESCAPES = {
@@ -2971,6 +3180,30 @@ def _interpret_echo_escapes(text: str) -> str:
     return "".join(out)
 
 
+_TEE_TARGET_RE = re.compile(r"\btee\s+(?P<append>-a\s+)?(?P<target>[^\s;|&<>]+)")
+_HEREDOC_START_RE = re.compile(
+    r"<<-?\s*['\"]?(?P<marker>[A-Za-z_][A-Za-z0-9_]*)['\"]?"
+)
+
+
+def _heredoc_body_for_marker(command: str, marker: str, start: int) -> str | None:
+    """The body of the heredoc whose head ends at ``start``.
+
+    Lines after the head line, up to the line that is exactly the
+    marker; an unterminated heredoc's body is the rest of the command
+    (the shell reads to EOF — the same rule _heredoc_bodies uses).
+    None when there is no line after the head at all.
+    """
+    head_end = command.find("\n", start)
+    if head_end == -1:
+        return None
+    lines = command[head_end + 1 :].splitlines(keepends=True)
+    for idx, line in enumerate(lines):
+        if line.strip() == marker:
+            return "".join(lines[:idx])
+    return "".join(lines)
+
+
 def _bash_code_writes(command: str) -> list[tuple[str, str, bool]]:
     """Every (target, content, is_append) code write in a bash command.
 
@@ -2980,6 +3213,15 @@ def _bash_code_writes(command: str) -> list[tuple[str, str, bool]]:
     uses for a single write). Unquoted echo bodies are not extracted:
     they may hold variables or globs, not a literal the model wrote.
     Returns [] when the command writes nothing extractable.
+
+    Tee writes are extracted too (A/B refactor, defect 3): in
+    ``tee TARGET <<M`` and ``cat <<M | tee TARGET`` the heredoc body
+    lands in TARGET with no ``cat > TARGET`` head for the pairing
+    below to see, so the write used to be invisible to every consumer
+    of this function — the payload parse check, the placeholder check,
+    and the stand-in check all missed it (the /tmp rule noted the same
+    blind spot for redirect scans). A tee match inside a cat-heredoc
+    body is file content, not a command, and is ignored.
     """
     writes: list[tuple[str, str, bool]] = []
     bodies = _heredoc_bodies(command)
@@ -2988,6 +3230,36 @@ def _bash_code_writes(command: str) -> list[tuple[str, str, bool]]:
             break
         head = match.group(0).split("<<", 1)[0]
         writes.append((match.group("target"), bodies[position], ">>" in head))
+    body_spans = _heredoc_body_spans(command)
+    for match in _TEE_TARGET_RE.finditer(command):
+        if any(start <= match.start() < end for start, end in body_spans):
+            continue  # 'tee' inside a heredoc body is file content
+        target = match.group("target").strip("'\"")
+        is_append = bool(match.group("append"))
+        body: str | None = None
+        tail = command[match.end() :]
+        head_line_end = tail.find("\n")
+        head_line = tail if head_line_end == -1 else tail[:head_line_end]
+        start_match = _HEREDOC_START_RE.search(head_line)
+        if start_match is not None:
+            # Shape 1: tee TARGET <<M — tee itself carries the heredoc.
+            body = _heredoc_body_for_marker(
+                command, start_match.group("marker"), match.end() + start_match.end()
+            )
+        else:
+            # Shape 2: <<M ... | tee TARGET — the heredoc head line
+            # ends at this tee; the start is earlier on the same line.
+            line_start = command.rfind("\n", 0, match.start()) + 1
+            head_line = command[line_start : match.start()]
+            start_match = _HEREDOC_START_RE.search(head_line)
+            if start_match is not None:
+                body = _heredoc_body_for_marker(
+                    command,
+                    start_match.group("marker"),
+                    line_start + start_match.end(),
+                )
+        if body is not None:
+            writes.append((target, body, is_append))
     shell = _strip_heredoc_bodies(command)
     for match in _ECHO_WRITE_RE.finditer(shell):
         segments = _quoted_segments(match.group("body"))
@@ -3124,13 +3396,134 @@ def _syntax_error_detail(exc: SyntaxError) -> str:
     return msg
 
 
+def _heredoc_python_parse_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    goal_text: str | None = None,
+    index: Any | None = None,
+    modules: _ModuleSourceCache | None = None,
+) -> list[str]:
+    """String view of _heredoc_python_parse_error_records."""
+    return [
+        record.message
+        for record in _heredoc_python_parse_error_records(
+            nodes, repo_root, goal_text, index, modules=modules
+        )
+    ]
+
+
+def _heredoc_python_parse_error_records(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    goal_text: str | None = None,
+    index: Any | None = None,
+    modules: _ModuleSourceCache | None = None,
+) -> list[PlanError]:
+    """Parse-check every Python payload a bash node writes, at plan time.
+
+    A/B refactor (defect 3): this check used to live inside
+    _code_append_errors as its .py branch — the payload parse was
+    incidental to an append-corruption rule, and it only ever saw the
+    writes _bash_code_writes could extract. It is now a first-class
+    validator (code 'heredoc_parse'): every extracted bash write to a
+    .py file — heredoc, echo/printf redirect, or tee — is simulated
+    (append to the file on disk, or the content alone for a new file)
+    and parsed with ast.parse, so the __main__-guard indentation class
+    from retry #33 output 3 (unittest.main() at column 0 under its
+    if __name__ guard — the file the node claimed as its test suite
+    could not even be imported) is named at validation, not discovered
+    when the test node runs. Echo escapes are interpreted the way dash
+    echo does, so the simulated file is the file execution produces.
+
+    Skipped when the written literal is already a hardcoded answer: the
+    stand-in rule owns that defect (retry #12). Skipped when the
+    existing file itself no longer parses — it is already broken, and
+    this rule cannot judge the write. A scaffold write is NOT
+    parse-checked here — that is _scaffold_parse_errors' job.
+    """
+    if modules is None:
+        modules = _ModuleSourceCache()
+    records: list[PlanError] = []
+    grounded = _grounded_move_text(index, goal_text)
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("bash", "shell_exec"):
+            continue
+        command = node.inputs.get("command") or node.inputs.get("cmd")
+        if not isinstance(command, str) or not command:
+            continue
+        for target, content, is_append in _bash_code_writes(command):
+            if not is_code_path(target):
+                continue
+            if _literal_is_answer(content):
+                continue
+            if Path(target).suffix.lower() != ".py":
+                continue
+            exists = _path_exists_on_disk(target, repo_root)
+            if exists:
+                existing = modules.source(
+                    _resolve_target_path(target, repo_root)
+                )
+                if existing is None:
+                    continue
+                try:
+                    ast.parse(existing)
+                except SyntaxError:
+                    continue
+                if is_append:
+                    simulated = existing
+                    if not simulated.endswith("\n"):
+                        simulated += "\n"
+                    simulated += content
+                    if not simulated.endswith("\n"):
+                        simulated += "\n"
+                else:
+                    simulated = content
+                try:
+                    ast.parse(simulated)
+                except SyntaxError as exc:
+                    records.append(
+                        PlanError(
+                            code="heredoc_parse",
+                            message=(
+                                f"Planner node '{node.id}' writes code into "
+                                f"{target!r} that would break the module: after "
+                                f"this write the file no longer parses as Python "
+                                f"({_syntax_error_detail(exc)}). A bash append "
+                                "or heredoc must not corrupt an existing code "
+                                "file — write the edit with real code (scaffold "
+                                "claw, or a bash heredoc) and verify the file "
+                                "still parses (python -m py_compile "
+                                f"{target}) and the tests pass.{grounded}"
+                            ),
+                            node_id=node.id,
+                        )
+                    )
+            else:
+                try:
+                    ast.parse(content)
+                except SyntaxError as exc:
+                    records.append(
+                        PlanError(
+                            code="heredoc_parse",
+                            message=(
+                                f"Planner node '{node.id}' writes {target!r} "
+                                "with code that does not parse as Python "
+                                f"({_syntax_error_detail(exc)}) — write valid "
+                                f"code.{grounded}"
+                            ),
+                            node_id=node.id,
+                        )
+                    )
+    return records
+
+
 def _code_append_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None,
     goal_text: str | None = None,
     index: Any | None = None,
 ) -> list[str]:
-    """Reject bash writes that would corrupt an existing code file.
+    """Reject bash writes into existing non-Python code files nobody verifies.
 
     Retry #16: node-1 and node-2 echoed two lines into freetalon/api.py
     (a comment, then 'def health():\\nreturn "OK"') with only exit_code
@@ -3140,24 +3533,16 @@ def _code_append_errors(
     fires only on JSON literals, so an echo-append of broken code was
     unguarded. Two mechanisms, by language:
 
-    - Python (.py): simulate the write at plan time (append to the file
-      on disk, or the content alone for a new file) and parse the result
-      with ast.parse. A write that leaves the file unparseable is
-      rejected by name, with the syntax error and the grounded move.
-      Echo escapes are interpreted the way dash echo does, so the
-      simulated file is the file execution produces.
+    - Python (.py): the payload parse check — now its own validator,
+      _heredoc_python_parse_errors (A/B refactor, defect 3).
     - Other code files (.js, .sh, ...): no parser is available, so the
       write is rejected unless some node in the plan measures the file
       still working (a tests_pass criterion, a test-suite run, or a
-      py_compile on the file).
+      py_compile on the file). That branch is what remains here.
 
     Skipped when the written literal is already a hardcoded answer: the
     stand-in rule owns that defect (retry #12: a JSON literal echoed
-    over api.py). Skipped when the existing file itself no longer parses
-    — it is already broken, and this rule cannot judge the write. A
-    scaffold write is NOT parse-checked here — that is
-    `_scaffold_parse_errors`' job (retry #23: v1's accepted scaffold
-    content did not parse, and the loop executed it).
+    over api.py).
     """
     errors: list[str] = []
     grounded = _grounded_move_text(index, goal_text)
@@ -3172,53 +3557,10 @@ def _code_append_errors(
                 continue
             if _literal_is_answer(content):
                 continue
-            exists = _path_exists_on_disk(target, repo_root)
             if Path(target).suffix.lower() == ".py":
-                if exists:
-                    try:
-                        existing = _resolve_target_path(target, repo_root).read_text(
-                            encoding="utf-8"
-                        )
-                    except OSError:
-                        continue
-                    try:
-                        ast.parse(existing)
-                    except SyntaxError:
-                        continue
-                    if is_append:
-                        simulated = existing
-                        if not simulated.endswith("\n"):
-                            simulated += "\n"
-                        simulated += content
-                        if not simulated.endswith("\n"):
-                            simulated += "\n"
-                    else:
-                        simulated = content
-                    try:
-                        ast.parse(simulated)
-                    except SyntaxError as exc:
-                        errors.append(
-                            f"Planner node '{node.id}' writes code into "
-                            f"{target!r} that would break the module: after "
-                            f"this write the file no longer parses as Python "
-                            f"({_syntax_error_detail(exc)}). A bash append "
-                            "or heredoc must not corrupt an existing code "
-                            "file — write the edit with real code (scaffold "
-                            "claw, or a bash heredoc) and verify the file "
-                            "still parses (python -m py_compile "
-                            f"{target}) and the tests pass.{grounded}"
-                        )
-                else:
-                    try:
-                        ast.parse(content)
-                    except SyntaxError as exc:
-                        errors.append(
-                            f"Planner node '{node.id}' writes {target!r} "
-                            "with code that does not parse as Python "
-                            f"({_syntax_error_detail(exc)}) — write valid "
-                            f"code.{grounded}"
-                        )
-            elif exists and not _plan_measures_validity(nodes, target):
+                continue  # _heredoc_python_parse_errors owns .py payloads
+            exists = _path_exists_on_disk(target, repo_root)
+            if exists and not _plan_measures_validity(nodes, target):
                 errors.append(
                     f"Planner node '{node.id}' writes into {target!r}, an "
                     "existing code file, but no node in the plan measures "
@@ -3287,11 +3629,107 @@ def _scaffold_parse_errors(
     return errors
 
 
+# Elision markers: a comment (or bare statement) that stands in for
+# code the model did not write. The pattern mirrors the planner A/B
+# replay harness's soundness rule verbatim
+# (tools/replay-planner-corpus.py), so the planner and the harness
+# judge the same content the same way.
+_ELISION_RE = re.compile(
+    r"^\s*(?:#+|//+|--)?\s*\.\.\.\s*(?:existing|remaining|rest of|unchanged|original|same as|other)\b"
+    r"|^\s*(?:#+|//+|--)\s*\.\.\.\s*$"
+    r"|^\s*\.\.\.\s*(?:#.*)?$",
+    re.MULTILINE,
+)
+
+
+def _elision_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    goal_text: str | None = None,
+    index: Any | None = None,
+    modules: _ModuleSourceCache | None = None,
+) -> list[str]:
+    """Reject scaffold writes that elide an existing module's code.
+
+    A/B refactor (defect 1): retry #33's fourth output — the first
+    accepted plan in 33 retries — scaffolded freetalon/api.py with a
+    five-line fragment whose body was two elision comments
+    ('# ... existing code ...', '# ... remaining code ...') around a
+    single /health branch. It parsed; it was not a placeholder (it
+    carried a real def and a real branch); and the overwrite guard
+    exempted it as fragment-scale. It executed and clobbered api.py
+    (219 lines -> 5) before the run failed elsewhere. The offline
+    corpus replay then showed the same shape accepted in retries
+    #28/#29 and the llama3 sanity run: every plan the old planner
+    accepted was an unsound fragment.
+
+    An elision marker is the defect stated plainly — the content
+    itself says the code is not there — so it is a named rejection
+    independent of definition counts. The retention guard cannot see
+    this defect class at all: a scaffold can keep every definition
+    NAME while eliding the bodies, so the two rules are
+    complementary. Fires only when the target is an existing Python
+    module (a new file has nothing to elide). Content another rule
+    owns is skipped, with the guard's skip list: unparseable content
+    (the parse check), placeholder content and stubs (the placeholder
+    check), hardcoded literal answers (the stand-in check).
+    """
+    if modules is None:
+        modules = _ModuleSourceCache()
+    errors: list[str] = []
+    grounded = _grounded_move_text(index, goal_text)
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("scaffold", "file_writer"):
+            continue
+        target = (
+            node.inputs.get("file_path")
+            or node.inputs.get("path")
+            or (node.outputs[0] if node.outputs else "")
+        )
+        content = node.inputs.get("content")
+        if not isinstance(target, str) or not target:
+            continue
+        if not isinstance(content, str):
+            continue
+        if not is_code_path(target):
+            continue
+        if Path(target).suffix.lower() != ".py":
+            continue
+        if _literal_is_answer(content):
+            continue
+        if is_placeholder_content(content) or _is_placeholder_stub(content):
+            continue
+        try:
+            ast.parse(content)
+        except SyntaxError:
+            continue  # _scaffold_parse_errors owns unparseable content
+        if modules.source(_resolve_plan_target(target, root)) is None:
+            continue  # a new file: nothing exists to elide
+        if not _ELISION_RE.search(content):
+            continue
+        errors.append(
+            f"Planner node '{node.id}' scaffolds {target!r} with content "
+            "that elides the existing module — it carries elision markers "
+            "(comments standing in for code the plan does not write, like "
+            "'... existing code ...') in place of the module's real code. "
+            "A scaffold overwrites the whole file, so the elided code "
+            "would be deleted, and a file_exists criterion cannot see the "
+            "loss. Scaffold the FULL updated module (every existing "
+            "definition with its real body, plus the new code) or extend "
+            "the module in place with an anchored edit (anchor + position "
+            "+ only the new code), which preserves the untouched code by "
+            f"construction.{grounded}"
+        )
+    return errors
+
+
 def _scaffold_overwrite_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None,
     goal_text: str | None = None,
     index: Any | None = None,
+    modules: _ModuleSourceCache | None = None,
 ) -> list[str]:
     """Reject scaffold writes that delete most of an existing module.
 
@@ -3323,19 +3761,25 @@ def _scaffold_overwrite_errors(
     write — the same stance as _code_append_errors). Content another
     rule owns is skipped: unparseable content (the parse check),
     placeholder content and placeholder stubs (the placeholder
-    check), and hardcoded literal answers (the stand-in check).
+    check), hardcoded literal answers (the stand-in check), and
+    elision-carrying content (the elision check, A/B refactor).
 
-    The replacement must itself be module-scale — at least four
-    qualified definitions — before its omissions count as
-    deletions. The retry-#26 replacement was a self-contained
-    module (5 definitions, its own server class); a fragment-scale
-    scaffold (a route-branch snippet, a two-definition Flask app)
-    is not a module replacement, and the fragment-scale defects
-    stay owned by the parse, placeholder, framework, and grounding
-    checks. (The grounded-plan fixtures scaffold api.py with a
-    three-line branch fragment — zero definitions — and must keep
-    passing.)
+    A/B refactor (defect 1): the replacement no longer needs to be
+    module-scale before its omissions count as deletions. The old
+    floor (the scaffold itself needed >= 4 definitions) exempted
+    exactly the fragments that did the damage: the corpus replay
+    showed retries #28/#29 scaffolding api.py with a three-line
+    branch fragment (zero definitions, dropping all 12), retry #33's
+    elision fragment (one definition, dropping all 12), and the
+    llama3 run replacing tests/test_api.py with two definitions
+    (dropping 27) — all accepted, all unsound. A full-content
+    scaffold now faces the same retention judgment a materialized
+    anchored edit faces by construction: what it omits, it deletes,
+    whatever its own size. The judgment is unchanged otherwise —
+    same module floor, same drop thresholds.
     """
+    if modules is None:
+        modules = _ModuleSourceCache()
     errors: list[str] = []
     grounded = _grounded_move_text(index, goal_text)
     root = index.root if index is not None else resolve_repo_root(repo_root)
@@ -3360,21 +3804,20 @@ def _scaffold_overwrite_errors(
             continue
         if is_placeholder_content(content) or _is_placeholder_stub(content):
             continue
+        if _ELISION_RE.search(content):
+            continue  # _elision_errors owns elided content
         try:
             ast.parse(content)
         except SyntaxError:
             continue  # _scaffold_parse_errors owns unparseable content
         path = _resolve_plan_target(target, root)
-        try:
-            existing = path.read_text(encoding="utf-8")
-        except OSError:
+        existing = modules.source(path)
+        if existing is None:
             continue  # a new file: nothing exists to delete
-        existing_names = qualified_def_names(existing)
+        existing_names = modules.def_names(path)
         if len(existing_names) < 4:
             continue  # tiny module: too little structure to judge
         scaffold_names = qualified_def_names(content)
-        if len(scaffold_names) < 4:
-            continue  # fragment-scale write, not a module replacement
         kept = set(scaffold_names)
         dropped = [name for name in existing_names if name not in kept]
         if len(dropped) < 3 or len(dropped) * 2 < len(existing_names):
@@ -3503,6 +3946,37 @@ def _placeholder_bash_errors(
     return errors
 
 
+def _command_error_records(
+    node: PlanNode, repo_root: str | Path | None = None
+) -> list[PlanError]:
+    """_command_errors as records: prose commands carry their own code.
+
+    The forbidden-approach steering names prose commands separately
+    from other command defects, so the prose error (recomputed with
+    the same function _validate_bash_command uses) is tagged
+    'prose_command'; every other command error is 'command'.
+    """
+    messages = _command_errors(node, repo_root)
+    if not messages:
+        return []
+    prose_message: str | None = None
+    command = node.inputs.get("command") or node.inputs.get("cmd")
+    if isinstance(command, str) and command.strip():
+        prose = _prose_command_error(_strip_heredoc_bodies(command))
+        if prose is not None:
+            prose_message = (
+                f"Planner node '{node.id}' has an invalid bash command: {prose}."
+            )
+    return [
+        PlanError(
+            code="prose_command" if message == prose_message else "command",
+            message=message,
+            node_id=node.id,
+        )
+        for message in messages
+    ]
+
+
 def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
@@ -3510,7 +3984,30 @@ def _collect_plan_errors(
     workspace: str | None = None,
     index: Any | None = None,
 ) -> tuple[list[str], bool]:
-    """Collect EVERY plan validation error, grouped by node, plus plan-level rules.
+    """String view of _collect_plan_error_records (kept for callers
+    that compose message lists); the records carry the error codes."""
+    records, cheap = _collect_plan_error_records(
+        nodes, repo_root, goal_text, workspace, index=index
+    )
+    return [record.message for record in records], cheap
+
+
+def _collect_plan_error_records(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None = None,
+    goal_text: str | None = None,
+    workspace: str | None = None,
+    index: Any | None = None,
+    modules: _ModuleSourceCache | None = None,
+) -> tuple[list[PlanError], bool]:
+    """Collect EVERY plan validation error as structured records.
+
+    Each validator is an independent function registered here with a
+    stable error code; this aggregator is the only place they are
+    composed. Adding a validator is one registration line plus the
+    function — previously it also meant extending the steering
+    blocks' message-marker lists and hoping no other rejection's
+    wording contained the new marker.
 
     Each node is checked against every rule (claw allowlist, structured
     criteria, command/port validation, repo grounding) and every failure is
@@ -3532,12 +4029,18 @@ def _collect_plan_errors(
     rejection (retry #10), so the repair loop can fix them instead of
     the driver dying on a bare raise.
 
-    Returns (errors, cheap): ``cheap`` is True when every error is a
+    ``modules`` is the per-parse cache of existing-module sources, so
+    the validators that read module files share one read + parse per
+    file per parse call; a fresh cache is created when none is given.
+
+    Returns (records, cheap): ``cheap`` is True when every error is a
     stand-in / code-overwrite fake (retry #12) or a placeholder scaffold
     (retry #17) — a rejection the repair loop may re-prompt for free,
     without spending the repair budget.
     """
-    errors: list[str] = []
+    if modules is None:
+        modules = _ModuleSourceCache()
+    records: list[PlanError] = []
     needs_index = any(
         node.assigned_claw in ("scaffold", "file_writer") for node in nodes
     ) or goal_text is not None
@@ -3546,18 +4049,30 @@ def _collect_plan_errors(
     for node in nodes:
         error = _claw_error(node)
         if error is not None:
-            errors.append(error)
-        errors.extend(_criteria_errors(node, repo_root))
-        errors.extend(_command_errors(node, repo_root))
+            records.append(
+                PlanError(code="unknown_claw", message=error, node_id=node.id)
+            )
+        records.extend(
+            _error_records("criteria", _criteria_errors(node, repo_root))
+        )
+        records.extend(_command_error_records(node, repo_root))
         if index is not None:
             error = _grounding_error(node, index)
             if error is not None:
-                errors.append(error)
-    errors.extend(_unwritten_file_errors(nodes, repo_root))
-    placeholder_errors = _placeholder_scaffold_errors(
+                records.append(
+                    PlanError(
+                        code="duplicate_code", message=error, node_id=node.id
+                    )
+                )
+    records.extend(
+        _error_records(
+            "unwritten_file", _unwritten_file_errors(nodes, repo_root)
+        )
+    )
+    placeholder_records = _placeholder_scaffold_error_records(
         nodes, repo_root, index=index, goal_text=goal_text
     )
-    if not placeholder_errors:
+    if not placeholder_records:
         # Retry #20: a plan whose only placeholder defect is a bash
         # heredoc (no scaffold placeholder) is the same failed approach,
         # named once. When a scaffold placeholder already names it, the
@@ -3565,22 +4080,83 @@ def _collect_plan_errors(
         # new one — listing it too only inflates the count (retry #17
         # attempt-4 stays 1 error) while the cheap free re-prompt lets
         # the model iterate one placeholder defect at a time.
-        placeholder_errors.extend(
-            _placeholder_bash_errors(nodes, repo_root, index=index, goal_text=goal_text)
+        placeholder_records = _error_records(
+            "placeholder_bash",
+            _placeholder_bash_errors(
+                nodes, repo_root, index=index, goal_text=goal_text
+            ),
         )
-    errors.extend(placeholder_errors)
-    errors.extend(_code_append_errors(nodes, repo_root, goal_text, index))
-    errors.extend(_scaffold_parse_errors(nodes, repo_root, goal_text, index))
-    errors.extend(_scaffold_overwrite_errors(nodes, repo_root, goal_text, index))
-    errors.extend(_sed_noop_errors(nodes, repo_root, goal_text, index))
-    standin_errors = _static_standin_errors(nodes, index=index, goal_text=goal_text)
-    errors.extend(standin_errors)
+    records.extend(placeholder_records)
+    records.extend(
+        _heredoc_python_parse_error_records(
+            nodes, repo_root, goal_text, index, modules=modules
+        )
+    )
+    records.extend(
+        _error_records(
+            "code_append", _code_append_errors(nodes, repo_root, goal_text, index)
+        )
+    )
+    records.extend(
+        _error_records(
+            "scaffold_parse",
+            _scaffold_parse_errors(nodes, repo_root, goal_text, index),
+        )
+    )
+    records.extend(
+        _error_records(
+            "scaffold_overwrite",
+            _scaffold_overwrite_errors(
+                nodes, repo_root, goal_text, index, modules=modules
+            ),
+        )
+    )
+    records.extend(
+        _error_records(
+            "elision",
+            _elision_errors(nodes, repo_root, goal_text, index, modules=modules),
+        )
+    )
+    records.extend(
+        _error_records(
+            "sed_noop",
+            _sed_noop_errors(nodes, repo_root, goal_text, index, modules=modules),
+        )
+    )
+    standin_records = _error_records(
+        "static_standin",
+        _static_standin_errors(nodes, index=index, goal_text=goal_text),
+    )
+    records.extend(standin_records)
     if index is not None:
-        errors.extend(_route_engagement_errors(nodes, index, goal_text))
-        errors.extend(_tmp_write_errors(nodes, index, goal_text))
-        errors.extend(_framework_errors(nodes, index, goal_text))
-        errors.extend(_wrong_location_errors(nodes, index, workspace))
-    errors.extend(_missing_directory_errors(nodes, repo_root, index))
+        records.extend(
+            _error_records(
+                "route_engagement",
+                _route_engagement_errors(nodes, index, goal_text),
+            )
+        )
+        records.extend(
+            _error_records(
+                "tmp_write", _tmp_write_errors(nodes, index, goal_text)
+            )
+        )
+        records.extend(
+            _error_records(
+                "framework", _framework_errors(nodes, index, goal_text)
+            )
+        )
+        records.extend(
+            _error_records(
+                "wrong_location",
+                _wrong_location_errors(nodes, index, workspace),
+            )
+        )
+    records.extend(
+        _error_records(
+            "missing_directory",
+            _missing_directory_errors(nodes, repo_root, index),
+        )
+    )
     # Cheap rejection (retry #12): the only errors are stand-in /
     # code-overwrite fakes, so re-prompting costs the model nothing to
     # fix and must not spend the repair budget. A rejection whose only
@@ -3590,10 +4166,10 @@ def _collect_plan_errors(
     # heredocs (retry #20). Any other error mixed in makes it a real
     # rejection.
     cheap = (
-        bool(errors)
-        and len(standin_errors) + len(placeholder_errors) == len(errors)
+        bool(records)
+        and len(standin_records) + len(placeholder_records) == len(records)
     )
-    return errors, cheap
+    return records, cheap
 
 
 # --- Anti-fake validation (retry #2, run-20261117T054715Z-698173) ---
@@ -4738,55 +5314,54 @@ def _dropped_fields_note(prev_text: str | None, cur_text: str) -> str:
     )
 
 
-# Rejection-message markers for defects in a plan's CONTENT (the code
-# itself), as opposed to defects in its command/criterion strings.
-# Retry #25: attempt 1's scaffold plan failed only on two interpreter
-# strings (bare `python` in a criterion command, ./venv/bin/python in
-# a bash command) — no content marker appears in that rejection — and
-# attempts 2/3 then abandoned the scaffold shape for sed one-liners.
-# When a scaffold plan's rejection names no content defect, the repair
-# prompt says the shape was right, so the model fixes the named
-# strings instead of switching mechanism.
+# Error codes for defects in a plan's CONTENT (the code itself), as
+# opposed to defects in its command/criterion strings. Retry #25:
+# attempt 1's scaffold plan failed only on two interpreter strings
+# (bare `python` in a criterion command, ./venv/bin/python in a bash
+# command) — no content defect — and attempts 2/3 then abandoned the
+# scaffold shape for sed one-liners. When a scaffold plan's rejection
+# carries no content-defect code, the repair prompt says the shape
+# was right, so the model fixes the named strings instead of
+# switching mechanism.
 #
-# The anchored-edit materialization errors' distinctive stems,
-# shared by the steering triggers below: every
-# _materialize_scaffold_edit rejection carries one ("anchors an
-# edit on ...", "anchors its edit on ...", "anchors a 'replace'
-# edit on ...", "... an anchored edit ..."), and none appears in
-# any other rejection, in model output, or in the node-shape
-# block.
-_MATERIALIZATION_MARKERS = (
-    "anchors an edit",
-    "anchors its edit",
-    "anchors a 'replace' edit",
-    "an anchored edit",
+# A/B refactor: this set replaces _CONTENT_DEFECT_MARKERS, a list of
+# message substrings. The substring list caused both historical
+# steering contradictions: retry #28 (the overwrite guard's phrase
+# was not yet a marker, so the shape block blessed a wholesale
+# replacement) and retry #33 (the materialization stems were not
+# markers either, so it blessed a dedented delta the same way —
+# measured: 489 chars of "none of its code was rejected" on a
+# rejection whose only defect was the code). A validator's code is
+# assigned where the error is created and cannot drift when a
+# message is reworded; a new validator joins this set with one entry
+# when its defect is in the code, and no other rejection's wording
+# can accidentally match it.
+_CONTENT_DEFECT_CODES = frozenset(
+    {
+        "scaffold_parse",  # scaffold content does not parse
+        "heredoc_parse",  # a bash-written Python payload does not parse
+        "placeholder_scaffold",
+        "placeholder_stub",
+        "placeholder_bash",
+        "placeholder_delta",  # materialized edit whose delta is placeholder-only
+        "static_standin",  # hardcoded literal answers
+        "framework",  # Flask / FastAPI over a stdlib module
+        "scaffold_overwrite",  # retention guard: drops existing definitions
+        "elision",  # elided module content
+        "anchored_edit",  # materialization defects (bad anchor/indent/shape)
+    }
 )
 
-_CONTENT_DEFECT_MARKERS = (
-    "does not parse as Python",
-    "no longer parses as Python",
-    "placeholder",
-    "hardcoded answer",
-    "Flask",
-    "FastAPI",
-    # Retry #28: the overwrite guard's phrase ("drops N of the
-    # existing module's M definitions"). Attempts 2 and 3 were
-    # parse-clean wholesale replacements whose ONLY defect was the
-    # scaffold content itself, yet this block told the repair round
-    # "none of its code was rejected — keep the same code; fix ONLY
-    # the named strings", contradicting the rejection in the same
-    # prompt. The guard's wording is a content defect like the others.
-    "of the existing module's",
-    # Retry #33: the materialization stems. Retry #32's output 3
-    # was rejected ONLY for its delta's indentation — a defect in
-    # the code itself — yet no marker matched, so this block told
-    # the repair round the same "none of its code was rejected"
-    # line (measured: 489 chars on the real rejection) while the
-    # concrete extension block stayed silent (its trigger is the
-    # guard's phrase only): the repair prompt contradicted the
-    # rejection it carried, and output 4 abandoned the edit form
-    # for a Flask scaffold — the #28 misfire one level down.
-    *_MATERIALIZATION_MARKERS,
+# Codes whose rejection is answered with the grounded skeleton in the
+# repair prompt (retry #21): a placeholder reply needs the concrete
+# shape again, not just the prohibition. Exactly the three cases the
+# old text test ("placeholder content only" in the message) selected:
+# the materialization placeholder delta, the comment-only scaffold,
+# and the placeholder bash heredoc — NOT the placeholder stub (its
+# message never carried the phrase, and its repair round is not
+# answered with the skeleton today).
+_PLACEHOLDER_SKELETON_CODES = frozenset(
+    {"placeholder_delta", "placeholder_scaffold", "placeholder_bash"}
 )
 
 
@@ -4806,19 +5381,25 @@ def _previous_plan_used_scaffold(response_text: str) -> bool:
     )
 
 
-def _shape_steering_block(response_text: str, error_text: str) -> str:
+def _shape_steering_block(
+    response_text: str, codes: Collection[str]
+) -> str:
     """Steer a repair back to a scaffold shape that was one fix away.
 
     Returns "" unless the previous output used the scaffold claw AND
-    its rejection names no content defect (see _CONTENT_DEFECT_MARKERS):
-    only then was the plan's shape right, with its defects confined to
-    command/criterion strings. Retry #25: without this, the repair
-    after the interpreter-only rejection abandoned the scaffold for
-    sed -i one-liners that failed shell quoting and pattern grounding.
+    its rejection carries no content-defect code (see
+    _CONTENT_DEFECT_CODES): only then was the plan's shape right,
+    with its defects confined to command/criterion strings.
+    Retry #25: without this, the repair after the interpreter-only
+    rejection abandoned the scaffold for sed -i one-liners that
+    failed shell quoting and pattern grounding. The decision keys
+    off the rejection's structured codes (A/B refactor) — the
+    message-substring version of this test produced the retry-#28
+    and retry-#33 contradictions.
     """
     if not _previous_plan_used_scaffold(response_text):
         return ""
-    if any(marker in error_text for marker in _CONTENT_DEFECT_MARKERS):
+    if _CONTENT_DEFECT_CODES & set(codes):
         return ""
     return (
         "\nYour previous plan's SHAPE was right: it made the code "
@@ -4833,15 +5414,9 @@ def _shape_steering_block(response_text: str, error_text: str) -> str:
     )
 
 
-# The overwrite guard's distinctive phrase, shared by the steering
-# triggers below: it appears in exactly one rejection (the guard's),
-# never in model output or in the node-shape block.
-_OVERWRITE_MARKER = "of the existing module's"
-
-
 def _extension_steering_block(
     response_text: str,
-    error_text: str,
+    codes: Collection[str],
     repo_root: str | Path | None = None,
 ) -> str:
     """The concrete in-place pattern for a repair after an overwrite rejection.
@@ -4863,11 +5438,13 @@ def _extension_steering_block(
     against the current file by parse_planner_response, so the
     dropped definitions return by construction) — the full updated
     module remains only as the fallback the guard accepts. Returns
-    "" unless the rejection is the guard's and a
+    "" unless the rejection carries the guard's code
+    ('scaffold_overwrite' — A/B refactor: the trigger used to be the
+    guard's distinctive phrase in the message text) and a
     scaffold node in the failed output recomputes to a guard-scale
     drop.
     """
-    if _OVERWRITE_MARKER not in error_text:
+    if "scaffold_overwrite" not in codes:
         return ""
     try:
         payload = parse_json_object(sanitize_llm_output(response_text))
@@ -4909,8 +5486,9 @@ def _extension_steering_block(
         if not existing_names:
             continue
         scaffold_names = qualified_def_names(content)
-        if len(scaffold_names) < 4:
-            continue  # fragment-scale: the guard did not fire on it
+        # A/B refactor: no fragment-scale floor here either — the
+        # recompute mirrors the guard's own thresholds, and the
+        # guard no longer exempts small scaffolds (defect 1).
         kept = set(scaffold_names)
         dropped = [name for name in existing_names if name not in kept]
         if len(dropped) < 3 or len(dropped) * 2 < len(existing_names):
@@ -4962,7 +5540,7 @@ def _extension_steering_block(
 
 def _materialization_steering_block(
     response_text: str,
-    error_text: str,
+    codes: Collection[str],
     repo_root: str | Path | None = None,
 ) -> str:
     """The concrete edit-form pattern for a repair after a materialization rejection.
@@ -4985,17 +5563,18 @@ def _materialization_steering_block(
     round the module's FULL definition list, the anchor's own
     indentation, the module's skeleton (real indentation, bodies
     elided), and the keep-the-edit-form pattern. Returns ""
-    unless the rejection is a materialization rejection (a
-    _MATERIALIZATION_MARKERS stem in the error text) and an
+    unless the rejection is a materialization rejection (it
+    carries the 'anchored_edit' code — A/B refactor: the trigger
+    used to be the materialization stems in the message text) and an
     edit-form node in the failed output targets a module that
     grounds (existing, parseable, at the guard's four-definition
     floor). The placeholder-delta rejection is excluded: it is
     cheap, and its repair round already answers with the grounded
     skeleton.
     """
-    if "placeholder content only" in error_text:
+    if "placeholder_delta" in codes:
         return ""
-    if not any(marker in error_text for marker in _MATERIALIZATION_MARKERS):
+    if "anchored_edit" not in codes:
         return ""
     try:
         payload = parse_json_object(sanitize_llm_output(response_text))
@@ -5661,9 +6240,35 @@ _APPROACH_MARKERS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _rejected_approaches(message: str) -> list[str]:
-    """Approach names a rejection message shows the model already tried."""
-    return [label for marker, label in _APPROACH_MARKERS if marker in message]
+# Which structured error codes evidence which forbidden approach.
+# A/B refactor: _rejected_approaches used to substring-match the
+# rejection message for the _APPROACH_MARKERS keys (each key is the
+# owning rejection's own wording). The codes are assigned where the
+# errors are created, so this mapping cannot drift when a message is
+# reworded — and a code from an unrelated rejection can never
+# accidentally contain another rule's key the way message text could.
+_CODE_TO_APPROACH_KEY = {
+    "framework": "Flask",
+    "tmp_write": "/tmp",
+    "placeholder_scaffold": "placeholder",
+    "placeholder_stub": "placeholder",
+    "placeholder_bash": "placeholder",
+    "placeholder_delta": "placeholder",
+    "prose_command": "prose, not a shell command",
+    "static_standin": "hardcoded answer",
+    "sed_noop": "sed -i",
+    "scaffold_overwrite": "of the existing module's",
+}
+
+
+def _rejected_approaches(codes: Collection[str]) -> list[str]:
+    """Approach names a rejection's error codes show the model already tried."""
+    keys = {
+        _CODE_TO_APPROACH_KEY[code]
+        for code in codes
+        if code in _CODE_TO_APPROACH_KEY
+    }
+    return [label for key, label in _APPROACH_MARKERS if key in keys]
 
 
 def _forbidden_block(
@@ -5873,7 +6478,7 @@ def _call_llm_with_repair(
     disk, the module's full definition list, and the concrete pattern
     (the full updated module, definitions in place, plus the new
     code) — and the shape-steering block stays silent, because the
-    guard's phrase is a content-defect marker
+    guard's code is a content-defect code
     (_extension_steering_block).
 
     After a materialization rejection the repair prompt carries the
@@ -5936,7 +6541,13 @@ def _call_llm_with_repair(
             return nodes, metadata
         except LLMResponseError as exc:
             last_error = exc
-            for approach in _rejected_approaches(str(exc)):
+            # Steering keys off the rejection's structured codes
+            # (A/B refactor) — never off substrings of its message.
+            error_codes = {
+                record.code
+                for record in getattr(exc, "plan_errors", None) or []
+            }
+            for approach in _rejected_approaches(error_codes):
                 if approach not in rejected_approaches:
                     rejected_approaches.append(approach)
             if isinstance(exc, EmptyPlanError):
@@ -5981,7 +6592,7 @@ def _call_llm_with_repair(
                                 "repairs.\n"
                             )
                         skeleton_block = f"{forceful}{skeleton_block}"
-            elif "placeholder content only" in str(exc):
+            elif error_codes & _PLACEHOLDER_SKELETON_CODES:
                 # Retry #21: after a placeholder rejection the model needs
                 # the concrete shape again, not just the prohibition — the
                 # skeleton is the fill-in-the-blanks with the actual branch
@@ -5989,9 +6600,9 @@ def _call_llm_with_repair(
                 # something real to complete instead of another TODO to
                 # copy. The lead-in names the placeholder rejection, so
                 # the model is never told its reply was empty when it was
-                # a stub. Only the placeholder phrase is matched: it
-                # appears in exactly the two placeholder errors, never in
-                # the node-shape block or any other rejection.
+                # a stub. The code set is exactly the two cases the old
+                # message-phrase test selected (the placeholder delta and
+                # the comment-only scaffold — not the placeholder stub).
                 skeleton = _grounded_skeleton(
                     goal_text, repo_root, workspace, after="placeholder"
                 )
@@ -6005,12 +6616,12 @@ def _call_llm_with_repair(
                 max_repairs,
                 spent_repair,
             )
-            steering_block = _shape_steering_block(response_text, str(exc))
+            steering_block = _shape_steering_block(response_text, error_codes)
             extension_block = _extension_steering_block(
-                response_text, str(exc), repo_root
+                response_text, error_codes, repo_root
             )
             materialization_block = _materialization_steering_block(
-                response_text, str(exc), repo_root
+                response_text, error_codes, repo_root
             )
             prompt = (
                 f"{user_prompt}\n\n"
@@ -6039,11 +6650,15 @@ def _call_llm_with_repair(
         # operator. Name the grounded move in the escalation itself.
         grounded = _grounded_move_for_goal(goal_text, repo_root)
         if grounded:
-            raise EmptyPlanError(
+            escalation = EmptyPlanError(
                 f"{last_error}{grounded} The model returned empty plans "
                 "repeatedly instead of a plan DAG — produce the grounded "
                 "plan above, do not return another empty plan."
-            ) from last_error
+            )
+            _attach_plan_errors(
+                escalation, getattr(last_error, "plan_errors", None) or []
+            )
+            raise escalation from last_error
     raise last_error
 
 

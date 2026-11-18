@@ -12,10 +12,13 @@ from freetalon.orchestrator.executor import (
     MAX_INJECTION_ATTEMPTS,
     Executor,
     ExecutorError,
+    _SUITE_NODE_TIMEOUT_S,
     _all_dependencies_met,
     _collect_runnable,
+    _command_runs_full_suite,
     _count_in_flight,
     _derive_plan_status,
+    _effective_node_timeout,
     _inject_subdag,
     _is_dependency_missing,
     _is_terminal,
@@ -763,3 +766,95 @@ class TestScaffoldGuardExecutor(unittest.TestCase):
         self.assertEqual(result.nodes[0].status, PlanStatus.FAILED)
         self.assertEqual(result.nodes[0].measurement["verdict"], VERDICT_FAIL)
         self.assertEqual(target.read_text(encoding="utf-8"), "x = 1\n")
+
+
+# ── Suite-node timeout floor (planner A/B refactor, defect 2) ────────────────
+
+
+class TestSuiteNodeTimeout(unittest.TestCase):
+    """A bash node that runs the full test suite gets a floor under
+    its timeout in the executor: the suite takes ~385s and the
+    default node timeout is 300s, so retry #33's accepted plan could
+    never pass — its suite node was killed at 300.0s. The floor is
+    derived where the timeout is enforced, so any plan that runs
+    the suite is executable within its timeouts by construction.
+    """
+
+    def _node(self, command: str, timeout_s: float = 300.0) -> PlanNode:
+        return PlanNode(
+            id="n1",
+            objective="run tests",
+            assigned_claw="bash",
+            inputs={"command": command},
+            timeout_s=timeout_s,
+        )
+
+    def test_full_suite_shapes_detected(self) -> None:
+        for command in (
+            "cd /repo && .venv/bin/python -m unittest discover -s tests",
+            ".venv/bin/python -m unittest discover -s tests -v",
+            "python -m unittest",
+            "python -m unittest -v",
+            "pytest",
+            "pytest tests",
+            "python -m pytest tests/",
+            "make test && python -m unittest discover",
+        ):
+            self.assertTrue(_command_runs_full_suite(command), command)
+
+    def test_scoped_runs_not_detected(self) -> None:
+        for command in (
+            "python -m unittest tests.test_api",
+            "python -m unittest tests.test_api.TestHealth.test_ok",
+            "pytest tests/test_api.py",
+            "pytest tests/test_api.py::test_ok",
+            "python3 /home/seeker/freetalon-workspace/test_health.py",
+            "curl -s http://localhost:8765/health",
+        ):
+            self.assertFalse(_command_runs_full_suite(command), command)
+
+    def test_suite_node_timeout_floored(self) -> None:
+        node = self._node("python -m unittest discover -s tests", timeout_s=30.0)
+        self.assertEqual(_effective_node_timeout(node), _SUITE_NODE_TIMEOUT_S)
+        self.assertGreater(_SUITE_NODE_TIMEOUT_S, 385.0)
+
+    def test_declared_larger_timeout_kept(self) -> None:
+        node = self._node(
+            "python -m unittest discover -s tests", timeout_s=1800.0
+        )
+        self.assertEqual(_effective_node_timeout(node), 1800.0)
+
+    def test_scoped_and_non_bash_nodes_untouched(self) -> None:
+        scoped = self._node("python -m unittest tests.test_api", timeout_s=30.0)
+        self.assertEqual(_effective_node_timeout(scoped), 30.0)
+        other = PlanNode(
+            id="n2",
+            objective="write",
+            assigned_claw="scaffold",
+            inputs={"command": "python -m unittest discover -s tests"},
+            timeout_s=30.0,
+        )
+        self.assertEqual(_effective_node_timeout(other), 30.0)
+
+    def test_suite_node_completes_past_its_declared_timeout(self) -> None:
+        # Behavioral: the handler runs 1.0s; the node declares 0.2s.
+        # A scoped command times out; the suite command completes
+        # because the floor, not the declared value, is enforced.
+        async def slow_handler(inputs: dict) -> dict:
+            await asyncio.sleep(1.0)
+            return {"done": True}
+
+        for index, (command, expected) in enumerate(
+            (
+                ("python -m unittest discover -s tests", PlanStatus.COMPLETED),
+                ("python -m unittest tests.test_api", PlanStatus.FAILED),
+            )
+        ):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                store = _make_store(tmpdir)
+                registry = ToolRegistry()
+                registry.register("bash", slow_handler)
+                plan_id = f"suite-timeout-{index}"
+                store.save(_make_plan(plan_id, [self._node(command, timeout_s=0.2)]))
+                result = _run(Executor(store=store, registry=registry).run(plan_id))
+                self.assertEqual(result.nodes[0].status, expected, command)
