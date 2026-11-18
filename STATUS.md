@@ -4324,3 +4324,100 @@ Deliberately left out:
   re-run 1132/1132 OK in 474.1s
   (logs/rerun10-arm1-suite-post-restore.out).
   Log: logs/health-rerun10-2026-11-18.log.
+
+## Update - 2026-11-18 (Live re-run #10, Arm 2: devstral-small-2:24b on cycle 13 — scoped-run steering lands its first live catch at the test node; the replan then collapses on elision; two residual fixture couplings fired only by this model's payload shape)
+
+- Run (FREETALON_OLLAMA_MODEL=devstral-small-2:24b,
+  FREETALON_LLM_TEMPERATURE=0.0, timeout 900,
+  FREETALON_LLM_THINK unset, formatter OFF,
+  critic OFF; driver exit 0; run
+  run-20261118T211910Z-0397bb; loop elapsed
+  141.8s; plan plan-a86e98d402f3 accepted;
+  4 raw outputs total incl. the replan
+  sequence; GPU peak observed 79C, no
+  thermal pause, 0 Xid; fans manual 85%
+  during, auto after, verified
+  GPUFanControlState=0): node-1 PASS
+  (anchored /health replacement +31/-1,
+  computes ollama_reachable via a socket
+  probe to localhost:11434 and the GPU
+  temperature via nvidia-smi; payload
+  {"ok": true, "status": {"service":
+  "running", "ollama_reachable": ...,
+  "gpu_temp_c": ...}} — a nested status
+  object); node-2 PASS (tests/test_health.py
+  new, 2 tests); node-3 FAIL exit_code 1
+  after 1.3s; nodes 4-5 never ran.
+- Node-3 is cycle 13's scoped run, taken
+  up live for the first time: the plan
+  gives the new tests their own bash node
+  ('Run the new health tests'), and the
+  model's broken tests fail THERE — in
+  1.3s, with their own diagnostics —
+  instead of inside a 470s full suite.
+  Both tests error in handler construction:
+  self.api._httpd.RequestHandlerClass(...)
+  -> TypeError: BaseRequestHandler.__init__()
+  missing 1 required positional argument:
+  'server'. The steering did exactly its
+  job; the repair path behind it did not
+  get used (next bullet).
+- Judge: replan (informative); the
+  replan's repair loop stuck on the same
+  elision rejection 3x — its step_1 tried
+  to scaffold the whole api.py carrying
+  elision markers ('... existing code
+  ...') — escalate; plan FAILED, 1
+  version. (In re-run #9 arm 3 the same
+  model's replan died on cycle 12's
+  elision marker in an anchored replace;
+  here the base elision validator catches
+  its full-scaffold attempt.)
+- The endpoint itself was right: a live
+  check with the changes in place
+  returned 200 {"ok": true, "status":
+  {"service": "running",
+  "ollama_reachable": true, "gpu_temp_c":
+  66}} against a concurrent nvidia-smi
+  reading of 66, with Ollama answering
+  on 11434 — extended checks (1) and
+  (2) pass on the values (temperature
+  field status.gpu_temp_c tracks
+  nvidia-smi exactly; values computed
+  via a socket probe and a subprocess,
+  not literals). Check (3) fails: both
+  new tests error instead of passing.
+- With-changes suite (parent-side re-run,
+  the loop never reached a suite node):
+  Ran 1134 tests, FAILED (failures=1,
+  errors=3). The 2 own-test errors
+  above, plus TWO residual post-goal
+  couplings of the cycle-13 family,
+  fired only by this model's payload
+  shape: (i) TestPlannerSignalLossFix's
+  recorded sed fixture searches api.py
+  for the literal '"status": "ready"',
+  which a computed status dict removes
+  — the recorded output is rejected at
+  parse because its pattern no longer
+  occurs; (ii) TestPlannerDeltaBlankFix
+  .test_skeleton_step1_delta_is_real_code
+  asserts the /health branch's first
+  return (per _health_branch_span) is
+  the 'return self._send' line, but a
+  branch with nested helper definitions
+  returns True from a helper first.
+  Cycle 13's reference tree (a flat
+  branch: statements + a multi-line
+  return) fired neither, and neither
+  did arm 1's flat branch. Check (4)
+  fails. Zero API-behavior failures.
+- Verdict: FAIL at execution (the test
+  node, then the replan collapse); NOT
+  a verified success. Files changed:
+  freetalon/api.py (M),
+  tests/test_health.py (new); restored
+  (porcelain 0); post-restore suite
+  re-run 1132/1132 OK in 466.2s
+  (logs/rerun10-arm2-suite-post-restore.out).
+  Log: logs/health-rerun10-2026-11-18.log.
