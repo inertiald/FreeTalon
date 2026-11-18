@@ -3259,3 +3259,45 @@ Deliberately left out:
   are now steered in both prompt and error text),
   27B second (its plan now reaches the overwrite
   question in round one).
+
+## Update - 2026-11-18 (Live re-run #7, Arm 1: qwen2.5-coder:14b on cycle 9 — the test file arrives, the criteria discipline does not)
+
+- Run (FREETALON_OLLAMA_MODEL=qwen2.5-coder:14b,
+  timeout 900, temperature 0, formatter OFF, critic
+  OFF; driver exit 1; GPU peak observed 73C, no
+  thermal pause; fans manual 85% during, auto after,
+  verified): 3 raw outputs, all rejected at planning
+  (errors replayed offline through
+  parse_planner_response). Nothing executed, no
+  files changed (porcelain 0), no run or memory
+  records, no restore or suite re-run needed.
+- Output 1 was one criterion from acceptance: the
+  anchored do_GET replace again computes both fields
+  (subprocess curl probe for ollama_reachable,
+  subprocess nvidia-smi query for gpu_temperature),
+  and — new under cycle 9's steering — step_2 WRITES
+  tests/test_health.py. The single rejection:
+  step_4's file_matches named a
+  health_response.json in the workspace that the
+  validator does not credit the node with writing.
+- The repair rounds went backwards. Output 2 dropped
+  the anchor for a full-module scaffold and moved
+  the test run into a bash node whose tests_pass
+  named the tests directory — rejected with exactly
+  the cycle-9 target-rule text. Output 3 repeated
+  that tests_pass verbatim (the rule was shown, not
+  acted on), invented a criterion type "command",
+  and its step_1 scaffold dropped 8 of api.py's 12
+  definitions — scaffold_overwrite fired; repair
+  exhausted, planning failed.
+- Cycle-9 accounting: the hoist never fired (Qwen
+  nests nothing — every output carried outputs/
+  acceptance/criteria at top level); no custom_check
+  was attempted, so the empty-registry text never
+  came into play; placeholder_value and
+  missing_target fired 0 times; the tests_pass error
+  carried the new target rule in both rounds that
+  tripped it. Verdict: FAIL at planning — the test
+  file and the substance now arrive in round one,
+  but repair-round criteria discipline is still
+  what stops this model.
