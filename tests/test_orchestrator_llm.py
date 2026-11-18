@@ -149,6 +149,96 @@ def _expected_retry10_error_count() -> int:
     return 7 if os.path.exists(RETRY10_API_PATH) else 9
 
 
+def _health_branch_span(do_get: str) -> tuple[int, int]:
+    """(start, end) line indexes of the /health branch in a do_GET text.
+
+    The branch runs from its `if path == "/health":` line through the
+    branch's own return line (the first return at a deeper indent).
+    Cycle 10: fixtures find the branch in whatever form the current
+    module carries it — the one-line return today, a computed
+    multi-line branch once /health is really implemented — instead of
+    naming today's literal return line, which silently stopped
+    matching the moment the branch grew (re-run #7 Arm 2 fallout:
+    seven grounding fixtures failed on a faithful anchored splice of
+    the executed /health code, none of them an API-behavior test).
+    """
+    lines = do_get.splitlines()
+    start = next(
+        i for i, line in enumerate(lines) if 'if path == "/health":' in line
+    )
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        line_indent = len(lines[i]) - len(lines[i].lstrip())
+        if (
+            stripped == "return"
+            or stripped.startswith("return ")
+            or stripped.startswith("return(")
+        ) and line_indent > indent:
+            return start, i
+    raise AssertionError("no /health branch return found")
+
+
+def _health_branch_block_span(do_get: str) -> tuple[int, int]:
+    """(start, end) line indexes of the whole /health if-block.
+
+    The block runs from the branch line through the last line that
+    belongs to it: everything indented deeper than the branch line,
+    plus else/elif continuations at the branch's own indent. A
+    trailing except/finally of a try the branch opens sits deeper
+    than the branch line, so it is included — a computed branch may
+    wrap its work in try/except whose handler follows the return
+    line (re-run #7 Arm 2's executed form), and a span that stops
+    at the return orphans the handler, leaving a definition that
+    no longer parses. The next sibling statement at the branch's
+    indent ends the block.
+    """
+    lines = do_get.splitlines()
+    start = next(
+        i for i, line in enumerate(lines) if 'if path == "/health":' in line
+    )
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = start
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if not line.strip():
+            continue
+        line_indent = len(line) - len(line.lstrip())
+        if line_indent > indent:
+            end = i
+            continue
+        stripped = line.strip()
+        if line_indent == indent and (
+            stripped.startswith("else") or stripped.startswith("elif")
+        ):
+            end = i
+            continue
+        break
+    return start, end
+
+
+def _with_extended_health_return(do_get: str) -> str:
+    """``do_get`` with its /health branch return replaced by the extended one.
+
+    The extended return is the fixtures' canonical completed branch
+    (the extra fields as literals the planning checks judge); the
+    line it replaces is derived from the source via
+    _health_branch_span, so the completion works on the branch in
+    whatever form the module currently carries it.
+    """
+    lines = do_get.splitlines()
+    _start, end = _health_branch_span(do_get)
+    return_line = lines[end]
+    indent = return_line[: len(return_line) - len(return_line.lstrip())]
+    lines[end] = (
+        indent
+        + 'return self._send(200, {"ok": True, "status": "ready", '
+        + '"service_status": "ready", "ollama_reachable": True, '
+        + '"gpu_temperature": 42})'
+    )
+    return "\n".join(lines)
+
+
 def _rejection_codes(raw: str, **kwargs: object) -> set:
     """The structured error codes of the rejection ``raw`` raises.
 
@@ -15008,6 +15098,35 @@ class TestPlannerSkeletonGroundingFix(unittest.TestCase):
             },
         ]
 
+    def _source_presentation(self):
+        """Pin the full-source presentation of the live module (cycle 10).
+
+        These fixtures ground on the real api.py for its nesting, but
+        which presentation the planner serves depends on the file's
+        size against _STRUCTURE_FULL_SOURCE_MAX_CHARS — and a real
+        /health implementation grows api.py past that budget (cycle
+        10 measurement: a faithful anchored splice of re-run #7
+        Arm 2's executed code is 10,450 chars), after which the live
+        file legitimately gets the skeleton and every fixture that
+        assumed the source presentation failed although no API
+        behavior changed. The presentation under test in this group
+        is the source branch, so pin it — exactly as
+        test_route_goal_shape_skeleton_branch_when_source_too_big
+        pins the other side. The boundary itself is pinned
+        hermetically by test_structure_presentation_flips_at_the_
+        budget.
+        """
+        from freetalon.orchestrator import planner
+
+        source = (self.repo_root / "freetalon" / "api.py").read_text(
+            encoding="utf-8"
+        )
+        return patch.object(
+            planner,
+            "_existing_module_structure",
+            return_value=("source", source),
+        )
+
     # --- The shape block carries the structure ---
 
     def test_route_goal_shape_carries_module_source_with_real_nesting(self) -> None:
@@ -15015,12 +15134,17 @@ class TestPlannerSkeletonGroundingFix(unittest.TestCase):
 
         handler_line = "        class Handler(BaseHTTPRequestHandler):"
         for delta in (False, True):
-            shape = _route_goal_shape(
-                self.HEALTH_GOAL, str(self.repo_root), delta=delta
-            )
+            with self._source_presentation():
+                shape = _route_goal_shape(
+                    self.HEALTH_GOAL, str(self.repo_root), delta=delta
+                )
             self.assertIn("EXISTING MODULE", shape)
-            # api.py is 9,380 chars — under the full-source threshold,
-            # so the shape carries the module itself, not the skeleton.
+            # Cycle 10: the full-source presentation is pinned by
+            # _source_presentation — the shape carries the module
+            # itself, not the skeleton, whatever api.py's current
+            # size (it was 9,380 chars when this fixture was written;
+            # a real /health implementation grows it past the
+            # full-source budget).
             self.assertIn("The module's full current source is below", shape)
             # The Handler class line appears with its REAL leading
             # indentation (8 spaces), as a whole line of the block.
@@ -15061,11 +15185,49 @@ class TestPlannerSkeletonGroundingFix(unittest.TestCase):
         )
         self.assertNotIn("The module's full current source is below", shape)
 
+    def test_structure_presentation_flips_at_the_budget(self) -> None:
+        # Cycle 10: the budget boundary itself, pinned hermetically —
+        # a synthetic module at/under the budget is served whole; the
+        # same module padded past it is served as the skeleton. This
+        # is the behavior the live-module fixtures in this class must
+        # NOT depend on: api.py's own size crosses the boundary the
+        # moment /health is really implemented (a faithful anchored
+        # splice of re-run #7 Arm 2's executed code measures 10,450
+        # chars against the 10,000 budget), so both sides are covered
+        # here with a fixture-owned module at pinned sizes instead.
+        import tempfile
+
+        from freetalon.orchestrator.planner import (
+            _STRUCTURE_FULL_SOURCE_MAX_CHARS,
+            _existing_module_structure,
+        )
+
+        body = (
+            "def a():\n    return 1\n\n\n"
+            "def b():\n    return 2\n\n\n"
+            "def c():\n    return 3\n\n\n"
+            "def d():\n    return 4\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mod.py"
+            path.write_text(body, encoding="utf-8")
+            kind, text = _existing_module_structure(path)
+            self.assertEqual(kind, "source")
+            self.assertEqual(text, body)
+            padded = (
+                body + "\n# " + "x" * _STRUCTURE_FULL_SOURCE_MAX_CHARS + "\n"
+            )
+            self.assertGreater(len(padded), _STRUCTURE_FULL_SOURCE_MAX_CHARS)
+            path.write_text(padded, encoding="utf-8")
+            kind, text = _existing_module_structure(path)
+            self.assertEqual(kind, "skeleton")
+            self.assertIn("def a():", text)
+
     def test_initial_prompt_carries_module_structure(self) -> None:
         from freetalon.orchestrator.planner import plan_task_intent
 
         good = self._dag(self._grounded_health_nodes())
-        with patch(
+        with self._source_presentation(), patch(
             "freetalon.orchestrator.planner.call_llm", side_effect=[good]
         ) as call_mock:
             plan_task_intent(self.intent, settings=self.settings)
@@ -15087,7 +15249,7 @@ class TestPlannerSkeletonGroundingFix(unittest.TestCase):
             "failed_nodes": [],
             "workspace": self.WS,
         }
-        with patch(
+        with self._source_presentation(), patch(
             "freetalon.orchestrator.planner.call_llm", side_effect=[echo, good]
         ) as call_mock:
             nodes = replan_from_brief(
@@ -15730,12 +15892,9 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
         }
         start, end = spans["HiveAPIServer.start.Handler.do_GET"]
         do_get = "\n".join(source.splitlines()[start - 1 : end])
-        delta = do_get.replace(
-            'return self._send(200, {"ok": True, "status": "ready"})',
-            'return self._send(200, {"ok": True, "status": "ready", '
-            '"service_status": "ready", "ollama_reachable": True, '
-            '"gpu_temperature": 42})',
-        )
+        # Cycle 10: derived from the source, not the literal line
+        # (see _with_extended_health_return).
+        delta = _with_extended_health_return(do_get)
         self.assertNotEqual(delta, do_get)
         ws = self.WS
         nodes = [
@@ -16215,11 +16374,13 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
         }
         start, end = spans["HiveAPIServer.start.Handler.do_GET"]
         do_get = "\n".join(source.splitlines()[start - 1 : end])
-        parsed["nodes"][0]["inputs"]["content"] = do_get.replace(
-            'return self._send(200, {"ok": True, "status": "ready"})',
-            'return self._send(200, {"ok": True, "status": "ready", '
-            '"service_status": "ready", "ollama_reachable": True, '
-            '"gpu_temperature": 42})',
+        # Cycle 10: the extension replaces the branch's return line
+        # in whatever form the current module carries it — naming
+        # today's literal line silently stopped matching once the
+        # branch grew (re-run #7 Arm 2), so the line is derived from
+        # the source (see _with_extended_health_return).
+        parsed["nodes"][0]["inputs"]["content"] = (
+            _with_extended_health_return(do_get)
         )
         nodes, _meta = parse_planner_response(
             json.dumps(parsed),
@@ -16307,10 +16468,12 @@ class TestPlannerAnchoredEditFix(unittest.TestCase):
         }
         start, end = spans["HiveAPIServer.start.Handler.do_GET"]
         do_get = "\n".join(source.splitlines()[start - 1 : end])
-        branch = (
-            '                if path == "/health":\n'
-            "                    return self._send(200, "
-            '{"ok": True, "status": "ready"})'
+        # Cycle 10: the branch text is the current module's own —
+        # its whole if-block, in whatever form it stands today
+        # (see _health_branch_block_span).
+        branch_start, branch_end = _health_branch_block_span(do_get)
+        branch = "\n".join(
+            do_get.splitlines()[branch_start : branch_end + 1]
         )
         extended_branch = "\n".join(
             [
@@ -16608,9 +16771,16 @@ class TestPlannerDeltaBlankFix(unittest.TestCase):
         self.assertEqual(
             content, "\n".join(source.splitlines()[start - 1 : end])
         )
-        self.assertIn(
-            'return self._send(200, {"ok": True, "status": "ready"})',
-            content,
+        # Cycle 10: the branch's return line is the file's own, in
+        # whatever form it stands (content is the definition
+        # verbatim — asserted just above); naming today's literal
+        # line broke the moment a real implementation replaced it
+        # (re-run #7 Arm 2).
+        _branch_start, branch_return = _health_branch_span(content)
+        self.assertTrue(
+            content.splitlines()[branch_return]
+            .strip()
+            .startswith("return self._send")
         )
         self.assertNotIn("payload", content)
         self.assertNotIn("= ...", content)
@@ -19595,3 +19765,368 @@ class TestPlannerCycle9CriteriaHoist(unittest.TestCase):
             "write-tests requirement",
             REPLAN_SYSTEM_PROMPT,
         )
+
+
+class TestPlannerWrittenFileCreditingFix(unittest.TestCase):
+    """Written-file crediting for file criteria (planner cycle 10).
+
+    Re-run #7 (logs/health-rerun7-2026-11-18.log) left Qwen's plans
+    one criterion from acceptance in both arms: the verify node's
+    file_matches named /home/seeker/freetalon-workspace/
+    health_response.json, "a file this node writes or runs". The
+    investigation (logs/cycle10-crediting-2026-11-18.log) recovered
+    the exact shapes from the run artifacts and found the premise
+    only half true:
+
+    - Qwen's verify command is a BARE `curl -sf
+      http://localhost:8765/health` in every recorded output — no
+      redirect, no -o, no tee; no node in any arm writes the file,
+      and it does not exist on disk. A bare stdout curl writes
+      nothing, so no deterministic, executor-mirroring rule can
+      credit it: crediting the claim would bless the retry-#8 fake
+      (answer echoed to stdout, file claimed in outputs) and accept
+      a criterion that is unmeasurable by construction. Those shapes
+      still reject, pinned below — the model must actually write the
+      file, and now every real way of writing it counts.
+    - The validator's written set was genuinely narrower than the
+      executor: the bash claw runs a real shell
+      (create_subprocess_shell), which writes files via redirects,
+      heredocs, curl -o/--output, wget -O, tee, dd of=, cp/mv and
+      touch, but _node_written_paths credited only redirects and
+      heredocs; spelling variants (a relative write against an
+      absolute criterion) and cross-node writes (an earlier node
+      writes, the verify node checks) were not credited either; and
+      file_matches had NO plan-level unwritten check at all, so an
+      outputs claim alone could carry it (the outputs-only hole).
+
+    The rule now: a file_exists/file_matches path is credited iff it
+    is one of the node's own declared strings (the historical rule),
+    or it _same_path-matches a demonstrable write target of the node
+    itself or — threaded from _collect_plan_error_records — of any
+    node in the plan; and file_matches joins file_exists under the
+    plan-level unwritten check (written by some node, named in some
+    node's command, or already on disk; an outputs listing alone
+    earns nothing). The 27B re-plan inventions (file_exists on
+    /tmp/api_server_running and .freetalon.pid from a `cli start`
+    node) keep rejecting with the same codes.
+    """
+
+    WS = "/home/seeker/freetalon-workspace"
+    HEALTH_JSON = "/home/seeker/freetalon-workspace/health_response.json"
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+
+    @staticmethod
+    def _node(node_id, command, criteria, outputs=None):
+        from freetalon.orchestrator.models import PlanNode
+
+        return PlanNode(
+            id=node_id,
+            objective="Verify the /health endpoint live",
+            assigned_claw="bash",
+            inputs={"command": command},
+            outputs=outputs or [],
+            criteria=criteria,
+        )
+
+    def _matches(self, **extra):
+        criterion = {"type": "file_matches", "path": self.HEALTH_JSON}
+        criterion.update(extra or {"json_keys": ["ok", "status"]})
+        return criterion
+
+    # --- The executor's write forms are credited -------------------
+
+    def test_written_paths_cover_the_shells_write_forms(self) -> None:
+        from freetalon.orchestrator.planner import _node_written_paths
+
+        cases = {
+            "curl -s http://localhost:8765/health > /tmp/a.json": "/tmp/a.json",
+            "curl -sf http://localhost:8765/health -o /tmp/b.json": "/tmp/b.json",
+            "curl -sf http://localhost:8765/health --output=/tmp/c.json": "/tmp/c.json",
+            "wget -q -O /tmp/d.json http://localhost:8765/health": "/tmp/d.json",
+            "curl -s http://localhost:8765/health | tee /tmp/e.json": "/tmp/e.json",
+            "curl -s http://localhost:8765/health | tee -a /tmp/f.json": "/tmp/f.json",
+            "dd if=/dev/zero of=/tmp/g.bin bs=1 count=1": "/tmp/g.bin",
+            "cp /tmp/src.json /tmp/h.json": "/tmp/h.json",
+            "mv /tmp/src.json /tmp/i.json": "/tmp/i.json",
+            "touch /tmp/j.json": "/tmp/j.json",
+            "cat > /tmp/k.json <<'EOF'\n{}\nEOF": "/tmp/k.json",
+        }
+        for command, target in cases.items():
+            node = self._node("n", command, [{"type": "exit_code", "equals": 0}])
+            self.assertIn(target, _node_written_paths(node), command)
+
+    def test_written_paths_do_not_invent_writes(self) -> None:
+        from freetalon.orchestrator.planner import _node_written_paths
+
+        # A bare stdout curl writes nothing (Qwen's recorded shape).
+        node = self._node(
+            "n", "curl -sf http://localhost:8765/health",
+            [{"type": "exit_code", "equals": 0}],
+        )
+        self.assertEqual(_node_written_paths(node), set())
+        # -o on a program that takes no output file names no write.
+        node = self._node(
+            "n", "unzip -o /tmp/x.json", [{"type": "exit_code", "equals": 0}]
+        )
+        self.assertNotIn("/tmp/x.json", _node_written_paths(node))
+        # An expansion target names a file the validator cannot know.
+        node = self._node(
+            "n", "curl -s http://localhost:8765/health -o $HOME/x.json",
+            [{"type": "exit_code", "equals": 0}],
+        )
+        self.assertEqual(_node_written_paths(node), set())
+        # /dev/null is not a file credit.
+        node = self._node(
+            "n", "curl -s http://localhost:8765/health > /dev/null",
+            [{"type": "exit_code", "equals": 0}],
+        )
+        self.assertEqual(_node_written_paths(node), set())
+
+    def test_relative_download_write_credits_absolute_criterion(self) -> None:
+        from freetalon.orchestrator.planner import _criteria_errors
+
+        node = self._node(
+            "step_4",
+            "curl -sf http://localhost:8765/health -o health_response.json",
+            [self._matches()],
+        )
+        self.assertEqual(_criteria_errors(node), [])
+
+    def test_tee_and_download_writes_pass_the_plan_level_check(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _unwritten_file_matches_errors,
+        )
+
+        for command in (
+            f"curl -s http://localhost:8765/health | tee {self.HEALTH_JSON}",
+            f"curl -sf http://localhost:8765/health -o {self.HEALTH_JSON}",
+            f"curl -sf http://localhost:8765/health > {self.HEALTH_JSON}",
+        ):
+            node = self._node("step_4", command, [self._matches()])
+            self.assertEqual(
+                _unwritten_file_matches_errors([node], str(self.repo_root)),
+                [],
+                command,
+            )
+
+    def test_cross_node_write_credits_the_checking_node(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _criteria_errors,
+            _node_written_paths,
+        )
+
+        writer = self._node(
+            "step_3",
+            f"curl -s http://localhost:8765/health > {self.HEALTH_JSON}",
+            [{"type": "exit_code", "equals": 0}],
+        )
+        checker = self._node(
+            "step_4", "curl -sf http://localhost:8765/health", [self._matches()]
+        )
+        # Without plan context the per-node rule is unchanged...
+        self.assertIn(
+            "is not a file this node writes or runs",
+            "\n".join(_criteria_errors(checker)),
+        )
+        # ...and with the plan's written set threaded in, the earlier
+        # node's demonstrable write credits the criterion.
+        plan_written = _node_written_paths(writer) | _node_written_paths(checker)
+        self.assertEqual(
+            _criteria_errors(checker, plan_written=plan_written), []
+        )
+
+    def test_full_plan_with_a_download_write_is_accepted(self) -> None:
+        # Qwen's verify-node shape WITH the write it lacked in re-run
+        # #7: the same bare curl, plus -o naming the criterion's file.
+        import json
+
+        ws = self.WS
+        nodes = [
+            {
+                "id": "step_1",
+                "objective": "Extend the health endpoint in freetalon/api.py",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {
+                    "file_path": self.api_path,
+                    "anchor": "HiveAPIServer.start.Handler.do_GET",
+                    "position": "replace",
+                    "content": GROUNDED_DO_GET_DELTA,
+                },
+                "outputs": [self.api_path],
+                "criteria": [{"type": "file_exists", "path": self.api_path}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Write the health endpoint test file",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": TestPlannerHeredocFix.HEREDOC_TEST},
+                "outputs": [f"{ws}/test_health.py"],
+                "criteria": [
+                    {"type": "file_exists", "path": f"{ws}/test_health.py"}
+                ],
+            },
+            {
+                "id": "step_3",
+                "objective": "Run the health endpoint tests",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": f"python3 {ws}/test_health.py"},
+                "outputs": ["test results"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_4",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_3"],
+                "assigned_claw": "bash",
+                "inputs": {
+                    "command": (
+                        "curl -sf http://localhost:8765/health "
+                        f"-o {self.HEALTH_JSON}"
+                    )
+                },
+                "outputs": [self.HEALTH_JSON],
+                "criteria": [
+                    {"type": "exit_code", "equals": 0},
+                    self._matches(),
+                ],
+            },
+        ]
+        parsed, _meta = parse_planner_response(
+            json.dumps({"nodes": nodes, "metadata": {}}),
+            goal_text=self.HEALTH_GOAL,
+            workspace=ws,
+            repo_root=str(self.repo_root),
+        )
+        self.assertEqual(len(parsed), 4)
+
+    # --- What still rejects, exactly as before ----------------------
+
+    def test_qwen_recorded_shape_still_rejected_no_write_anywhere(self) -> None:
+        # Re-run #7 Arm 1 output 1 / Arm 3 output 3, step_4 verbatim:
+        # a bare stdout curl and a file_matches on a file nothing
+        # writes. Crediting this would require treating stdout (or
+        # the outputs list) as a file write — the retry-#8 fake.
+        from freetalon.orchestrator.planner import (
+            _criteria_errors,
+            _unwritten_file_matches_errors,
+        )
+
+        for outputs in (["live_verification"], []):
+            node = self._node(
+                "step_4",
+                "curl -sf http://localhost:8765/health",
+                [
+                    {"type": "exit_code", "equals": 0},
+                    self._matches(sha256="e3b0c44298fc1c149afbf4c8996fb924"
+                                         "27ae41e4649b934ca495991b7852b855"),
+                ],
+                outputs=outputs,
+            )
+            self.assertIn(
+                "is not a file this node writes or runs",
+                "\n".join(_criteria_errors(node)),
+            )
+            errors = _unwritten_file_matches_errors(
+                [node], str(self.repo_root)
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertIn(self.HEALTH_JSON, errors[0])
+            self.assertIn("does not count", errors[0])
+
+    def test_outputs_claim_alone_earns_nothing_at_plan_level(self) -> None:
+        # Re-run #7 Arm 1 output 2's step_4: the path is listed in
+        # outputs (which satisfies the historical per-node substring
+        # rule — pinned unchanged) but no node writes it, so the new
+        # plan-level check rejects it: the outputs-only hole is
+        # closed in the sound direction.
+        from freetalon.orchestrator.planner import (
+            _criteria_errors,
+            _unwritten_file_matches_errors,
+        )
+
+        node = self._node(
+            "step_4",
+            "curl -sf http://localhost:8765/health",
+            [self._matches(sha256="0" * 64)],
+            outputs=[self.HEALTH_JSON],
+        )
+        self.assertEqual(_criteria_errors(node), [])
+        errors = _unwritten_file_matches_errors([node], str(self.repo_root))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("no node in the plan writes that file", errors[0])
+
+    def test_redirect_to_another_file_earns_no_credit(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _criteria_errors,
+            _unwritten_file_matches_errors,
+        )
+
+        node = self._node(
+            "step_4",
+            "curl -s http://localhost:8765/health > /tmp/other_response.json",
+            [self._matches()],
+        )
+        self.assertIn(
+            "is not a file this node writes or runs",
+            "\n".join(_criteria_errors(node)),
+        )
+        self.assertEqual(
+            len(_unwritten_file_matches_errors([node], str(self.repo_root))),
+            1,
+        )
+
+    def test_inventions_still_reject_with_the_same_codes(self) -> None:
+        # Re-run #7 Arm 2 re-plan outputs 5/6: file_exists on files
+        # nothing writes, from a server-start node. Same rejection,
+        # same unwritten_file code — and the file_matches twin now
+        # fires for the same invention in file_matches form.
+        raw_nodes = [
+            {
+                "id": "node-3",
+                "objective": "Start the API server",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "inputs": {
+                    "command": "cd /home/seeker/projects/FreeTalon && "
+                    "./.venv/bin/python -m freetalon.cli start"
+                },
+                "outputs": [],
+                "criteria": [
+                    {"type": "file_exists", "path": "/tmp/api_server_running"}
+                ],
+            }
+        ]
+        import json
+
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                json.dumps({"nodes": raw_nodes, "metadata": {}}),
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=str(self.repo_root),
+            )
+        codes = {r.code for r in caught.exception.plan_errors}
+        self.assertIn("unwritten_file", codes)
+        self.assertIn("/tmp/api_server_running", str(caught.exception))
+
+        from freetalon.orchestrator.planner import (
+            _unwritten_file_matches_errors,
+        )
+
+        node = self._node(
+            "node-3",
+            "cd /home/seeker/projects/FreeTalon && "
+            "./.venv/bin/python -m freetalon.cli start",
+            [self._matches()],
+        )
+        node.criteria[0]["path"] = "/home/seeker/projects/FreeTalon/.freetalon.pid"
+        errors = _unwritten_file_matches_errors([node], str(self.repo_root))
+        self.assertEqual(len(errors), 1)
+        self.assertIn(".freetalon.pid", errors[0])

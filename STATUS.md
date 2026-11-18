@@ -3420,3 +3420,104 @@ Deliberately left out:
   grounding properties, and whether a faithful
   anchored edit keeps those fixtures green is the
   question the next success-shaped run answers.
+
+## Update - 2026-11-18 (Cycle 10: written-file crediting + grounding-fixture decoupling — Qwen's file_matches hole closed in the sound direction; the suite no longer depends on api.py's size or branch shape)
+
+- Target 1 (file crediting): the investigation
+  (log logs/cycle10-crediting-2026-11-18.log)
+  recovered Qwen's exact re-run #7 verify nodes
+  from the artifacts — and the premise was only
+  half true. The verify command is a BARE curl to
+  stdout in every recorded output: no redirect,
+  no -o, no tee; no node in any arm writes
+  health_response.json, and the file is not on
+  disk. A bare stdout curl writes nothing, so no
+  deterministic executor-mirroring rule can
+  credit it — crediting the claim would bless
+  the retry-#8 fake and accept an unmeasurable
+  criterion. That sub-part was STOPPED as
+  unsound, with the shapes pinned still-rejected.
+  What was genuinely broken is built:
+  _node_written_paths now credits the shell's
+  full deterministic write set (redirects and
+  heredocs, plus curl/wget download targets,
+  tee, dd of=, cp/mv destination, touch —
+  expansion targets and /dev/ excluded, download
+  targets only in curl/wget segments), matching
+  what the bash claw's real shell performs and
+  the set memory.py already extracts; a
+  file_exists/file_matches path is also credited
+  when it _same_path-matches a demonstrable
+  write by the node itself (relative write,
+  absolute criterion) or by any node in the plan
+  (plan_written threaded from
+  _collect_plan_error_records; direct
+  _criteria_errors calls unchanged); and
+  file_matches joins file_exists under a
+  plan-level unwritten check
+  (_unwritten_file_matches_errors, code
+  unwritten_file) — an outputs claim alone no
+  longer carries a file_matches (the outputs-only
+  hole, closed in the sound direction). The 27B
+  inventions (/tmp/api_server_running,
+  .freetalon.pid) keep rejecting with the same
+  codes; a redirect to a different file earns no
+  credit. One self-inflicted regression was
+  caught by the suite and fixed: the new segment
+  regex initially shadowed the existing
+  _SEGMENT_SPLIT_RE (the prose detector's, which
+  also splits on ' - '), costing retry-14's
+  node-3 prose error in 9 pins; renamed to
+  _WRITE_SEGMENT_SPLIT_RE, all 9 restored.
+- Target 2 (grounding-budget coupling): the
+  deciding measurement came first. Arm 2's
+  executed /health code as a FAITHFUL ANCHORED
+  splice of the current api.py (do_GET only,
+  byte-identical outside) measures 10,450 chars —
+  over the 10,000 full-source budget, so any real
+  implementation flips the presentation; the
+  budget itself is not mis-sized (its num_ctx
+  accounting still holds) and is unchanged. In
+  scratch trees the splice fails exactly 7 of
+  the 13 (the 6 retry16 pins pass — their Arm 2
+  failures were the retype's drift, not size):
+  3 SkeletonGrounding pins assumed the
+  full-source presentation, and 4 AnchoredEdit/
+  DeltaBlank pins string-replaced the branch's
+  literal one-line return. Both dependences are
+  incidental, so the fixtures now pin what they
+  test: the SkeletonGrounding source-presentation
+  tests force ("source", live source) via
+  patch.object — mirroring the existing
+  skeleton-branch patch — a new hermetic test
+  pins the budget boundary itself on a synthetic
+  module at pinned sizes, and the branch
+  extensions derive the branch/return lines from
+  the current source (_health_branch_span /
+  _health_branch_block_span /
+  _with_extended_health_return; the block span
+  covers a try/except handler following the
+  return, Arm 2's form). NO planner mechanism
+  change for this target. Proof: the affected
+  classes (65 tests) are green in BOTH scratch
+  trees — current api.py (9,382 chars) and the
+  anchored-grown api.py (10,450 chars).
+- Measurement: suite 1107/1107 (1096 + 11 new:
+  10 crediting pins in
+  TestPlannerWrittenFileCreditingFix, 1 boundary
+  pin); framework guard ALL CHECKS PASSED;
+  original corpus replay unchanged (0/28
+  accepted, mean 1.32, 0 of 56 rows moved);
+  model-ab corpus replay unchanged (gemma3:27b
+  mean 1.67, qwen2.5-coder:14b mean 2.67, 0 of
+  12 rows moved — exactly as the artifacts
+  predict: the recorded Qwen outputs contain no
+  demonstrable write to credit, so Target 1's
+  acceptance effect lands on the NEXT live
+  outputs that actually write the file they
+  check). Pins changed: 7 grounding fixtures
+  re-pinned to derived/pinned presentations and
+  branch forms (reasons above); no
+  error-count pins changed. No live runs, no
+  GPU. Log:
+  logs/cycle10-crediting-2026-11-18.log.

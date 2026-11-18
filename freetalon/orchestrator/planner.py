@@ -1238,6 +1238,37 @@ def _criterion_path_is_node_path(criterion_path: str, node: PlanNode) -> bool:
     return False
 
 
+def _criterion_path_is_credited(
+    criterion_path: str,
+    node: PlanNode,
+    plan_written: set[str] | None = None,
+) -> bool:
+    """True if a file criterion path is credited to this node or plan.
+
+    The crediting rule (cycle 10): the path is one of the node's own
+    declared strings (the historical per-node rule), OR it names —
+    under _same_path's spelling-insensitive comparison — a file the
+    node itself demonstrably writes (_node_written_paths: a relative
+    redirect/download target in its command credits the absolute
+    criterion path naming the same file), OR, when the caller threads
+    the plan's written set in, a file ANY node in the plan
+    demonstrably writes. Declared outputs alone are not a write and
+    earn nothing here beyond the historical substring rule: a bare
+    stdout command (curl with no redirect and no -o) writes no file,
+    however the outputs list describes it.
+    """
+    if _criterion_path_is_node_path(criterion_path, node):
+        return True
+    for target in _node_written_paths(node):
+        if _same_path(criterion_path, target):
+            return True
+    if plan_written:
+        for target in plan_written:
+            if _same_path(criterion_path, target):
+                return True
+    return False
+
+
 def _custom_checker_registry_text() -> str:
     """The registered custom checkers, as error text (cycle 9).
 
@@ -1263,9 +1294,21 @@ def _custom_checker_registry_text() -> str:
 
 
 def _usable_criterion_error(
-    criterion: Any, node: PlanNode, repo_root: str | Path | None = None
+    criterion: Any,
+    node: PlanNode,
+    repo_root: str | Path | None = None,
+    plan_written: set[str] | None = None,
 ) -> str | None:
-    """Return an error string if the criterion is unusable, else None."""
+    """Return an error string if the criterion is unusable, else None.
+
+    ``plan_written`` (cycle 10) is the plan's demonstrable written set
+    (the union of _node_written_paths over every node), threaded in by
+    _collect_plan_error_records: a file_exists/file_matches path is
+    also usable when some node in the plan demonstrably writes that
+    file (an earlier node's redirect, download target, tee target, or
+    heredoc target), even when the checking node never names it. None
+    (direct calls) keeps the per-node rule exactly as before.
+    """
     if not isinstance(criterion, dict):
         return f"criterion is not an object: {criterion!r}"
     ctype = criterion.get("type")
@@ -1296,7 +1339,7 @@ def _usable_criterion_error(
         path = criterion.get("path")
         if not isinstance(path, str) or not path:
             return "file_exists criterion needs a non-empty 'path'"
-        if not _criterion_path_is_node_path(path, node):
+        if not _criterion_path_is_credited(path, node, plan_written):
             return f"file_exists path {path!r} is not a file this node writes or runs"
         return None
     if ctype == CRITERION_FILE_MATCHES:
@@ -1305,7 +1348,7 @@ def _usable_criterion_error(
             return "file_matches criterion needs a non-empty 'path'"
         if "sha256" not in criterion and "json_keys" not in criterion:
             return "file_matches criterion needs 'sha256' or 'json_keys'"
-        if not _criterion_path_is_node_path(path, node):
+        if not _criterion_path_is_credited(path, node, plan_written):
             return f"file_matches path {path!r} is not a file this node writes or runs"
         return None
     if ctype == CRITERION_METRIC:
@@ -2913,7 +2956,9 @@ def _claw_error(node: PlanNode) -> str | None:
 
 
 def _criteria_errors(
-    node: PlanNode, repo_root: str | Path | None = None
+    node: PlanNode,
+    repo_root: str | Path | None = None,
+    plan_written: set[str] | None = None,
 ) -> list[str]:
     """Return every unusable-criterion error for one node."""
     errors: list[str] = []
@@ -2925,7 +2970,9 @@ def _criteria_errors(
             f"file_matches, metric, or tests_pass). {_CRITERION_SHAPE_EXAMPLE}."
         ]
     for criterion in criteria:
-        error = _usable_criterion_error(criterion, node, repo_root)
+        error = _usable_criterion_error(
+            criterion, node, repo_root, plan_written=plan_written
+        )
         if error is not None:
             errors.append(
                 f"Planner node '{node.id}' has an unusable criterion: {error}."
@@ -2983,8 +3030,9 @@ def _tmp_write_errors(
     come from _node_written_paths (scaffold target, heredoc targets,
     and every redirect in the shell, heredoc bodies and quoted
     segments stripped first), so a redirect in any segment of a piped
-    or &&-chained command is flagged. A `tee` write is not caught —
-    there is no redirect to scan — noted, not fixed.
+    or &&-chained command is flagged. (Cycle 10: tee targets are in
+    the written set too, so a tee write to /tmp is flagged like a
+    redirect.)
     """
     if not goal_text:
         return []
@@ -3242,6 +3290,81 @@ def _missing_directory_errors(
 _REDIRECT_RE = re.compile(r"(?:^|[\s;&|])(?:\d+)?>>?\s*(?P<target>[^\s;&|]+)")
 
 
+# The bash claw runs its command through a real shell
+# (tool_registry.bash_handler -> create_subprocess_shell), so every
+# deterministic write form the shell performs is a write the executor
+# will actually make: redirects and heredoc targets (above), plus —
+# cycle 10 — download targets, tee targets, dd of=, and cp/mv/touch
+# destinations. memory.py's _bash_write_targets extracts the same set
+# for approach signatures; the two constructions agree on what a
+# write is. Targets carrying shell expansion ($, backtick, globs) are
+# NOT credited for these forms: the shell would expand them to a name
+# the validator cannot know, and crediting a guessed name is how an
+# unmeasurable criterion gets blessed.
+_DOWNLOAD_TARGET_RE = re.compile(
+    r"(?:-o|-O|--output|--output-document)[=\s]+"
+    r"(\"[^\"]+\"|'[^']+'|[^\s;|&]+)"
+)
+_DD_TARGET_RE = re.compile(r"\bof=(\"[^\"]+\"|'[^']+'|[^\s;|&]+)")
+_TEE_WRITTEN_RE = re.compile(r"\btee\s+(?:-\w+\s+)*(\"[^\"]+\"|'[^']+'|[^\s;|&]+)")
+_WRITE_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\|")
+_EXPANSION_CHARS = "$`"
+
+
+def _unquote_shell_target(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+        return token[1:-1]
+    return token
+
+
+def _bash_extra_write_targets(command: str) -> set[str]:
+    """Write targets of a bash command beyond redirects/heredocs.
+
+    Download targets are credited only in a segment whose program is
+    curl or wget — a bare -o on some other program takes no file
+    argument (unzip -o names no output), so crediting it would invent
+    a write. Tee targets are scanned on the heredoc-stripped shell,
+    so a 'tee' inside file content is not a command. cp/mv credit
+    only the destination (the last token of the segment); touch
+    credits its file argument.
+    """
+    targets: set[str] = set()
+
+    def _add(token: str) -> None:
+        target = _unquote_shell_target(token.strip())
+        if (
+            target
+            and not target.startswith("/dev/")
+            and not any(char in target for char in _EXPANSION_CHARS)
+            and "*" not in target
+            and "?" not in target
+        ):
+            targets.add(target)
+
+    stripped = _strip_heredoc_bodies(command)
+    for match in _TEE_WRITTEN_RE.finditer(stripped):
+        _add(match.group(1))
+    for match in _DD_TARGET_RE.finditer(stripped):
+        _add(match.group(1))
+    for segment in _WRITE_SEGMENT_SPLIT_RE.split(stripped):
+        tokens = segment.split()
+        while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+            tokens = tokens[1:]
+        if not tokens:
+            continue
+        program = tokens[0].rsplit("/", 1)[-1]
+        if program in ("curl", "wget"):
+            for match in _DOWNLOAD_TARGET_RE.finditer(segment):
+                _add(match.group(1))
+        elif program in ("cp", "mv") and len(tokens) >= 3:
+            _add(tokens[-1])
+        elif program == "touch" and len(tokens) >= 2:
+            for token in tokens[1:]:
+                if not token.startswith("-"):
+                    _add(token)
+    return targets
+
+
 def _node_written_paths(node: PlanNode) -> set[str]:
     """Paths a node writes: scaffold target, bash redirect/heredoc targets.
 
@@ -3249,7 +3372,11 @@ def _node_written_paths(node: PlanNode) -> set[str]:
     the node produces, and a fake plan lists a file there without ever
     creating it (retry #8: node-1 listed health.json in outputs while
     echoing its answer to stdout). Only a real write counts: the scaffold
-    claw's file_path, a redirect, or a heredoc target.
+    claw's file_path, a redirect, or a heredoc target. Cycle 10: the
+    bash branch also credits the shell's other deterministic write
+    forms (download targets, tee, dd of=, cp/mv, touch — see
+    _bash_extra_write_targets), mirroring what the executor's shell
+    actually performs.
     """
     written: set[str] = set()
     claw = node.assigned_claw or ""
@@ -3272,6 +3399,7 @@ def _node_written_paths(node: PlanNode) -> set[str]:
                 target = match.group("target")
                 if target and not target.startswith("/dev/"):
                     written.add(target)
+            written.update(_bash_extra_write_targets(command))
     return written
 
 
@@ -3349,6 +3477,61 @@ def _unwritten_file_errors(
                 "does not exist on disk — the file would be unmeasurable. A "
                 "file_exists criterion must point at a file the plan writes "
                 "(scaffold file_path, a bash redirect, or a heredoc target), "
+                "a file a node runs or reads in its command, or a file that "
+                "already exists. Listing the path in 'outputs' does not "
+                "count: echoing an answer to stdout does not create the file."
+            )
+    return errors
+
+
+def _unwritten_file_matches_errors(
+    nodes: list[PlanNode], repo_root: str | Path | None
+) -> list[str]:
+    """Reject file_matches criteria on paths the plan never produces.
+
+    The file_matches twin of _unwritten_file_errors (cycle 10).
+    file_exists has had the plan-level check since retry #8;
+    file_matches never did, so a file_matches path carried only by a
+    node's "outputs" claim passed validation although nothing in the
+    plan writes the file and the measurement could only ever report
+    "does not exist" (the outputs-only hole: re-run #7's Qwen verify
+    nodes named a workspace health_response.json that no node's
+    command writes — a bare `curl` to stdout creates no file). The
+    crediting rule is the same as file_exists': written by some node
+    in the plan (the extended _node_written_paths set), named in a
+    node's bash command, or already on disk. An outputs listing alone
+    does not count.
+    """
+    written: set[str] = set()
+    for node in nodes:
+        written.update(_node_written_paths(node))
+    errors: list[str] = []
+    for node in nodes:
+        if (node.assigned_claw or "") not in KNOWN_CLAW_NAMES:
+            continue
+        for criterion in node.criteria or []:
+            if not isinstance(criterion, dict):
+                continue
+            if criterion.get("type") != CRITERION_FILE_MATCHES:
+                continue
+            path = criterion.get("path")
+            if not isinstance(path, str) or not path:
+                continue  # _usable_criterion_error already flags this
+            if "sha256" not in criterion and "json_keys" not in criterion:
+                continue  # _usable_criterion_error already flags this
+            if any(_same_path(path, target) for target in written):
+                continue
+            if any(_node_command_mentions_path(other, path) for other in nodes):
+                continue
+            if _path_exists_on_disk(path, repo_root):
+                continue
+            errors.append(
+                f"Planner node '{node.id}' has a file_matches criterion on "
+                f"{path!r}, but no node in the plan writes that file and it "
+                "does not exist on disk — the file would be unmeasurable. A "
+                "file_matches criterion must point at a file the plan writes "
+                "(scaffold file_path, a bash redirect, a download target "
+                "such as curl -o, a tee target, or a heredoc target), "
                 "a file a node runs or reads in its command, or a file that "
                 "already exists. Listing the path in 'outputs' does not "
                 "count: echoing an answer to stdout does not create the file."
@@ -4698,6 +4881,9 @@ def _collect_plan_error_records(
     ) or goal_text is not None
     if index is None and needs_index:
         index = build_repo_index(repo_root)
+    plan_written: set[str] = set()
+    for node in nodes:
+        plan_written.update(_node_written_paths(node))
     for node in nodes:
         error = _claw_error(node)
         if error is not None:
@@ -4705,7 +4891,10 @@ def _collect_plan_error_records(
                 PlanError(code="unknown_claw", message=error, node_id=node.id)
             )
         records.extend(
-            _error_records("criteria", _criteria_errors(node, repo_root))
+            _error_records(
+                "criteria",
+                _criteria_errors(node, repo_root, plan_written=plan_written),
+            )
         )
         records.extend(_command_error_records(node, repo_root))
         if index is not None:
@@ -4719,6 +4908,12 @@ def _collect_plan_error_records(
     records.extend(
         _error_records(
             "unwritten_file", _unwritten_file_errors(nodes, repo_root)
+        )
+    )
+    records.extend(
+        _error_records(
+            "unwritten_file",
+            _unwritten_file_matches_errors(nodes, repo_root),
         )
     )
     placeholder_records = _placeholder_scaffold_error_records(
