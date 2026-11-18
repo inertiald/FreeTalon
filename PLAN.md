@@ -10,6 +10,8 @@ goal and it plans the work, gathers data, runs tests, makes research bets,
 trains models, measures what happened, and iterates — stopping for a human
 only at irreversible steps.
 
+North Star (2026-11-17): the finance example, taken all the way. FreeTalon collects its own market data, applies real ML methods to it, develops a model, and trades the real market for profit - paper first, real money only at the human gate. Every other vertical is judged against the same bar: scary capable on its own, stopped only at cliff edges (publish, pay, flash, send).
+
 Two worked examples define what "done" looks like:
 
 - **Financial automation.** "Automate a mean-reversion strategy": research
