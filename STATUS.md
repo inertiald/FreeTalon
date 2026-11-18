@@ -3648,3 +3648,49 @@ Deliberately left out:
   executed FAIL/RETRY, then FAIL/ESCALATE) — no
   memory-driven escalation. Log:
   logs/health-rerun8-2026-11-18.log.
+
+## Update - 2026-11-18 (Live re-run #8, Arm 2: gemma3:27b on cycle 11 — two of three outputs never become JSON; the middle one is stopped by both scaffold_overwrite branches)
+
+- Run (FREETALON_OLLAMA_MODEL=gemma3:27b, timeout
+  900, temperature 0, formatter OFF, critic OFF;
+  driver exit 1; GPU peak observed 75C, no thermal
+  pause; fans manual 85% during, auto after,
+  verified GPUFanControlState=0): 3 raw outputs,
+  none accepted; repair exhausted at planning.
+  Nothing executed, no files changed (porcelain
+  0), no run or memory records (experiments stay
+  167), no restore or suite re-run needed.
+- Output 1 (20,118 chars) never closed: step_1's
+  differs_by fell into a repetition loop (the same
+  two sentences about the Ollama timeout and the
+  response keys, repeated dozens of times) and the
+  node carried no inputs at all — the edit
+  described in prose, never supplied. Not valid
+  JSON.
+- Output 2 was complete JSON and drew exactly 2
+  errors, both scaffold_overwrite: step_1's
+  content was a free-standing
+  "class Handler(BaseHTTPRequestHandler)" fragment
+  (drops 12 of api.py's 12 definitions), and
+  step_2 scaffolded a replacement for
+  tests/test_api.py (drops 27 of 27) — cycle 11's
+  test-module error branch fired with its new
+  text (NEW test file, e.g. tests/test_health.py,
+  or an anchored insert). The criteria themselves
+  were disciplined: file_exists on the targets,
+  exit_code on every bash node, no metric
+  criteria, no file_matches. (Errors replayed
+  offline through parse_planner_response.)
+- Output 3 answered with a full-module retype of
+  api.py and broke JSON validity a second time
+  (invalid control character at char ~3950 on
+  replay); repair exhausted on LLMResponseError
+  ("LLM response was not valid JSON"). The hoist
+  never fired; placeholder_value and
+  missing_target fired 0 times; local repair
+  never engaged (nothing executed). Verdict: FAIL
+  at planning — on this arm the 27B's generation
+  stability, not criteria discipline, is the wall:
+  two outputs lost to malformed JSON before
+  validation could judge their substance. Log:
+  logs/health-rerun8-2026-11-18.log.
