@@ -2404,3 +2404,67 @@ Deliberately left out:
   because the re-plan brief is criterion-shaped. The next
   lever is brief substance (carry the failing assertion /
   stderr into replan_from_brief), not more re-plan budget.
+
+## Update - 2026-11-18 (Cycle 5: re-plan brief substance — the brief carries the failure, not just its shape)
+
+- Re-run #2's diagnosis was precise: the judge's re-plan brief
+  rendered a failed node as its criterion ("failed criterion:
+  exit_code 1 != 0"), while the assertion that names the defect
+  never reached the prompt. Investigation found it was already
+  inside the brief dict: the executor merges the handler result
+  into the node's inputs after measurement, so the failed node's
+  stderr rides along in brief["failed_nodes"][i]["inputs"] (and
+  in the experiment record's approach.key_params) — the prose
+  renderer simply never read it. Both re-plans in both runs were
+  aimed blind: v2/v3 re-emitted the identical Ellipsis delta,
+  and at temperature 0.4 the identical omission variant.
+- Fix, at the judge seam: build_replan_brief now extracts a
+  bounded diagnostic excerpt per failed node
+  (_failure_diagnostics in judge.py): the tail of the node's
+  captured output — stderr, else stdout — last 12 lines, each
+  line capped at 300 chars, the whole capped at 1500 chars
+  (front lines dropped first; the assertion sits at the tail).
+  The brief entry gains "diagnostics";
+  _format_brief_for_prompt renders it as a "Captured output
+  from failed node {id} (tail):" block under the node's line,
+  so the failure is attributed to the node and its failing
+  criterion. A node that captured no output yields "" and the
+  brief and prompt render byte-identically to before (pinned
+  by fixture, including a pre-cycle-5-shaped brief dict).
+- Repeat naming: the Judge is per-run and builds every brief,
+  so it now remembers the diagnostic fingerprint (the excerpt's
+  last Error line) of each brief it issues. When a later plan
+  version's failed node reproduces a fingerprint from an
+  earlier version, the entry gains repeated_diagnostic /
+  repeated_from_version and the prompt adds a "Repeated
+  failure:" line naming the assertion and the version that
+  first produced it, stating the previous delta did not remove
+  it. Information for the planner only — no gate, no budget or
+  escalation change. The signature-based repeat check could
+  never see this repeat: the failing test-run node is plumbing
+  (no approach signature, cycle 3), and the defective edit
+  node passed its own measurement, so it is not a failed node.
+- Verified against the real artifact before fixtures: a brief
+  built from re-run #2's recorded node-3 stderr carries
+  "AssertionError: 'Ellipsis' is not an instance of
+  <class 'bool'>" with its traceback (test_health.py line 48);
+  a second brief from the same judge flags it as a repeat of
+  plan version 1.
+- Measurement: suite 1051/1051 (1044 baseline + 7 new fixtures,
+  tests/test_judge.py TestBriefDiagnostics: diagnostics carried
+  and attributed; bound held under a 5000-line stderr with the
+  assertion surviving; no-output brief unchanged; pre-cycle-5
+  brief shape renders byte-identical; repeat flagged on the
+  second brief; no-Error-line diagnostics carried but
+  untracked; stdout fallback). No pins changed. Framework
+  guard: ALL CHECKS PASSED. Corpus replay unchanged (accepted
+  2/28, accepted-sound 2/28, accepted-unsound 0, both root
+  variants) — the replay path exercises parse/validate only
+  and never builds a brief. Planning-stage repair prompts (the
+  PlanError-code path) untouched. No live driver runs.
+- Net: the re-plan budget is still 2, but the re-plans are now
+  informed — the planner sees WHAT failed (the assertion, the
+  traceback frame) and, on a second failure, that it is looking
+  at the same failure again. Next live re-run will show whether
+  Gemma uses the substance to change the delta instead of
+  re-emitting it.

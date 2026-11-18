@@ -4998,6 +4998,12 @@ def _format_brief_for_prompt(brief: dict[str, Any]) -> str:
     thresholds, the failed nodes with their exact measurements, the
     relevant memory as lessons, the remaining budget — with nothing
     copyable. (Same fix family as the intent prose rendering in 04b76e1.)
+    Cycle 5: a failed node's entry also carries "diagnostics" — the
+    bounded tail of the node's own captured output, extracted by the
+    judge — rendered as its own block under the node's line. It is
+    output the node produced in this run, not a command or a memory
+    record, and the failing assertion it names is exactly what the
+    planner needs to change the substance instead of re-emitting it.
     """
     lines = ["Re-plan brief:"]
     goal = brief.get("goal", {})
@@ -5038,6 +5044,21 @@ def _format_brief_for_prompt(brief: dict[str, Any]) -> str:
             f"Measurement: {_describe_measurement(node.get('measurement') or {})}. "
             f"Error: {node.get('error', '') or 'none'}."
         )
+        diagnostics = node.get("diagnostics")
+        if isinstance(diagnostics, str) and diagnostics:
+            lines.append(
+                f"Captured output from failed node {node.get('id', '')} "
+                f"(tail):\n{diagnostics}"
+            )
+        repeated = node.get("repeated_diagnostic")
+        if isinstance(repeated, str) and repeated:
+            lines.append(
+                f"Repeated failure: node {node.get('id', '')} produced "
+                f"the same failure already briefed for plan version "
+                f"{node.get('repeated_from_version', '')}: {repeated}. "
+                "The previous delta plan did not remove it; change what "
+                "produces this result, not just the steps around it."
+            )
     measurements = brief.get("measurements") or []
     if measurements:
         lines.append("Measurements so far:")

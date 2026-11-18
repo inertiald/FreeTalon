@@ -221,5 +221,207 @@ class TestValidateDeltaPlan(unittest.TestCase):
         self.assertIn("replans", brief["remaining_budget"])
 
 
+
+# The node-3 failure shape from live re-run #2 (2026-11-18): a bash
+# test-run node whose measurement is criterion-shaped ("exit_code 1
+# != 0") while the assertion that names the actual defect lives only
+# in the node's captured stderr.
+_NODE3_STDERR = """F
+======================================================================
+FAIL: test_route_answers (__main__.RouteEndpointTests.test_route_answers)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/seeker/freetalon-workspace/test_health.py", line 48, in test_route_answers
+    self.assertIsInstance(data["ollama_reachable"], bool)
+AssertionError: 'Ellipsis' is not an instance of <class 'bool'>
+
+----------------------------------------------------------------------
+Ran 1 test in 0.563s
+
+FAILED (failures=1)
+"""
+
+_NODE3_ASSERTION = "AssertionError: 'Ellipsis' is not an instance of <class 'bool'>"
+
+
+def _executed_measurement():
+    return {
+        "node_id": "node-3",
+        "verdict": "FAIL",
+        "results": [
+            {
+                "criterion": {"type": "exit_code", "equals": 0},
+                "passed": False,
+                "measured": True,
+                "detail": "exit_code 1 != 0",
+            }
+        ],
+        "exit_code": 1,
+        "duration_s": 0.773,
+        "envelope_status": "completed",
+    }
+
+
+class TestBriefDiagnostics(unittest.TestCase):
+    """Cycle 5: the re-plan brief carries the failure's substance."""
+
+    def _brief(self, judge, node, plan_version=1):
+        from freetalon.orchestrator.models import GoalContract
+
+        plan = _plan([node])
+        return judge.build_replan_brief(
+            GoalContract(objective="g"),
+            plan,
+            [_executed_measurement()],
+            [],
+            plan_version,
+        )
+
+    def _node3(self, stderr=_NODE3_STDERR):
+        return _node(
+            "node-3",
+            measurement=_executed_measurement(),
+            error="failed criterion: exit_code 1 != 0",
+            inputs={
+                "command": "./.venv/bin/python /home/seeker/freetalon-workspace/test_health.py",
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": stderr,
+            },
+        )
+
+    def test_brief_carries_failure_diagnostics(self):
+        judge = Judge(RunBudget())
+        brief = self._brief(judge, self._node3())
+        entry = brief["failed_nodes"][0]
+        # The assertion and its traceback frame reach the brief,
+        # attributed to the node whose criterion line alone would
+        # have said only "exit_code 1 != 0".
+        self.assertIn(_NODE3_ASSERTION, entry["diagnostics"])
+        self.assertIn('test_health.py", line 48', entry["diagnostics"])
+        self.assertNotIn("repeated_diagnostic", entry)
+
+        from freetalon.orchestrator.planner import _format_brief_for_prompt
+
+        text = _format_brief_for_prompt(brief)
+        self.assertIn("Captured output from failed node node-3", text)
+        self.assertIn(_NODE3_ASSERTION, text)
+        self.assertIn("failed criterion: exit_code 1 != 0", text)
+
+    def test_brief_diagnostics_bounded_under_large_stderr(self):
+        judge = Judge(RunBudget())
+        big = "\n".join(f"noise line {i} " + "x" * 40 for i in range(5000))
+        big += "\n" + _NODE3_STDERR
+        brief = self._brief(judge, self._node3(stderr=big))
+        diagnostics = brief["failed_nodes"][0]["diagnostics"]
+        self.assertLessEqual(len(diagnostics), 1500)
+        self.assertLessEqual(len(diagnostics.splitlines()), 12)
+        # The tail survives the bound: the assertion is the substance.
+        self.assertIn(_NODE3_ASSERTION, diagnostics)
+
+    def test_brief_without_output_is_unchanged(self):
+        judge = Judge(RunBudget())
+        node = _node(
+            "node-3",
+            measurement=_executed_measurement(),
+            error="failed criterion: exit_code 1 != 0",
+            inputs={"command": "./.venv/bin/python tests/test_health.py"},
+        )
+        brief = self._brief(judge, node)
+        entry = brief["failed_nodes"][0]
+        self.assertEqual(entry["diagnostics"], "")
+        self.assertNotIn("repeated_diagnostic", entry)
+
+        from freetalon.orchestrator.planner import _format_brief_for_prompt
+
+        text = _format_brief_for_prompt(brief)
+        self.assertNotIn("Captured output", text)
+        self.assertNotIn("Repeated failure", text)
+
+    def test_format_brief_without_diagnostics_keys_is_byte_unchanged(self):
+        # A brief dict in the pre-cycle-5 shape (no diagnostics keys)
+        # renders exactly the prose it rendered before the change.
+        from freetalon.orchestrator.planner import _format_brief_for_prompt
+
+        brief = {
+            "goal": {"objective": "g"},
+            "plan_id": "p1",
+            "plan_version": 1,
+            "failed_nodes": [
+                {
+                    "id": "node-1",
+                    "objective": "node node-1",
+                    "assigned_claw": "bash",
+                    "hypothesis": "h1",
+                    "measurement": {
+                        "node_id": "node-1",
+                        "verdict": "FAIL",
+                        "exit_code": 1,
+                        "results": [
+                            {
+                                "criterion": {"type": "exit_code", "equals": 0},
+                                "passed": False,
+                                "measured": True,
+                                "detail": "exit_code 1 != 0",
+                            }
+                        ],
+                    },
+                    "error": "failed criterion: exit_code 1 != 0",
+                }
+            ],
+            "measurements": [],
+            "memory": [],
+            "remaining_budget": {},
+            "instruction": "",
+        }
+        self.assertEqual(
+            _format_brief_for_prompt(brief),
+            "Re-plan brief:\n"
+            "Goal: g\n"
+            "Plan: p1 (version 1)\n"
+            "Failed node node-1: node node-1 (claw: bash). "
+            "Hypothesis: h1. "
+            "Measurement: node node-1; verdict FAIL; exit 1; "
+            "failed criterion: exit_code 1 != 0. "
+            "Error: failed criterion: exit_code 1 != 0.",
+        )
+
+    def test_repeated_diagnostic_flagged_in_second_brief(self):
+        judge = Judge(RunBudget())
+        first = self._brief(judge, self._node3(), plan_version=1)
+        self.assertNotIn("repeated_diagnostic", first["failed_nodes"][0])
+        second = self._brief(judge, self._node3(), plan_version=2)
+        entry = second["failed_nodes"][0]
+        self.assertEqual(entry["repeated_diagnostic"], _NODE3_ASSERTION)
+        self.assertEqual(entry["repeated_from_version"], 1)
+
+        from freetalon.orchestrator.planner import _format_brief_for_prompt
+
+        text = _format_brief_for_prompt(second)
+        self.assertIn("Repeated failure: node node-3", text)
+        self.assertIn("plan version 1", text)
+        self.assertIn(_NODE3_ASSERTION, text)
+
+    def test_diagnostics_without_error_line_not_tracked(self):
+        judge = Judge(RunBudget())
+        node = self._node3(stderr="curl: (7) Failed to connect to localhost\n")
+        first = self._brief(judge, node, plan_version=1)
+        self.assertIn("Failed to connect", first["failed_nodes"][0]["diagnostics"])
+        second = self._brief(judge, self._node3(
+            stderr="curl: (7) Failed to connect to localhost\n"), plan_version=2)
+        self.assertNotIn("repeated_diagnostic", second["failed_nodes"][0])
+
+    def test_stdout_used_when_no_stderr(self):
+        judge = Judge(RunBudget())
+        node = _node(
+            "node-3",
+            measurement=_executed_measurement(),
+            error="failed criterion: exit_code 1 != 0",
+            inputs={"stdout": "some output\n" + _NODE3_ASSERTION + "\n"},
+        )
+        brief = self._brief(judge, node)
+        self.assertIn(_NODE3_ASSERTION, brief["failed_nodes"][0]["diagnostics"])
+
+
 if __name__ == "__main__":
     unittest.main()

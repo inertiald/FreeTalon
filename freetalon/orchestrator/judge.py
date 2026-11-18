@@ -93,6 +93,70 @@ def _is_unmeasurable(node: PlanNode) -> bool:
     return (node.measurement or {}).get("verdict") == VERDICT_UNMEASURABLE
 
 
+# Bounds for the diagnostic excerpt a re-plan brief carries per failed
+# node (see _failure_diagnostics): the tail of the node's captured
+# output, where test runners put the failure block and the assertion.
+_DIAGNOSTIC_TAIL_LINES = 12
+_DIAGNOSTIC_LINE_CHARS = 300
+_DIAGNOSTIC_MAX_CHARS = 1500
+
+
+def _failure_diagnostics(node: PlanNode) -> str:
+    """The bounded tail of a failed node's captured output.
+
+    The executor merges the handler's result into the node's inputs,
+    so a bash node's own stderr (else stdout) is on the node at brief
+    time. That text is where the substance of an executed failure
+    lives — the assertion a test raised, the error a tool printed —
+    while the measurement itself records only the criterion's shape
+    ("exit_code 1 != 0"). The excerpt is the output's last lines
+    (test runners print the failure block and its assertion at the
+    tail), each line and the whole capped, so a full-suite dump
+    cannot flood the re-plan prompt. Returns "" when the node
+    captured no output; the brief then renders exactly as it did
+    before diagnostics existed.
+    """
+    inputs = node.inputs or {}
+    text = ""
+    for key in ("stderr", "stdout"):
+        value = inputs.get(key)
+        if isinstance(value, str) and value.strip():
+            text = value
+            break
+    if not text:
+        return ""
+    lines = [line.rstrip() for line in text.strip("\n").splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    excerpt = lines[-_DIAGNOSTIC_TAIL_LINES:]
+    excerpt = [
+        line
+        if len(line) <= _DIAGNOSTIC_LINE_CHARS
+        else line[: _DIAGNOSTIC_LINE_CHARS - 3] + "..."
+        for line in excerpt
+    ]
+    while len(excerpt) > 1 and len("\n".join(excerpt)) > _DIAGNOSTIC_MAX_CHARS:
+        excerpt.pop(0)
+    return "\n".join(excerpt)
+
+
+def _diagnostic_fingerprint(diagnostics: str) -> str | None:
+    """The identity of a failure for repeat detection: its Error line.
+
+    The last line of the excerpt naming an error (AssertionError,
+    ValueError, ...) is the failure's substance in one line — the
+    same assertion raised again by a later plan version is the same
+    failure, whatever the surrounding steps were. Returns None when
+    the excerpt names no error; such failures are carried in the
+    brief but not tracked for repeats.
+    """
+    fingerprint: str | None = None
+    for line in diagnostics.splitlines():
+        if "Error" in line:
+            fingerprint = line.strip()
+    return fingerprint
+
+
 class Judge:
     """Stateful per-run judge: budget accounting, decisions, re-plan briefs."""
 
@@ -104,6 +168,11 @@ class Judge:
         self.retries_by_node: dict[str, int] = {}
         self.unmeasurable_streak: dict[str, int] = {}
         self.progress = ProgressTracker()
+        # Diagnostic fingerprints of the briefs this judge has already
+        # issued in this run, keyed by fingerprint with the plan
+        # version first briefed — a later brief whose failed node
+        # reproduces one names the repeat (see build_replan_brief).
+        self._briefed_diagnostics: dict[str, int] = {}
 
     # ── Bookkeeping ──────────────────────────────────────────────────────
 
@@ -226,28 +295,46 @@ class Judge:
     ) -> dict[str, Any]:
         """Structured brief for the planner: same goal, new information."""
         failed = [n for n in plan.nodes if n.status == PlanStatus.FAILED]
+        failed_entries: list[dict[str, Any]] = []
+        new_fingerprints: dict[str, int] = {}
+        for n in failed:
+            diagnostics = _failure_diagnostics(n)
+            entry: dict[str, Any] = {
+                "id": n.id,
+                "objective": n.objective,
+                "hypothesis": n.hypothesis,
+                "assigned_claw": n.assigned_claw,
+                # The node's inputs ride along so repeat detection
+                # (validate_delta_plan) can compute the failed
+                # approach's substance signature from what the
+                # node actually did, not from its wording. The
+                # planner's brief prompt reads only the prose
+                # fields and the bounded diagnostics below; the raw
+                # inputs are for the judge.
+                "inputs": dict(n.inputs or {}),
+                "measurement": n.measurement,
+                "error": n.error,
+                # The failure's substance, from the node's own
+                # captured output: the criterion detail alone
+                # ("exit_code 1 != 0") tells the planner THAT the
+                # node failed, never WHAT failed. Empty when the
+                # node captured no output.
+                "diagnostics": diagnostics,
+            }
+            fingerprint = _diagnostic_fingerprint(diagnostics)
+            if fingerprint is not None:
+                first_version = self._briefed_diagnostics.get(fingerprint)
+                if first_version is not None and first_version < plan_version:
+                    entry["repeated_diagnostic"] = fingerprint
+                    entry["repeated_from_version"] = first_version
+                new_fingerprints.setdefault(fingerprint, plan_version)
+            failed_entries.append(entry)
+        self._briefed_diagnostics.update(new_fingerprints)
         return {
             "goal": contract.model_dump(mode="json"),
             "plan_id": plan.plan_id,
             "plan_version": plan_version,
-            "failed_nodes": [
-                {
-                    "id": n.id,
-                    "objective": n.objective,
-                    "hypothesis": n.hypothesis,
-                    "assigned_claw": n.assigned_claw,
-                    # The node's inputs ride along so repeat detection
-                    # (validate_delta_plan) can compute the failed
-                    # approach's substance signature from what the
-                    # node actually did, not from its wording. The
-                    # planner's brief prompt reads only the prose
-                    # fields above; inputs are for the judge.
-                    "inputs": dict(n.inputs or {}),
-                    "measurement": n.measurement,
-                    "error": n.error,
-                }
-                for n in failed
-            ],
+            "failed_nodes": failed_entries,
             "measurements": measurements,
             "memory": memory,
             "remaining_budget": self.remaining_budget(),
