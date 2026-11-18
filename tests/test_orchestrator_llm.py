@@ -7379,14 +7379,27 @@ class TestPlannerPlaceholderCheapFix(unittest.TestCase):
 
         skeleton = _grounded_skeleton(self.HEALTH_GOAL, workspace=self.WS)
         self.assertIn("Do NOT write a TODO comment", skeleton)
-        self.assertIn("Write the FULL module", skeleton)
-        # The step-1 content is still placeholder-only (all comment
+        # Anchored-edit fix (retry #30): step-1 is no longer a
+        # full-module scaffold — the "Write the FULL module"
+        # instruction this test used to pin IS the retry-#30 defect
+        # (the model copied the sketch under it verbatim as a comment
+        # stub), so the phrase must be GONE from the skeleton, and
+        # step-1 is an anchored edit of the handler definition.
+        self.assertNotIn("Write the FULL module", skeleton)
+        # The step-1 delta is still placeholder-only (all comment
         # lines), so a verbatim copy of the sketch is rejected cheaply
-        # instead of slipping through as a plan. The branch lines carry
-        # quotes, which the JSON dump escapes, so they are asserted on
-        # the parsed content, not the raw skeleton string.
+        # instead of slipping through as a plan — now by anchored-edit
+        # materialization (a comment-only delta), not the scaffold
+        # placeholder check. The branch lines carry quotes, which the
+        # JSON dump escapes, so they are asserted on the parsed
+        # content, not the raw skeleton string.
         parsed = json.loads(skeleton.split("\n", 1)[1])
-        content = parsed["nodes"][0]["inputs"]["content"]
+        inputs = parsed["nodes"][0]["inputs"]
+        self.assertEqual(
+            inputs["anchor"], "HiveAPIServer.start.Handler.do_GET"
+        )
+        self.assertEqual(inputs["position"], "replace")
+        content = inputs["content"]
         self.assertIn('if path == "/health"', content)
         self.assertIn("self._send", content)
         self.assertTrue(is_placeholder_content(content))
@@ -15006,3 +15019,847 @@ class TestPlannerSkeletonGroundingFix(unittest.TestCase):
                     "drops %d of the existing module's 12 definitions" % dropped,
                     message,
                 )
+
+
+class TestPlannerAnchoredEditFix(unittest.TestCase):
+    """Anchored-edit scaffolds for existing modules (retry #30).
+
+    Retry #30 (log llm-end-to-end-health-retry30-2026-11-17.log,
+    DRIVER_EXIT 1) was the first run with the structure grounding
+    (1b6de40) live: the initial prompt carried api.py's FULL source
+    and the instruction to write the full updated module. The model
+    instead emitted step_1's scaffold as a 5-line COMMENT STUB —
+    the grounded skeleton's commented branch sketch plus the
+    steering sentences, copied into comments ("# Extend ... in
+    place ...", "# Do NOT write a TODO comment") — zero code. The
+    placeholder check rejected all three real plans (outputs 3/4/5:
+    1, 2, and 1 errors; the rest of those plans was the best-formed
+    yet — a real ephemeral-port test, the grounded CLI start, a curl
+    verify), and two repairs naming the defect did not move it.
+
+    Conclusion: a 12B model will not retype a 219-line module as one
+    node among five. The grounded source must reach the scaffold BY
+    CONSTRUCTION: the system seeds from the existing file and the
+    model supplies only the delta. A scaffold node for an existing
+    parseable module may now carry an anchored edit instead of the
+    whole file — inputs "anchor" (a qualified definition name),
+    "position" ("replace" substitutes the definition; "after" /
+    "before" insert a sibling next to it), and "content" holding
+    ONLY the new code, written at the exact indentation it has in
+    the file. _materialize_plan_edits runs in parse_planner_response
+    on the raw node dicts (the interpreter-normalization seam):
+    it reads the current file, splices the delta in at the anchor's
+    ast line span (decorators included), validates the result
+    (parses; every existing qualified definition still present),
+    and rewrites the node to the legacy full-content form BEFORE
+    the schema check and _collect_plan_errors run — so the
+    overwrite guard, the placeholder check, and the executor see
+    exactly the full-content world they see today, unchanged.
+    Materialization errors are named and steerable (anchor not
+    found / ambiguous, position invalid, delta placeholder or
+    comment-only, delta at the wrong indentation, a 'replace' delta
+    that is not the one definition, a splice that does not parse or
+    loses definitions); a rejection whose only errors are
+    placeholder deltas is cheap, like a placeholder scaffold.
+
+    Steering teaches the edit form as the PREFERRED way to change
+    an existing module: the EXISTING MODULE block in
+    _route_goal_shape (which also names the goal's natural anchor),
+    _extension_steering_block after a guard rejection, the
+    _APPROACH_MARKERS replacement for wholesale replacement, and
+    _grounded_skeleton's step-1 — the literal source of retry
+    #30's stub — which is now an anchored edit of the handler
+    definition with the branch sketch as the delta blank. The full
+    source / skeleton stay in the prompt (anchor choice and exact
+    indentation are copied from them), and the preservation
+    contract stays as the fallback for a plain full-content
+    scaffold. Legacy full-content scaffolds (new files, small
+    files, everything else) work unchanged; bash/heredoc writes
+    are untouched. The retry-#30 outputs still reject with exactly
+    the same profiles under both repo roots, and the retry-#28/#29
+    fixtures keep theirs (pinned by their own classes).
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+    WS = "/home/seeker/freetalon-workspace"
+
+    # The exact retry-#30 outputs 3, 4, and 5 (the three real
+    # plans), verbatim from the RAW PLANNER OUTPUT blocks of the
+    # retry-#30 driver section of
+    # logs/llm-end-to-end-health-retry30-2026-11-17.log (the same
+    # extraction tools/probe-retry30-rejections.py performs).
+    # Embedded (not read from the log) so the tests stay hermetic
+    # in CI.
+    RETRY30_OUTPUT3_RAW = '{\n"nodes":[\n{"id":"step-1","objective":"Extend /home/seeker/projects/FreeTalon/freetalon/api.py in place   add the fields the goal asks for to the existing /health branch in the do_GET method of the Handler class (defined inside HiveAPIServer.start)","depends_on":[],"assigned_claw":"scaffold","inputs":{"file_path":"/home/seeker/projects/FreeTalon/freetalon/api.py","content":"# Extend /home/seeker/projects/FreeTalon/freetalon/api.py in place   add the fields the goal asks for to the existing /health branch in the do_GET method of the Handler class (defined inside HiveAPIServer.start):\\n#  if path == \\"/health\\":\\n#    return self._send(200,{\\"ok\\":True,\\"status\\":\\"ready\\"})\\n# Write the FULL module with the extended branch   the scaffold replaces the whole file, so a fragment alone is not a plan.\\n# Do NOT write a TODO comment   a comment-only scaffold is rejected."},"outputs":["/home/seeker/projects/FreeTalon/freetalon/api.py"],"acceptance":["The /health endpoint is implemented in /home/seeker/projects/FreeTalon/freetalon/api.py."],"criteria":[{"type":"file_exists","path":"/home/seeker/projects/FreeTalon/freetalon/api.py"}]},{"id":"step-2","objective":"Write the tests for /health","depends_on":["step-1"],"assigned_claw":"bash","inputs":{"command":"cat > /home/seeker/freetalon-workspace/test_health.py <<\'EOF\'\\nimport json\\nimport sys\\nimport tempfile\\nimport unittest\\nimport urllib.request\\nfrom pathlib import Path\\n\\nsys.path.insert(0, \\"/home/seeker/projects/FreeTalon\\")\\n\\nfrom freetalon.api import HiveAPIServer\\nfrom freetalon.config import HiveConfig\\nfrom freetalon.hive import HiveController\\n\\n\\nclass RouteEndpointTests(unittest.TestCase):\\n    def setUp(self):\\n        self.tmpdir = tempfile.TemporaryDirectory()\\n        base = Path(self.tmpdir.name)\\n        config = HiveConfig(\\n            workspace=base,\\n            state_path=base / \\"state.json\\",\\n            audit_log_path=base / \\"audit.log\\",\\n            worker_cap=2,\\n            queue_multiplier=3,\\n            poll_interval_seconds=0.02,\\n        )\\n        self.controller = HiveController(config)\\n        self.controller.start()\\n        self.server = HiveAPIServer(self.controller, \\"test-token\\")\\n        self.server.start(\\"127.0.0.1\\", 0)\\n        port = self.server._httpd.server_address[1]\\n        self.base = f\\"http://127.0.0.1:{port}\\"\\n\\n    def tearDown(self):\\n        self.server.stop()\\n        self.controller.stop()\\n        self.tmpdir.cleanup()\\n\\n    def test_route_answers(self):\\n        with urllib.request.urlopen(f\\"{self.base}/health\\", timeout=3) as resp:\\n            status = resp.status\\n            data = json.loads(resp.read())\\n        self.assertEqual(status, 200)\\n        self.assertTrue(data[\\"ok\\"])\\n        self.assertIn(\\"status\\", data)\\n        self.assertIn(\\"service_status\\", data)\\n        self.assertIn(\\"ollama_reachable\\", data)\\n        self.assertIsInstance(data[\\"ollama_reachable\\"], bool)\\n        self.assertIn(\\"gpu_temperature\\", data)\\n        self.assertIsInstance(data[\\"gpu_temperature\\"], (int, float))\\n\\n\\nif __name__ == \\"__main__\\":\\n    unittest.main()\\nEOF"},"outputs":["/home/seeker/freetalon-workspace/test_health.py"],"acceptance":["The tests for /health exist."],"criteria":[{"type":"file_exists","path":"/home/seeker/freetalon-workspace/test_health.py"}]},{"id":"step-3","objective":"Run the tests for /health","depends_on":["step-2"],"assigned_claw":"bash","inputs":{"command":"python3 /home/seeker/freetalon-workspace/test_health.py"},"outputs":["test results"],"acceptance":["The tests for /health pass."],"criteria":[{"type":"exit_code","equals":0}]},{"id":"step-4","objective":"Start the API server for /health","depends_on":["step-3"],"assigned_claw":"bash","inputs":{"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli stop; ./venv/bin/python -m freetalon.cli start && for i in $(seq 1 30); do curl -sf http://localhost:8765/health && break; sleep 1; done; curl -sf http://localhost:8765/health"},"outputs":["API server running"],"acceptance":["The API server answers /health."],"criteria":[{"type":"exit_code","equals":0}]},{"id":"step-5","objective":"Verify /health live","depends_on":["step-4"],"assigned_claw":"bash","inputs":{"command":"curl -s http://localhost:8765/health"},"outputs":["verification"],"acceptance":["/health returns its JSON live."],"criteria":[{"type":"exit_code","equals":0}]}]\n}'
+    RETRY30_OUTPUT4_RAW = '{\n"nodes":\n[\n{\n"id":\n"step-1",\n"objective":\n"Extend /home/seeker/projects/FreeTalon/freetalon/api.py in place   add a /health branch to the do_GET method of the Handler class (defined inside HiveAPIServer.start)",\n"depends_on":\n[],\n"assigned_claw":\n"scaffold",\n"inputs":\n{\n"file_path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":\n"# Extend /home/seeker/projects/FreeTalon/freetalon/api.py in place   add the fields the goal asks for to the existing /health branch in the do_GET method of the Handler class (defined inside HiveAPIServer.start):\\n#\\tif path == \\"/health\\":\\n#\\t\\t\\treturn self._send(200,{\\"ok\\": True, \\"status\\": \\"ready\\"})\\n# Write the FULL module with the extended branch   the scaffold replaces the whole file, so a fragment alone is not a plan.\\n# Do NOT write a TODO comment   a comment-only scaffold is rejected."\n},\n"outputs":\n[\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n],\n"acceptance":\n[\n"The /health endpoint is implemented in /home/seeker/projects/FreeTalon/freetalon/api.py."\n],\n"criteria":\n[\n{\n"type":\n"file_exists",\n"path":\n"/home/seeker/projects/FreeTalon/freetalon/api.py"\n}\n]\n},\n{\n"id":\n"step-2",\n"objective":\n"Write the tests for /health",\n"depends_on":\n[\n"step-1"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"cat > /home/seeker/freetalon-workspace/test_health.py <<\'EOF\'\\nimport json\\nimport sys\\nimport tempfile\\nimport unittest\\nimport urllib.request\\nfrom pathlib import Path\\n\\nsys.path.insert(0, \\"/home/seeker/projects/FreeTalon\\")\\n\\nfrom freetalon.api import HiveAPIServer\\nfrom freetalon.config import HiveConfig\\nfrom freetalon.hive import HiveController\\n\\n\\nclass RouteEndpointTests(unittest.TestCase):\\n    def setUp(self):\\n        self.tmpdir = tempfile.TemporaryDirectory()\\n        base = Path(self.tmpdir.name)\\n        config = HiveConfig(\\n            workspace=base,\\n            state_path=base / \\"state.json\\",\\n            audit_log_path=base / \\"audit.log\\",\\n            worker_cap=2,\\n            queue_multiplier=3,\\n            poll_interval_seconds=0.02,\\n        )\\n        self.controller = HiveController(config)\\n        self.controller.start()\\n        self.server = HiveAPIServer(self.controller, \\"test-token\\")\\n        self.server.start(\\"127.0.0.1\\", 0)\\n        port = self.server._httpd.server_address[1]\\n        self.base = f\\"http://127.0.0.1:{port}\\"\\n\\n    def tearDown(self):\\n        self.server.stop()\\n        self.controller.stop()\\n        self.tmpdir.cleanup()\\n\\n    def test_route_answers(self):\\n        with urllib.request.urlopen(f\\"{self.base}/health\\", timeout=3) as resp:\\n            status = resp.status\\n            data = json.loads(resp.read())\\n        self.assertEqual(status, 200)\\n        self.assertTrue(data[\\"ok\\"])\\n        self.assertIn(\\"status\\", data)\\n        self.assertIn(\\"service_status\\", data)\\n        self.assertIn(\\"ollama_reachable\\", data)\\n        self.assertIsInstance(data[\\"ollama_reachable\\"], bool)\\n        self.assertIn(\\"gpu_temperature\\", data)\\n        self.assertIsInstance(data[\\"gpu_temperature\\"], (int, float))\\n\\n\\nif __name__ == \\"__main__\\":\\nunittest.main()\\nEOF"\n},\n"outputs":\n[\n"/home/seeker/freetalon-workspace/test_health.py"\n],\n"acceptance":\n[\n"The tests for /health exist."\n],\n"criteria":\n[\n{\n"type":\n"file_exists",\n"path":\n"/home/seeker/freetalon-workspace/test_health.py"\n}\n]\n},\n{\n"id":\n"step-3",\n"objective":\n"Run the tests for /health",\n"depends_on":\n[\n"step-2"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"python3 /home/seeker/freetalon-workspace/test_health.py"\n},\n"outputs":\n[\n"test results"\n],\n"acceptance":\n[\n"The tests for /health pass."\n],\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n]\n},\n{\n"id":\n"step-4",\n"objective":\n"Start the API server for /health",\n"depends_on":\n[\n"step-3"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli stop; ./venv/bin/python -m freetalon.cli start && for i in $(seq 1 30); do curl -sf http://localhost:8765/health && break; sleep 1; done; curl -sf http://localhost:8765/health"\n},\n"outputs":\n[\n"API server running"\n],\n"acceptance":\n[\n"The API server answers /health."\n],\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n]\n},\n{\n"id":\n"step-5",\n"objective":\n"Verify /health live",\n"depends_on":\n[\n"step-4"\n],\n"assigned_claw":\n"bash",\n"inputs":\n{\n"command":\n"curl -s http://localhost:8765/health"\n},\n"outputs":\n[\n"verification"\n],\n"acceptance":\n[\n"/health returns its JSON live."\n],\n"criteria":\n[\n{\n"type":\n"exit_code",\n"equals":\n0\n}\n]\n}\n]\n}'
+    RETRY30_OUTPUT5_RAW = '{\n"nodes":[\n{"id":"step-1",\n"objective":"Extend /home/seeker/projects/FreeTalon/freetalon/api.py in place   add a /health branch to the do_GET method of the Handler class (defined inside HiveAPIServer.start)",\n"depends_on":[],\n"assigned_claw":"scaffold",\n"inputs":{\n"file_path":"/home/seeker/projects/FreeTalon/freetalon/api.py",\n"content":"# Extend /home/seeker/projects/FreeTalon/freetalon/api.py in place   add the fields the goal asks for to the existing /health branch in the do_GET method of the Handler class (defined inside HiveAPIServer.start):\\n#\\tif path == \\"/health\\":\\n#\\t\\t\\treturn self._send(200,{\\"ok\\":True,\\"status\\":\\"ready\\",\\"service_status\\":\\"running\\",\\"ollama_reachable\\":true,\\"gpu_temperature\\":25})\\n# Write the FULL module with the extended branch   the scaffold replaces the whole file, so a fragment alone is not a plan.\\n# Do NOT write a TODO comment   a comment-only scaffold is rejected."\n},\n"outputs":["/home/seeker/projects/FreeTalon/freetalon/api.py"],\n"acceptance":["The /health endpoint is implemented in /home/seeker/projects/FreeTalon/freetalon/api.py."],\n"criteria":[{"type":"file_exists",\n"path":"/home/seeker/projects/FreeTalon/freetalon/api.py"}]\n},\n{"id":"step-2",\n"objective":"Write the tests for /health",\n"depends_on":["step-1"],\n"assigned_claw":"bash",\n"inputs":{\n"command":"cat > /home/seeker/freetalon-workspace/test_health.py <<\'EOF\'\\nimport json\\nimport sys\\nimport tempfile\\nimport unittest\\nimport urllib.request\\nfrom pathlib import Path\\n\\nsys.path.insert(0, \\"/home/seeker/projects/FreeTalon\\")\\n\\nfrom freetalon.api import HiveAPIServer\\nfrom freetalon.config import HiveConfig\\nfrom freetalon.hive import HiveController\\n\\n\\nclass RouteEndpointTests(unittest.TestCase):\\n    def setUp(self):\\n        self.tmpdir = tempfile.TemporaryDirectory()\\n        base = Path(self.tmpdir.name)\\n        config = HiveConfig(\\n            workspace=base,\\n            state_path=base / \\"state.json\\",\\n            audit_log_path=base / \\"audit.log\\",\\n            worker_cap=2,\\n            queue_multiplier=3,\\n            poll_interval_seconds=0.02,\\n        )\\n        self.controller = HiveController(config)\\n        self.controller.start()\\n        self.server = HiveAPIServer(self.controller, \\"test-token\\")\\n        self.server.start(\\"127.0.0.1\\", 0)\\n        port = self.server._httpd.server_address[1]\\n        self.base = f\\"http://127.0.0.1:{port}\\"\\n\\n    def tearDown(self):\\n        self.server.stop()\\n        self.controller.stop()\\n        self.tmpdir.cleanup()\\n\\n    def test_route_answers(self):\\n        with urllib.request.urlopen(f\\"{self.base}/health\\", timeout=3) as resp:\\n            status = resp.status\\n            data = json.loads(resp.read())\\n        self.assertEqual(status, 200)\\n        self.assertTrue(data[\\"ok\\"])\\n        self.assertIn(\\"status\\", data)\\n        self.assertIn(\\"service_status\\", data)\\n        self.assertIn(\\"ollama_reachable\\", data)\\n        self.assertIsInstance(data[\\"ollama_reachable\\"], bool)\\n        self.assertIn(\\"gpu_temperature\\", data)\\n        self.assertIsInstance(data[\\"gpu_temperature\\"], (int, float))\\n\\n\\nif __name__ == \\"__main__\\":\\n    unittest.main()\\nEOF"\n},\n"outputs":["/home/seeker/freetalon-workspace/test_health.py"],\n"acceptance":["The tests for /health exist."],\n"criteria":[{"type":"file_exists",\n"path":"/home/seeker/freetalon-workspace/test_health.py"}]\n},\n{"id":"step-3",\n"objective":"Run the tests for /health",\n"depends_on":["step-2"],\n"assigned_claw":"bash",\n"inputs":{\n"command":"python3 /home/seeker/freetalon-workspace/test_health.py"\n},\n"outputs":["test results"],\n"acceptance":["The tests for /health pass."],\n"criteria":[{"type":"exit_code",\n"equals":0}]\n},\n{"id":"step-4",\n"objective":"Start the API server for /health",\n"depends_on":["step-3"],\n"assigned_claw":"bash",\n"inputs":{\n"command":"cd /home/seeker/projects/FreeTalon && ./venv/bin/python -m freetalon.cli stop; ./venv/bin/python -m freetalon.cli start && for i in $(seq 1 30); do curl -sf http://localhost:8765/health && break; sleep 1; done; curl -sf http://localhost:8765/health"\n},\n"outputs":["API server running"],\n"acceptance":["The API server answers /health."],\n"criteria":[{"type":"exit_code",\n"equals":0}]\n},\n{"id":"step-5",\n"objective":"Verify /health live",\n"depends_on":["step-4"],\n"assigned_claw":"bash",\n"inputs":{\n"command":"curl -s http://localhost:8765/health"\n},\n"outputs":["verification"],\n"acceptance":["/health returns its JSON live."],\n"criteria":[{"type":"exit_code",\n"equals":0}]\n}\n]\n}'
+
+    # A fixture module with the shapes materialization must handle:
+    # a decorated multi-line module-level function, a class whose
+    # method defines a nested handler class, a one-line body.
+    # Qualified definitions (9): _wrap, _wrap.inner, greet, Server,
+    # Server.start, Server.start.Handler,
+    # Server.start.Handler.do_GET, Server.start.Handler.do_POST,
+    # Server.stop.
+    MODULE_SOURCE = (
+        '"""Fixture module for anchored edits."""\n'
+        "import functools\n"
+        "\n"
+        "\n"
+        "def _wrap(fn):\n"
+        "    @functools.wraps(fn)\n"
+        "    def inner(*args, **kwargs):\n"
+        "        return fn(*args, **kwargs)\n"
+        "    return inner\n"
+        "\n"
+        "\n"
+        "@_wrap\n"
+        "def greet(\n"
+        "    name: str,\n"
+        ") -> str:\n"
+        '    return "hello " + name\n'
+        "\n"
+        "\n"
+        "class Server:\n"
+        "    def start(self):\n"
+        "        class Handler:\n"
+        "            def do_GET(self):\n"
+        '                return "ok"\n'
+        "\n"
+        "            def do_POST(self):\n"
+        '                return "posted"\n'
+        "\n"
+        "        return Handler\n"
+        "\n"
+        "    def stop(self):\n"
+        "        return None\n"
+    )
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_root = Path(self._tmp.name)
+        self.module_path = str(self.tmp_root / "fixture_module.py")
+        Path(self.module_path).write_text(self.MODULE_SOURCE, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _edit_node(
+        self,
+        target: str,
+        anchor: object,
+        position: object,
+        content: object,
+        node_id: str = "step-1",
+    ) -> dict:
+        return {
+            "id": node_id,
+            "objective": "Edit the module in place",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": target,
+                "anchor": anchor,
+                "position": position,
+                "content": content,
+            },
+            "outputs": [target],
+            "acceptance": ["The module is edited."],
+            "criteria": [{"type": "file_exists", "path": target}],
+        }
+
+    def _rejection(self, raw: str, **kwargs: object) -> str:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(raw, **kwargs)
+        return str(caught.exception)
+
+    # --- Materialization correctness ---
+
+    def test_replace_nested_method_materializes_full_module(self) -> None:
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        delta = (
+            "            def do_GET(self):\n"
+            '                return "ok-extended"\n'
+        )
+        nodes, _meta = parse_planner_response(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "replace",
+                        delta,
+                    )
+                ]
+            )
+        )
+        self.assertEqual(len(nodes), 1)
+        inputs = nodes[0].inputs
+        # The node is now indistinguishable from a legacy
+        # full-content scaffold: no edit keys survive.
+        self.assertNotIn("anchor", inputs)
+        self.assertNotIn("position", inputs)
+        content = inputs["content"]
+        import ast
+
+        ast.parse(content)
+        self.assertEqual(
+            qualified_def_names(content),
+            qualified_def_names(self.MODULE_SOURCE),
+        )
+        self.assertIn('"ok-extended"', content)
+        # Byte-exact splice: only the anchor's span changed.
+        expected = self.MODULE_SOURCE.replace(
+            '            def do_GET(self):\n                return "ok"\n',
+            delta,
+        )
+        self.assertEqual(content, expected)
+
+    def test_insert_after_adds_sibling_method(self) -> None:
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        delta = (
+            "            def do_PUT(self):\n"
+            '                return "put"\n'
+        )
+        nodes, _meta = parse_planner_response(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "after",
+                        delta,
+                    )
+                ]
+            )
+        )
+        content = nodes[0].inputs["content"]
+        names = qualified_def_names(content)
+        # qualified_def_names is in document order: the new sibling
+        # appears in position, between the anchor and the next method.
+        expected = qualified_def_names(self.MODULE_SOURCE)
+        expected.insert(
+            expected.index("Server.start.Handler.do_GET") + 1,
+            "Server.start.Handler.do_PUT",
+        )
+        self.assertEqual(names, expected)
+        # The sibling lands between the anchor and the next method.
+        self.assertLess(content.index("def do_GET"), content.index("def do_PUT"))
+        self.assertLess(content.index("def do_PUT"), content.index("def do_POST"))
+
+    def test_insert_before_at_module_level(self) -> None:
+        delta = 'def farewell(name: str) -> str:\n    return "bye " + name\n'
+        nodes, _meta = parse_planner_response(
+            self._dag(
+                [self._edit_node(self.module_path, "greet", "before", delta)]
+            )
+        )
+        content = nodes[0].inputs["content"]
+        self.assertIn("farewell", content)
+        # Inserted before the anchor's DECORATOR line: the decorator
+        # still belongs to greet.
+        self.assertLess(content.index("def farewell"), content.index("@_wrap"))
+        self.assertLess(content.index("@_wrap"), content.index("def greet"))
+
+    def test_replace_decorated_multiline_definition(self) -> None:
+        delta = (
+            "@_wrap\n"
+            "def greet(\n"
+            "    name: str,\n"
+            ") -> str:\n"
+            '    return "hi " + name\n'
+        )
+        nodes, _meta = parse_planner_response(
+            self._dag(
+                [self._edit_node(self.module_path, "greet", "replace", delta)]
+            )
+        )
+        content = nodes[0].inputs["content"]
+        self.assertIn('"hi " + name', content)
+        self.assertNotIn('"hello " + name', content)
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        self.assertEqual(
+            qualified_def_names(content),
+            qualified_def_names(self.MODULE_SOURCE),
+        )
+
+    def test_multiple_edits_same_module_accumulate(self) -> None:
+        first = self._edit_node(
+            self.module_path,
+            "Server.start.Handler.do_GET",
+            "replace",
+            '            def do_GET(self):\n                return "ok-extended"\n',
+        )
+        second = self._edit_node(
+            self.module_path,
+            "Server.start.Handler.do_POST",
+            "after",
+            '            def do_PUT(self):\n                return "put"\n',
+            node_id="step-2",
+        )
+        second["depends_on"] = ["step-1"]
+        nodes, _meta = parse_planner_response(self._dag([first, second]))
+        self.assertEqual(len(nodes), 2)
+        # The second node's content is built on the first edit's
+        # result (not the stale file): it carries BOTH changes, so
+        # executing the nodes in order lands both edits.
+        final = nodes[1].inputs["content"]
+        self.assertIn('"ok-extended"', final)
+        self.assertIn('"put"', final)
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        self.assertIn(
+            "Server.start.Handler.do_PUT", qualified_def_names(final)
+        )
+
+    def test_real_module_edit_in_grounded_plan_accepted(self) -> None:
+        # The grounded plan shape for the /health goal, with step-1
+        # as an anchored edit of the real api.py: replace do_GET
+        # with its own text plus the extended /health branch.
+        from freetalon.orchestrator.planner import _definition_spans
+
+        source = Path(self.api_path).read_text(encoding="utf-8")
+        spans = {
+            name: (start, end)
+            for name, start, end, _indent in _definition_spans(source)
+        }
+        start, end = spans["HiveAPIServer.start.Handler.do_GET"]
+        do_get = "\n".join(source.splitlines()[start - 1 : end])
+        delta = do_get.replace(
+            'return self._send(200, {"ok": True, "status": "ready"})',
+            'return self._send(200, {"ok": True, "status": "ready", '
+            '"service_status": "ready", "ollama_reachable": True, '
+            '"gpu_temperature": 42})',
+        )
+        self.assertNotEqual(delta, do_get)
+        ws = self.WS
+        nodes = [
+            {
+                "id": "step_1",
+                "objective": "Extend the health endpoint in freetalon/api.py",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {
+                    "file_path": self.api_path,
+                    "anchor": "HiveAPIServer.start.Handler.do_GET",
+                    "position": "replace",
+                    "content": delta,
+                },
+                "outputs": [self.api_path],
+                "criteria": [{"type": "file_exists", "path": self.api_path}],
+            },
+            {
+                "id": "step_2",
+                "objective": "Write the health endpoint test file",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": TestPlannerHeredocFix.HEREDOC_TEST},
+                "outputs": [f"{ws}/test_health.py"],
+                "criteria": [
+                    {"type": "file_exists", "path": f"{ws}/test_health.py"}
+                ],
+            },
+            {
+                "id": "step_3",
+                "objective": "Run the health endpoint tests",
+                "depends_on": ["step_2"],
+                "assigned_claw": "bash",
+                "inputs": {"command": f"python3 {ws}/test_health.py"},
+                "outputs": ["test results"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+            {
+                "id": "step_4",
+                "objective": "Verify the endpoint live",
+                "depends_on": ["step_3"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "curl -s http://localhost:8765/health"},
+                "outputs": ["verification"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+        for root in (None, str(self.repo_root)):
+            parsed, _meta = parse_planner_response(
+                self._dag(nodes),
+                goal_text=self.HEALTH_GOAL,
+                workspace=ws,
+                repo_root=root,
+            )
+            self.assertEqual(len(parsed), 4)
+            content = parsed[0].inputs["content"]
+            self.assertNotIn("anchor", parsed[0].inputs)
+            self.assertIn('"gpu_temperature": 42', content)
+            from freetalon.orchestrator.repo_index import qualified_def_names
+
+            self.assertEqual(
+                qualified_def_names(content), qualified_def_names(source)
+            )
+
+    # --- Error cases: named and steerable ---
+
+    def test_anchor_not_found_names_the_definitions(self) -> None:
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_DELETE",
+                        "replace",
+                        "            def do_DELETE(self):\n"
+                        '                return "gone"\n',
+                    )
+                ]
+            )
+        )
+        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("is not a definition of", message)
+        self.assertIn("Server.start.Handler.do_DELETE", message)
+        # The full definition list rides along, so the repair can
+        # pick a real anchor.
+        self.assertIn("Server.start.Handler.do_GET", message)
+        self.assertIn("Server.stop", message)
+        self.assertIn("ANCHORED EDIT", message)
+
+    def test_ambiguous_anchor(self) -> None:
+        dup_path = str(self.tmp_root / "dup.py")
+        Path(dup_path).write_text(
+            "class Dup:\n"
+            "    def m(self):\n"
+            "        return 1\n"
+            "\n"
+            "    def m(self):\n"
+            "        return 2\n"
+            "\n"
+            "\n"
+            "def a():\n"
+            "    return 1\n"
+            "\n"
+            "\n"
+            "def b():\n"
+            "    return 2\n",
+            encoding="utf-8",
+        )
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        dup_path,
+                        "Dup.m",
+                        "replace",
+                        "    def m(self):\n        return 3\n",
+                    )
+                ]
+            )
+        )
+        self.assertIn("names 2 definitions", message)
+        self.assertIn("must name exactly one", message)
+
+    def test_placeholder_delta_is_a_cheap_rejection(self) -> None:
+        from freetalon.orchestrator.planner import CheapRejectionError
+
+        raw = self._dag(
+            [
+                self._edit_node(
+                    self.module_path,
+                    "Server.start.Handler.do_GET",
+                    "replace",
+                    "# TODO: write the extended handler here\n",
+                )
+            ]
+        )
+        with self.assertRaises(CheapRejectionError) as caught:
+            parse_planner_response(raw)
+        message = str(caught.exception)
+        self.assertIn("placeholder content only", message)
+        self.assertIn("anchored edit", message)
+
+    def test_unparseable_splice(self) -> None:
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "after",
+                        "            def do_PUT(self)\n"
+                        '                return "put"\n',
+                    )
+                ]
+            )
+        )
+        self.assertIn("does not parse as Python", message)
+        self.assertIn("Server.start.Handler.do_GET", message)
+
+    def test_indent_mismatch(self) -> None:
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "replace",
+                        'def do_GET(self):\n    return "ok"\n',
+                    )
+                ]
+            )
+        )
+        self.assertIn("starts at 0 spaces of indentation", message)
+        self.assertIn("sits at 12 spaces in the file", message)
+
+    def test_replace_losing_nested_definitions(self) -> None:
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start",
+                        "replace",
+                        "    def start(self):\n        return None\n",
+                    )
+                ]
+            )
+        )
+        self.assertIn("loses existing definitions", message)
+        self.assertIn("Server.start.Handler", message)
+        self.assertIn("Server.start.Handler.do_GET", message)
+
+    def test_replace_with_a_different_definition(self) -> None:
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "replace",
+                        "            def do_FETCH(self):\n"
+                        '                return "x"\n',
+                    )
+                ]
+            )
+        )
+        self.assertIn("defines do_FETCH at its top level", message)
+        self.assertIn(
+            "complete new version of 'Server.start.Handler.do_GET'", message
+        )
+
+    def test_replace_with_body_fragment(self) -> None:
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.start.Handler.do_GET",
+                        "replace",
+                        "            if True:\n                return 1\n",
+                    )
+                ]
+            )
+        )
+        self.assertIn("defines no definition at its top level", message)
+
+    def test_replace_with_the_whole_module(self) -> None:
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path, "greet", "replace", self.MODULE_SOURCE
+                    )
+                ]
+            )
+        )
+        self.assertIn("not the whole module", message)
+
+    def test_position_without_anchor_and_bad_position(self) -> None:
+        node = self._edit_node(
+            self.module_path,
+            "Server.stop",
+            "replace",
+            "    def stop(self):\n        return None\n",
+        )
+        del node["inputs"]["anchor"]
+        message = self._rejection(self._dag([node]))
+        self.assertIn("carries a 'position' but no usable 'anchor'", message)
+
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        self.module_path,
+                        "Server.stop",
+                        "sideways",
+                        "    def stop(self):\n        return None\n",
+                    )
+                ]
+            )
+        )
+        self.assertIn("'position' must be 'replace'", message)
+
+    def test_anchor_on_new_file(self) -> None:
+        new_path = str(self.tmp_root / "brand_new.py")
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        new_path,
+                        "thing",
+                        "replace",
+                        "def thing():\n    return 1\n",
+                    )
+                ]
+            )
+        )
+        self.assertIn("does not exist", message)
+        self.assertIn("without an 'anchor'", message)
+
+    def test_anchor_on_tiny_and_unparseable_modules(self) -> None:
+        tiny_path = str(self.tmp_root / "tiny.py")
+        Path(tiny_path).write_text(
+            "def a():\n    return 1\n\n\ndef b():\n    return 2\n\n\n"
+            "def c():\n    return 3\n",
+            encoding="utf-8",
+        )
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        tiny_path, "a", "replace", "def a():\n    return 9\n"
+                    )
+                ]
+            )
+        )
+        self.assertIn("too small for an anchored edit", message)
+
+        broken_path = str(self.tmp_root / "broken.py")
+        Path(broken_path).write_text("def nope(:\n", encoding="utf-8")
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        broken_path, "nope", "replace", "def nope():\n    pass\n"
+                    )
+                ]
+            )
+        )
+        self.assertIn("does not parse as Python", message)
+        self.assertIn("no definition in it can be anchored", message)
+
+    def test_anchor_on_non_python_target(self) -> None:
+        text_path = str(self.tmp_root / "notes.txt")
+        Path(text_path).write_text("some notes\n", encoding="utf-8")
+        message = self._rejection(
+            self._dag(
+                [
+                    self._edit_node(
+                        text_path, "thing", "replace", "def thing():\n    pass\n"
+                    )
+                ]
+            )
+        )
+        self.assertIn("is not a Python module", message)
+
+    # --- Legacy form untouched ---
+
+    def test_legacy_full_content_scaffold_unchanged(self) -> None:
+        node = {
+            "id": "step-1",
+            "objective": "Rewrite the module wholesale (legacy form)",
+            "depends_on": [],
+            "assigned_claw": "scaffold",
+            "inputs": {
+                "file_path": self.module_path,
+                "content": self.MODULE_SOURCE,
+            },
+            "outputs": [self.module_path],
+            "acceptance": ["The module exists."],
+            "criteria": [{"type": "file_exists", "path": self.module_path}],
+        }
+        nodes, _meta = parse_planner_response(self._dag([node]))
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].inputs["content"], self.MODULE_SOURCE)
+
+    # --- Steering ---
+
+    def test_shape_block_teaches_anchored_edit(self) -> None:
+        from freetalon.orchestrator.planner import _route_goal_shape
+
+        for delta in (False, True):
+            shape = _route_goal_shape(
+                self.HEALTH_GOAL, str(self.repo_root), delta=delta
+            )
+            self.assertIn("EXISTING MODULE", shape)
+            self.assertIn("PREFER an anchored edit", shape)
+            self.assertIn('"anchor"', shape)
+            # The goal's natural anchor is named concretely.
+            self.assertIn(
+                "natural anchor is 'HiveAPIServer.start.Handler.do_GET'",
+                shape,
+            )
+            # The preservation contract stays as the fallback.
+            self.assertIn("full updated module", shape)
+            self.assertIn("same nesting", shape)
+
+    def test_extension_block_teaches_anchored_edit(self) -> None:
+        from freetalon.orchestrator.planner import _extension_steering_block
+
+        raw = TestPlannerExtensionSteeringFix.RETRY28_OUTPUT2_RAW
+        message = self._rejection(
+            raw,
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+            repo_root=None,
+        )
+        block = _extension_steering_block(raw, message, None)
+        self.assertIn("EXISTING-MODULE EXTENSION", block)
+        self.assertIn("ANCHORED EDIT", block)
+        self.assertIn('"anchor"', block)
+        self.assertIn("return by construction", block)
+        # The fallback contract is still stated.
+        self.assertIn("FULL updated module", block)
+
+    def test_grounded_skeleton_step1_is_an_anchored_edit(self) -> None:
+        import json
+
+        from freetalon.orchestrator.planner import _grounded_skeleton
+
+        skeleton = _grounded_skeleton(
+            self.HEALTH_GOAL, str(self.repo_root), self.WS
+        )
+        self.assertIn("anchored edit", skeleton)
+        parsed = json.loads(skeleton.split("\n", 1)[1])
+        step1 = parsed["nodes"][0]
+        self.assertEqual(
+            step1["inputs"]["anchor"], "HiveAPIServer.start.Handler.do_GET"
+        )
+        self.assertEqual(step1["inputs"]["position"], "replace")
+
+    def test_completed_skeleton_is_accepted(self) -> None:
+        # The money test for retry #30's failure mode: take the
+        # grounded skeleton the repair loop hands back, complete
+        # step-1 with the real extended do_GET (the work retry #30's
+        # model could not do by retyping the module), and the whole
+        # plan validates.
+        import json
+
+        from freetalon.orchestrator.planner import (
+            _definition_spans,
+            _grounded_skeleton,
+        )
+
+        skeleton = _grounded_skeleton(
+            self.HEALTH_GOAL, str(self.repo_root), self.WS
+        )
+        parsed = json.loads(skeleton.split("\n", 1)[1])
+        source = Path(self.api_path).read_text(encoding="utf-8")
+        spans = {
+            name: (start, end)
+            for name, start, end, _indent in _definition_spans(source)
+        }
+        start, end = spans["HiveAPIServer.start.Handler.do_GET"]
+        do_get = "\n".join(source.splitlines()[start - 1 : end])
+        parsed["nodes"][0]["inputs"]["content"] = do_get.replace(
+            'return self._send(200, {"ok": True, "status": "ready"})',
+            'return self._send(200, {"ok": True, "status": "ready", '
+            '"service_status": "ready", "ollama_reachable": True, '
+            '"gpu_temperature": 42})',
+        )
+        nodes, _meta = parse_planner_response(
+            json.dumps(parsed),
+            goal_text=self.HEALTH_GOAL,
+            workspace=self.WS,
+        )
+        self.assertEqual(len(nodes), 5)
+        content = nodes[0].inputs["content"]
+        self.assertIn('"gpu_temperature": 42', content)
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        self.assertEqual(
+            qualified_def_names(content), qualified_def_names(source)
+        )
+
+    def test_verbatim_skeleton_rejected_as_placeholder_delta(self) -> None:
+        import json
+
+        from freetalon.orchestrator.planner import (
+            CheapRejectionError,
+            _grounded_skeleton,
+        )
+
+        skeleton = _grounded_skeleton(
+            self.HEALTH_GOAL, str(self.repo_root), self.WS
+        )
+        raw = skeleton.split("\n", 1)[1]
+        with self.assertRaises(CheapRejectionError) as caught:
+            parse_planner_response(
+                raw, goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("placeholder content only", message)
+        self.assertIn("anchored edit", message)
+        # Silence the unused-import lint pattern used elsewhere.
+        self.assertIsInstance(json.loads(raw), dict)
+
+    def test_anchor_helpers(self) -> None:
+        from freetalon.orchestrator.planner import (
+            _definition_spans,
+            _route_branch_anchor,
+        )
+        from freetalon.orchestrator.repo_index import qualified_def_names
+
+        source = Path(self.api_path).read_text(encoding="utf-8")
+        self.assertEqual(
+            _route_branch_anchor(source, "/health"),
+            "HiveAPIServer.start.Handler.do_GET",
+        )
+        self.assertIsNone(_route_branch_anchor(source, "/no-such-route"))
+        self.assertIsNone(_route_branch_anchor("def nope(:\n", "/health"))
+        spans = _definition_spans(source)
+        self.assertEqual(
+            [name for name, _s, _e, _i in spans], qualified_def_names(source)
+        )
+        by_name = {name: indent for name, _s, _e, indent in spans}
+        self.assertEqual(by_name["HiveAPIServer.start.Handler"], 8)
+        self.assertEqual(by_name["HiveAPIServer.start.Handler.do_GET"], 12)
+        self.assertEqual(_definition_spans("def nope(:\n"), [])
+
+    # --- Retry-#30 fixtures: identical rejections, both roots ---
+
+    def test_retry30_outputs_still_rejected_identically(self) -> None:
+        for root in (None, str(self.repo_root)):
+            message3 = self._rejection(
+                self.RETRY30_OUTPUT3_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertIn("was rejected with 1 error", message3)
+            self.assertIn("placeholder content only", message3)
+            message4 = self._rejection(
+                self.RETRY30_OUTPUT4_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertIn("was rejected with 2 errors", message4)
+            self.assertIn("placeholder content only", message4)
+            message5 = self._rejection(
+                self.RETRY30_OUTPUT5_RAW,
+                goal_text=self.HEALTH_GOAL,
+                workspace=self.WS,
+                repo_root=root,
+            )
+            self.assertIn("was rejected with 1 error", message5)
+            self.assertIn("placeholder content only", message5)

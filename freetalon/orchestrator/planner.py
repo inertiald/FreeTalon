@@ -8,6 +8,7 @@ import re
 import shlex
 import hashlib
 import heapq
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -804,6 +805,14 @@ def parse_planner_response(
     # for every shape this does not cover.
     _normalize_plan_interpreters(nodes_raw)
 
+    # Anchored-edit materialization (retry #30): a scaffold node for
+    # an existing module may carry an "anchor" + "position" + only
+    # the new code instead of the whole file; splice each edit into
+    # the current module here, on the raw dicts, so the schema check,
+    # every content check, and the executor see the full-content
+    # nodes they see today.
+    _materialize_plan_edits(nodes_raw, repo_root)
+
     # Normalize: topologically order the DAG and assign deterministic
     # node-1, node-2, ... ids, remapping depends_on. Without this the raw
     # LLM ids/order leak through and downstream code cannot rely on
@@ -1329,6 +1338,417 @@ def _normalize_plan_interpreters(nodes_raw: list[Any]) -> None:
                     value = criterion.get("command")
                     if isinstance(value, str):
                         criterion["command"] = _normalize_bash_interpreters(value)
+
+
+# --- Anchored-edit scaffolds for existing modules (retry #30) ---
+#
+# Retry #30: shown api.py's full source (the 1b6de40 grounding) and
+# told to write the FULL updated module, the model emitted step_1's
+# scaffold as a 5-line comment stub copying the steering text into
+# comments — zero code — and the placeholder check rejected all
+# three (best-formed yet) plans. A 12B model will not retype a
+# 219-line module as one node among five, so the grounded source
+# now reaches the scaffold BY CONSTRUCTION: for an existing module
+# the model may emit an anchored edit instead of the whole file —
+# "anchor" (a qualified definition name in the target), "position"
+# ("replace" substitutes that definition; "after"/"before" insert
+# a sibling next to it), and "content" holding ONLY the new code.
+# Materialization runs in parse_planner_response on the raw node
+# dicts, before normalize_plan_nodes: it reads the current file,
+# splices the delta in at the anchor's exact line span (decorators
+# included), and rewrites the node's inputs to the legacy
+# full-content form, so the schema check, every content check
+# (placeholder, parse, overwrite guard — all unchanged, all judging
+# the materialized module), and the executor see exactly the
+# full-content nodes they see today. The executor cannot tell the
+# difference and is not touched.
+
+_EDIT_POSITIONS = ("replace", "after", "before")
+
+_EDIT_SHAPE_EXAMPLE = (
+    'ANCHORED EDIT — to change ONE definition of an existing module, '
+    'a scaffold node\'s inputs may be {"file_path": "<path>", '
+    '"anchor": "<qualified definition name, e.g. '
+    'ClassName.method_name>", "position": "replace" | "after" | '
+    '"before", "content": "<only the new code, written at the '
+    'indentation it has in the file>"}: "replace" substitutes the '
+    'anchored definition (content is its complete new version, def '
+    'line included), "after"/"before" insert the content as a '
+    'sibling next to it. The system applies the edit to the current '
+    'file, so every other definition is preserved — never retype '
+    'the whole module.'
+)
+
+
+def _definition_spans(source: str) -> list[tuple[str, int, int, int]]:
+    """(qualified name, first line, last line, indent) per definition.
+
+    The span walk mirrors repo_index.qualified_def_names exactly —
+    it descends only through def/class nodes (a definition nested
+    under an ``if``/``try`` inside a function is invisible to both),
+    so the spans and the qualified names the guard and the
+    grounding use always agree. A definition's first line is its
+    first decorator line when it has decorators. [] when the
+    source does not parse.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    spans: list[tuple[str, int, int, int]] = []
+
+    def _visit(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                qualified = prefix + child.name
+                start = child.lineno
+                for decorator in child.decorator_list:
+                    start = min(start, decorator.lineno)
+                spans.append(
+                    (
+                        qualified,
+                        start,
+                        child.end_lineno or child.lineno,
+                        child.col_offset,
+                    )
+                )
+                _visit(child, qualified + ".")
+
+    _visit(tree, "")
+    return spans
+
+
+def _route_branch_anchor(source: str, route: str) -> str | None:
+    """Qualified name of the definition holding a route's branch.
+
+    The innermost definition whose span covers an ``if`` whose test
+    compares something == the route literal (the same branch shape
+    repo_index._route_branch reads) — for /health in freetalon/api.py,
+    HiveAPIServer.start.Handler.do_GET. None when the source does
+    not parse or no such branch sits inside a definition.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    spans = _definition_spans(source)
+    if not spans:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value == route
+        ):
+            continue
+        containing = [
+            span for span in spans if span[1] <= node.lineno <= span[2]
+        ]
+        if containing:
+            return min(containing, key=lambda span: span[2] - span[1])[0]
+    return None
+
+
+def _delta_top_level_def_names(content: str) -> list[str] | None:
+    """Top-level def names of a dedented edit delta, or None.
+
+    A "replace" delta is ONE definition written at its file
+    indentation; dedented, it must parse with exactly that
+    definition at its top level. None when the dedented delta does
+    not parse at all (a body fragment, a comment sketch, a syntax
+    error) — the caller names the defect.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(content))
+    except SyntaxError:
+        return None
+    return [
+        node.name
+        for node in tree.body
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        )
+    ]
+
+
+def _materialize_scaffold_edit(
+    label: str,
+    inputs: dict[str, Any],
+    repo_root: str | Path | None,
+    sources: dict[Path, str],
+) -> tuple[str, bool] | None:
+    """Materialize one node's anchored edit in place.
+
+    On success the node's inputs hold the full materialized module
+    as "content" (the "anchor"/"position" keys removed) and None is
+    returned. On failure an (error, placeholder_delta) pair is
+    returned and the inputs are left untouched: every error names
+    the defect and the fix, so the repair round can steer.
+    ``sources`` carries the current text per resolved target path
+    across the nodes of one plan, seeded from disk: a second edit
+    of the same module materializes against the first edit's
+    result, not against the stale file.
+    """
+    anchor = inputs.get("anchor")
+    position = inputs.get("position")
+    target = inputs.get("file_path") or inputs.get("path")
+    content = inputs.get("content")
+    if not isinstance(anchor, str) or not anchor.strip():
+        return (
+            f"Planner node '{label}' carries a 'position' but no usable "
+            "'anchor' — an anchored edit names the definition it "
+            "changes: 'anchor' is a qualified definition name from the "
+            "target module (e.g. 'ClassName.method_name'), 'position' "
+            "is 'replace', 'after', or 'before', and 'content' holds "
+            "only the new code. Drop both keys to scaffold a full file "
+            "instead.",
+            False,
+        )
+    if position not in _EDIT_POSITIONS:
+        return (
+            f"Planner node '{label}' anchors an edit on {anchor!r} "
+            f"with position {position!r} — 'position' must be 'replace' "
+            "(the content substitutes the anchored definition), "
+            "'after', or 'before' (the content is inserted as a "
+            "sibling next to it).",
+            False,
+        )
+    if not isinstance(target, str) or not target:
+        return (
+            f"Planner node '{label}' anchors an edit on {anchor!r} but "
+            "names no 'file_path' — an anchored edit needs the "
+            "existing module's path in 'file_path'.",
+            False,
+        )
+    if not isinstance(content, str):
+        return (
+            f"Planner node '{label}' anchors an edit on {anchor!r} in "
+            f"{target!r} but its 'content' is missing or not a string "
+            "— the content is the new code for the anchored "
+            "definition, and nothing else.",
+            False,
+        )
+    if not is_code_path(target) or Path(target).suffix.lower() != ".py":
+        return (
+            f"Planner node '{label}' anchors an edit on {target!r}, "
+            "which is not a Python module — anchored edits work on "
+            "existing Python modules only; scaffold the full content "
+            "for anything else, without an 'anchor'.",
+            False,
+        )
+    resolved = _resolve_plan_target(target, resolve_repo_root(repo_root))
+    if resolved in sources:
+        source = sources[resolved]
+    else:
+        try:
+            source = resolved.read_text(encoding="utf-8")
+        except OSError:
+            return (
+                f"Planner node '{label}' anchors an edit on {target!r}, "
+                "which does not exist — an anchored edit changes an "
+                "existing module; to create a new file, scaffold its "
+                "full content without an 'anchor'.",
+                False,
+            )
+    try:
+        ast.parse(source)
+    except SyntaxError as exc:
+        return (
+            f"Planner node '{label}' anchors an edit on {target!r}, "
+            "whose current content does not parse as Python "
+            f"({_syntax_error_detail(exc)}) — no definition in it can "
+            "be anchored. Scaffold the full corrected module instead, "
+            "without an 'anchor'.",
+            False,
+        )
+    names = qualified_def_names(source)
+    if len(names) < 4:
+        return (
+            f"Planner node '{label}' anchors an edit on {target!r}, "
+            f"which has only {len(names)} definitions — too small for "
+            "an anchored edit (the floor is four, the overwrite "
+            "guard's). Scaffold the full updated module instead, "
+            "without an 'anchor'.",
+            False,
+        )
+    if (
+        not content.strip()
+        or is_placeholder_content(content)
+        or _is_placeholder_stub(content)
+    ):
+        return (
+            f"Planner node '{label}' scaffolds {target!r} with an "
+            "anchored edit whose content is placeholder content only "
+            "(comments and/or a docstring, no code) — the edit's "
+            f"content must be the real new code for {anchor!r}: the "
+            "complete definition (def line included) for 'replace', "
+            "or the complete new sibling for 'after'/'before', at its "
+            "indentation in the file — not a comment about it.",
+            True,
+        )
+    spans = _definition_spans(source)
+    matches = [span for span in spans if span[0] == anchor]
+    if not matches:
+        return (
+            f"Planner node '{label}' anchors its edit on {anchor!r}, "
+            f"which is not a definition of {target!r} — the module's "
+            f"definitions are: {', '.join(names)}. Anchor on one of "
+            "those names, exactly as written.",
+            False,
+        )
+    if len(matches) > 1:
+        return (
+            f"Planner node '{label}' anchors its edit on {anchor!r}, "
+            f"which names {len(matches)} definitions of {target!r} — "
+            "an anchor must name exactly one. Anchor on a unique "
+            "definition, or scaffold the full updated module instead.",
+            False,
+        )
+    _name, start, end, indent = matches[0]
+    delta_lines = content.splitlines()
+    while delta_lines and not delta_lines[0].strip():
+        delta_lines.pop(0)
+    while delta_lines and not delta_lines[-1].strip():
+        delta_lines.pop()
+    delta_indent = len(delta_lines[0]) - len(delta_lines[0].lstrip())
+    if delta_indent != indent:
+        return (
+            f"Planner node '{label}' anchors an edit on {anchor!r} in "
+            f"{target!r}, but the edit's content starts at "
+            f"{delta_indent} spaces of indentation while {anchor!r} "
+            f"sits at {indent} spaces in the file — write the new code "
+            "at exactly the indentation it must have in the file (for "
+            "'replace', the complete definition starting with its "
+            f"def/class line at {indent} spaces).",
+            False,
+        )
+    if position == "replace":
+        leaf = anchor.rsplit(".", 1)[-1]
+        top = _delta_top_level_def_names(content)
+        if top is None:
+            return (
+                f"Planner node '{label}' anchors a 'replace' edit on "
+                f"{anchor!r} in {target!r}, but the content does not "
+                "parse as a definition on its own — for 'replace' the "
+                f"content is the complete new version of {anchor!r} "
+                "(decorators if any, the def/class line, and the whole "
+                "body), at its indentation in the file — not a fragment "
+                "of its body and not a comment about it.",
+                False,
+            )
+        if top != [leaf]:
+            shown = ", ".join(top) if top else "no definition"
+            return (
+                f"Planner node '{label}' anchors a 'replace' edit on "
+                f"{anchor!r} in {target!r}, but the content defines "
+                f"{shown} at its top level — for 'replace' the content "
+                f"is the complete new version of {anchor!r} alone (one "
+                f"definition, named {leaf!r}), not the whole module. "
+                "Put helper code inside the definition, or add it with "
+                "a separate 'after' edit anchored on the same "
+                "definition.",
+                False,
+            )
+    lines = source.splitlines()
+    if position == "replace":
+        lines[start - 1 : end] = delta_lines
+    elif position == "after":
+        lines[end:end] = delta_lines
+    else:  # before
+        lines[start - 1 : start - 1] = delta_lines
+    materialized = "\n".join(lines)
+    if source.endswith("\n"):
+        materialized += "\n"
+    try:
+        ast.parse(materialized)
+    except SyntaxError as exc:
+        return (
+            f"Planner node '{label}' anchors an edit on {anchor!r} in "
+            f"{target!r}, but the result does not parse as Python "
+            f"({_syntax_error_detail(exc)}) — the edit's content must "
+            "be complete, valid code for the anchored definition at "
+            "its indentation in the file.",
+            False,
+        )
+    lost = [name for name in names if name not in qualified_def_names(materialized)]
+    if lost:
+        shown = ", ".join(lost[:8])
+        if len(lost) > 8:
+            shown += f", ... ({len(lost) - 8} more)"
+        return (
+            f"Planner node '{label}' anchors an edit on {anchor!r} in "
+            f"{target!r}, but the result loses existing definitions: "
+            f"{shown} — an anchored edit must keep every definition "
+            "it does not replace. For 'replace', the content must be "
+            f"the complete new version of {anchor!r} itself (same "
+            "name, same indentation); inserted code must not swallow "
+            "the definitions around the anchor.",
+            False,
+        )
+    inputs["content"] = materialized
+    inputs.pop("anchor", None)
+    inputs.pop("position", None)
+    sources[resolved] = materialized
+    return None
+
+
+def _materialize_plan_edits(
+    nodes_raw: list[Any], repo_root: str | Path | None
+) -> None:
+    """Rewrite anchored-edit scaffold nodes to full-content nodes.
+
+    Runs on the raw node dicts in parse_planner_response, after
+    interpreter normalization and before normalize_plan_nodes — the
+    same in-place raw-dict seam. A node is an edit-form node when it
+    is a scaffold/file_writer node whose inputs carry an "anchor"
+    (or a stray "position" — a malformed edit, named as such).
+    Legacy full-content nodes are untouched. Errors from every edit
+    node are collected into ONE numbered rejection in the house
+    format, naming the model's own raw node ids; when every error
+    is a placeholder delta, the rejection is cheap (the retry-#17
+    placeholder rule: a comment stub costs the model nothing to
+    replace with real code, so the re-prompt is free) — and its
+    text carries the "placeholder content only" phrase, so the
+    repair loop answers it with the grounded skeleton.
+    """
+    errors: list[tuple[str, bool]] = []
+    sources: dict[Path, str] = {}
+    for node_position, raw in enumerate(nodes_raw, start=1):
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("assigned_claw") not in ("scaffold", "file_writer"):
+            continue
+        inputs = raw.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        if "anchor" not in inputs and "position" not in inputs:
+            continue
+        raw_id = raw.get("id")
+        label = raw_id if isinstance(raw_id, str) else f"position {node_position}"
+        outcome = _materialize_scaffold_edit(label, inputs, repo_root, sources)
+        if outcome is not None:
+            errors.append(outcome)
+    if not errors:
+        return
+    lines = "\n".join(
+        f"{index}. {error}" for index, (error, _placeholder) in enumerate(errors, start=1)
+    )
+    noun = "error" if len(errors) == 1 else "errors"
+    message = (
+        f"Planner output was rejected with {len(errors)} {noun} — "
+        f"fix ALL of them:\n{lines}\n{_EDIT_SHAPE_EXAMPLE}"
+    )
+    if all(placeholder for _error, placeholder in errors):
+        raise CheapRejectionError(message)
+    raise LLMResponseError(message)
 
 
 def _bash_interpreter_errors(
@@ -3929,6 +4349,14 @@ def _route_goal_shape(
     # qualified definition of each serving module here, with the
     # preservation contract the guard enforces, so the first attempt
     # already knows the full-module shape it must produce.
+    # Retry #31: the block now teaches the anchored edit as the
+    # PREFERRED shape, with the preservation contract kept as the
+    # fallback for a plain full-content scaffold: retry #30's model,
+    # told to produce the full-module shape, emitted a comment stub
+    # instead — the module now reaches the scaffold by construction
+    # (parse_planner_response materializes the edit against the
+    # current file), so this block only has to teach the model to
+    # name an anchor and write the one definition.
     seen_modules: set[str] = set()
     for _route, module in named:
         if module in seen_modules:
@@ -3938,13 +4366,40 @@ def _route_goal_shape(
         definitions = _existing_module_definitions(module_path)
         if not definitions:
             continue
+        anchor_hint = ""
+        module_source = _grounded_module_source(module_path)
+        if module_source is not None:
+            for route_name, route_module in named:
+                if route_module != module:
+                    continue
+                anchor_name = _route_branch_anchor(module_source, route_name)
+                if anchor_name is not None:
+                    anchor_hint = (
+                        f" For this goal the natural anchor is "
+                        f"{anchor_name!r}: 'replace' it with its "
+                        f"extended version."
+                    )
+                    break
         lines.append(
             f"EXISTING MODULE — {module_path} already exists with "
             f"{len(definitions)} definitions: "
             + ", ".join(definitions)
             + ". Node 1 EXTENDS this module — it does not write a new "
-            "one. A scaffold overwrites the WHOLE file, so node 1's "
-            "scaffold content must be the full updated module: every "
+            "one. PREFER an anchored edit for node 1: its scaffold "
+            "inputs carry \"anchor\" (ONE definition name from the "
+            "list above — the definition the change belongs to), "
+            "\"position\" (\"replace\" substitutes that definition; "
+            "\"after\"/\"before\" insert a new sibling next to it), "
+            "and \"content\" holding ONLY the new code — for "
+            "\"replace\", the anchored definition's complete new "
+            "version, def line included — written at the exact "
+            "indentation that definition has in the file. The system "
+            "applies the edit to the current file, so every other "
+            "definition is preserved by construction — do NOT retype "
+            "the whole module."
+            + anchor_hint
+            + " A plain full-content scaffold is still accepted, but "
+            "then its content must be the full updated module: every "
             "definition listed above, kept in the same place with the "
             "same nesting (a name like A.B.C is defined inside B, "
             "which is defined inside A — keep it there), plus the new "
@@ -3957,28 +4412,36 @@ def _route_goal_shape(
         # Show the structure itself — the full source when it fits
         # the prompt budget, else the signature skeleton — with
         # the file's real indentation, so the nesting is copied,
-        # not inferred.
+        # not inferred. Retry #31: the structure's job is now to let
+        # the model choose the edit's anchor and copy the exact
+        # indentation the new code must fit — the edit itself is
+        # materialized against this file, so nothing in it needs to
+        # be retyped.
         structure = _existing_module_structure(module_path)
         if structure is not None:
             kind, text = structure
             if kind == "source":
                 lines.append(
-                    "The module's full current source is below. Node "
-                    "1's scaffold is THIS source with the new code "
-                    "added in place: copy every existing definition "
-                    "exactly as written, at the indentation shown, "
-                    "and add the new code inside the definition it "
-                    f"belongs to.\n```python\n{text.rstrip()}\n```"
+                    "The module's full current source is below. Use "
+                    "it to choose the edit's anchor and to copy the "
+                    "exact indentation and surrounding code the new "
+                    "code must fit — you do NOT retype it: the "
+                    "system starts from this file and applies your "
+                    "anchored edit to it."
+                    f"\n```python\n{text.rstrip()}\n```"
                 )
             else:
                 lines.append(
                     "The module's structure is below, with its real "
                     "indentation (a line containing only ... stands "
-                    "for a definition's existing body — write the "
-                    "real body in your scaffold; never copy a ... "
+                    "for a definition's existing body — when your "
+                    "anchored edit replaces that definition, write "
+                    "its real new body; never copy a ... "
                     "line as a body). Definitions nested in the "
-                    "file appear nested here: keep every definition "
-                    f"at exactly this nesting.\n```python\n{text}\n```"
+                    "file appear nested here — anchor names use "
+                    "exactly this nesting (A.B.C is defined inside "
+                    "B, which is defined inside A)."
+                    f"\n```python\n{text}\n```"
                 )
     # Retry #25: attempt 1's scaffold plan was good code and failed
     # ONLY on two interpreter strings the model composed from prose —
@@ -4198,12 +4661,15 @@ def _extension_steering_block(
     silent). This block recomputes the failed scaffold against the
     module on disk with the guard's own thresholds and hands the
     repair round the FULL dropped list (no truncation), the module's
-    FULL definition list, and the concrete pattern to copy: the full
-    updated module, every definition in its existing place, plus the
-    new code. Retry #30: the block also appends the module's
-    signature skeleton (real indentation, bodies elided) — the names
-    alone left the nesting to guesswork. Returns "" unless the
-    rejection is the guard's and a
+    FULL definition list, and the concrete pattern to copy. Retry
+    #30: the block also appends the module's signature skeleton
+    (real indentation, bodies elided) — the names alone left the
+    nesting to guesswork. Retry #31: the pattern is now the anchored
+    edit (anchor + position + only the new code, materialized
+    against the current file by parse_planner_response, so the
+    dropped definitions return by construction) — the full updated
+    module remains only as the fallback the guard accepts. Returns
+    "" unless the rejection is the guard's and a
     scaffold node in the failed output recomputes to a guard-scale
     drop.
     """
@@ -4277,14 +4743,23 @@ def _extension_steering_block(
             + ", ".join(dropped)
             + f". The module's full definition list is: "
             + ", ".join(existing_names)
-            + ". Rewrite the scaffold as the FULL updated module: "
-            "every definition in that list, kept in the same place "
-            "with the same nesting (a name like A.B.C is defined "
-            "inside B, which is defined inside A — it stays there; do "
-            "not move a definition to the top level, rename it, or "
-            "drop it), plus your new code added. Do not write a new "
-            "smaller module in its place — a scaffold that omits an "
-            "existing definition is rejected again."
+            + ". Rewrite the node as an ANCHORED EDIT of the module "
+            "instead of a whole-file scaffold: inputs \"anchor\" (the "
+            "ONE definition from that list the change belongs to — "
+            "for a route branch, the handler method that serves the "
+            "route), \"position\": \"replace\", and \"content\" "
+            "holding ONLY that definition's complete new code, at "
+            "the indentation it has in the file. The system applies "
+            "the edit to the current file, so the dropped definitions "
+            "return by construction — do NOT retype the whole module. "
+            "If you write a full scaffold again instead, it must be "
+            "the FULL updated module: every definition in that list, "
+            "kept in the same place with the same nesting (a name "
+            "like A.B.C is defined inside B, which is defined inside "
+            "A — it stays there; do not move a definition to the top "
+            "level, rename it, or drop it), plus your new code added "
+            "— a scaffold that omits an existing definition is "
+            "rejected again."
             + structure_part
             + "\n"
         )
@@ -4334,7 +4809,15 @@ def _grounded_skeleton(
     real code to extend instead of a blank to fill (retry #17: the
     model followed the skeleton shape but filled it with placeholder
     comments). A verbatim copy of the sketch is still placeholder-only
-    (all comment lines), so the guard rejects it, cheaply.
+    (all comment lines), so the guard rejects it, cheaply. Retry #30:
+    the model copied the sketch verbatim anyway — completing the old
+    step-1 meant retyping the whole module under a "write the FULL
+    module" instruction, and the copied sketch WAS its answer — so
+    step-1 is now an anchored edit (retry #31): the blank is the ONE
+    handler definition the route lives in, named by its qualified
+    anchor, with the sketch riding as the delta's comment blank; a
+    verbatim copy is a comment-only delta, which materialization
+    rejects as placeholder content.
     Step-2's test is runnable real code, not a stub (retry #21): the old
     skeleton showed a "# TODO: replace this comment with the real test
     code" heredoc, and the model copied the TODO verbatim into its plan
@@ -4372,6 +4855,7 @@ def _grounded_skeleton(
         else str(index.root / "tests" / "test_health.py")
     )
     branch = index.route_branches.get(route)
+    anchor: str | None = None
     if branch is not None:
         # The existing branch, as a commented sketch the model extends:
         # the route literal and the response fields are named, so the
@@ -4379,16 +4863,86 @@ def _grounded_skeleton(
         # a verbatim copy is still placeholder-only (all comment lines),
         # so the guard rejects it instead of letting it through.
         sketch = "\n".join(f"#     {line}" for line in branch.splitlines())
-        content = (
-            f"# Extend {module_path} in place — add the fields the goal asks "
-            f"for to the existing {route} branch in {handler}:\n"
-            f"{sketch}\n"
-            "# Write the FULL module with the extended branch — the scaffold "
-            "replaces the whole file, so a fragment alone is not a plan.\n"
-            "# Do NOT write a TODO comment — a comment-only scaffold is rejected."
-        )
+        # Retry #31: step-1 is an anchored edit, not a full-module
+        # scaffold. Retry #30's model copied this skeleton's old
+        # step-1 verbatim — the commented sketch under a "Write the
+        # FULL module" instruction — as its scaffold content (a
+        # comment stub, rejected as a placeholder): completing the
+        # old blank meant retyping a 219-line module. The blank is
+        # now the ONE definition the change belongs to — the route
+        # handler's qualified name, derived from the branch's
+        # position in the real module — and a verbatim copy of the
+        # sketch is a comment-only delta, which materialization
+        # rejects as placeholder content. When no anchor is
+        # derivable (module unreadable or unparseable, branch
+        # outside any definition), step-1 keeps the legacy
+        # full-content form below.
+        anchor_indent = 0
+        try:
+            module_source: str | None = Path(module_path).read_text(
+                encoding="utf-8"
+            )
+        except OSError:
+            module_source = None
+        if module_source is not None:
+            anchor = _route_branch_anchor(module_source, route)
+            if anchor is not None:
+                for span_name, _span_start, _span_end, span_indent in (
+                    _definition_spans(module_source)
+                ):
+                    if span_name == anchor:
+                        anchor_indent = span_indent
+                        break
+        if anchor is not None:
+            content = (
+                f"# Write the COMPLETE new version of {anchor} here — "
+                f"real code only, starting with its def line at the "
+                f"indentation it has in the module ({anchor_indent} "
+                f"spaces), with the existing {route} branch extended "
+                f"with the fields the goal asks for. The branch as it "
+                f"exists today:\n"
+                f"{sketch}\n"
+                "# The system inserts your code into the current file "
+                "in place of the old definition — every other "
+                "definition is preserved. Do NOT write the whole "
+                "module.\n"
+                "# Do NOT write a TODO comment — comment-only content "
+                "is rejected."
+            )
+        else:
+            content = (
+                f"# Extend {module_path} in place — add the fields the goal asks "
+                f"for to the existing {route} branch in {handler}:\n"
+                f"{sketch}\n"
+                "# Write the FULL module with the extended branch — the scaffold "
+                "replaces the whole file, so a fragment alone is not a plan.\n"
+                "# Do NOT write a TODO comment — a comment-only scaffold is rejected."
+            )
     else:
         content = f"# TODO: replace this comment with the real code — {edit.lower()}"
+    if anchor is not None:
+        step1_inputs: dict[str, Any] = {
+            "file_path": module_path,
+            "anchor": anchor,
+            "position": "replace",
+            "content": content,
+        }
+        step1_guidance = (
+            "Step-1 is an anchored edit of the serving module: its "
+            "\"content\" shows the existing branch as a commented sketch "
+            "— replace the sketch with the complete new version of the "
+            "anchored definition (real code, def line included, at its "
+            "indentation in the file); the system inserts it into the "
+            "current module, so do not write the whole module, and do "
+            "not copy the sketch's comment lines as the content."
+        )
+    else:
+        step1_inputs = {"file_path": module_path, "content": content}
+        step1_guidance = (
+            "Step-1 shows the existing branch as a commented sketch "
+            "— extend it with the fields the goal asks for and write the FULL "
+            "module; do not copy the sketch's comment lines into the scaffold."
+        )
     # Step-2's test is runnable real code (see the docstring): the old
     # skeleton's TODO heredoc was copied verbatim into the model's plan
     # twice in retry #21. For /health the field assertions follow the
@@ -4464,10 +5018,7 @@ def _grounded_skeleton(
             "objective": edit,
             "depends_on": [],
             "assigned_claw": "scaffold",
-            "inputs": {
-                "file_path": module_path,
-                "content": content,
-            },
+            "inputs": step1_inputs,
             "outputs": [module_path],
             "acceptance": [f"The {route} endpoint is implemented in {module_path}."],
             "criteria": [{"type": "file_exists", "path": module_path}],
@@ -4543,9 +5094,7 @@ def _grounded_skeleton(
     return (
         f"{lead} The skeleton is the SHAPE of your output, not instruction "
         "text to re-serialize: every \"# TODO\" line must be replaced with "
-        "real code. Step-1 shows the existing branch as a commented sketch "
-        "— extend it with the fields the goal asks for and write the FULL "
-        "module; do not copy the sketch's comment lines into the scaffold. "
+        f"real code. {step1_guidance} "
         "Step-2's test is runnable real code, not a stub — extend its "
         "assertions with the fields the goal asks the endpoint to report; "
         "do not replace it with a TODO comment. Copying a TODO comment "
@@ -4630,9 +5179,11 @@ _APPROACH_MARKERS: tuple[tuple[str, str], ...] = (
         "of the existing module's",
         "Do NOT replace an existing module with a new, smaller module "
         "— a scaffold overwrites the whole file, so every definition "
-        "it omits is deleted. Instead, scaffold the FULL updated "
-        "module: every existing definition, kept in the same place "
-        "with the same nesting, plus the new code.",
+        "it omits is deleted. Instead, extend it with an anchored "
+        "edit (anchor + position + only the new code — the system "
+        "applies the edit to the current file), or scaffold the FULL "
+        "updated module: every existing definition, kept in the same "
+        "place with the same nesting, plus the new code.",
     ),
 )
 
