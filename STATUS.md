@@ -3967,3 +3967,81 @@ Deliberately left out:
   Files changed: none. Log:
   logs/health-rerun9-2026-11-18.log.
 
+## Update - 2026-11-18 (Live re-run #9, Arm 3: devstral-small-2:24b on cycle 12 — a second clean endpoint, the same suite wall, and cycle 12's elision marker fires live for the first time)
+
+- Run (FREETALON_OLLAMA_MODEL=devstral-small-2:24b,
+  FREETALON_LLM_TEMPERATURE=0.0, timeout 900,
+  formatter OFF, critic OFF; driver exit 0;
+  run-20261118T184823Z-2a15e7, loop elapsed
+  550.7s; GPU peak observed 80C during
+  planning, no thermal pause; fans manual 85%
+  during, auto after, verified
+  GPUFanControlState=0): Devstral's own plan
+  (plan-a86e98d402f3) accepted after 2 raw
+  outputs (one planning repair round); 5 raw
+  outputs total. Its node-3 carries the suite
+  as its own bash command with a command-less
+  exit_code criterion — cycle 12's placement,
+  taken up by a second model.
+- Execution: node-1 PASS — an anchored /health
+  branch replacement (+34/-1, siblings
+  preserved) that COMPUTES both fields:
+  ollama_reachable from a real socket
+  connection to localhost:11434,
+  gpu_temperature from a subprocess nvidia-smi
+  query, returning {"ok", "status": "ready",
+  "ollama_reachable", "gpu_temp_c"}. Node-2
+  PASS — tests/test_health.py written.
+  Node-3 FAIL — the full suite exited 1 after
+  473.4s; nodes 4-5 never ran.
+- The with-changes suite, re-run by hand
+  (logs/rerun9-arm3-suite-with-changes.out):
+  1128 tests, FAILED (failures=7, errors=8) —
+  15, again zero API behavior: (a) 2 errors
+  are the model's own tests — setUp builds
+  MagicMock(spec=HiveAPIServer) as the
+  controller and dies on its missing 'status'
+  attribute before any assertion; (b) 13 are
+  fixture couplings to the pre-goal tree: the
+  4 cycle-12 test_health.py-existence errors
+  and 6 retry16 live-line-number failures from
+  Arm 1, plus 2 TestPlannerAnchoredEditFix
+  errors (recorded grounded-plan edits no
+  longer materialize against the edited live
+  module) and
+  test_route_branches_read_from_the_real_module,
+  which asserts the literal '"ok": True' in
+  the real /health branch — Devstral returns
+  '"ok": service_ok'.
+- Judge: replan on the node-3 failure — and
+  here cycle 12 earned its keep: the
+  re-planner's step_4 anchored 'replace' body
+  carried the elision marker '# ... rest of
+  existing do_GET implementation ...', and
+  the new _anchored_elision_marker rejected
+  it at materialize (code anchored_edit). The
+  elision shape that clobbered api.py in the
+  retry era and slipped Arm 1 of re-run #8
+  was stopped at planning, in a live run, for
+  the first time. The replan failed on that
+  single rejection and the run escalated with
+  one version attempted.
+- Verdict: FAIL at execution (suite node);
+  not a verified success — extended check (4)
+  fails and the new tests error in setUp.
+  Across arms 1 and 3 the pattern is now
+  exact: two different models write clean,
+  computing /health code and place the suite
+  correctly, and the run dies because the
+  repo's own test suite cannot stay green
+  with the goal's changes in place — the
+  model's tests do not run, and thirteen-plus
+  fixtures are coupled to the pre-goal tree
+  (a file's non-existence, live line numbers,
+  a branch's literal text). Files changed:
+  freetalon/api.py (M), tests/test_health.py
+  (new); restored (porcelain 0); post-restore
+  suite re-run 1126/1126 OK in 467.0s
+  (logs/rerun9-arm3-suite-post-restore.out).
+  Log: logs/health-rerun9-2026-11-18.log.
+
