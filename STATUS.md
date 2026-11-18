@@ -2802,3 +2802,94 @@ Deliberately left out:
   materializes and validates with all definitions
   retained. No live driver runs this cycle; re-run #5 is
   the test of the new ask.
+
+## Update - 2026-11-18 (Live re-run #5 on cycle 7: the Ellipsis is gone — the copy comes back unextended)
+
+- Pre-flight (once): GPU 52C idle; power limit exactly
+  300.00W; link gen4 x16; 0 Xid 79/154; Ollama tags list
+  gemma-3-abliterated:latest; head bf24e49 clean; baseline
+  suite 1069/1069 in 451.6s. Fans manual 85% during each
+  run, auto after (GPUFanControlState=0 verified after
+  each run); 0 Xid throughout. (The push-triggered CI GPU
+  suite ran concurrently in the actions-runner tree early
+  in Run 1 — separate checkout, CPU contention only.)
+- Run 1 (production defaults; driver exit 0;
+  run-20261118T112342Z-2cb409; loop elapsed 102.0s; GPU
+  peak 77C, no pause): planning took 2 raw outputs (empty,
+  then the accepted plan) — plan-7885a4ef9d99 accepted,
+  5 nodes. placeholder_value and missing_target fired
+  0 times in the whole run; no Ellipsis appeared in any
+  raw output. v1 executed: node-1 (scaffold, full-module
+  content, no anchor) PASS on file_exists — it wrote the
+  whole api.py retyped (whitespace collapsed; the git
+  diff was +16/-24 of pure reformatting) with the /health
+  branch UNEXTENDED: return
+  self._send(200,{"ok":True,"status":"ready"}). The
+  unchanged-copy watch-item in whole-module form. node-2
+  PASS (the real RouteEndpointTests test written to the
+  workspace test_health.py). node-3 FAIL exit 1 in 0.771s
+  — the plan's own test caught it: AssertionError:
+  'service_status' not found in {'ok': True, 'status':
+  'ready'}. Judge replan; the re-plan's repair produced
+  3 candidates: a degenerate
+  {"nodes":[{"id":"hive",...}]}, a candidate carrying
+  REAL probe code (a urllib3 request to Ollama for
+  ollama_reachable, a subprocess nvidia-smi parse for
+  gpu_temp) but as a clobber-shaped standalone module
+  written over api.py that also omitted service_status,
+  and a terminal candidate rejected with exactly 1 error
+  — a stand-in plan that never touches freetalon/api.py.
+  Re-planner failed -> escalate. Verdict FAIL.
+- Run 2 (FREETALON_LLM_TEMPERATURE=0.4; driver exit 0;
+  run-20261118T113912Z-db3f56; loop elapsed 485.7s
+  including one thermal freeze; GPU peak 85C — SIGSTOP
+  pause at 85C, in-flight generation completed while
+  frozen, SIGCONT at 64C): planning again 2 raw outputs
+  (empty -> accepted, same plan id). v1 executed
+  identically: node-1 PASS with the same unextended
+  /health branch (+15/-24 reformatting), node-2 PASS,
+  node-3 FAIL exit 1 in 0.774s with the identical
+  assertion; nodes 4-5 never left draft. Judge replan;
+  5 candidates: {"nodes":[]}; a full-module plan; the
+  fake-literal route-around (status =
+  {'ollama_reachable': True,  # Assume reachable for now.
+  + 'gpu_temperature': gpu_temp} in a standalone handler
+  shape — never accepted); empty; and an anchored-edit
+  candidate — the complete do_GET definition with
+  /health STILL unextended, at 4 spaces of indentation
+  vs the anchor's 12 — rejected with exactly 1 error
+  (indentation mismatch, anchored-edit steering
+  attached). Re-planner failed -> escalate. Verdict
+  FAIL.
+- Memory: both runs recorded every executed node's
+  measurement (ids 154-156 and 157-159, stage=executed,
+  full stderr on the node-3 FAILs; decisions
+  CONTINUE/CONTINUE/REPLAN). Neither escalation was a
+  memory lock — both were re-planner rejections; the
+  cycle-3 signature fix held live again.
+- Files/suites: each run modified freetalon/api.py and
+  wrote the workspace test_health.py; all restored/
+  removed after each run (git checkout api.py; the
+  workspace test file deleted; tree clean verified,
+  porcelain 0). Post-run suites 1069/1069 (437.7s,
+  444.7s). The pre-existing workspace api.py and fib.py
+  strays predate this session and were left untouched.
+- Verdict on the cycle-7 question: NO — completing from
+  the verbatim definition did not produce the substance
+  in an accepted plan at either temperature. But the
+  failure shape changed, twice over: (1) the Ellipsis
+  is gone — zero placeholder_value firings across 12 raw
+  outputs in the two runs; the slot sketch no longer
+  teaches it, and nothing replaced it in the accepted
+  plans. (2) Substance attempts now surface in re-plan
+  candidates (real probes in Run 1's candidate) — the
+  model reaches for real computation when completing
+  freely and loses the vessel/shape discipline instead
+  (clobber module, standin, 4-space anchored copy).
+  The binding limit remains the 12B planner, now at the
+  shape/substance joint rather than in any single
+  channel: it can copy the definition exactly or
+  compute the fields freely, not both in one
+  plan-shaped output. Node-local repair remains the
+  queued harness lever; the stronger-planner-model
+  decision remains Pat's.
