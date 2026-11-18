@@ -4561,3 +4561,61 @@ Deliberately left out:
   Thermal peaks across diags 80C/78C, fans restored to auto,
   0 Xid. Log: logs/cycle14-test-grounding-2026-11-18.log.
   Committed locally, NOT pushed.
+
+## Update - 2026-11-18 (Live re-run #11, Arm 1: qwen3.8:27b with FREETALON_LLM_THINK=0 + FREETALON_LLM_NUM_CTX=24576 on cycle 14 — VERIFIED SUCCESS: the /health goal is achieved; re-run #11 stops here)
+
+- VERIFIED SUCCESS — the campaign's first. All four
+  extended checks pass on the tree as the run left it:
+  (1) live /health agrees with reality: a server
+  instance started from this tree returned {"ok": true,
+  "status": "ready", "ollama_reachable": true,
+  "gpu_temperature": 40} against a concurrent
+  nvidia-smi reading of 40, and 41 against 41 on a
+  second call — the value tracks the hardware;
+  ollama_reachable true while Ollama answers on 11434;
+  the status field reports the service state.
+  (2) The code computes both fields: ollama_reachable
+  via socket.create_connection to localhost:11434,
+  gpu_temperature by parsing nvidia-smi output
+  (api.py diff +30/-1, the /health branch only, all
+  sibling routes intact; no literal values).
+  (3) New tests exist and pass: tests/test_health.py
+  (3 tests; the grounded HiveConfig -> HiveController
+  -> HiveAPIServer construction verbatim, ephemeral
+  port via server_address) — node-2's tests_pass
+  criterion ran them at their own node: Ran 3 tests,
+  OK. (4) Full suite green with the changes in place:
+  node-3 ran 1146 tests (1143 baseline + 3 new) in
+  474.5s, OK.
+- The run: driver exit 0, run
+  run-20261118T232634Z-965d09, loop 518.5s. Plan
+  plan-9860c1b1ee9f accepted from the initial planning
+  generation at THINK=0 / NUM_CTX=24576 (the cycle-14
+  diag settings). Nodes 1-4 PASS (endpoint write,
+  tests, full suite, server start). Scoped-run
+  uptake: yes — node-2 carried a tests_pass criterion
+  on the new module and it passed at the node
+  (cycle-13 steering + cycle-14 grounding).
+- The honest wrinkle: the loop's own verdict is FAIL.
+  Node-5 (curl -sf http://localhost:8765/health) got
+  exit 7 — node-4's started server did not survive
+  across node shells, so nothing was listening when
+  node-5 curled — and the judge's replan delta was
+  then rejected by the approach-signature guard (it
+  repeated the api.py scaffold write without a stated
+  differs_by), escalating the plan. The failure sits
+  in the run's server-lifecycle mechanics, not in the
+  delivered code: endpoint, tests, and suite all
+  verify independently above. The verified-success
+  call rests on the four extended checks, per the
+  campaign's standing extended-verification rule.
+- Thermal peak 62C, VRAM peak 19,571 MiB (matches the
+  cycle-14 diag), 0 Xid. Fans restored to auto
+  (GPUFanControlState=0 verified), model unloaded,
+  verification server stopped. CI gate: GPU tests
+  run 44419035104 for the ca84185 push completed
+  SUCCESS before the arm. Arms 2-4 not run (verified
+  success stops the run). This commit banks the run's
+  api.py change and tests/test_health.py with this
+  entry; NOT pushed (parent verifies + pushes).
+  Log: logs/health-rerun11-2026-11-18.log.

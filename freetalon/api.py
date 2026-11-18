@@ -42,7 +42,36 @@ class HiveAPIServer:
                 qs = parse_qs(parsed.query)
 
                 if path == "/health":
-                    return self._send(200, {"ok": True, "status": "ready"})
+                    import socket
+                    import subprocess
+
+                    ollama_reachable = False
+                    try:
+                        sock = socket.create_connection(("localhost", 11434), timeout=2)
+                        sock.close()
+                        ollama_reachable = True
+                    except OSError:
+                        pass
+
+                    gpu_temp = None
+                    try:
+                        result = subprocess.run(
+                            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if result.returncode == 0 and result.stdout.strip():
+                            gpu_temp = int(result.stdout.strip().split("\n")[0])
+                    except (OSError, ValueError):
+                        pass
+
+                    return self._send(200, {
+                        "ok": True,
+                        "status": "ready",
+                        "ollama_reachable": ollama_reachable,
+                        "gpu_temperature": gpu_temp,
+                    })
 
                 if path == "/status":
                     if not self._authorized():
