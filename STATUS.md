@@ -2213,3 +2213,71 @@ Deliberately left out:
   live driver runs in this cycle; the Arm A re-run is the
   next step, now unblocked. Log:
   /home/seeker/freetalon-workspace/logs/memory-signature-2026-11-17.log.
+
+## Update - 2026-11-18 (Live re-run on cycle 3: /health runs at defaults and temperature 0.4)
+
+- First live runs on the cycle-3 code (head 87e1b21, suite
+  1038/1038 baseline green). Pre-flight: GPU 52C idle, power
+  limit exactly 300.00W, PCIe x16, 0 Xid 79/154 (7d), Ollama
+  tags list gemma-3-abliterated:latest, tree clean. Log:
+  /home/seeker/freetalon-workspace/logs/health-rerun-2026-11-17.log.
+- RUN 1 (production defaults, run-20261118T062628Z-884d40,
+  DRIVER_EXIT 0, goal FAIL, 309.8s): output 1 {"nodes":[]}
+  rejected empty_plan; output 2 accepted as plan-7885a4ef9d99
+  (the Arm A plan) — the cycle-3 memory fix holds LIVE: no
+  memory escalation; the plan executed. The payload channel
+  fired in v1 (the step-2 heredoc was materialized
+  bash->scaffold). All 3 versions executed identically:
+  node-1 PASS (scaffold write of api.py, file_exists),
+  node-2 PASS (test file written), node-3 FAIL exit_code
+  127 — the test-run command used a RELATIVE interpreter
+  (./.venv/bin/python) and the bash claw's working directory
+  is not the repo root, so /bin/sh reported "not found".
+  Judge re-planned twice on the 127 (informative failure);
+  both re-plans kept the relative interpreter; then
+  escalated: re-plan budget spent. Nodes 4-5 never attempted.
+- Substance, exactly the carried-in Arm A risk: the applied
+  /health branch assigns literal ... (Ellipsis) to
+  service_status, ollama_reachable and gpu_temperature —
+  retention-sound, semantically hollow. The designated
+  catcher works: the LLM's own tests/test_health.py, run
+  manually against the modified api.py, FAILS with
+  "'Ellipsis' is not an instance of <class 'bool'>" — the
+  endpoint answered live and the test caught the hollow
+  fields. It never fired in-loop because node-3 could not
+  start the interpreter at all.
+- RUN 2 (FREETALON_LLM_TEMPERATURE=0.4,
+  run-20261118T064402Z-537d4f, DRIVER_EXIT 0, goal FAIL,
+  601.3s including a ~6 min thermal pause): 9 raw outputs;
+  the accepted v1 plan was AGAIN plan-7885a4ef9d99 —
+  temperature 0.4 converged to the identical plan; diversity
+  appeared only in the re-plan outputs. Same trajectory:
+  node-1/node-2 PASS, node-3 exit 127 x3, judge escalated
+  on re-plan budget. Same Ellipsis substance defect; the
+  manual test diagnostic failed identically.
+- Memory behavior (both runs): 9 run-memory entries each;
+  no signature-based escalation anywhere — planning is no
+  longer memory-locked. The node-3 test-run FAILs are
+  plumbing steps and carry no approach signature (cycle-3
+  design); the node-1 scaffold writes measured PASS on
+  file_exists, so no executed-failure signature was recorded
+  either — the criterion is too weak to see hollow content.
+- Thermal: Run 1 peaked at 87C (brief, during generation).
+  Run 2 sustained 86-88C during one long re-plan
+  generation; the driver was SIGSTOPped per the pause rule,
+  the in-flight generation completed while frozen, and the
+  driver resumed at 72C and finished immediately. Peak 88C,
+  no 90C breach, 0 Xid 79/154 across both runs; fans
+  restored to auto and verified (GPUFanControlState=0)
+  after each run.
+- Files: both runs modified freetalon/api.py and wrote
+  tests/test_health.py (plus a workspace copy); restored
+  after each run (git checkout + removal of the LLM-written
+  test files); suite re-run on the restored tree after each
+  run: 1038/1038 OK. Tree clean at head 87e1b21.
+- Net: execution is now the expected path, and the loop's
+  binding failure has moved downstream — no longer planning
+  or memory, but a plan-authored command assuming the repo
+  root as cwd (relative ./.venv/bin/python), plus the
+  model's persistent Ellipsis-placeholder substance gap,
+  which its own tests reliably catch once they can run.
