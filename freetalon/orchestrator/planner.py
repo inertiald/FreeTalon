@@ -16,6 +16,7 @@ from typing import Any, Collection
 
 from pydantic import ValidationError
 
+from .executor import _command_runs_full_suite
 from .intake import (
     LLMBackendError,
     LLMResponseError,
@@ -32,6 +33,7 @@ from .repo_index import (
     qualified_def_names,
 )
 from .measure import (
+    CRITERION_COMMAND_TIMEOUT_S,
     CRITERION_CUSTOM_CHECK,
     CRITERION_EXIT_CODE,
     CRITERION_FILE_EXISTS,
@@ -2249,6 +2251,34 @@ def _materialize_scaffold_edit(
                 "definition.",
                 False,
             )
+    if position == "replace":
+        # Cycle 12: an elision marker inside the replacement body —
+        # a comment standing in for the rest of the definition —
+        # passes every check above (the content IS one complete
+        # definition by shape) and the name-retention check below
+        # (the definition survives; its branches do not). The delta
+        # is judged here, before the splice, where the body is still
+        # visible as a body. See _anchored_elision_marker.
+        marker = _anchored_elision_marker("\n".join(delta_lines))
+        if marker is not None:
+            return (
+                f"Planner node '{label}' anchors a 'replace' edit on "
+                f"{anchor!r} in {target!r}, but the replacement body "
+                f"elides the rest of {anchor!r} — it carries the "
+                f"elision marker {marker!r}, a comment standing in "
+                "for code the plan does not write. A 'replace' content "
+                "substitutes the WHOLE definition: the splice keeps "
+                "only what the content contains, so the code the "
+                "marker stands in for is deleted (the definition "
+                "keeps its name and loses its branches — a retention "
+                "check on definition names cannot see the loss, and "
+                "a file_exists criterion cannot either). Return the "
+                f"complete new version of {anchor!r}: the current "
+                "body carried over in full, with the goal's change "
+                "applied — every branch the goal does not change "
+                "keeps its real code, never a comment promising it.",
+                False,
+            )
     lines = source.splitlines()
     if position == "replace":
         lines[start - 1 : end] = delta_lines
@@ -3011,6 +3041,66 @@ def _criteria_errors(
         if error is not None:
             errors.append(
                 f"Planner node '{node.id}' has an unusable criterion: {error}."
+            )
+    return errors
+
+
+def _suite_criterion_command_errors(nodes: list[PlanNode]) -> list[str]:
+    """Reject a test-suite run attached to an exit_code criterion's command.
+
+    Cycle 12 (re-run #8): qwen2.5-coder:14b's accepted plans attached
+    the full suite (~477s) as an exit_code criterion's own "command"
+    in both arms (on the test-writing node in Arm 1, on the edit node
+    in Arm 3). A criterion command is run by the measurement step
+    under CRITERION_COMMAND_TIMEOUT_S (measure._eval_exit_code), so a
+    suite run there can only time out — and a measurement timeout is
+    judged RETRY (the timeout path never re-plans), so both runs
+    repeated the timeout and escalated with the suite never
+    completing a run anywhere. The suite has two sound placements
+    and the error names both: as the node's OWN command (where the
+    executor's suite floor gives it room), measured by an exit_code
+    criterion carrying no command of its own; or as a tests_pass
+    criterion, the type built for suites.
+
+    Detection is the executor's own suite definition,
+    _command_runs_full_suite — the same judgment that raises a suite
+    node's timeout floor — so "suite run" means one thing in the
+    codebase: unittest discovery, a bare unittest run, or an
+    unscoped pytest run. A scoped run (one test module, one test
+    file, one node id) is a quick probe and is untouched, as are the
+    recorded probe commands (curl, grep, nvidia-smi). The rejection
+    is cheap (registered in _collect_plan_error_records): moving the
+    suite from the criterion onto the node's own command is a
+    mechanical relocation, the placeholder_value rationale.
+    """
+    budget = (
+        f"{int(CRITERION_COMMAND_TIMEOUT_S)}s"
+        if float(CRITERION_COMMAND_TIMEOUT_S).is_integer()
+        else f"{CRITERION_COMMAND_TIMEOUT_S}s"
+    )
+    errors: list[str] = []
+    for node in nodes:
+        for criterion in node.criteria or []:
+            if not isinstance(criterion, dict):
+                continue
+            if criterion.get("type") != CRITERION_EXIT_CODE:
+                continue
+            command = criterion.get("command")
+            if not isinstance(command, str) or not command.strip():
+                continue
+            if not _command_runs_full_suite(command):
+                continue
+            errors.append(
+                f"Planner node '{node.id}' has an unusable criterion: "
+                f"its exit_code criterion command {command!r} runs the "
+                "full test suite — a criterion command is run by the "
+                f"measurement step under a {budget} timeout, so a suite "
+                "run attached to a criterion can only time out, and a "
+                "measurement timeout is retried rather than re-planned. "
+                "Run the suite as the node's own command instead and "
+                "measure it with an exit_code criterion carrying NO "
+                "command of its own, or use a tests_pass criterion "
+                "naming the suite this node runs."
             )
     return errors
 
@@ -4322,6 +4412,59 @@ def _elision_errors(
     return errors
 
 
+# Elision keywords for the anchored-replacement phrase check below:
+# the words a comment uses to point at code it stands in for. The set
+# is _ELISION_RE's keyword group minus the bare "other" — too weak on
+# its own, since it needs no elision company to appear in real prose.
+_ANCHORED_ELISION_KEYWORDS = (
+    "existing",
+    "remaining",
+    "rest of",
+    "unchanged",
+    "original",
+    "same as",
+)
+
+
+def _anchored_elision_marker(content: str) -> str | None:
+    """The elision-marker line in an anchored 'replace' body, or None.
+
+    Cycle 12 (re-run #8 Arm 1): the accepted plan's anchored do_GET
+    replacement ended with the standalone comment '# Existing
+    code...' — the /health branch written out, every sibling GET
+    route promised to a comment (executed diff +14/-70). Definition-
+    level retention cannot see the loss (do_GET survives by name;
+    its branches do not), and _ELISION_RE cannot either: its
+    alternatives are dots-first ('... existing code ...'), a bare
+    '...', or '# ...' alone, so the keyword-first form ('# Existing
+    code...') evades it, as does a parenthetical after the dots
+    ('# ... (rest of the original method) ...', the 27B's scaffold
+    form in the same run). This check runs on the DELTA at the
+    materialize seam — the only place the replacement body is
+    visible as a body, before the splice dissolves it into the
+    module — and fires on either shape: a line matching _ELISION_RE,
+    or a standalone comment line carrying '...' together with an
+    elision keyword. Both recorded must-accepts are clean under it:
+    Arm 3's complete delta, and the canonical grounded delta (the
+    verbatim current do_GET; its one comment names the M4 gates
+    section — no dots, no keyword). A comment naming existing code
+    WITHOUT the ellipsis does not fire: the dots are the marker's
+    signature — the comment claims the code is elsewhere, not shown.
+    """
+    for line in content.splitlines():
+        if _ELISION_RE.search(line):
+            return line.strip()
+        stripped = line.strip()
+        if not stripped.startswith(("#", "//")):
+            continue
+        text = stripped.lstrip("#/ ").lower()
+        if "..." in text and any(
+            keyword in text for keyword in _ANCHORED_ELISION_KEYWORDS
+        ):
+            return stripped
+    return None
+
+
 _ELLIPSIS_STUB_DECORATORS = frozenset({"overload", "abstractmethod"})
 
 
@@ -4920,7 +5063,8 @@ def _collect_plan_error_records(
 
     Returns (records, cheap): ``cheap`` is True when every error is a
     stand-in / code-overwrite fake (retry #12) or a placeholder scaffold
-    (retry #17), or placeholder values (cycle 6) — a rejection the repair
+    (retry #17), or placeholder values (cycle 6), or a suite run attached
+    to a criterion command (cycle 12) — a rejection the repair
     loop may re-prompt for free, without spending the repair budget.
     """
     if modules is None:
@@ -5064,6 +5208,11 @@ def _collect_plan_error_records(
     records.extend(
         _error_records("missing_target", _missing_target_errors(nodes))
     )
+    suite_criterion_records = _error_records(
+        "suite_criterion_command",
+        _suite_criterion_command_errors(nodes),
+    )
+    records.extend(suite_criterion_records)
     # Cheap rejection (retry #12): the only errors are stand-in /
     # code-overwrite fakes, so re-prompting costs the model nothing to
     # fix and must not spend the repair budget. A rejection whose only
@@ -5075,12 +5224,17 @@ def _collect_plan_error_records(
     # to replace with the real expression. A missing-target rejection
     # (cycle 7) is NOT cheap: the node is structurally incomplete — a
     # schema-class defect, like the raw-node schema errors. Any other
-    # error mixed in makes it a real rejection.
+    # error mixed in makes it a real rejection. A suite-criterion
+    # rejection (cycle 12) is cheap by the same rationale as
+    # placeholder values: the plan is executable as written except
+    # that the suite run sits on a criterion instead of the node's
+    # own command — a mechanical relocation, fixed in one re-prompt.
     cheap = (
         bool(records)
         and len(standin_records)
         + len(placeholder_records)
         + len(placeholder_value_records)
+        + len(suite_criterion_records)
         == len(records)
     )
     return records, cheap

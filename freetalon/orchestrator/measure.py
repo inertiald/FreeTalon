@@ -41,6 +41,15 @@ CRITERION_METRIC = "metric"
 CRITERION_TESTS_PASS = "tests_pass"
 CRITERION_CUSTOM_CHECK = "custom_check"
 
+# The default time budget for an exit_code criterion's own "command"
+# (see _eval_exit_code): a criterion command is a quick probe the
+# measurement step runs itself (a curl, a grep, nvidia-smi), never a
+# job of work — a test-suite run attached to a criterion can only
+# time out here, which is why the planner rejects that shape at
+# planning time (cycle 12) and the prompts publish this budget,
+# derived from this constant (prompts._criterion_command_budget_text).
+CRITERION_COMMAND_TIMEOUT_S = 60.0
+
 # A custom checker receives (envelope, workdir) and returns
 # (passed: bool, detail: str). Checkers are pre-registered by name — never
 # code generated during the same run, which would let the system grade
@@ -108,7 +117,9 @@ def _eval_exit_code(
     expected = criterion.get("equals", 0)
     command = criterion.get("command")
     if isinstance(command, str) and command.strip():
-        timeout = _criterion_timeout_s(criterion, default=60.0)
+        timeout = _criterion_timeout_s(
+            criterion, default=CRITERION_COMMAND_TIMEOUT_S
+        )
         try:
             proc = subprocess.run(
                 command,

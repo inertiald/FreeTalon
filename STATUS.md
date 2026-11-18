@@ -3750,3 +3750,91 @@ Deliberately left out:
   changed: freetalon/api.py only; restored
   (porcelain 0); post-arm suite re-run 1117/1117
   OK. Log: logs/health-rerun8-2026-11-18.log.
+
+## Update - 2026-11-18 (Cycle 12: the suite leaves the criterion — cheap rejection for suite-as-criterion-command, the 60s budget published, and the keyword-first elision comment closed)
+
+- Investigation (log
+  logs/cycle12-criterion-command-2026-11-18.log):
+  the 60s cap is measure._eval_exit_code's
+  default for an exit_code criterion's own
+  command (a criterion may override it with
+  timeout_s); it scopes to criterion commands
+  only — tests_pass runs its own invocation,
+  and the executor's 900s suite floor is a
+  separate mechanism on NODE timeouts. The
+  detection set is the executor's own suite
+  definition (_command_runs_full_suite):
+  unittest discovery, a bare unittest run, an
+  unscoped pytest run; a scoped run (one
+  module, file, or node id) is a probe.
+- Fix 1: a suite run attached to an exit_code
+  criterion command is now a CHEAP planning
+  rejection (code suite_criterion_command),
+  on the placeholder_value precedent — the
+  error names both sound placements: the
+  suite as the node's own command, measured
+  by an exit_code criterion carrying NO
+  command of its own, or a tests_pass
+  criterion. The cap itself does not move.
+  Verified on the verbatim recorded plans:
+  Arm 3's rejects cheap with exactly this one
+  error; Arm 1's rejects earlier, at
+  materialize (fix 3).
+- Fix 2: both prompts now state the budget —
+  "60-second", derived from the new named
+  constant measure.CRITERION_COMMAND_TIMEOUT_S
+  (the 60.0 literal, value unchanged) by the
+  cycle-11 lazy-derivation pattern — and the
+  suite-placement rule.
+- Fix 3: elision inside anchored replacements.
+  Arm 1's '# Existing code...' is keyword-
+  first, so the dots-first _ELISION_RE never
+  matched it; _anchored_elision_marker runs
+  on the delta at the materialize seam and
+  also fires on a standalone comment carrying
+  '...' plus an elision keyword (existing,
+  remaining, rest of, unchanged, original,
+  same as), rejecting as anchored_edit. Arm
+  3's complete body and the canonical grounded
+  delta pass. Dispatch-literal retention was
+  assessed and NOT built: recorded corpus
+  deltas (retry32-3, retry33-3, llama3-2/3)
+  also drop route literals, and cycle 6
+  pinned two of them to reject with exactly
+  {placeholder_value} — a retention error at
+  any seam would move the original corpus
+  replay. It remains a separate, larger
+  decision.
+- Corpus: the model-ab corpus gains re-run
+  #8's 5 outputs (11 total; the original
+  corpus untouched). Before: both Qwen
+  outputs replay ACCEPTED/SOUND, agreeing
+  with the live round-one accepts (the
+  harness's mirrored soundness rule shares
+  the elision blind spot). After: r8a1
+  rejects at materialize [anchored_edit],
+  r8a3 rejects at validate with exactly
+  [suite_criterion_command] — 4 of 22 rows
+  moved, all intended; the original corpus
+  is row-identical (56 rows, 0 moved).
+  Per-model: gemma3:27b mean 1.50, accepted 0
+  (unchanged); qwen2.5-coder:14b mean 1.60 ->
+  2.00, accepted 2 -> 0. The replay parses
+  recorded initial outputs, so this shows
+  the rejections firing on them; fix 1's
+  real effect is on the next live generation
+  (the prompt now states the budget) and on
+  the repair loop (a cheap re-prompt instead
+  of a retried measurement timeout).
+- Pins: two changed, one collision — the
+  interpreter-parity and bare-python
+  normalization tests used the suite as
+  their criterion-command payload, the shape
+  fix 1 outlaws; re-vehicled on the scoped
+  run '-m unittest tests.test_health' with
+  every interpreter assertion preserved (the
+  first full-suite run caught it: 1126 ran,
+  those 2 errors; both classes green after).
+  Suite: 1126/1126 OK (1117 baseline + 9
+  new). Framework guard: ALL CHECKS PASSED.
+  No live runs, no GPU. NOT pushed.

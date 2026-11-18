@@ -24,18 +24,37 @@ def _reportable_metrics_text() -> str:
     return "; ".join(parts)
 
 
+def _criterion_command_budget_text() -> str:
+    """The exit_code criterion-command time budget, from measure.
+
+    Cycle 12: a criterion's own "command" runs under
+    measure.CRITERION_COMMAND_TIMEOUT_S at measurement time, and the
+    planner rejects a test-suite run attached to a criterion command
+    — so the prompts state the budget the model is planning against,
+    derived from the constant the measurement step enforces (the
+    cycle-11 pattern: one source, no hand-copied number). The import
+    is lazy, like _reportable_metrics_text's, so this module stays
+    import-light at module scope.
+    """
+    from .measure import CRITERION_COMMAND_TIMEOUT_S
+
+    value = CRITERION_COMMAND_TIMEOUT_S
+    rendered = str(int(value)) if float(value).is_integer() else str(value)
+    return f"{rendered}-second"
+
+
 def planner_system_prompt() -> str:
     """PLANNER_SYSTEM_PROMPT with the derived metric set filled in."""
     return PLANNER_SYSTEM_PROMPT.replace(
         "__REPORTABLE_METRICS__", _reportable_metrics_text()
-    )
+    ).replace("__CRITERION_COMMAND_BUDGET__", _criterion_command_budget_text())
 
 
 def replan_system_prompt() -> str:
     """REPLAN_SYSTEM_PROMPT with the derived metric set filled in."""
     return REPLAN_SYSTEM_PROMPT.replace(
         "__REPORTABLE_METRICS__", _reportable_metrics_text()
-    )
+    ).replace("__CRITERION_COMMAND_BUDGET__", _criterion_command_budget_text())
 
 
 INTAKE_SYSTEM_PROMPT = """You normalize user requests into a strict JSON TaskIntent object.
@@ -123,7 +142,7 @@ NODE SHAPE — every entry of \"nodes\" MUST be exactly this object:
 There is NO \"type\" field and NO \"write_file\" / \"execute_command\" node kind. To write a file use the \"scaffold\" claw (inputs \"file_path\" and \"content\"); to run a command use the \"bash\" claw (inputs \"command\"). \"depends_on\" lists node ids only (e.g. \"step_1\") — never an output name, a file path, or a description. \"assigned_claw\" MUST be one of the ALLOWED CLAWS above — never a node \"type\".
 
 MEASURABLE CRITERIA — every node MUST have a "criteria" array with at least one criterion, next to the human-readable "acceptance" strings. A node with no measurable criterion is rejected. Criterion shapes:
-- {"type": "exit_code", "equals": 0} — for "bash" nodes: the command must exit 0. An exit_code criterion may carry its own "command" ({"type": "exit_code", "equals": 0, "command": "<shell command>"}), which is run and measured instead of the node's command — use that to verify one specific command (for example a curl) instead of inventing a criterion type for it.
+- {"type": "exit_code", "equals": 0} — for "bash" nodes: the command must exit 0. An exit_code criterion may carry its own "command" ({"type": "exit_code", "equals": 0, "command": "<shell command>"}), which is run and measured instead of the node's command — use that to verify one specific command (for example a curl) instead of inventing a criterion type for it. A criterion "command" is run by the measurement step under a __CRITERION_COMMAND_BUDGET__ time budget, so it must be a quick probe (a curl, a grep, nvidia-smi) — NEVER attach a test-suite run (unittest discover, a bare unittest or pytest run) to a criterion command: it can only time out, and a timeout is retried, never re-planned. To run the suite, make the suite a node's own "command" and measure that node with an exit_code criterion carrying NO "command" of its own, or with a tests_pass criterion.
 - {"type": "file_exists", "path": "<absolute path>"} — the file must exist after the node runs.
 - {"type": "file_matches", "path": "<absolute path>", "sha256": "<hex>"} — file contents must match a hash.
 - {"type": "metric", "name": "<metric>", "op": ">=", "value": <number>} — a numeric metric the node's claw reports. The metrics each claw reports are exactly: __REPORTABLE_METRICS__. "bash" and "scaffold" report NO metrics — never put a metric criterion on them, and never invent a metric name (for example "json_response") for a check no claw reports: to verify a response a bash command produces, use an "exit_code" criterion on that node instead.
@@ -291,7 +310,12 @@ Rules:
   __REPORTABLE_METRICS__; "bash" and "scaffold" report no metrics, and
   an invented metric name (for example "json_response") is rejected —
   verify a bash response with an "exit_code" criterion on that node
-  instead. A file criterion's "path"
+  instead. An exit_code criterion's own "command" is measured under a
+  __CRITERION_COMMAND_BUDGET__ budget — quick probes only (a curl, a
+  grep): never attach a test-suite run to a criterion command, it can
+  only time out; run the suite as the node's own command and measure
+  it with an exit_code criterion carrying NO "command", or with a
+  tests_pass criterion. A file criterion's "path"
   must be a file the plan demonstrably writes (a scaffold/file_writer
   target, a heredoc or redirect target, a curl -o / wget -O download
   target, a tee target, a "dd of=" target, a cp/mv destination, or a

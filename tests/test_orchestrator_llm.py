@@ -14049,6 +14049,10 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
         # applied there. A criterion command naming a nonexistent
         # interpreter normalization does not cover (./bin/python) is
         # rejected identically with repo_root=None and explicit.
+        # Cycle 12: the payload is a SCOPED run (tests.test_health),
+        # not the suite — a suite run on a criterion command is now
+        # itself a cheap planning rejection, which would confound
+        # the interpreter behavior under test here.
         node = {
             "id": "step_1",
             "objective": "Verify the endpoint live",
@@ -14060,7 +14064,7 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
                 {
                     "type": "exit_code",
                     "equals": 0,
-                    "command": "./bin/python -m unittest discover -s tests",
+                    "command": "./bin/python -m unittest tests.test_health",
                 }
             ],
         }
@@ -14084,7 +14088,7 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
             {
                 "type": "exit_code",
                 "equals": 0,
-                "command": "./venv/bin/python -m unittest discover -s tests",
+                "command": "./venv/bin/python -m unittest tests.test_health",
             }
         ]
         for root in (None, str(self.repo_root)):
@@ -14094,7 +14098,7 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
             self.assertEqual(len(nodes), 1)
             self.assertEqual(
                 nodes[0].criteria[0]["command"],
-                "./.venv/bin/python -m unittest discover -s tests",
+                "./.venv/bin/python -m unittest tests.test_health",
             )
         # The grounded interpreter in a criterion command passes on
         # both paths (the .venv exemption is machine-independent).
@@ -14103,7 +14107,7 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
             {
                 "type": "exit_code",
                 "equals": 0,
-                "command": "./.venv/bin/python -m unittest discover -s tests",
+                "command": "./.venv/bin/python -m unittest tests.test_health",
             }
         ]
         for root in (None, str(self.repo_root)):
@@ -14555,6 +14559,10 @@ class TestPlannerInterpreterNormalizationFix(unittest.TestCase):
         self.assertIn("./.venv/bin/python", errors[0])
 
     def test_bare_python_criterion_command_normalized(self) -> None:
+        # Cycle 12: the payload is a scoped run (tests.test_health) —
+        # a suite run on a criterion command is itself a cheap
+        # planning rejection since cycle 12; the interpreter
+        # normalization of the criterion command is what's pinned.
         node = {
             "id": "step_1",
             "objective": "Verify the endpoint live",
@@ -14566,7 +14574,7 @@ class TestPlannerInterpreterNormalizationFix(unittest.TestCase):
                 {
                     "type": "exit_code",
                     "equals": 0,
-                    "command": "python -m unittest discover -s tests",
+                    "command": "python -m unittest tests.test_health",
                 }
             ],
         }
@@ -14577,7 +14585,7 @@ class TestPlannerInterpreterNormalizationFix(unittest.TestCase):
             self.assertEqual(len(nodes), 1)
             self.assertEqual(
                 nodes[0].criteria[0]["command"],
-                "./.venv/bin/python -m unittest discover -s tests",
+                "./.venv/bin/python -m unittest tests.test_health",
             )
 
 
@@ -20409,3 +20417,367 @@ class TestPlannerCycle11SteeringFix(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("FULL updated module", errors[0])
         self.assertNotIn("NEW test file", errors[0])
+
+
+class TestPlannerCycle12CriterionCommandFix(unittest.TestCase):
+    """Cycle 12: the suite-as-criterion-command cheap rejection, the
+    published criterion-command budget, and the anchored-replacement
+    elision marker (re-run #8).
+
+    Re-run #8: qwen2.5-coder:14b's round-one ACCEPTED plans attached
+    the full suite as an exit_code criterion's own "command" in both
+    arms (Arm 1 on the test-writing node, Arm 3 on the edit node);
+    criterion commands run under measure's 60s cap, so both runs died
+    on measurement timeouts the judge could only RETRY — the timeout
+    path never re-plans. Arm 1's anchored do_GET replacement also
+    ended at a literal '# Existing code...' comment, dropping every
+    sibling GET route (+14/-70 executed): definition-level retention
+    passed it (do_GET survives by name) and the dots-first
+    _ELISION_RE never matched the keyword-first comment. These tests
+    pin the two planning rejections, the probe/boundary shapes that
+    must stay untouched, and the prompt budget derived from the code
+    constant.
+    """
+
+    HEALTH_GOAL = TestPlannerFakeAndMemoryFix.HEALTH_GOAL
+
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+    DO_GET_ANCHOR = "HiveAPIServer.start.Handler.do_GET"
+
+    # Re-run #8 Arm 1, verbatim: nodes[0].inputs.content of the raw
+    # planner output (logs/rerun8-arm1.out on seeker7, 2026-11-18).
+    # The /health branch written out, then the standalone comment
+    # standing in for every sibling route.
+    ARM1_ELIDED_DO_GET = 'def do_GET(self) -> None:  # noqa: N802\n    parsed = urlparse(self.path)\n    path = parsed.path\n    qs = parse_qs(parsed.query)\n\n    if path == "/health":\n        import subprocess\n        try:\n            ollama_status = subprocess.run([\'curl\', \'-sf\', \'http://localhost:11434\'], capture_output=True, text=True)\n            gpu_temp = subprocess.run([\'nvidia-smi\', \'--query-gpu=temperature.gpu\', \'--format=csv,noheader,nounits\'], capture_output=True, text=True)\n        except Exception as e:\n            return self._send(500, {"ok": False, "error": str(e)})\n\n        status = {\n            "ok": True,\n            "status": "ready",\n            "ollama_reachable": ollama_status.returncode == 0,\n            "gpu_temperature": gpu_temp.stdout.strip() if gpu_temp.returncode == 0 else None\n        }\n        return self._send(200, status)\n\n    # Existing code...\n'
+
+    # Re-run #8 Arm 3, verbatim: the complete replacement — every
+    # sibling branch carried over, no elision marker.
+    ARM3_CLEAN_DO_GET = 'def do_GET(self) -> None:  # noqa: N802\n    parsed = urlparse(self.path)\n    path = parsed.path\n    qs = parse_qs(parsed.query)\n\n    if path == "/health":\n        import subprocess\n        ollama_reachable = True\n        gpu_temp = "N/A"\n        try:\n            subprocess.check_call([\'curl\', \'-sf\', \'http://localhost:11434\'], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)\n        except subprocess.CalledProcessError:\n            ollama_reachable = False\n        try:\n            nvidia_smi_output = subprocess.check_output([\'nvidia-smi\', \'--query-gpu=temperature.gpu\', \'--format=csv,noheader,nounits\'], text=True, stderr=subprocess.STDOUT)\n            gpu_temp = nvidia_smi_output.strip()\n        except subprocess.CalledProcessError:\n            pass\n        return self._send(200, {"ok": True, "status": "ready", "ollama_reachable": ollama_reachable, "gpu_temperature": gpu_temp})\n\n    if path == "/status":\n        if not self._authorized():\n            return\n        return self._send(200, {"ok": True, "status": api.controller.status()})\n\n    if path == "/metrics":\n        if not self._authorized():\n            return\n        status = api.controller.status()\n        metrics = {\n            "workers_healthy": status["workers"]["healthy"],\n            "workers_configured": status["workers"]["configured"],\n            "tasks_running": status["queue"]["running"],\n            "tasks_queued": status["queue"]["queued"],\n            "queue_max": status["queue"]["max"],\n        }\n        return self._send(200, {"ok": True, "metrics": metrics})\n\n    if path == "/tasks":\n        if not self._authorized():\n            return\n        status_filter = qs.get("status", [None])[0]\n        tasks = api.controller.list_tasks(status=status_filter)\n        return self._send(200, {"ok": True, "tasks": tasks, "count": len(tasks)})\n\n    if path.startswith("/tasks/") and len(path.split("/")) == 3:\n        if not self._authorized():\n            return\n        task_id = path.split("/")[2]\n        task = api.controller.get_task(task_id)\n        if task is None:\n            return self._send(404, {"ok": False, "error": "Task not found"})\n        return self._send(200, {"ok": True, "task": task})\n\n    if path == "/resources":\n        if not self._authorized():\n            return\n        return self._send(200, {"ok": True, "resources": resource_summary_safe()})\n\n    # M4: approval gates — list packets, optionally filtered.\n    if path == "/gates":\n        if not self._authorized():\n            return\n        status_filter = qs.get("status", [None])[0]\n        run_filter = qs.get("run_id", [None])[0]\n        if run_filter:\n            packets = api.gate_store.list_for_run(run_filter)\n        elif status_filter == "pending":\n            packets = api.gate_store.pending()\n        else:\n            packets = api.gate_store.all()\n        return self._send(\n            200,\n            {\n                "ok": True,\n                "gates": [pkt.model_dump(mode="json") for pkt in packets],\n                "count": len(packets),\n            },\n        )\n\n    if path.startswith("/gates/") and len(path.split("/")) == 3:\n        if not self._authorized():\n            return\n        packet_id = path.split("/")[2]\n        packet = api.gate_store.get(packet_id)\n        if packet is None:\n            return self._send(404, {"ok": False, "error": "Gate not found"})\n        return self._send(200, {"ok": True, "gate": packet.model_dump(mode="json")})\n\n    return self._send(404, {"ok": False, "error": "Not Found"})'
+
+    # Arm 1 and Arm 3 both attached this exact command (Arm 1 on
+    # step_2, Arm 3 on step_1) as an exit_code criterion's command.
+    RECORDED_SUITE_COMMAND = (
+        "cd /home/seeker/projects/FreeTalon && "
+        "./.venv/bin/python -m unittest discover -s tests"
+    )
+
+    TEST_FILE_CONTENT = (
+        "import unittest\n\n\n"
+        "class TestHealthEndpoint(unittest.TestCase):\n"
+        "    def test_health_reports_status(self):\n"
+        "        self.assertIn('status', {'status': 'ready'})\n\n\n"
+        "if __name__ == '__main__':\n"
+        "    unittest.main()\n"
+    )
+
+    def _dag(self, nodes):
+        import json
+
+        return json.dumps({"nodes": nodes})
+
+    def _node(self, node_id, claw, inputs, criteria, outputs=None,
+              depends_on=None):
+        return {
+            "id": node_id,
+            "objective": f"Do {node_id}",
+            "depends_on": depends_on or [],
+            "assigned_claw": claw,
+            "inputs": inputs,
+            "outputs": outputs or [],
+            "acceptance": ["done"],
+            "criteria": criteria,
+            "status": "draft",
+            "timeout_s": 30,
+            "max_retries": 1,
+            "responds_to": "",
+            "differs_by": "",
+        }
+
+    def _grounded_plan(self, edit_content, edit_criteria,
+                       test_criteria=None):
+        """The canonical grounded /health plan (the cycle-9 fixture
+        shape) with the edit node's content/criteria and the test
+        node's criteria parameterizable."""
+        api_path = str(self.REPO_ROOT / "freetalon" / "api.py")
+        test_path = str(self.REPO_ROOT / "tests" / "test_health.py")
+        if test_criteria is None:
+            test_criteria = [
+                {"type": "file_exists", "path": test_path},
+                {"type": "tests_pass", "suite": str(self.REPO_ROOT / "tests")},
+            ]
+        return [
+            self._node(
+                "step_1", "scaffold",
+                {"file_path": api_path, "anchor": self.DO_GET_ANCHOR,
+                 "position": "replace", "content": edit_content},
+                edit_criteria, outputs=[api_path]),
+            self._node(
+                "step_2", "scaffold",
+                {"file_path": test_path, "content": self.TEST_FILE_CONTENT},
+                test_criteria, outputs=[test_path], depends_on=["step_1"]),
+            self._node(
+                "step_3", "bash",
+                {"command": "curl -sf http://localhost:8765/health || true"},
+                [{"type": "exit_code", "equals": 0}], depends_on=["step_2"]),
+        ]
+
+    def _criterion_node(self, command):
+        from freetalon.orchestrator.models import PlanNode
+
+        return PlanNode(
+            id="step_1", objective="probe", assigned_claw="scaffold",
+            inputs={"file_path": "x.py", "content": "y = 1\n"},
+            outputs=[],
+            criteria=[{"type": "exit_code", "equals": 0,
+                       "command": command}],
+        )
+
+    # --- Fix 1: suite-as-criterion-command is a cheap rejection ---
+
+    def test_suite_criterion_on_edit_node_rejects_cheap_arm3_shape(self):
+        """Arm 3's recorded shape: the suite as the EDIT node's
+        exit_code criterion command rejects at planning with exactly
+        the suite_criterion_command error, in the cheap class — the
+        repair loop re-prompts instead of the run dying on a
+        measurement timeout the judge can only retry."""
+        from freetalon.orchestrator.planner import (
+            CheapRejectionError,
+            parse_planner_response,
+        )
+
+        api_path = str(self.REPO_ROOT / "freetalon" / "api.py")
+        nodes = self._grounded_plan(
+            self.ARM3_CLEAN_DO_GET,
+            [{"type": "file_exists", "path": api_path},
+             {"type": "exit_code", "equals": 0,
+              "command": "python3 -m unittest discover -s tests"}],
+        )
+        with self.assertRaises(CheapRejectionError) as ctx:
+            parse_planner_response(
+                self._dag(nodes), goal_text=self.HEALTH_GOAL)
+        codes = [record.code for record in ctx.exception.plan_errors]
+        self.assertEqual(codes, ["suite_criterion_command"])
+        message = str(ctx.exception)
+        self.assertIn("step_1", message)
+        self.assertIn("60s timeout", message)
+        self.assertIn("node's own command", message)
+        self.assertIn("carrying NO command of its own", message)
+        self.assertIn("tests_pass criterion", message)
+
+    def test_suite_criterion_on_test_node_rejects_cheap_arm1_shape(self):
+        """Arm 1's recorded position: the suite criterion sat on the
+        test-writing node (step_2). Same single cheap error. (Arm 1's
+        own step_1 body is fix 3's fixture — materialize runs before
+        the aggregator, so this test isolates fix 1 with the clean
+        canonical body on step_1.)"""
+        from freetalon.orchestrator.planner import (
+            CheapRejectionError,
+            parse_planner_response,
+        )
+
+        api_path = str(self.REPO_ROOT / "freetalon" / "api.py")
+        test_path = str(self.REPO_ROOT / "tests" / "test_health.py")
+        nodes = self._grounded_plan(
+            GROUNDED_DO_GET_DELTA,
+            [{"type": "file_exists", "path": api_path}],
+            test_criteria=[
+                {"type": "file_exists", "path": test_path},
+                {"type": "exit_code", "equals": 0,
+                 "command": "python3 -m unittest discover -s tests"},
+            ],
+        )
+        with self.assertRaises(CheapRejectionError) as ctx:
+            parse_planner_response(
+                self._dag(nodes), goal_text=self.HEALTH_GOAL)
+        codes = [record.code for record in ctx.exception.plan_errors]
+        self.assertEqual(codes, ["suite_criterion_command"])
+        self.assertIn("step_2", str(ctx.exception))
+
+    def test_recorded_qwen_suite_command_rejected_verbatim(self):
+        """The exact command string both Qwen arms recorded is a
+        suite run under the executor's own definition, and the
+        validator names it once."""
+        from freetalon.orchestrator.executor import (
+            _command_runs_full_suite,
+        )
+        from freetalon.orchestrator.planner import (
+            _suite_criterion_command_errors,
+        )
+
+        self.assertTrue(
+            _command_runs_full_suite(self.RECORDED_SUITE_COMMAND))
+        errors = _suite_criterion_command_errors(
+            [self._criterion_node(self.RECORDED_SUITE_COMMAND)])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("step_1", errors[0])
+        self.assertIn("full test suite", errors[0])
+
+    def test_probe_criterion_commands_untouched(self):
+        """The recorded probe shapes (curl, grep, nvidia-smi) are not
+        suite runs: no validator error, and a grounded plan carrying
+        a curl criterion command parses accepted."""
+        from freetalon.orchestrator.planner import (
+            _suite_criterion_command_errors,
+            parse_planner_response,
+        )
+
+        for probe in (
+            "curl -sf http://localhost:8765/health",
+            "grep -q 'def do_GET' freetalon/api.py",
+            "nvidia-smi --query-gpu=temperature.gpu "
+            "--format=csv,noheader,nounits",
+        ):
+            self.assertEqual(
+                _suite_criterion_command_errors(
+                    [self._criterion_node(probe)]), [])
+        api_path = str(self.REPO_ROOT / "freetalon" / "api.py")
+        nodes = self._grounded_plan(
+            GROUNDED_DO_GET_DELTA,
+            [{"type": "file_exists", "path": api_path},
+             {"type": "exit_code", "equals": 0,
+              "command": "curl -sf http://localhost:8765/health"}],
+        )
+        parsed, _intent = parse_planner_response(
+            self._dag(nodes), goal_text=self.HEALTH_GOAL)
+        # Parse normalizes the model's ids to node-N (retry #17).
+        self.assertEqual(
+            [node.id for node in parsed], ["node-1", "node-2", "node-3"])
+
+    def test_scoped_runs_are_probes_suite_runs_reject(self):
+        """The cap's boundary, from the executor's suite definition:
+        a run scoped to one module/file/node id is a quick probe and
+        stays untouched; discovery, a bare run, or an unscoped
+        target (the tests tree itself) is the suite."""
+        from freetalon.orchestrator.planner import (
+            _suite_criterion_command_errors,
+        )
+
+        for scoped in (
+            "python3 -m unittest tests.test_health",
+            "python3 -m unittest tests.test_health.TestHealthEndpoint",
+            "python3 -m pytest tests/test_health.py",
+            "python3 -m pytest "
+            "tests/test_health.py::TestHealthEndpoint",
+        ):
+            self.assertEqual(
+                _suite_criterion_command_errors(
+                    [self._criterion_node(scoped)]), [], scoped)
+        for suite in (
+            "python3 -m unittest discover -s tests",
+            "python3 -m unittest",
+            "python3 -m pytest",
+            "pytest tests",
+            "python3 -m pytest tests/",
+        ):
+            self.assertEqual(
+                len(_suite_criterion_command_errors(
+                    [self._criterion_node(suite)])), 1, suite)
+
+    # --- Fix 2: the prompts publish the budget from the constant ---
+
+    def test_prompts_state_budget_derived_from_measure_constant(self):
+        from freetalon.orchestrator.measure import (
+            CRITERION_COMMAND_TIMEOUT_S,
+        )
+        from freetalon.orchestrator.prompts import (
+            _criterion_command_budget_text,
+            planner_system_prompt,
+            replan_system_prompt,
+        )
+
+        self.assertEqual(CRITERION_COMMAND_TIMEOUT_S, 60.0)
+        self.assertEqual(_criterion_command_budget_text(), "60-second")
+        planner = planner_system_prompt()
+        replan = replan_system_prompt()
+        for prompt in (planner, replan):
+            self.assertIn("60-second", prompt)
+            self.assertNotIn("__CRITERION_COMMAND_BUDGET__", prompt)
+        self.assertIn("NEVER attach a test-suite run", planner)
+        self.assertIn('carrying NO "command" of its own', planner)
+        self.assertIn("never attach a test-suite run", replan)
+        self.assertIn('carrying NO "command"', replan)
+
+    # --- Fix 3: the elision marker in an anchored replacement ---
+
+    def test_arm1_elided_delta_rejects_at_materialize(self):
+        """Arm 1's verbatim replacement body — the /health branch
+        plus '# Existing code...' — is a named planning rejection
+        (anchored_edit, the materialize stage's code), not an
+        accepted plan whose splice silently deletes the sibling
+        routes."""
+        from freetalon.orchestrator.intake import LLMResponseError
+        from freetalon.orchestrator.planner import (
+            CheapRejectionError,
+            parse_planner_response,
+        )
+
+        api_path = str(self.REPO_ROOT / "freetalon" / "api.py")
+        nodes = self._grounded_plan(
+            self.ARM1_ELIDED_DO_GET,
+            [{"type": "file_exists", "path": api_path},
+             {"type": "exit_code", "equals": 0,
+              "command": "grep -q 'def do_GET' freetalon/api.py"}],
+        )
+        with self.assertRaises(LLMResponseError) as ctx:
+            parse_planner_response(
+                self._dag(nodes), goal_text=self.HEALTH_GOAL)
+        self.assertNotIsInstance(ctx.exception, CheapRejectionError)
+        codes = [record.code for record in ctx.exception.plan_errors]
+        self.assertEqual(codes, ["anchored_edit"])
+        message = str(ctx.exception)
+        self.assertIn("elides", message)
+        self.assertIn("# Existing code...", message)
+
+    def test_arm3_clean_delta_parses_accepted(self):
+        """Arm 3's verbatim body — every sibling branch carried
+        over — passes materialize. (Its own suite criterion command
+        is fix 1's fixture above; here the body is judged with Arm
+        1's probe criteria so the two fixes stay isolated.)"""
+        from freetalon.orchestrator.planner import parse_planner_response
+
+        api_path = str(self.REPO_ROOT / "freetalon" / "api.py")
+        nodes = self._grounded_plan(
+            self.ARM3_CLEAN_DO_GET,
+            [{"type": "file_exists", "path": api_path},
+             {"type": "exit_code", "equals": 0,
+              "command": "grep -q 'def do_GET' freetalon/api.py"}],
+        )
+        parsed, _intent = parse_planner_response(
+            self._dag(nodes), goal_text=self.HEALTH_GOAL)
+        # Parse normalizes the model's ids to node-N (retry #17).
+        self.assertEqual(
+            [node.id for node in parsed], ["node-1", "node-2", "node-3"])
+
+    def test_anchored_elision_marker_forms(self):
+        """Unit pins for the marker: the recorded keyword-first form
+        and the dots-first forms fire; a keyword WITHOUT the
+        ellipsis, and the canonical body's one real comment, do
+        not."""
+        from freetalon.orchestrator.planner import _anchored_elision_marker
+
+        self.assertEqual(
+            _anchored_elision_marker(self.ARM1_ELIDED_DO_GET),
+            "# Existing code...")
+        self.assertIsNone(
+            _anchored_elision_marker(self.ARM3_CLEAN_DO_GET))
+        self.assertIsNone(
+            _anchored_elision_marker(GROUNDED_DO_GET_DELTA))
+        self.assertEqual(
+            _anchored_elision_marker(
+                "def f():\n    # ... existing code ...\n    pass\n"),
+            "# ... existing code ...")
+        self.assertEqual(
+            _anchored_elision_marker(
+                "def f():\n    # Remaining handlers...\n    pass\n"),
+            "# Remaining handlers...")
+        self.assertIsNone(
+            _anchored_elision_marker(
+                "def f():\n"
+                "    # Existing routes are handled below.\n"
+                "    pass\n"))
+        self.assertIsNone(
+            _anchored_elision_marker(
+                "def f():\n"
+                "    # M4: approval gates — list packets, optionally"
+                " filtered.\n"
+                "    pass\n"))
