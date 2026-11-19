@@ -3043,6 +3043,52 @@ def _sed_noop_errors(
             break
     return errors
 
+def _sed_ban_errors(
+    nodes: list[PlanNode],
+    goal_text: str | None = None,
+    index: Any | None = None,
+) -> list[str]:
+    """Hard-reject sed -i edits of Python files, whatever the pattern.
+
+    Reversal of the retry-#18 pin (approved by Pat 2026-11-19).
+    Retry #18 judged sed -i edits case by case: a search pattern
+    that occurs in the file passed, and _sed_noop_errors still
+    rejects the ones that do not. But a judged-and-passed sed -i is
+    still an ungrounded rewrite — it bypasses the anchored-edit
+    machinery, its result is never checked against the file's real
+    contents before it lands, and sed-shaped edits have clobbered
+    modules in the campaign record. So the rule is now categorical:
+    any in-place sed (an -i flag, a bundle containing i, -iSUFFIX,
+    or --in-place) whose target path ends in .py is rejected by
+    name. The ban does not consult the disk — a .py the plan itself
+    creates is covered — and it does not reach sed without -i or
+    sed -i on non-.py files; those keep their previous behavior,
+    the no-op judgment included.
+    """
+    errors: list[str] = []
+    grounded = _grounded_move_text(index, goal_text)
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("bash", "shell_exec"):
+            continue
+        command = node.inputs.get("command") or node.inputs.get("cmd")
+        if not isinstance(command, str) or not command:
+            continue
+        shell = _strip_heredoc_bodies(command)
+        for _script, target in _sed_in_place_edits(shell):
+            if Path(target).suffix.lower() != ".py":
+                continue
+            errors.append(
+                f"Planner node '{node.id}' runs sed -i on {target!r}: "
+                f"in-place sed edits of Python files are banned — the "
+                f"edit bypasses the anchored-edit machinery, so nothing "
+                f"checks it against the file's real contents before it "
+                f"lands. Write the code with the scaffold claw, or a "
+                f"bash heredoc carrying the full intended content."
+                f"{grounded}"
+            )
+            break
+    return errors
+
 
 def _claw_error(node: PlanNode) -> str | None:
     """Return an error if the node's assigned_claw is not a registered claw."""
@@ -5205,6 +5251,12 @@ def _collect_plan_error_records(
         _error_records(
             "sed_noop",
             _sed_noop_errors(nodes, repo_root, goal_text, index, modules=modules),
+        )
+    )
+    records.extend(
+        _error_records(
+            "sed_ban",
+            _sed_ban_errors(nodes, goal_text, index),
         )
     )
     standin_records = _error_records(
@@ -7502,6 +7554,7 @@ _CODE_TO_APPROACH_KEY = {
     "prose_command": "prose, not a shell command",
     "static_standin": "hardcoded answer",
     "sed_noop": "sed -i",
+    "sed_ban": "sed -i",
     "scaffold_overwrite": "of the existing module's",
     "scope_widening": "scope",
 }

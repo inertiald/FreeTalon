@@ -8364,7 +8364,10 @@ class TestPlannerSignalLossFix(unittest.TestCase):
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Sed hard-ban (2026-11-19): now 5 -- step-1's sed -i targets
+        # a .py file, so the hard ban (the reversed retry-#18 pin)
+        # adds one error alongside the sed no-op.
         # Planner cycle 2 (payload channel): now 4 -- step-2's
         # heredoc payload is repaired and rerouted to the scaffold
         # form at materialization, so its parse error no longer
@@ -8432,7 +8435,7 @@ class TestPlannerSignalLossFix(unittest.TestCase):
         self.assertEqual(len(nodes), 4)
         self.assertEqual(nodes[0].assigned_claw, "scaffold")
 
-    def test_sed_against_existing_pattern_and_write_to_existing_dir_pass(self) -> None:
+    def test_sed_against_existing_pattern_is_banned(self) -> None:
         test_path = str(self.repo_root / "tests" / "test_health_check.py")
         # Cycle 14: the sed pattern is derived from the live file,
         # the way _expected_retry16_error_line derives its line —
@@ -8491,10 +8494,52 @@ class TestPlannerSignalLossFix(unittest.TestCase):
                 "criteria": [{"type": "file_exists", "path": test_path}],
             },
         ]
+        # Sed hard-ban (2026-11-19): this plan was the retry-#18 pin --
+        # a sed -i whose pattern occurs in api.py used to PASS. The
+        # pin is reversed (Pat-approved): sed -i on a .py file is a
+        # hard rejection whatever the pattern, so the same plan now
+        # rejects with exactly the ban error (the pattern matches, so
+        # the no-op judgment does not fire; step 2 is clean). The
+        # write-to-existing-dir half of the old pin is preserved by
+        # test_write_to_existing_dir_passes below.
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag(nodes), goal_text=self.HEALTH_GOAL, workspace=self.WS
+            )
+        message = str(caught.exception)
+        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("sed -i", message)
+        self.assertIn("banned", message)
+
+    def test_write_to_existing_dir_passes(self) -> None:
+        test_path = str(self.repo_root / "tests" / "test_health_check.py")
+        nodes = [
+            {
+                "id": "step_2",
+                "objective": "Write the health endpoint test file",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "inputs": {
+                    "command": (
+                        f"cat > {test_path} <<'EOF'\nimport unittest\n\n\n"
+                        "class TestHealthCheck(unittest.TestCase):\n"
+                        "    def test_ok(self):\n"
+                        "        self.assertTrue(True)\nEOF"
+                    )
+                },
+                "outputs": [test_path],
+                "acceptance": ["The test file exists."],
+                "criteria": [{"type": "file_exists", "path": test_path}],
+            },
+        ]
+        # The generic goal, not the health goal: a /health-goal plan
+        # must touch api.py (the route-goal guard), which was step 1's
+        # job in the combined pin -- the write behavior pinned here
+        # is goal-independent.
         parsed, _metadata = parse_planner_response(
-            self._dag(nodes), goal_text=self.HEALTH_GOAL, workspace=self.WS
+            self._dag(nodes), goal_text=self.GENERIC_GOAL, workspace=self.WS
         )
-        self.assertEqual(len(parsed), 2)
+        self.assertEqual(len(parsed), 1)
 
     # --- Focused unit tests for the three new checks ---
 
@@ -8547,7 +8592,7 @@ class TestPlannerSignalLossFix(unittest.TestCase):
         self.assertIn("/tmp/out.json", message)
         self.assertIn("not a /tmp scratch file", message)
 
-    def test_sed_noop_is_rejected_and_matching_sed_passes(self) -> None:
+    def test_sed_noop_is_rejected_and_ban_stacks(self) -> None:
         from freetalon.orchestrator.planner import (
             _sed_noop_errors,
             _sed_script_patterns,
@@ -8579,16 +8624,20 @@ class TestPlannerSignalLossFix(unittest.TestCase):
             "acceptance": ["Edited."],
             "criteria": [{"type": "exit_code", "equals": 0}],
         }
-        # The generic goal names no route, so only the sed error fires.
+        # The generic goal names no route, so only the sed errors
+        # fire: the no-op judgment, plus the hard ban -- the target
+        # is a .py file (sed hard-ban, 2026-11-19: 2 errors, where
+        # the retry-#18 era pinned 1).
         with self.assertRaises(LLMResponseError) as caught:
             parse_planner_response(
                 self._dag([bad]), goal_text=self.GENERIC_GOAL
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("was rejected with 2 errors", message)
         self.assertIn("sed -i", message)
         self.assertIn("def nope():", message)
         self.assertIn("does not occur", message)
+        self.assertIn("banned", message)
 
     def test_missing_directory_is_rejected_with_correct_location(self) -> None:
         node = {
@@ -9513,7 +9562,10 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         # Interpreter normalization (retry #27 fix): now 5 -- step-3's bare
         # `python` is rewritten to ./.venv/bin/python at parse time and no
         # longer errors; the other five defects are unchanged.
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Sed hard-ban (2026-11-19): now 5 -- step-1's sed -i targets
+        # a .py file, so the hard ban (the reversed retry-#18 pin)
+        # adds one error alongside the sed no-op.
         # Planner cycle 2 (payload channel): now 4 -- step-2's
         # heredoc payload is repaired and rerouted to the scaffold
         # form at materialization, so its parse error no longer
@@ -10427,7 +10479,10 @@ class TestPlannerSeededReplanFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Sed hard-ban (2026-11-19): now 5 -- step-1's sed -i targets
+        # a .py file, so the hard ban (the reversed retry-#18 pin)
+        # adds one error alongside the sed no-op.
         # Planner cycle 2 (payload channel): now 4 -- step-2's
         # heredoc payload is repaired and rerouted to the scaffold
         # form at materialization, so its parse error no longer
@@ -11309,7 +11364,10 @@ class TestPlannerSchemaSignalFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Sed hard-ban (2026-11-19): now 5 -- step-1's sed -i targets
+        # a .py file, so the hard ban (the reversed retry-#18 pin)
+        # adds one error alongside the sed no-op.
         # Planner cycle 2 (payload channel): now 4 -- step-2's
         # heredoc payload is repaired and rerouted to the scaffold
         # form at materialization, so its parse error no longer
@@ -12152,7 +12210,10 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
                 workspace=self.WS,
             )
         message = str(caught.exception)
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
+        # Sed hard-ban (2026-11-19): now 5 -- step-1's sed -i targets
+        # a .py file, so the hard ban (the reversed retry-#18 pin)
+        # adds one error alongside the sed no-op.
         # Planner cycle 2 (payload channel): now 4 -- step-2's
         # heredoc payload is repaired and rerouted to the scaffold
         # form at materialization, so its parse error no longer
@@ -13905,7 +13966,10 @@ null
         # here until interpreter normalization (retry #27 fix):
         # step_2's bare `python` is rewritten to ./.venv/bin/python
         # at parse time and no longer errors.
-        self.assertIn("was rejected with 2 errors", message)
+        # Sed hard-ban (2026-11-19): now 3 again -- step_1's sed -i
+        # targets a .py file, so the hard ban (the reversed
+        # retry-#18 pin) adds one error alongside the sed no-op.
+        self.assertIn("was rejected with 3 errors", message)
         self.assertIn("hardcoded answer", message)
         self.assertIn('"ollama_reachable": True', message)
         self.assertIn('"gpu_temp": "N/A"', message)
@@ -21368,3 +21432,96 @@ class TestPlannerCycle14GroundingAndKnobs(unittest.TestCase):
         )
         start, end = _health_branch_span(flat)
         self.assertIn("return self._send", flat.splitlines()[end])
+
+
+class TestSedHardBan(unittest.TestCase):
+    """The sed hard-ban (2026-11-19, reversing the retry-#18 pin).
+
+    sed -i on a .py target is a hard rejection in every flag form;
+    sed without -i, and sed -i on non-.py files, keep exactly the
+    behavior they had under the retry-#18 judgment.
+    """
+
+    GENERIC_GOAL = "Add a logging helper to the app and verify it works."
+    WS = "/home/seeker/freetalon-workspace"
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.api_path = str(self.repo_root / "freetalon" / "api.py")
+        self.readme_path = str(self.repo_root / "README.md")
+
+    @staticmethod
+    def _dag(nodes: list[dict]) -> str:
+        import json
+
+        return json.dumps({"nodes": nodes, "metadata": {}})
+
+    def _node(self, command: str, target: str) -> dict:
+        return {
+            "id": "step_1",
+            "objective": "Edit a file",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": command},
+            "outputs": [target],
+            "acceptance": ["Edited."],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+
+    def _rejection(self, command: str, target: str) -> str:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._dag([self._node(command, target)]),
+                goal_text=self.GENERIC_GOAL,
+            )
+        return str(caught.exception)
+
+    def test_bundled_and_long_flag_forms_are_banned(self) -> None:
+        # The pattern occurs verbatim in api.py, so the no-op
+        # judgment stays silent and the ban is the only error.
+        for flags in ("-i", "-ni", "-i.bak", "--in-place", "--in-place=.bak"):
+            message = self._rejection(
+                f"sed {flags} 's/def do_GET/def do_GET/' {self.api_path}",
+                self.api_path,
+            )
+            self.assertIn("was rejected with 1 error", message, flags)
+            self.assertIn("banned", message, flags)
+
+    def test_ban_does_not_consult_the_disk(self) -> None:
+        ghost = str(self.repo_root / "freetalon" / "not_yet_written.py")
+        message = self._rejection(f"sed -i 's/a/b/' {ghost}", ghost)
+        self.assertIn("banned", message)
+
+    def test_sed_without_in_place_on_py_is_untouched(self) -> None:
+        node = self._node(
+            f"sed -n 's/status/state/p' {self.api_path}",
+            self.api_path,
+        )
+        parsed, _metadata = parse_planner_response(
+            self._dag([node]), goal_text=self.GENERIC_GOAL
+        )
+        self.assertEqual(len(parsed), 1)
+
+    def test_sed_in_place_on_non_py_keeps_noop_judgment(self) -> None:
+        # Non-matching pattern on an existing non-.py file: the
+        # retry-#18 no-op judgment fires exactly as before, and the
+        # ban does not stack on top of it.
+        message = self._rejection(
+            f"sed -i 's/def nope():/x/' {self.readme_path}",
+            self.readme_path,
+        )
+        self.assertIn("was rejected with 1 error", message)
+        self.assertIn("does not occur", message)
+        self.assertNotIn("banned", message)
+
+    def test_sed_in_place_on_non_py_with_matching_pattern_passes(self) -> None:
+        source = Path(self.readme_path).read_text(encoding="utf-8")
+        word = next(w for w in source.split() if w.isalpha() and len(w) > 3)
+        node = self._node(
+            f"sed -i 's/{word}/{word}/' {self.readme_path}",
+            self.readme_path,
+        )
+        parsed, _metadata = parse_planner_response(
+            self._dag([node]), goal_text=self.GENERIC_GOAL
+        )
+        self.assertEqual(len(parsed), 1)
