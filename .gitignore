@@ -215,3 +215,16 @@ Modelfile
 models/
 generated/
 freetalon-workspace/
+
+# Secret material — never commit (see docs/secret-hygiene.md).
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.tar
+*.tar.gz
+*.tgz
