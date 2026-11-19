@@ -46,7 +46,7 @@ def _urllib_transport(
 
 
 class ContentQueueClient:
-    """Thin wrapper over the internal content API's five operations."""
+    """Thin wrapper over the internal content API's operations."""
 
     def __init__(
         self,
@@ -54,6 +54,7 @@ class ContentQueueClient:
         token: str,
         transport: Transport | None = None,
         timeout_seconds: float = 60.0,
+        video_timeout_seconds: float = 300.0,
     ) -> None:
         if not token:
             raise ContentQueueError("a pipeline token is required")
@@ -64,6 +65,17 @@ class ContentQueueClient:
             def transport(method, url, headers, body):  # noqa: F811
                 return _urllib_transport(method, url, headers, body, timeout_seconds)
 
+            def video_transport(method, url, headers, body):
+                return _urllib_transport(
+                    method, url, headers, body, video_timeout_seconds
+                )
+
+            # The video upload gets its own, longer leash (a video
+            # is tens of MB over the tailnet); every other call
+            # keeps the standard timeout.
+            self._video_transport = video_transport
+        else:
+            self._video_transport = transport
         self._transport = transport
 
     def _request(
@@ -123,24 +135,24 @@ class ContentQueueClient:
             {"action": "submit", "drafts": drafts},
         )
 
-    def submit_treated_media(
-        self, entry_id: str, look: str, filename: str, data: bytes
+    def _put_bytes(
+        self,
+        transport: Transport,
+        path: str,
+        content_type: str,
+        data: bytes,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Upload one treated version of an entry photo (slice 1d):
-        the PLATE standard (look 'standard') or one alternate look.
-        The entry must be claimed ('processing'); the site stores the
-        bytes under the entry's treated/ or alternates/<look>/ folder
-        and records them on the media item."""
-        path = (
-            f"/api/internal/content/{entry_id}/treated/"
-            f"{urllib.parse.quote(look, safe='')}/"
-            f"{urllib.parse.quote(filename, safe='')}"
-        )
+        """One raw-body PUT with bearer auth (treated media, video):
+        the response discipline is shared so the two uploads can
+        never drift apart."""
         headers = {
             "Authorization": f"Bearer {self._token}",
-            "Content-Type": "image/jpeg",
+            "Content-Type": content_type,
         }
-        status, raw = self._transport("PUT", f"{self._base_url}{path}", headers, data)
+        if extra_headers:
+            headers.update(extra_headers)
+        status, raw = transport("PUT", f"{self._base_url}{path}", headers, data)
         if status == 401:
             raise ContentQueueError("content queue rejected the pipeline token (401)")
         if not 200 <= status < 300:
@@ -160,6 +172,53 @@ class ContentQueueClient:
         if not isinstance(decoded, dict):
             raise ContentQueueError(f"content queue returned a non-object for {path}")
         return decoded
+
+    def submit_treated_media(
+        self, entry_id: str, look: str, filename: str, data: bytes
+    ) -> dict[str, Any]:
+        """Upload one treated version of an entry photo (slice 1d):
+        the PLATE standard (look 'standard') or one alternate look.
+        The entry must be claimed ('processing'); the site stores the
+        bytes under the entry's treated/ or alternates/<look>/ folder
+        and records them on the media item."""
+        path = (
+            f"/api/internal/content/{entry_id}/treated/"
+            f"{urllib.parse.quote(look, safe='')}/"
+            f"{urllib.parse.quote(filename, safe='')}"
+        )
+        return self._put_bytes(self._transport, path, "image/jpeg", data)
+
+    def submit_video(
+        self,
+        entry_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        duration_seconds: float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> dict[str, Any]:
+        """Upload the entry's generated video (YouTube V1). The
+        entry must be claimed ('processing'); the site stores the
+        bytes under the entry's video/ folder and records them on
+        the entry. Render metadata rides as headers so the site
+        can record it without probing the file itself. Sent over
+        the video transport: the longer timeout scoped to this
+        call only."""
+        path = (
+            f"/api/internal/content/{entry_id}/video/"
+            f"{urllib.parse.quote(filename, safe='')}"
+        )
+        extra: dict[str, str] = {}
+        if duration_seconds is not None:
+            extra["X-Video-Duration-Seconds"] = f"{duration_seconds:.2f}"
+        if width is not None:
+            extra["X-Video-Width"] = str(width)
+        if height is not None:
+            extra["X-Video-Height"] = str(height)
+        return self._put_bytes(
+            self._video_transport, path, "video/mp4", data, extra
+        )
 
     def fetch_media(self, entry_id: str, filename: str) -> bytes:
         """Raw bytes of one media file stored on an entry."""

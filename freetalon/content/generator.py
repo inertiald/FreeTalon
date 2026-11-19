@@ -19,6 +19,14 @@ standard (freetalon.content.photos - PLATE, Pat's pick on
 The photo callable is optional and advisory in the same way vision
 is: a treatment failure ships that photo untreated, and an upload
 failure never holds the drafts back.
+
+YouTube V1: an entry that selected the youtube output and has at
+least one treated still also gets a generated video
+(freetalon.content.video): a title card carrying the generated
+YouTube title, then the PLATE stills as a Ken Burns slideshow.
+The video callable is optional and advisory in the same way: a
+render or upload failure is logged and the entry still lands at
+drafts-ready with its text drafts and treated photos.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ from .vision import VisionFn, make_ollama_vision
 
 if TYPE_CHECKING:
     from .photos import TreatedPhoto
+    from .video import RenderedVideo
 
 log = logging.getLogger("freetalon.content")
 
@@ -47,6 +56,11 @@ ChatFn = Callable[[str, str], str]
 # pipeline's only Pillow consumer, so it is imported lazily in
 # main() and injected here; the generator itself stays Pillow-free.
 PhotoFn = Callable[[bytes], "TreatedPhoto"]
+
+# render(still_bytes_in_media_order, youtube_title) -> RenderedVideo.
+# The video module is likewise imported lazily in main() (it shells
+# out to ffmpeg) and injected here.
+VideoFn = Callable[[list[bytes], str], "RenderedVideo"]
 
 _DEFAULT_SITE_BASE_URL = "http://100.87.140.12:3000"
 _DEFAULT_MODEL = "qwen3.8:27b"
@@ -134,11 +148,13 @@ class ContentGenerator:
         chat: ChatFn,
         vision: VisionFn | None = None,
         photos: PhotoFn | None = None,
+        videos: VideoFn | None = None,
     ) -> None:
         self._client = client
         self._chat = chat
         self._vision = vision
         self._photos = photos
+        self._videos = videos
 
     def _enrich_media(
         self, entry: dict[str, Any]
@@ -263,6 +279,7 @@ class ContentGenerator:
         try:
             drafts, treated = self.generate_drafts(entry)
             self._submit_treated(entry_id, treated)
+            self._submit_video(entry_id, entry, drafts, treated)
             self._client.submit_drafts(entry_id, drafts)
         except Exception as exc:  # one bad entry never wedges the queue
             note = f"{type(exc).__name__}: {exc}"[:900]
@@ -298,6 +315,61 @@ class ContentGenerator:
                         type(exc).__name__,
                         exc,
                     )
+
+    def _submit_video(
+        self,
+        entry_id: str,
+        entry: dict[str, Any],
+        drafts: dict[str, Any],
+        treated: dict[str, TreatedPhoto],
+    ) -> None:
+        """Render and upload the entry's video (YouTube V1), between
+        the treated uploads and the drafts submit. Advisory, exactly
+        like _submit_treated: only entries that selected youtube and
+        produced at least one treated still get a video, and any
+        render or upload failure is logged loudly while the drafts
+        still submit - the video enhances an entry, it never gates
+        it."""
+        if self._videos is None:
+            return
+        youtube = drafts.get("youtube")
+        if not isinstance(youtube, dict) or not youtube.get("title"):
+            return
+        stills = [
+            treated[item["filename"]].standard
+            for item in entry.get("media") or []
+            if item.get("filename") in treated
+        ]
+        if not stills:
+            log.info("entry %s: no treated stills, skipping video", entry_id)
+            return
+        try:
+            rendered = self._videos(stills, youtube["title"])
+        except Exception as exc:  # the render is advisory, never fatal
+            log.error(
+                "video render failed for %s (%s: %s); drafts still submit",
+                entry_id,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        try:
+            self._client.submit_video(
+                entry_id,
+                rendered.filename,
+                rendered.data,
+                duration_seconds=rendered.duration_seconds,
+                width=rendered.width,
+                height=rendered.height,
+            )
+        except Exception as exc:  # the upload is advisory too
+            log.error(
+                "video upload failed for %s/%s (%s: %s); drafts still submit",
+                entry_id,
+                rendered.filename,
+                type(exc).__name__,
+                exc,
+            )
 
     def run_once(self) -> list[EntryResult]:
         entries = self._client.list_received()
@@ -351,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
     # Deferred import: photos is the pipeline's only Pillow
     # consumer; the rest of the package imports without it.
     from .photos import process_photo
+    from .video import render_video
 
     client = ContentQueueClient(args.base_url, token)
     generator = ContentGenerator(
@@ -358,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
         make_ollama_chat(settings_from_env()),
         vision=make_ollama_vision(vision_settings_from_env()),
         photos=process_photo,
+        videos=render_video,
     )
     try:
         results = generator.run_once()
