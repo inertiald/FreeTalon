@@ -5338,3 +5338,67 @@ Deliberately left out:
   docstring still lists only network. libvirt itself stays a
   deferred dependency (lazy import, clear error) until it is
   vendored + SHA256-pinned, same pattern as netmiko.
+
+## Update - 2026-11-19 (Branch triage execution, part 2: DAG-viz rework, hardening mined, consumed branches deleted; sed hard-ban)
+
+- REWORK: copilot/task-4-1-dag-visualization consumed without
+  merging the branch. dag.py + its tests cherry-picked
+  (f76252d); the dashboard hunks hand-applied onto the current
+  root dashboard.py (plan rows sorted by (depth, original
+  order), 20px-per-level indent capped at depth 8, tree
+  connectors, horizontal scroll, and a crash fix for a node
+  with no objective) + the ADR Task 4.1 flip (cb0687d).
+  Suite 1258/1258.
+- MINED, not merged: copilot/production-grade-hardening
+  (tip e7bf512, a July tree). All three mechanisms were
+  genuinely absent from the current tree and were implemented
+  fresh in current style (10a0e12): jittered exponential
+  backoff for hive retries (config max_backoff_seconds /
+  retry_jitter), per-request correlation IDs (thread-local in
+  audit.py, minted in the API handlers, echoed as
+  X-Request-ID), and a request body size cap (config
+  max_request_body_bytes; 413 over the cap, 400 on a
+  malformed Content-Length). The branch's readiness split
+  and structured error codes were NOT taken: /health
+  semantics are owned by the proving-ground work and the
+  current error shape is consistent as-is. 12 new tests in
+  tests/test_hardening.py. Suite 1270/1270. Placement note:
+  the request ID is minted inline as the first line of
+  do_GET/do_POST -- the planner pins freetalon/api.py's
+  qualified-def inventory (12 names) and reads route branches
+  from the do_GET def, so no def may be added, renamed or
+  removed in that module; a wrapper-method form of this same
+  change cost 52 planner tests before the inline form.
+- Consumed source branches deleted (remote; no local copies
+  existed), tips recorded for recoverability:
+  copilot/freetalonorchestratorclawshypervisorpy (510e339),
+  copilot/task-4-1-dag-visualization (127ab1b),
+  copilot/production-grade-hardening (e7bf512). Together with
+  part 1's drop list, no copilot/* branches remain.
+  dev/critic-experiment and main were not touched.
+- SED HARD-BAN (Pat approved 2026-11-19; reverses the
+  retry-#18 pin): a bash/shell_exec node running sed -i (any
+  in-place flag form) against a .py target is now a HARD
+  planner rejection (_sed_ban_errors, error code sed_ban),
+  whether or not the search pattern occurs and whether or
+  not the file exists yet. Rationale: a judged-and-passed
+  sed -i is still an ungrounded rewrite -- it bypasses the
+  anchored-edit machinery, nothing checks it against the
+  file's real contents before it lands, and sed-shaped edits
+  have clobbered modules in the campaign record. Scope pins:
+  sed without -i, and sed -i on non-.py files, keep the
+  retry-#18 behavior exactly, the no-op judgment included.
+  Re-pins, each justified in code: retry-18 attempt 3 now
+  rejects with 5 errors (was 4) in all five copies that pin
+  it; retry-25 attempt 3 now rejects with 3 (was 2); the sed
+  no-op unit test now expects 2 errors (no-op + ban) and is
+  renamed test_sed_noop_is_rejected_and_ban_stacks; the
+  matching-sed pin is reversed as
+  test_sed_against_existing_pattern_is_banned (exactly the 1
+  ban error), its write half preserved as
+  test_write_to_existing_dir_passes. New TestSedHardBan
+  class: 5 scope tests. Planner corpus replay before/after
+  the ban: 56/56 rows identical (verdict, stage, error count,
+  codes, soundness) -- no corpus re-pins; the corpus contains
+  no sed -i. Suite 1276/1276 (fecca12). Full log:
+  freetalon-workspace/logs/branch-exec-2026-11-19.log.
