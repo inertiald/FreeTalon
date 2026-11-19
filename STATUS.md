@@ -3507,3 +3507,48 @@ Deliberately left out:
   Log: logs/critic-cycle18-2026-11-18.log, battery JSON
   alongside it. Committed locally on
   dev/critic-experiment, NOT pushed.
+## Update - 2026-11-18 (Critic cycle 18 live confirmation: FP-safety proven in the loop with qwen2.5-coder:7b as judge; the 12B dies at planning again)
+
+- Live confirmation followed the 4/4 battery (build
+  commit 817d31b). Critic ON in the worktree loop via the
+  variant driver; judge = seeker88 qwen2.5-coder:7b with
+  the deterministic confession rule active; goal = the
+  /health goal verbatim. CI gate honored (the running
+  GPU-tests run from the cycle-17 push was waited out).
+  Pre-flight: GPU 47C idle, 300.00 W, x16, 0 Xid; fans
+  85% during the arms, restored to auto after (verified).
+- Arm A (generator qwen2.5-coder:14b, the substantive
+  control): run run-20261119T015428Z-36abf3, driver exit
+  0. Audit: loop.critic.reviewed reviewed=2 hollow=0 on
+  plan-237682b2adf9 v1; no loop.critic.hollow, no
+  loop.critic.voided, no loop.critic.degraded; zero
+  critic_review measurements. Both write nodes — the
+  computing /health module (socket probe + nvidia-smi
+  subprocess behind fallback initializers, the exact
+  shape llama3 false-flagged in the first live test) and
+  the test file — were reviewed, NOT flagged, executed,
+  and PASSed. FP-safety is now proven in the live loop,
+  not only in the battery. The run's eventual FAIL is
+  critic-unrelated: the suite node invoked
+  ./.venv/bin/python relative to the worktree (the venv
+  lives in the main checkout), exit 127; the judge's
+  replan was rejected at planning on an anchored-edit
+  indentation defect and the run escalated. Worktree
+  restored after the arm.
+- Arm B (generator gemma-3-abliterated:latest, the 12B):
+  driver exit 1 — planning failure, its habit. No plan
+  reached the loop, so the critic never engaged (0
+  versions reviewed). The final output was rejected with
+  2 errors: a scaffold dropping all 12 of api.py's
+  definitions, and a FastAPI app. The hollow side of the
+  live question therefore stands on the battery evidence
+  (Ellipsis convicted by the judge with verified quotes;
+  the confessing literal dict convicted by the rule),
+  exactly as the cycle's gating allowed.
+- Suite: full worktree suite re-run at closeout — 1113
+  ran, exactly the 6 pre-existing test_retry16_*
+  failures (1105 at the 5d9a8ca baseline + 8 new critic
+  tests), no new failures. seeker88 untouched (site 200;
+  llama3:latest and qwen2.5-coder:7b both present).
+  Log: logs/critic-cycle18-2026-11-18.log. Committed
+  locally on dev/critic-experiment, NOT pushed.
