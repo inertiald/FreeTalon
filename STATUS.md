@@ -4705,3 +4705,477 @@ Deliberately left out:
   79C during the aborted planning run (fans 85%, restored to
   auto, GPUFanControlState=0 verified; model unloaded).
   Log: logs/cycle15-node-persistence-2026-11-18.log.
+## Update - 2026-11-18 (Track B: the GAN critic — a second model as an internal measurement; branch dev/critic-experiment, NOT merged)
+
+- Built in an isolated worktree
+  (/home/seeker/projects/FreeTalon-critic at f8edd0d)
+  so the parallel Track A live runs on the main
+  checkout were never disturbed. No live driver run,
+  no GPU, no call to seeker88: the critic client is
+  stubbed in every test, as the formatter tests stub
+  theirs.
+- Design (Pat's GAN pairing): seeker88's llama3 is
+  the adversarial-but-collaborative critic of the
+  planner's work. The formatter role failed for
+  Llama (matrix Arm B: re-emission degraded
+  content); critique is a judgment task, not
+  re-emission, and was untested. The critic is wired
+  as an internal MEASUREMENT, not a human gate —
+  gates belong only at cliff edges.
+- Plumbing follows the cycle-2 formatter pattern:
+  freetalon/orchestrator/critic.py (new) with frozen
+  CriticSettings (base_url/model; None falls back to
+  the planner's settings) and
+  critic_settings_from_env(): FREETALON_CRITIC_ENABLED
+  or either of FREETALON_CRITIC_OLLAMA_BASE_URL /
+  FREETALON_CRITIC_OLLAMA_MODEL configures it;
+  otherwise None and the loop behaves exactly as
+  before (pinned). The critic's documented target is
+  the matrix Arm B endpoint: seeker88's Ollama at
+  http://100.87.140.12:11434, llama3:latest. Note the
+  fallback: enabling with FREETALON_CRITIC_ENABLED
+  alone points the critic at the PLANNER's endpoint
+  and model — seeker88 must be named in the endpoint
+  vars to get the second model.
+- Seam: inside LoopRunner.run_plan's per-version
+  loop, after the version's plan is loaded and
+  before the Executor is built — v1 and every
+  re-plan version are reviewed. When ON, each write
+  node (scaffold / file_writer carrying a content
+  payload; anchored edits arrive as scaffold nodes)
+  is judged on SUBSTANCE ONLY: a placeholder, an
+  invented constant for a measurable value, an
+  unchanged copy of the current code (the prompt
+  carries the target's on-disk content so this class
+  is judgeable), or the right code in a vessel that
+  cannot run. One call per node through
+  intake.call_llm with a shallow verdict schema
+  (substantive | hollow + one-line reason) and
+  temperature pinned 0.0 — a measurement must be
+  reproducible even when the planner is sampled.
+- A hollow verdict lands in the existing judge
+  machinery, not a parallel one: the node is FAILED
+  with a measurement in the executor's own shape
+  (criterion type critic_review; detail and stderr
+  carry "critic review (hollow): <reason>"), the
+  version does not execute, and the judge's re-plan
+  brief carries the reason as the node's diagnostics
+  (cycle 5). Budget accounting is untouched: one unit
+  per REPLAN decision, proven by fixture. The record
+  is measured=False by design — the approach was
+  refused before it ran, so experiment memory files
+  it as a planning-stage rejection (cycle 3's stage
+  rule) and the content-blind failed-approach
+  signatures are never poisoned by a content judgment
+  (pinned by fixture). Cycle-8 local repair cannot
+  serve a critic failure (its mapping requires the
+  failed node not be a writer; the hollow node is the
+  writer), so whole-task re-plan serves — same unit.
+- Degradation: a critic that is unreachable, errors,
+  times out, or answers unparseably voids the whole
+  review (a partial review is never trusted) and the
+  version executes as if there were no critic; the
+  degradation is audit-logged (loop.critic.degraded;
+  loop.critic.reviewed / loop.critic.hollow record
+  the reviews that do land). A second model's
+  availability never blocks the loop.
+- Fixtures (tests/test_critic.py, 15 tests, stubbed
+  client): (i) the real plan-7885a4ef9d99 Ellipsis
+  shape with a stubbed hollow verdict is NOT
+  executed (module byte-identical on disk), the
+  brief carries the critic's reason, the re-plan
+  proceeds; (ii) the cycle-6 filled-slots variant
+  with a substantive verdict executes normally;
+  (iii) critic OFF executes the same Ellipsis plan
+  exactly as before, critic never called; (iv) a
+  critic raising LLMBackendError degrades, executes,
+  and the audit log records it; (v) with
+  max_replans=1, a second hollow version escalates
+  on the spent budget — exactly one re-plan unit
+  consumed.
+- Measurement: full suite in the worktree 1098/1098
+  (1083 baseline + 15 new; ZERO pins changed — the
+  loop change is additive and gated on settings the
+  default path never has). Framework guard: ALL
+  CHECKS PASSED. Corpus replay identical to the
+  f8edd0d baseline (accepted 0/28, accepted-sound
+  0/28, mean errors/output 1.32, both rows): the
+  critic is execution-side and the replay never
+  executes, so no movement is expected or seen.
+- State: committed locally on dev/critic-experiment,
+  NOT pushed, NOT merged. Enabling it live is a
+  separate step: run the driver with
+  FREETALON_CRITIC_ENABLED=1,
+  FREETALON_CRITIC_OLLAMA_BASE_URL=http://100.87.140.12:11434
+  and FREETALON_CRITIC_OLLAMA_MODEL=llama3:latest,
+  and read whether llama3's verdicts separate the
+  Ellipsis shape from the filled-slots shape on the
+  real goal before trusting it with the loop.
+
+## Update - 2026-11-18 (Track B live test: the critic's first enable run — machinery verified live, llama3's verdicts do not discriminate on this evidence)
+
+- What ran: the Track B critic enabled live for the
+  first time, in this worktree only (the main
+  checkout, holding the banked /health success at
+  7abb936, was not touched). The stock driver
+  hard-points at the main checkout, so the run used
+  a variant (tools/llm_end_to_end_critic.py in the
+  workspace) identical except sys.path resolves to
+  this worktree and LoopRunner gets an AuditLogger
+  (the stock driver injects none, and loop.critic.*
+  events are only recorded with one). All three
+  critic envs set explicitly:
+  FREETALON_CRITIC_ENABLED=1,
+  FREETALON_CRITIC_OLLAMA_BASE_URL=http://100.87.140.12:11434,
+  FREETALON_CRITIC_OLLAMA_MODEL=llama3:latest.
+  Goal: the /health goal, verbatim as in the driver.
+  Log: logs/critic-live-2026-11-18.log in the
+  workspace; audit trail in
+  logs/critic-live-audit.jsonl.
+- Gates before any GPU work: CI for the parent's
+  7abb936 push (GPU tests run 44422786969) completed
+  SUCCESS (10m47s). Pre-flight: seeker88
+  /api/tags answered with llama3:latest present;
+  GPU idle 47C, limit 300.00W, link x16, Xid count
+  0; worktree clean at 94d32ce; critic tests
+  re-confirmed 15/15 OK.
+- Arm 1 (generator gemma-3-abliterated:latest, the
+  hollow producer): PLANNING FAILURE — the critic
+  never saw a plan. Driver exit 1: after 3 raw
+  planner outputs, plan_task_intent raised
+  LLMResponseError; the final output was rejected
+  with 2 errors (step_1 scaffolds freetalon/api.py
+  dropping 12 of its 12 definitions; step_1 writes
+  a FastAPI app). No plan reached LoopRunner, so
+  the hollow side of the discrimination question
+  is UNTESTED live. No files changed; GPU peak
+  observed 63C.
+- Arm 2 (positive control, generator
+  qwen2.5-coder:14b): plan-237682b2adf9, run
+  run-20261118T235130Z-c37b01, driver exit 0, plan
+  FAILED in 79.2s without executing. The critic
+  reviewed version 1's two write nodes and flagged
+  BOTH hollow. Verbatim reasons (also the
+  critic_review measurements, measured=false,
+  passed=false, nodes marked FAIL):
+  node-1: "critic review (hollow): it assigns an
+  invented constant for a value that exists only by
+  measuring it — a service's reachability, a
+  temperature, any reading of the live world —
+  instead of probing, running, or computing it."
+  node-2: "critic review (hollow): it assigns an
+  invented constant for a value that exists only by
+  measuring it — the GPU temperature, instead of
+  probing or computing it"
+  The judge replanned, its decision carrying both
+  reasons verbatim ("informative failure: node-1:
+  critic review (hollow): ...; node-2: critic
+  review (hollow): ..."); the re-plan delta was
+  then rejected by the approach-signature guard
+  ("re-plan repeats failed approach ('scaffold'
+  write of .../freetalon/api.py) without a stated
+  differs_by") and the run escalated. Audit:
+  loop.critic.reviewed (reviewed=2, hollow=2) and
+  two loop.critic.hollow events; ZERO
+  loop.critic.degraded events — seeker88 answered
+  both calls, so this is a judgment result, not a
+  degraded no-result. GPU peak observed 75C.
+- The verdicts are FALSE POSITIVES, from the run's
+  own plan snapshot (plan-v001.json): node-1's
+  /health branch computes ollama_reachable via
+  socket.create_connection(('localhost', 11434),
+  timeout=1) and gpu_temperature via
+  subprocess.run(['nvidia-smi',
+  '--query-gpu=temperature.gpu', ...]) parsed to
+  int — the same probe code the banked success
+  runs. The critic's content window
+  (_CONTENT_MAX_CHARS=10000) covered the whole
+  branch (content 10574 chars, branch at
+  ~1400-3600). Node-2's test asserts only that the
+  response is 200 and the keys exist; it assigns
+  no constant of any kind. The node-1 reason
+  reproduces the CRITIC_SYSTEM_PROMPT rubric line
+  for this goal's shape ("a service's
+  reachability, a temperature, any reading of the
+  live world") almost verbatim — llama3 matched
+  the rubric to the goal instead of grounding in
+  the content it was shown.
+- Discrimination verdict: NOT demonstrated. The
+  machinery is verified live end-to-end (review
+  fires pre-execution per version, hollow verdicts
+  land as measured=false failures, the brief and
+  the judge carry the reasons, budget behavior as
+  designed), but llama3:latest as configured
+  FAILED the positive control 2/2 and the hollow
+  arm never produced a reviewable plan. Do not
+  trust this critic with the loop as configured;
+  the open questions are critic-side (model,
+  prompt, or what content slice it judges), not
+  seam-side.
+- State: neither arm executed a node; worktree
+  clean after both arms, nothing to restore. Fans
+  restored to auto (GPUFanControlState=0
+  verified); models unloaded (VRAM 80 MiB); main
+  checkout verified untouched at 7abb936, clean.
+  This entry is committed locally on
+  dev/critic-experiment, NOT pushed.
+- Critic cycle 16 (2026-11-18): evidence-then-verdict.
+  A hollow verdict must now quote, in an "evidence"
+  field, the exact line(s) from the shown content
+  that assign the alleged invented constant;
+  critic._parse_verdict verifies every quote as a
+  literal substring of the content the critic was
+  shown (surrounding-whitespace strip only). A
+  hollow verdict whose evidence is missing, empty,
+  or not found is VOID: the node is treated as
+  substantive, the review continues, and the loop
+  audit-logs loop.critic.voided. The prompt now
+  demands the quote, states that an unquotable
+  suspicion is not a verdict, and states that
+  literal labels are not invented constants. Seam
+  otherwise identical (measurement shape,
+  measured=False, brief propagation, degraded
+  behavior, temperature pin). Critic tests 20/20
+  (5 new: verbatim evidence fires, no-evidence
+  voided, fabricated-evidence voided, substantive
+  ignores evidence, loop-level void-executes).
+  Full suite: 1103 ran, exactly the 6 pre-existing
+  test_retry16 failures (stash control: identical
+  at pristine 36b8f4a — those fixtures pin a line
+  in the MAIN checkout api.py, which grew when
+  the /health success landed; cycle 13 decoupled
+  them on main and this branch predates the fix).
+- Offline battery (production critic path against
+  seeker88; no live loop run this cycle): cases =
+  the live test plan-237682b2adf9 (positive
+  control, 2 write nodes), corpus retry33-3
+  (Ellipsis hollow), corpus retry28-4 (literal-
+  constant hollow), and the banked success node-1
+  (borderline: literal status "ready" plus both
+  values computed). llama3:latest: 3/4 — control
+  PASS (its node-2 hollow verdict was VOIDED:
+  empty evidence, the reason again the verbatim
+  rubric line — the cycle-16 check caught the
+  exact live-test failure mode), borderline PASS
+  (hollow verdict on the "ready" label VOIDED,
+  empty evidence), Ellipsis PASS (hollow;
+  evidence "...", a verbatim substring — minimal
+  but valid under the specified check), literals
+  FAIL (judged substantive outright; a false
+  negative). qwen2.5-coder:7b (pulled onto
+  seeker88 for this trial; llama3 untouched): 3/4
+  — control PASS clean (grounded reasons, no
+  voids needed), borderline PASS, literals FAIL
+  (the same false negative), Ellipsis FAIL on
+  quote mechanics: the verdict was hollow with
+  the correct reason and quoted all three
+  offending lines, but as one dedented multi-line
+  string — the content lines carry 8-space
+  indentation, so the joined quote is not a
+  literal substring and the check voided it (each
+  line individually, stripped, IS a substring;
+  the list form would have verified).
+- Verdict: NO judge is fully green, so the battery
+  acceptance is not met and no live confirmation
+  follows from this cycle. What the cycle proved:
+  the evidence mechanism voided every ungrounded
+  hollow verdict offered to it (3 voids across
+  both judges, all correct), and both judges
+  share one remaining failure — the false
+  negative on retry28-4, a full-module rewrite
+  whose payload dict neither judge read closely.
+  Open levers for the next critic cycle: steer
+  the judge to quote one line per evidence item
+  (or verify quotes per line), and whatever makes
+  a judge read a full-module rewrite payload.
+  seeker88 after: models [qwen2.5-coder:7b,
+  llama3:latest], site answering 200, services
+  untouched. This entry is committed locally on
+  dev/critic-experiment, NOT pushed. Log:
+  logs/critic-cycle16-2026-11-18.log, battery
+  JSONs alongside it.
+- Critic cycle 17 (2026-11-18): per-line quote
+  verification + evidence list form, then ONE
+  directed-attention prompt iteration. Fix 1
+  (critic.py): _parse_verdict verifies evidence
+  per line — every non-empty line of a quote,
+  stripped, must appear within some stripped line
+  of the shown content (new helpers _quote_lines
+  / _quote_verified). A quote carrying a line the
+  content lacks still voids; a quote with no
+  non-empty lines still voids as empty. Fix 2
+  (prompts.py + verdict schema): the prompt asks
+  for evidence as a JSON list, one item per
+  offending line, each copied
+  character-for-character; the schema evidence
+  field is anyOf [string, array-of-string] so
+  the grammar can speak the list form (the
+  parser already accepted both). Fix 3
+  (prompts.py; applied only after round 1 left
+  retry28-4 failing for both judges): a
+  directed-attention paragraph — scan the ENTIRE
+  content, dict literals and full-module
+  rewrites included, for literal bindings of
+  measured quantities; a comment admitting a
+  placeholder is itself evidence. Critic tests
+  22/22 (2 new: the exact cycle-16 qwen dedented
+  multi-line quote now fires; a partly
+  fabricated multi-line quote still voids).
+  Full suite: 1105 ran, exactly the 6
+  pre-existing test_retry16 failures (identical
+  at the f34a65c baseline) — no new failures.
+- Battery (identical cases, production critic
+  path, seeker88; JSONs
+  critic-cycle17-battery-*.json, round 1
+  preserved as *-round1.json): qwen2.5-coder:7b
+  3/4 in BOTH rounds — control PASS clean,
+  borderline PASS, Ellipsis PASS (Fix 1: the
+  dedented 3-line quote cycle 16 voided now
+  verifies per-line and the hollow verdict
+  stands with evidence), literals FAIL in both
+  rounds (judged substantive outright; Fix 3's
+  scan instruction did not move it — its reason
+  parrots the substantive rubric line).
+  llama3:latest: round 1 1/4 — a regression:
+  control hollow verdicts STOOD on both nodes
+  (node-1 evidence quoted the fallback
+  initializations that precede the real probes;
+  node-2 quoted the test assert lines — the
+  check verifies a quote's presence, not the
+  quoted lines' role), Ellipsis VOIDED on a
+  semicolon-merged fabricated quote, borderline
+  PASS via void. Round 2 (after Fix 3) 2/4 —
+  the literals miss is CURED (hollow, evidence
+  "'ollama_reachable': True,  # Replace with
+  actual check." verified verbatim) but control
+  still fails both nodes on present-but-misread
+  quotes and Ellipsis still voids on the same
+  merged fabrication.
+- Verdict: acceptance NOT met — no judge is
+  fully green after Fixes 1+2+3, so no live
+  confirmation run follows from this cycle
+  (none was run). What the cycle proved: the
+  quote-ergonomics failure mode is closed
+  (qwen's Ellipsis catch now stands), Fix 3's
+  directed attention works on the judge that
+  fabricates quotes (llama3 found the buried
+  dict), and the judges now fail in opposite
+  directions — qwen7b is clean on the controls
+  but blind to the buried literal dict even
+  when told to scan for it; llama3 can be
+  steered to the dict but convicts the
+  positive control on genuinely present quotes
+  whose role it misreads, a failure mode the
+  evidence check structurally cannot catch.
+  seeker88 after: models [qwen2.5-coder:7b,
+  llama3:latest], site answering 200, services
+  untouched. This entry is committed locally on
+  dev/critic-experiment, NOT pushed. Log:
+  logs/critic-cycle17-2026-11-18.log, battery
+  JSONs alongside it.
+## Update - 2026-11-18 (Critic cycle 18: the deterministic confession rule — what a comment confesses, code decides; battery 4/4 with qwen2.5-coder:7b)
+
+- The seam gains a deterministic rule beside the judge
+  (freetalon/orchestrator/critic.py:
+  deterministic_hollow_evidence). FIRE condition, all on
+  ONE line of the shown content: the line binds a literal
+  value — a dict entry 'key': <literal> or an assignment
+  name = <literal>, literal in {True, False, number,
+  quoted string} — AND the line's comment confesses
+  placeholder status, matching case-insensitively one of:
+  replace with actual / placeholder / todo / fixme /
+  dummy / stub / mock / fake / for now / temporary. The
+  verdict is hollow, its evidence is the line verbatim,
+  and its reason is prefixed "deterministic:" so the
+  audit trail never confuses it with a judge's call. It
+  flows through the unchanged CriticReview / measurement /
+  audit shapes. review_write_nodes runs the rule per node
+  BEFORE the judge; a convicted node is never put to the
+  judge. The confession requirement is the safety: a
+  fixed status label and a fallback initializer in front
+  of a real probe bind literals without confessing, and
+  do not fire.
+- Tests: critic suite 30/30 OK (22 at cycle 17 + 8 new):
+  fires on retry28-4's exact offending lines and on an
+  assignment-form binding; silent on the substantive
+  fixtures, on a literal binding with an innocent
+  comment, and on a confession with no literal binding;
+  review-level conviction with NO judge call; rule and
+  judge verdicts coexisting; a loop-level conviction
+  through the critic_review measurement with the judge
+  consulted only for the unconvicted node.
+- Corpus sweep (tools/cycle18_sweep.py): 40 recorded
+  write-node contents (both planner corpora + the
+  battery's recorded plans). 3 fires, all true hollows
+  of one family: corpus retry28-2
+  (ollama_reachable = True # Placeholder, implement
+  actual check), retry28-4 (the target case), retry29-4
+  (ollama_reachable = True # Replace with actual check).
+  Zero fires on every model-ab qwen output, on the
+  positive-control plan's nodes, and on the banked
+  success's borderline node. Two model-ab gemma27b rows
+  have malformed raw JSON and were scanned textually:
+  one carries no confession marker (silent), the other
+  carries the same family's confessing literal binding
+  (a true hollow). No false fire on any recorded
+  substantive output; no tightening was needed.
+- Battery (identical cases, production critic path,
+  judge qwen2.5-coder:7b ONLY, rule enabled): 4/4.
+  Positive control substantive on both nodes (judge);
+  hollow-Ellipsis hollow (judge, three Ellipsis lines as
+  verified evidence); hollow-literals (retry28-4) hollow
+  by the RULE in 0.0s with the confessing line as
+  evidence; borderline-status substantive (judge; the
+  rule silent on the unconfessed "ready" label). No
+  degraded review, no voided verdicts. llama3 stays
+  disqualified as judge of record (cycle 17: it convicts
+  the positive control on present-but-misread quotes).
+  seeker88 untouched (site 200; both models present).
+  Log: logs/critic-cycle18-2026-11-18.log, battery JSON
+  alongside it. Committed locally on
+  dev/critic-experiment, NOT pushed.
+## Update - 2026-11-18 (Critic cycle 18 live confirmation: FP-safety proven in the loop with qwen2.5-coder:7b as judge; the 12B dies at planning again)
+
+- Live confirmation followed the 4/4 battery (build
+  commit 817d31b). Critic ON in the worktree loop via the
+  variant driver; judge = seeker88 qwen2.5-coder:7b with
+  the deterministic confession rule active; goal = the
+  /health goal verbatim. CI gate honored (the running
+  GPU-tests run from the cycle-17 push was waited out).
+  Pre-flight: GPU 47C idle, 300.00 W, x16, 0 Xid; fans
+  85% during the arms, restored to auto after (verified).
+- Arm A (generator qwen2.5-coder:14b, the substantive
+  control): run run-20261119T015428Z-36abf3, driver exit
+  0. Audit: loop.critic.reviewed reviewed=2 hollow=0 on
+  plan-237682b2adf9 v1; no loop.critic.hollow, no
+  loop.critic.voided, no loop.critic.degraded; zero
+  critic_review measurements. Both write nodes — the
+  computing /health module (socket probe + nvidia-smi
+  subprocess behind fallback initializers, the exact
+  shape llama3 false-flagged in the first live test) and
+  the test file — were reviewed, NOT flagged, executed,
+  and PASSed. FP-safety is now proven in the live loop,
+  not only in the battery. The run's eventual FAIL is
+  critic-unrelated: the suite node invoked
+  ./.venv/bin/python relative to the worktree (the venv
+  lives in the main checkout), exit 127; the judge's
+  replan was rejected at planning on an anchored-edit
+  indentation defect and the run escalated. Worktree
+  restored after the arm.
+- Arm B (generator gemma-3-abliterated:latest, the 12B):
+  driver exit 1 — planning failure, its habit. No plan
+  reached the loop, so the critic never engaged (0
+  versions reviewed). The final output was rejected with
+  2 errors: a scaffold dropping all 12 of api.py's
+  definitions, and a FastAPI app. The hollow side of the
+  live question therefore stands on the battery evidence
+  (Ellipsis convicted by the judge with verified quotes;
+  the confessing literal dict convicted by the rule),
+  exactly as the cycle's gating allowed.
+- Suite: full worktree suite re-run at closeout — 1113
+  ran, exactly the 6 pre-existing test_retry16_*
+  failures (1105 at the 5d9a8ca baseline + 8 new critic
+  tests), no new failures. seeker88 untouched (site 200;
+  llama3:latest and qwen2.5-coder:7b both present).
+  Log: logs/critic-cycle18-2026-11-18.log. Committed
+  locally on dev/critic-experiment, NOT pushed.
