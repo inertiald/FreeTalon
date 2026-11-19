@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# FreeTalon pre-commit secret scan. See docs/secret-hygiene.md.
+# Install once per clone:  git config core.hooksPath scripts/git-hooks
+set -euo pipefail
+
+# Find gitleaks: PATH first, then the seeker7 workspace tools install.
+GITLEAKS=""
+if command -v gitleaks >/dev/null 2>&1; then
+  GITLEAKS="$(command -v gitleaks)"
+elif [ -x "$HOME/freetalon-workspace/tools/bin/gitleaks" ]; then
+  GITLEAKS="$HOME/freetalon-workspace/tools/bin/gitleaks"
+fi
+
+if [ -n "$GITLEAKS" ]; then
+  exec "$GITLEAKS" protect --staged --redact
+fi
+
+# Fallback: pattern scan of the staged diff. Patterns only; a match
+# blocks the commit without printing any matched content.
+echo "pre-commit: gitleaks not found; running fallback pattern scan of the staged diff" >&2
+PATTERNS='BEGIN (RSA |EC |OPENSSH |DSA |)PRIVATE KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|[sr]k_live_[A-Za-z0-9]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|Bearer [A-Za-z0-9._-]{20,}'
+if git diff --cached --no-color -U0 | grep -E '^\+' | grep -qE "$PATTERNS"; then
+  echo "pre-commit: staged diff matches a secret pattern - commit blocked." >&2
+  echo "Install gitleaks (https://github.com/gitleaks/gitleaks) for the full scan." >&2
+  exit 1
+fi
+exit 0
