@@ -4619,3 +4619,35 @@ Deliberately left out:
   api.py change and tests/test_health.py with this
   entry; NOT pushed (parent verifies + pushes).
   Log: logs/health-rerun11-2026-11-18.log.
+
+## Update - 2026-11-18 (Content pipeline slice 1b: FreeTalon draft generation for inertiald.com - the first vertical slice past the proving ground)
+
+- The /health proof unblocked the content pipeline's generation
+  half. Site side (inertiald-com df8ac34, deployed): a token-gated
+  internal API (GET received entries, PATCH claim/fail/submit,
+  GET media bytes) behind CONTENT_PIPELINE_TOKEN; the admin
+  Content tab now renders the real drafts.
+- FreeTalon side: freetalon/content/ (queue_client, media_info,
+  prompts, generator) + tools/run_content_generator.py in the
+  workspace. One pass claims each received entry, drafts its
+  selected outputs with qwen3.8:27b (think off, num_ctx 24576,
+  temp 0.7), and submits; any failure returns the entry to
+  received with the error noted. Drafts only - nothing posts
+  anywhere; approval stays Pat's.
+- Prompts are grounded in the Archives voice and restricted to
+  the blurb + media metadata (image dimensions parsed from the
+  stored bytes): no invented facts.
+- Verified end-to-end with one synthetic entry through the real
+  admin intake: received -> processing -> drafts-ready; drafts
+  read back through the admin API (blog 3,301 chars, Instagram
+  caption, YouTube title + description); the token gate 401s
+  with no token and with a wrong token on the app port, via
+  nginx, and cross-box; a claim on a drafts-ready entry 409s.
+  The test entry was discarded via the lifecycle and removed;
+  the queue is empty again, exactly as found.
+- Tests: 20 new in tests/test_content_pipeline.py; full suite
+  1166/1166 OK (1146 baseline + 20). GPU peaked at 52C during
+  generation; fans 85% during, auto after.
+  Logs: freetalon-workspace/logs/content-1b-2026-11-18.log
+  (this box), /home/seeker/logs/content-1b-2026-11-18.log
+  (seeker88).
