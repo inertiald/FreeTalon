@@ -15639,13 +15639,36 @@ class TestPlannerSkeletonGroundingFix(unittest.TestCase):
     # --- The guard's behavior is unchanged on the fixtures ---
 
     def test_retry29_outputs_still_rejected_as_before(self) -> None:
+        # Output 1's step_3 carries a file_exists criterion on the
+        # recorded absolute path /home/seeker/projects/FreeTalon/.venv.
+        # On the authoring machine that path exists (the project venv),
+        # so the validator's does-not-exist-on-disk error does not fire
+        # and the output rejects with 2 errors; on a machine without
+        # that exact path (a CI runner) a third error fires although
+        # the validator behaved identically. The path's existence is a
+        # precondition of the recording, not what this test measures,
+        # so pin it at the validator's existence seam for output 1's
+        # rejection only. The error-count pins below are unchanged.
+        from freetalon.orchestrator import planner
+
+        recorded_venv = "/home/seeker/projects/FreeTalon/.venv"
+        real_exists = planner._path_exists_on_disk
+
+        def recorded_exists(
+            path: str, repo_root: str | Path | None = None
+        ) -> bool:
+            if path == recorded_venv:
+                return True
+            return real_exists(path, repo_root)
+
         for root in (None, str(self.repo_root)):
-            message1 = self._rejection(
-                self.RETRY29_OUTPUT1_RAW,
-                goal_text=self.HEALTH_GOAL,
-                workspace=self.WS,
-                repo_root=root,
-            )
+            with patch.object(planner, "_path_exists_on_disk", recorded_exists):
+                message1 = self._rejection(
+                    self.RETRY29_OUTPUT1_RAW,
+                    goal_text=self.HEALTH_GOAL,
+                    workspace=self.WS,
+                    repo_root=root,
+                )
             self.assertIn("was rejected with 2 errors", message1)
             self.assertIn(
                 "drops 8 of the existing module's 12 definitions", message1
