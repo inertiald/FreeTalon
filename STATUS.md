@@ -3367,3 +3367,82 @@ Deliberately left out:
   dev/critic-experiment, NOT pushed. Log:
   logs/critic-cycle16-2026-11-18.log, battery
   JSONs alongside it.
+- Critic cycle 17 (2026-11-18): per-line quote
+  verification + evidence list form, then ONE
+  directed-attention prompt iteration. Fix 1
+  (critic.py): _parse_verdict verifies evidence
+  per line — every non-empty line of a quote,
+  stripped, must appear within some stripped line
+  of the shown content (new helpers _quote_lines
+  / _quote_verified). A quote carrying a line the
+  content lacks still voids; a quote with no
+  non-empty lines still voids as empty. Fix 2
+  (prompts.py + verdict schema): the prompt asks
+  for evidence as a JSON list, one item per
+  offending line, each copied
+  character-for-character; the schema evidence
+  field is anyOf [string, array-of-string] so
+  the grammar can speak the list form (the
+  parser already accepted both). Fix 3
+  (prompts.py; applied only after round 1 left
+  retry28-4 failing for both judges): a
+  directed-attention paragraph — scan the ENTIRE
+  content, dict literals and full-module
+  rewrites included, for literal bindings of
+  measured quantities; a comment admitting a
+  placeholder is itself evidence. Critic tests
+  22/22 (2 new: the exact cycle-16 qwen dedented
+  multi-line quote now fires; a partly
+  fabricated multi-line quote still voids).
+  Full suite: 1105 ran, exactly the 6
+  pre-existing test_retry16 failures (identical
+  at the f34a65c baseline) — no new failures.
+- Battery (identical cases, production critic
+  path, seeker88; JSONs
+  critic-cycle17-battery-*.json, round 1
+  preserved as *-round1.json): qwen2.5-coder:7b
+  3/4 in BOTH rounds — control PASS clean,
+  borderline PASS, Ellipsis PASS (Fix 1: the
+  dedented 3-line quote cycle 16 voided now
+  verifies per-line and the hollow verdict
+  stands with evidence), literals FAIL in both
+  rounds (judged substantive outright; Fix 3's
+  scan instruction did not move it — its reason
+  parrots the substantive rubric line).
+  llama3:latest: round 1 1/4 — a regression:
+  control hollow verdicts STOOD on both nodes
+  (node-1 evidence quoted the fallback
+  initializations that precede the real probes;
+  node-2 quoted the test assert lines — the
+  check verifies a quote's presence, not the
+  quoted lines' role), Ellipsis VOIDED on a
+  semicolon-merged fabricated quote, borderline
+  PASS via void. Round 2 (after Fix 3) 2/4 —
+  the literals miss is CURED (hollow, evidence
+  "'ollama_reachable': True,  # Replace with
+  actual check." verified verbatim) but control
+  still fails both nodes on present-but-misread
+  quotes and Ellipsis still voids on the same
+  merged fabrication.
+- Verdict: acceptance NOT met — no judge is
+  fully green after Fixes 1+2+3, so no live
+  confirmation run follows from this cycle
+  (none was run). What the cycle proved: the
+  quote-ergonomics failure mode is closed
+  (qwen's Ellipsis catch now stands), Fix 3's
+  directed attention works on the judge that
+  fabricates quotes (llama3 found the buried
+  dict), and the judges now fail in opposite
+  directions — qwen7b is clean on the controls
+  but blind to the buried literal dict even
+  when told to scan for it; llama3 can be
+  steered to the dict but convicts the
+  positive control on genuinely present quotes
+  whose role it misreads, a failure mode the
+  evidence check structurally cannot catch.
+  seeker88 after: models [qwen2.5-coder:7b,
+  llama3:latest], site answering 200, services
+  untouched. This entry is committed locally on
+  dev/critic-experiment, NOT pushed. Log:
+  logs/critic-cycle17-2026-11-18.log, battery
+  JSONs alongside it.

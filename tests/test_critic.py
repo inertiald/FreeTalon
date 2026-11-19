@@ -212,8 +212,15 @@ class TestCriticSettingsFromEnv(unittest.TestCase):
         )
         # Cycle 16: the evidence field is speakable (a hollow
         # verdict must fill it) but not required — a substantive
-        # verdict has nothing to quote.
+        # verdict has nothing to quote. Cycle 17: the speakable
+        # shapes are a single string or a list of strings (the
+        # prompt asks for the list, one quoted line per item).
         self.assertIn("evidence", schema["properties"])
+        evidence_types = {
+            option.get("type")
+            for option in schema["properties"]["evidence"]["anyOf"]
+        }
+        self.assertEqual(evidence_types, {"string", "array"})
 
 
 class TestCriticReview(unittest.TestCase):
@@ -442,6 +449,69 @@ class TestCriticReview(unittest.TestCase):
             self.assertEqual(len(review.voided), 2)
             self.assertIn("not in the shown content", review.voided[0].detail)
             self.assertIn("gpu_temperature = 42", review.voided[0].detail)
+
+    def test_hollow_with_dedented_multiline_quote_fires(self) -> None:
+        """Cycle 17: the exact cycle-16 battery shape — qwen2.5-
+        coder:7b quoted all three Ellipsis lines correctly but as
+        ONE dedented multi-line string, while the content carries
+        them indented; the whole-string check voided a right
+        verdict. Per-line verification stands it: every quoted
+        line, stripped, appears in the content."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._plan(tmp)
+            with patch(
+                "freetalon.orchestrator.critic.call_llm",
+                return_value=json.dumps(
+                    {
+                        "verdict": "hollow",
+                        "reason": HOLLOW_REASON,
+                        "evidence": (
+                            'payload["service_status"] = ...\n'
+                            'payload["ollama_reachable"] = ...\n'
+                            'payload["gpu_temperature"] = ...'
+                        ),
+                    }
+                ),
+            ):
+                review = review_write_nodes(
+                    plan, HEALTH_GOAL, CriticSettings(), settings=LLMSettings()
+                )
+            self.assertIsNone(review.degraded)
+            self.assertEqual([v.node_id for v in review.hollow], ["write-ellipsis"])
+            self.assertIn(
+                'payload["gpu_temperature"] = ...', review.hollow[0].evidence
+            )
+            # The note node's identical reply quotes lines its
+            # content does not contain, so that verdict is void.
+            self.assertEqual([v.node_id for v in review.voided], ["write-note"])
+
+    def test_hollow_with_partly_fabricated_multiline_quote_is_voided(self) -> None:
+        """Cycle 17: per-line verification is all-lines or nothing
+        — a multi-line quote mixing a real content line with an
+        invented one is void, exactly as a wholly fabricated quote
+        was under cycle 16: lines NOT in the content fail."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._plan(tmp)
+            with patch(
+                "freetalon.orchestrator.critic.call_llm",
+                return_value=json.dumps(
+                    {
+                        "verdict": "hollow",
+                        "reason": HOLLOW_REASON,
+                        "evidence": (
+                            'payload["gpu_temperature"] = ...\n'
+                            "gpu_temperature = 42"
+                        ),
+                    }
+                ),
+            ):
+                review = review_write_nodes(
+                    plan, HEALTH_GOAL, CriticSettings(), settings=LLMSettings()
+                )
+            self.assertIsNone(review.degraded)
+            self.assertEqual(review.hollow, [])
+            self.assertEqual(len(review.voided), 2)
+            self.assertIn("not in the shown content", review.voided[0].detail)
 
     def test_substantive_verdict_ignores_evidence(self) -> None:
         """Cycle 16: evidence is a hollow verdict's burden only —

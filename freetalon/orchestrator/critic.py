@@ -61,6 +61,19 @@ treated as substantive, the voiding is audit-logged
 (loop.critic.voided), and the review continues with the
 remaining nodes. Voiding is not degradation: the critic
 answered; its verdict simply carried no checkable evidence.
+
+Cycle 17 relaxes the quote check from whole-string to
+per-line: every non-empty line of a quote, stripped, must
+appear within some stripped line of the shown content. A
+judge re-quoting an indented block naturally drops the
+block's common indentation — cycle 16's battery had
+qwen2.5-coder:7b quote all three Ellipsis lines correctly
+but dedented, and the whole-string check voided a right
+verdict. Line for line the words remain verbatim — each
+quoted line must exist in the content — so the grounding
+requirement is unchanged; only block re-indentation stops
+counting as fabrication. The prompt now also asks for the
+evidence as a list, one quoted line per item.
 """
 
 from __future__ import annotations
@@ -134,16 +147,23 @@ def critic_verdict_schema() -> dict[str, Any]:
 
     Kept shallow like the plan envelope (small models degrade on
     deeply nested schemas): one verdict word, one reason line, and
-    the evidence quote a hollow verdict must produce — the harness
-    verifies the quote against the shown content (see
-    _parse_verdict); the schema only makes the field speakable.
+    the evidence a hollow verdict must produce — a list of quoted
+    lines, one per item (a single string is speakable too; the
+    parser accepts both) — the harness verifies each quoted line
+    against the shown content (see _parse_verdict); the schema
+    only makes the field speakable.
     """
     return {
         "type": "object",
         "properties": {
             "verdict": {"type": "string", "enum": ["substantive", "hollow"]},
             "reason": {"type": "string"},
-            "evidence": {"type": "string"},
+            "evidence": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}},
+                ]
+            },
         },
         "required": ["verdict", "reason"],
     }
@@ -310,10 +330,11 @@ def _critic_prompt(goal_text: str, plan: ExecutionPlan, node: PlanNode) -> str:
 def _evidence_quotes(value: Any) -> list[str] | None:
     """The verdict's evidence as a list of quotes, or None.
 
-    The contract asks for one string quoting the offending line(s)
-    verbatim; a list of strings (one quote per line) is accepted
-    too. Anything else — absent, a number, an empty list, a list
-    holding non-strings — is no usable evidence.
+    The contract asks for a list of strings, one quoted line per
+    item (cycle 17); a single string quoting the offending line(s)
+    verbatim is accepted too. Anything else — absent, a number, an
+    empty list, a list holding non-strings — is no usable
+    evidence.
     """
     if isinstance(value, str):
         return [value]
@@ -324,6 +345,34 @@ def _evidence_quotes(value: Any) -> list[str] | None:
     ):
         return list(value)
     return None
+
+
+def _quote_lines(quote: str) -> list[str]:
+    """A quote's non-empty lines, each stripped of surrounding
+    whitespace — the units the evidence check verifies."""
+    return [line.strip() for line in quote.splitlines() if line.strip()]
+
+
+def _quote_verified(quote: str, content_lines: list[str]) -> bool:
+    """Per-line verification of one evidence quote (cycle 17).
+
+    The quote verifies when every one of its non-empty lines,
+    stripped, appears within some stripped line of the shown
+    content (``content_lines`` is the shown content pre-split and
+    pre-stripped). A quote with no non-empty lines never
+    verifies. Single-line quotes behave exactly as the cycle-16
+    whole-string check did; multi-line quotes gain only the
+    freedom to re-indent the block they copy — every quoted line
+    must still exist in the content, character for character
+    after the strip.
+    """
+    lines = _quote_lines(quote)
+    if not lines:
+        return False
+    return all(
+        any(line in content_line for content_line in content_lines)
+        for line in lines
+    )
 
 
 def _parse_verdict(
@@ -342,9 +391,13 @@ def _parse_verdict(
     verdict plus a VoidedVerdict record — because the failure this
     guards against is a judge restating the rubric for the goal's
     shape while the content it was shown computes the value. The
-    only normalization applied to a quote is stripping its
-    surrounding whitespace; the rest must match the shown content
-    character for character.
+    check is per line (cycle 17): every non-empty line of a quote,
+    stripped of surrounding whitespace, must appear within some
+    stripped line of the shown content. Within a line the match
+    is character for character; across lines a quote may
+    re-indent the block it copies — a judge quoting an indented
+    block drops its common indentation, and that alone must not
+    void a grounded verdict.
     """
     data = json.loads(response_text.strip())
     if not isinstance(data, dict):
@@ -370,11 +423,15 @@ def _parse_verdict(
     if quotes is None:
         void_detail = "hollow verdict carried no usable evidence quote"
     else:
-        stripped = [quote.strip() for quote in quotes]
-        if any(not quote for quote in stripped):
+        content_lines = [line.strip() for line in shown_content.splitlines()]
+        if any(not _quote_lines(quote) for quote in quotes):
             void_detail = "hollow verdict's evidence quote is empty"
         else:
-            missing = [quote for quote in stripped if quote not in shown_content]
+            missing = [
+                quote.strip()
+                for quote in quotes
+                if not _quote_verified(quote, content_lines)
+            ]
             if missing:
                 void_detail = (
                     "hollow verdict's evidence is not in the shown content: "
