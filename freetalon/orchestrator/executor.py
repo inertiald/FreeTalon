@@ -223,6 +223,40 @@ class Executor:
         self._plan_repo_root: Path | None = None
 
     async def run(self, plan_id: str) -> ExecutionPlan:
+        try:
+            return await self._run_plan(plan_id)
+        finally:
+            self._sweep_detached_processes(plan_id)
+
+    def _sweep_detached_processes(self, plan_id: str) -> None:
+        """Reap process groups that outlived their bash node (cycle 15).
+
+        A node may background a server so a later node can talk to it;
+        those processes belong to the run, so the run ending — success,
+        failure, or error — terminates them (the registry tracks the
+        surviving members of each node shell's process group). A
+        cleanup failure is logged, never raised: it must not mask the
+        run's own outcome.
+        """
+        sweep = getattr(self._registry, "cleanup_detached_processes", None)
+        if not callable(sweep):
+            return
+        try:
+            swept = sweep()
+        except Exception:  # noqa: BLE001 - cleanup must not mask the result
+            logger.exception(
+                "Detached-process cleanup failed for plan %s.", plan_id
+            )
+            return
+        if swept:
+            logger.info(
+                "Plan %s: reaped %d detached process group(s) left by "
+                "backgrounded node processes.",
+                plan_id,
+                swept,
+            )
+
+    async def _run_plan(self, plan_id: str) -> ExecutionPlan:
         plan = self._store.load(plan_id)
         if plan is None:
             raise ExecutorError(f"Plan {plan_id!r} not found in store.")

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1080,3 +1082,179 @@ class TestExecutorRepoRootCoherence(unittest.TestCase):
         result = self._run_plan(plan)
         self.assertEqual(result.nodes[0].status, PlanStatus.COMPLETED)
         self.assertTrue((self._node_dir("n1") / "marker.txt").exists())
+
+
+# ── Cross-node background processes (cycle 15) ───────────────────────────────
+
+
+def _port_alive(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+def _server_pids(port: int) -> list[int]:
+    marker = f"http.server {port}"
+    hits: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            cmdline = (
+                Path(f"/proc/{entry}/cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode("utf-8", "replace")
+            )
+        except OSError:
+            continue
+        if marker in cmdline:
+            hits.append(int(entry))
+    return hits
+
+
+class TestCrossNodeBackgroundProcesses(unittest.TestCase):
+    """A server backgrounded by one bash node must serve later nodes —
+    and must not outlive the run (cycle 15).
+
+    Re-run #11's shape: node-4 started the API server, node-5 curled it.
+    The reproduction (logs/cycle15-repro.out) showed two defects in the
+    bash claw: with the server inheriting the node's output pipes, the
+    starting node could never complete (communicate() waited for a pipe
+    EOF the server held open) and burned its timeout, whose group-kill
+    then destroyed the server; with output redirected the shape worked
+    but the server leaked past the end of the run. The claw now
+    captures output to files, and the executor reaps the surviving
+    members of each node shell's process group when the run ends.
+    """
+
+    PORT_REDIRECTED = 18731
+    PORT_NAIVE = 18732
+    PORT_TIMEOUT = 18733
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.store = _make_store(self.tmpdir.name)
+        self.registry = ToolRegistry()
+        register_default_claws(self.registry)
+
+    def tearDown(self) -> None:
+        # Safety net: a failing test must never leak a server into the
+        # rest of the suite (or the box).
+        for port in (self.PORT_REDIRECTED, self.PORT_NAIVE, self.PORT_TIMEOUT):
+            for pid in _server_pids(port):
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+        self.tmpdir.cleanup()
+
+    def _run_plan(self, plan: ExecutionPlan) -> ExecutionPlan:
+        self.store.save(plan)
+        executor = Executor(store=self.store, registry=self.registry)
+        return _run(executor.run(plan.plan_id))
+
+    def _two_node_plan(self, plan_id: str, start_command: str, port: int) -> ExecutionPlan:
+        start = PlanNode(
+            id="start",
+            objective="Start the test server in the background",
+            assigned_claw="bash",
+            inputs={"command": start_command},
+            criteria=[{"type": "exit_code", "equals": 0}],
+            timeout_s=30.0,
+        )
+        probe = PlanNode(
+            id="probe",
+            objective="Fetch the server the previous node started",
+            assigned_claw="bash",
+            inputs={"command": f"curl -sf http://127.0.0.1:{port}/ -o /dev/null && echo REACHED"},
+            criteria=[{"type": "exit_code", "equals": 0}],
+            depends_on=["start"],
+            timeout_s=15.0,
+        )
+        return _make_plan(plan_id, [start, probe])
+
+    def _assert_server_gone(self, port: int) -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not _port_alive(port) and not _server_pids(port):
+                return
+            time.sleep(0.1)
+        self.fail(
+            f"server on port {port} survived the run: "
+            f"port_alive={_port_alive(port)} pids={_server_pids(port)}"
+        )
+
+    def test_redirected_background_server_reached_then_reaped(self) -> None:
+        port = self.PORT_REDIRECTED
+        log = Path(self.tmpdir.name) / "server.log"
+        command = (
+            f"{sys.executable} -m http.server {port} --bind 127.0.0.1 "
+            f">{log} 2>&1 & sleep 1; echo started"
+        )
+        result = self._run_plan(self._two_node_plan("bg-redirected", command, port))
+        self.assertEqual(result.status, PlanStatus.COMPLETED)
+        self.assertEqual(
+            {n.id: n.status for n in result.nodes},
+            {"start": PlanStatus.COMPLETED, "probe": PlanStatus.COMPLETED},
+        )
+        # The run is over: the server it started must not survive it.
+        self._assert_server_gone(port)
+        self.assertEqual(self.registry._detached_groups.pending(), {})
+
+    def test_naive_background_server_no_longer_hangs_its_node(self) -> None:
+        # The D1 regression shape: no redirect — the server inherits the
+        # node's output streams. Before cycle 15 this node burned its
+        # full 30s timeout and FAILED while the server sat healthy.
+        port = self.PORT_NAIVE
+        command = (
+            f"{sys.executable} -m http.server {port} --bind 127.0.0.1 "
+            "& sleep 1; echo started"
+        )
+        result = self._run_plan(self._two_node_plan("bg-naive", command, port))
+        self.assertEqual(result.status, PlanStatus.COMPLETED)
+        start = next(n for n in result.nodes if n.id == "start")
+        self.assertEqual(start.status, PlanStatus.COMPLETED)
+        self.assertIsNotNone(start.duration_s)
+        self.assertLess(start.duration_s, 15.0)
+        probe = next(n for n in result.nodes if n.id == "probe")
+        self.assertEqual(probe.status, PlanStatus.COMPLETED)
+        self._assert_server_gone(port)
+
+    def test_timed_out_node_still_kills_its_whole_group(self) -> None:
+        # The timeout path is unchanged: a node that overruns is killed
+        # with its entire process group, backgrounded children included —
+        # nothing is left for the run-end sweep to find.
+        port = self.PORT_TIMEOUT
+        node = PlanNode(
+            id="slow",
+            objective="Background a server then overrun the timeout",
+            assigned_claw="bash",
+            inputs={
+                "command": (
+                    f"{sys.executable} -m http.server {port} --bind 127.0.0.1 "
+                    ">/dev/null 2>&1 & sleep 30"
+                )
+            },
+            criteria=[{"type": "exit_code", "equals": 0}],
+            timeout_s=2.0,
+        )
+        result = self._run_plan(_make_plan("bg-timeout", [node]))
+        self.assertEqual(result.status, PlanStatus.FAILED)
+        self.assertEqual(result.nodes[0].status, PlanStatus.FAILED)
+        self._assert_server_gone(port)
+
+    def test_plain_run_tracks_no_detached_groups(self) -> None:
+        node = PlanNode(
+            id="plain",
+            objective="Say hello",
+            assigned_claw="bash",
+            inputs={"command": "echo hello"},
+            criteria=[{"type": "exit_code", "equals": 0}],
+        )
+        result = self._run_plan(_make_plan("bg-plain", [node]))
+        self.assertEqual(result.status, PlanStatus.COMPLETED)
+        self.assertEqual(self.registry._detached_groups.pending(), {})
+        self.assertEqual(self.registry.cleanup_detached_processes(), 0)

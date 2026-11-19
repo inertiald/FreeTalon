@@ -4651,3 +4651,57 @@ Deliberately left out:
   Logs: freetalon-workspace/logs/content-1b-2026-11-18.log
   (this box), /home/seeker/logs/content-1b-2026-11-18.log
   (seeker88).
+
+## Update - 2026-11-18 (Cycle 15: cross-node background processes — the re-run #11 harness gap, diagnosed and fixed)
+
+- Diagnosis first, and it corrects the re-run #11 reading: node-4's
+  server did NOT die crossing node shells. freetalon.err.log holds
+  exactly one traceback, timestamped at node-4's start second:
+  cmd_serve -> load_secret -> "Missing secret token" — the daemon
+  `freetalon.cli start` spawned (Popen, start_new_session=True,
+  output to files) crashed at startup because the node shell had no
+  FREETALON_API_TOKEN (config's api_token_file defaults to None).
+  A healthy daemonized server persists across nodes fine (proven in
+  the reproduction's cli variant, token provided).
+- The reproduction (production Executor + bash claw, four variants)
+  found the two REAL defects, both in the claw's output capture:
+  (1) a node that backgrounds a server the naive way
+  (`python -m http.server &`, inheriting the node's pipes) could
+  never complete — communicate() waits for pipe EOF, the server
+  holds the write ends open, the node burned its full timeout as a
+  FAIL while the server sat healthy and answering, and the timeout
+  process-group kill then destroyed the server; (2) with output
+  redirected the shape worked, but the server leaked past the end
+  of the run — nothing reaped it.
+- Fix (executor layer, no planner/prompt change): the bash claw now
+  captures node output to temp files instead of pipes, so node
+  completion depends only on the shell's own exit; surviving members
+  of each node shell's process group are recorded
+  (_DetachedProcessGroups in tool_registry.py, matched by pid +
+  /proc starttime so a recycled pid never counts) and Executor.run
+  sweeps those groups in a finally — SIGTERM, grace, SIGKILL —
+  whether the run passes, fails, or errors. Timeout behavior is
+  unchanged (whole-group kill). A process that daemonizes into its
+  own session (setsid, freetalon.cli start) deliberately leaves the
+  group and is NOT swept: its lifecycle stays with the plan/app
+  (e.g. freetalon.cli stop), as in an interactive shell.
+- Proof: 4 new tests (tests/test_executor.py,
+  TestCrossNodeBackgroundProcesses) — redirected AND naive
+  two-node shapes pass with the server reaped at run end, the
+  timeout group-kill still holds, a plain run tracks nothing.
+  Live hand-built plan through LoopRunner in the exact re-run #11
+  shape (node-1 backgrounds the real API server with a bare &,
+  node-2 curls /health): goal PASS, node-1 3.0s, node-2 PASS,
+  port 8765 dead after the run. The LLM mini-run variant was
+  aborted in planning: the route-goal machinery engaged on the
+  goal's /health URL and qwen3.8 looped a differs_by paragraph
+  (77K+ chars, the known no-EOS behavior) toward an api.py edit
+  the goal never asked for — nothing executed, tree untouched.
+- Full suite 1170/1170 OK (1166 baseline + 4 new, 500.6s).
+  Corpus replays identical to baseline
+  (original 0/28 accepted, mean 1.32 errors/output; model-ab
+  gemma3 1.50, qwen 2.20) — zero pins changed. Demo
+  tools/demo-framework-guard.py ALL CHECKS PASSED. GPU peaked
+  79C during the aborted planning run (fans 85%, restored to
+  auto, GPUFanControlState=0 verified; model unloaded).
+  Log: logs/cycle15-node-persistence-2026-11-18.log.

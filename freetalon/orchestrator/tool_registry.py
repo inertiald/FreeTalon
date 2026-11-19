@@ -12,7 +12,10 @@ import ast
 import asyncio
 import os
 import re
+import signal
 import subprocess
+import tempfile
+import time
 import warnings
 from collections.abc import Callable, Coroutine
 from pathlib import Path
@@ -225,11 +228,119 @@ def metrics_reported_by(claw: str) -> frozenset[str]:
     return CLA_METRICS.get(claw, frozenset())
 
 
+def _process_group_members(pgid: int) -> dict[int, int]:
+    """Live members of a process group: {pid: starttime} read from /proc.
+
+    The starttime (field 22 of /proc/<pid>/stat) identifies a process
+    incarnation: a pid recycled by an unrelated process never matches the
+    starttime recorded for the original, which is what makes the
+    detached-group sweep below safe against pid/group-id reuse.
+    """
+    members: dict[int, int] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return members
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path(f"/proc/{entry}/stat").read_text()
+            # comm (field 2) may contain spaces/parens; fields after the
+            # last ')' start at field 3, so field N is rest[N - 3]:
+            # pgrp is field 5 (rest[2]), starttime field 22 (rest[19]).
+            rest = stat.rsplit(")", 1)[1].split()
+            if int(rest[2]) == pgid:
+                members[int(entry)] = int(rest[19])
+        except (OSError, ValueError, IndexError):
+            continue
+    return members
+
+
+class _DetachedProcessGroups:
+    """Process groups that outlived the bash node that spawned them.
+
+    Cycle 15: a bash node runs in its own session
+    (``start_new_session=True``), so its process-group id is the shell's
+    pid. A process the node backgrounds (``server &``) stays in that
+    group after the shell exits — reparented to init, group id unchanged
+    (verified against /proc in the cycle-15 reproduction). The bash
+    handler records groups with surviving members here; the executor
+    sweeps them when the run ends, so a server a plan started for a
+    later node to talk to never leaks past the run.
+
+    A process that daemonizes into its OWN session (``setsid``, or
+    ``freetalon.cli start``'s Popen) has deliberately left the group and
+    is NOT tracked: its lifecycle belongs to the plan/app that detached
+    it (e.g. ``freetalon.cli stop``), exactly as in an interactive shell.
+    """
+
+    def __init__(self) -> None:
+        self._groups: dict[int, dict[int, int]] = {}
+
+    def record(self, pgid: int) -> None:
+        """Snapshot the surviving members of *pgid* (called at node end)."""
+        members = _process_group_members(pgid)
+        # Never track a group this process belongs to: in the
+        # pathological case where a dead group leader's id was recycled
+        # as a node shell's pid, the executor's own group could carry
+        # the same number, and sweeping it would signal ourselves.
+        if members and os.getpid() not in members:
+            self._groups.setdefault(pgid, {}).update(members)
+
+    def pending(self) -> dict[int, dict[int, int]]:
+        """The recorded groups: {pgid: {pid: starttime}} (a copy)."""
+        return {pgid: dict(members) for pgid, members in self._groups.items()}
+
+    def sweep(self, *, grace_s: float = 2.0) -> int:
+        """Terminate every recorded group; return the count swept.
+
+        A group is signalled only while at least one recorded member —
+        matched by pid AND starttime, so a recycled pid never counts —
+        is verified live in it immediately beforehand. SIGTERM first,
+        then SIGKILL for whatever is still alive after the grace.
+        """
+        groups, self._groups = self._groups, {}
+        swept = 0
+        for pgid, recorded in groups.items():
+            live = self._verified_live(pgid, recorded)
+            if not live:
+                continue
+            swept += 1
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except OSError:
+                continue
+            deadline = time.monotonic() + grace_s
+            while time.monotonic() < deadline:
+                if not self._verified_live(pgid, recorded):
+                    break
+                time.sleep(0.05)
+            if self._verified_live(pgid, recorded):
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except OSError:
+                    pass
+        return swept
+
+    @staticmethod
+    def _verified_live(pgid: int, recorded: dict[int, int]) -> dict[int, int]:
+        current = _process_group_members(pgid)
+        return {
+            pid: start
+            for pid, start in current.items()
+            if recorded.get(pid) == start
+        }
+
+
 class ToolRegistry:
     def __init__(self, *, strict: bool = True, scaffolder: Any | None = None) -> None:
         self._strict = strict
         self._handlers: dict[str, AsyncHandler] = {}
         self._scaffolder = scaffolder
+        # Cycle 15: process groups backgrounded by bash nodes and still
+        # alive at node end; swept by the executor when the run ends.
+        self._detached_groups = _DetachedProcessGroups()
 
         # Default claws are NOT auto-registered: callers that want them
         # (bootstrap.py) call register_default_claws(registry) explicitly.
@@ -330,27 +441,55 @@ class ToolRegistry:
             # optional workdir (the node's run directory). The process runs
             # in its own session so a timeout kills the whole group, not
             # just the shell.
+            #
+            # Cycle 15: output goes to temp files, NOT pipes. With pipes,
+            # communicate() returns only at pipe EOF, and EOF waits on
+            # EVERY process that inherited the pipe write ends — a node
+            # that backgrounds a server (`python -m http.server &`, the
+            # natural start-a-server step) could never complete: the
+            # server held the pipes open, the node burned its whole
+            # timeout, and the timeout group-kill then destroyed the
+            # server it had started (cycle-15 reproduction,
+            # logs/cycle15-repro.out: server alive and answering at the
+            # probe instant, node still FAILED as a timeout). With
+            # files, node completion depends only on the shell's own
+            # exit; a backgrounded process keeps running for later
+            # nodes, and its process group is recorded so the executor
+            # can reap it when the run ends.
             timeout = float(inputs.get("timeout_s", 300))
             workdir = inputs.get("workdir")
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=workdir or None,
-                start_new_session=True,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
+            with (
+                tempfile.TemporaryFile() as out_file,
+                tempfile.TemporaryFile() as err_file,
+            ):
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdout=out_file,
+                    stderr=err_file,
+                    cwd=workdir or None,
+                    start_new_session=True,
                 )
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                _kill_process_group(proc)
+                timed_out = False
                 try:
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(), timeout=5
-                    )
-                except Exception:  # noqa: BLE001 - best effort drain
-                    stdout, stderr = b"", b""
+                    await asyncio.wait_for(proc.wait(), timeout=timeout)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    timed_out = True
+                    _kill_process_group(proc)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except Exception:  # noqa: BLE001 - best effort reap
+                        pass
+                if not timed_out:
+                    # The shell exited on its own; anything it
+                    # backgrounded is still alive in its process group
+                    # (the shell's pid). Record survivors so the
+                    # executor reaps them at run end.
+                    self._detached_groups.record(proc.pid)
+                out_file.seek(0)
+                err_file.seek(0)
+                stdout = out_file.read()
+                stderr = err_file.read()
+            if timed_out:
                 return {
                     "exit_code": None,
                     "status": "timeout",
@@ -385,6 +524,16 @@ class ToolRegistry:
                 "summary": summary,
                 "metrics": {"summary_chars": len(summary)},
             }
+
+    def cleanup_detached_processes(self) -> int:
+        """Terminate process groups that outlived their bash node.
+
+        Cycle 15: called by the executor when a run ends (success or
+        failure). Returns how many groups still had live members and
+        were terminated; 0 when nothing was backgrounded or everything
+        already exited on its own.
+        """
+        return self._detached_groups.sweep()
 
     def resolve(self, capability: str, node_inputs: dict[str, Any] | None = None) -> AsyncHandler:
         """Return the handler for capability, scaffolding dynamically if missing."""
