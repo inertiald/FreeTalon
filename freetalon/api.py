@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .audit import current_request_id, set_request_id
 from .docker_manager import resource_summary_safe
 from .hive import HiveController
 from .orchestrator.gates import GateStore
@@ -34,9 +36,15 @@ class HiveAPIServer:
 
     def start(self, host: str, port: int) -> None:
         api = self
+        max_body = getattr(api.controller.config, "max_request_body_bytes", 65536)
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
+                # Correlation id: this request's audit events carry it
+                # and _send echoes it as X-Request-ID. Minted inline --
+                # the planner pins this module's def inventory, so no
+                # wrapper def may be added here.
+                set_request_id(uuid.uuid4().hex[:12])
                 parsed = urlparse(self.path)
                 path = parsed.path
                 qs = parse_qs(parsed.query)
@@ -145,6 +153,7 @@ class HiveAPIServer:
                 return self._send(404, {"ok": False, "error": "Not Found"})
 
             def do_POST(self) -> None:  # noqa: N802
+                set_request_id(uuid.uuid4().hex[:12])
                 path = urlparse(self.path).path
                 if path == "/shutdown":
                     if not self._authorized():
@@ -212,7 +221,23 @@ class HiveAPIServer:
                 return False
 
             def _json_body(self) -> dict[str, Any] | None:
-                length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._send(400, {"ok": False, "error": "Invalid Content-Length"})
+                    return None
+                if length < 0:
+                    self._send(400, {"ok": False, "error": "Invalid Content-Length"})
+                    return None
+                if length > max_body:
+                    self._send(
+                        413,
+                        {
+                            "ok": False,
+                            "error": f"Request body exceeds {max_body} bytes",
+                        },
+                    )
+                    return None
                 body = self.rfile.read(length)
                 try:
                     data = json.loads(body or b"{}")
@@ -228,6 +253,9 @@ class HiveAPIServer:
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))
+                rid = current_request_id()
+                if rid:
+                    self.send_header("X-Request-ID", rid)
                 self.end_headers()
                 self.wfile.write(encoded)
 

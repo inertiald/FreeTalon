@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 import uuid
@@ -40,6 +41,24 @@ class TaskRecord:
     updated_at: float = field(default_factory=time.time)
     cancel_requested: bool = False
     worker_id: str | None = None
+
+
+def _retry_delay_seconds(
+    config: HiveConfig, backoff_seconds: float, attempt: int
+) -> float:
+    """Exponential retry delay with a cap and optional full jitter.
+
+    Mined from copilot/production-grade-hardening (triage execution
+    2026-11-19): delay = backoff_seconds * 2**(attempt - 1), capped at
+    config.max_backoff_seconds; with config.retry_jitter on, the
+    actual delay is drawn uniformly from [0, capped] so tasks that
+    failed together do not retry in lockstep. Replaces the linear
+    backoff_seconds * attempt schedule.
+    """
+    capped = min(backoff_seconds * (2 ** (attempt - 1)), config.max_backoff_seconds)
+    if config.retry_jitter:
+        return random.uniform(0, capped)
+    return capped
 
 
 class HiveController:
@@ -274,7 +293,9 @@ class HiveController:
                     task.status = "cancelled"
                 elif task.attempt <= task.max_retries:
                     task.status = "retrying"
-                    task.next_run_at = time.time() + (task.backoff_seconds * task.attempt)
+                    task.next_run_at = time.time() + _retry_delay_seconds(
+                        self.config, task.backoff_seconds, task.attempt
+                    )
                 else:
                     task.status = "failed"
                 task.updated_at = time.time()
