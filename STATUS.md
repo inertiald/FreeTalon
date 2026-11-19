@@ -3446,3 +3446,64 @@ Deliberately left out:
   dev/critic-experiment, NOT pushed. Log:
   logs/critic-cycle17-2026-11-18.log, battery
   JSONs alongside it.
+## Update - 2026-11-18 (Critic cycle 18: the deterministic confession rule — what a comment confesses, code decides; battery 4/4 with qwen2.5-coder:7b)
+
+- The seam gains a deterministic rule beside the judge
+  (freetalon/orchestrator/critic.py:
+  deterministic_hollow_evidence). FIRE condition, all on
+  ONE line of the shown content: the line binds a literal
+  value — a dict entry 'key': <literal> or an assignment
+  name = <literal>, literal in {True, False, number,
+  quoted string} — AND the line's comment confesses
+  placeholder status, matching case-insensitively one of:
+  replace with actual / placeholder / todo / fixme /
+  dummy / stub / mock / fake / for now / temporary. The
+  verdict is hollow, its evidence is the line verbatim,
+  and its reason is prefixed "deterministic:" so the
+  audit trail never confuses it with a judge's call. It
+  flows through the unchanged CriticReview / measurement /
+  audit shapes. review_write_nodes runs the rule per node
+  BEFORE the judge; a convicted node is never put to the
+  judge. The confession requirement is the safety: a
+  fixed status label and a fallback initializer in front
+  of a real probe bind literals without confessing, and
+  do not fire.
+- Tests: critic suite 30/30 OK (22 at cycle 17 + 8 new):
+  fires on retry28-4's exact offending lines and on an
+  assignment-form binding; silent on the substantive
+  fixtures, on a literal binding with an innocent
+  comment, and on a confession with no literal binding;
+  review-level conviction with NO judge call; rule and
+  judge verdicts coexisting; a loop-level conviction
+  through the critic_review measurement with the judge
+  consulted only for the unconvicted node.
+- Corpus sweep (tools/cycle18_sweep.py): 40 recorded
+  write-node contents (both planner corpora + the
+  battery's recorded plans). 3 fires, all true hollows
+  of one family: corpus retry28-2
+  (ollama_reachable = True # Placeholder, implement
+  actual check), retry28-4 (the target case), retry29-4
+  (ollama_reachable = True # Replace with actual check).
+  Zero fires on every model-ab qwen output, on the
+  positive-control plan's nodes, and on the banked
+  success's borderline node. Two model-ab gemma27b rows
+  have malformed raw JSON and were scanned textually:
+  one carries no confession marker (silent), the other
+  carries the same family's confessing literal binding
+  (a true hollow). No false fire on any recorded
+  substantive output; no tightening was needed.
+- Battery (identical cases, production critic path,
+  judge qwen2.5-coder:7b ONLY, rule enabled): 4/4.
+  Positive control substantive on both nodes (judge);
+  hollow-Ellipsis hollow (judge, three Ellipsis lines as
+  verified evidence); hollow-literals (retry28-4) hollow
+  by the RULE in 0.0s with the confessing line as
+  evidence; borderline-status substantive (judge; the
+  rule silent on the unconfessed "ready" label). No
+  degraded review, no voided verdicts. llama3 stays
+  disqualified as judge of record (cycle 17: it convicts
+  the positive control on present-but-misread quotes).
+  seeker88 untouched (site 200; both models present).
+  Log: logs/critic-cycle18-2026-11-18.log, battery JSON
+  alongside it. Committed locally on
+  dev/critic-experiment, NOT pushed.

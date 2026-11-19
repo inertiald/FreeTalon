@@ -74,12 +74,35 @@ quoted line must exist in the content — so the grounding
 requirement is unchanged; only block re-indentation stops
 counting as fabrication. The prompt now also asks for the
 evidence as a list, one quoted line per item.
+
+Cycle 18 adds a deterministic rule beside the judge. One
+hollowness shape needs no judgment at all: a line that binds a
+literal value (a dict entry or an assignment) under a comment
+confessing the value is a placeholder — "replace with actual
+check" and its kin. The confession is the tell: legitimate
+literal bindings (a fixed status label, a fallback initializer
+in front of a real probe) do not confess, so the rule requires
+BOTH halves on ONE line — a literal binding AND a confession
+marker in that line's comment. A firing line is hollow by
+construction, with the line itself as the evidence (it passes
+the per-line quote check trivially), and the verdict's reason
+is prefixed "deterministic:" so the audit trail never confuses
+it with a judge's call. The rule runs before the judge for
+each node: a node it convicts is not put to the judge at all.
+The battery motivated the split — qwen2.5-coder:7b, the one
+judge that never false-flagged a substantive node, judged the
+confession-carrying corpus case substantive outright in every
+round, while llama3 could find it only when steered, and
+convicted the positive control in exchange. What a comment
+confesses, code should decide; what it does not, the judge
+still judges.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field, replace as dataclass_replace
 from pathlib import Path
 from typing import Any
@@ -459,6 +482,102 @@ def _parse_verdict(
     )
 
 
+# Cycle 18: the deterministic confession rule. A line that binds a
+# literal under a comment confessing placeholder status is hollow
+# by construction — no judge call is spent on it, and none is
+# needed: the confession is in the content, checkable by anyone.
+_CONFESSION_MARKERS = (
+    "replace with actual",
+    "placeholder",
+    "todo",
+    "fixme",
+    "dummy",
+    "stub",
+    "mock",
+    "fake",
+    "for now",
+    "temporary",
+)
+
+# A literal the rule recognizes: a boolean, a number, or a quoted
+# string. Deliberately narrow — an Ellipsis, a name, or a call is
+# not a literal binding, whatever comment rides beside it.
+_LITERAL_PATTERN = (
+    r"(?:True|False|-?\d+(?:\.\d+)?|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")"
+)
+
+# A dict entry binding a literal at the end of the code part of a
+# line (an optional trailing comma aside): 'key': <literal>.
+_DICT_LITERAL_RE = re.compile(
+    r"['\"][^'\"\n]+['\"]\s*:\s*" + _LITERAL_PATTERN + r"\s*,?\s*$"
+)
+
+# An assignment binding a literal at the end of the code part:
+# name = <literal> (subscript/attribute targets included; the
+# lookarounds keep ==, <=, >=, != from counting as bindings).
+_ASSIGN_LITERAL_RE = re.compile(
+    r"(?<![<>=!])=(?!=)\s*" + _LITERAL_PATTERN + r"\s*$"
+)
+
+
+def _split_comment(line: str) -> tuple[str, str]:
+    """Split a source line into (code, comment) at the first '#'
+    outside a string literal; the comment is '' when the line has
+    none. Quote state is tracked within the line, so a '#' inside
+    a quoted string is not a comment start."""
+    quote: str | None = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote is not None:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "#":
+            return line[:index], line[index + 1 :]
+        index += 1
+    return line, ""
+
+
+def _confession_marker(comment: str) -> str | None:
+    """The first placeholder-confession marker in a comment, if any."""
+    lowered = comment.lower()
+    for marker in _CONFESSION_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+def deterministic_hollow_evidence(
+    shown_content: str,
+) -> tuple[str, str] | None:
+    """The deterministic confession rule over one node's shown content.
+
+    Returns (line, marker) for the first line that BOTH binds a
+    literal value (a dict entry or an assignment) AND carries a
+    comment confessing the value is a placeholder — or None when
+    no line does. The confession requirement is the safety: a
+    literal binding alone is often legitimate (a fixed status
+    label, a fallback initializer in front of a real probe), and
+    a confession alone is just a note; together on one line they
+    are an admitted invention of a value.
+    """
+    for raw_line in shown_content.splitlines():
+        code, comment = _split_comment(raw_line)
+        if not comment:
+            continue
+        marker = _confession_marker(comment)
+        if marker is None:
+            continue
+        if _DICT_LITERAL_RE.search(code) or _ASSIGN_LITERAL_RE.search(code):
+            return raw_line.strip(), marker
+    return None
+
+
 def review_write_nodes(
     plan: ExecutionPlan,
     goal_text: str,
@@ -467,7 +586,9 @@ def review_write_nodes(
 ) -> CriticReview:
     """Review a plan version's write nodes for substance.
 
-    One call per reviewable write node, in plan order. Never
+    One judge call per reviewable write node, in plan order —
+    except a node the deterministic confession rule convicts,
+    which is decided on its own line without a call. Never
     raises: any backend or parse failure voids the review
     (``degraded`` carries the detail) and the caller executes the
     version as if there were no critic — the second model's
@@ -489,15 +610,38 @@ def review_write_nodes(
     voided: list[VoidedVerdict] = []
     try:
         for node in targets:
+            # The evidence check runs against exactly what the
+            # prompt shows the critic for this node — the bounded
+            # content _critic_prompt renders — and the
+            # deterministic rule judges that same text.
+            shown = _bounded(_node_content(node) or "", _CONTENT_MAX_CHARS)
+            # Cycle 18: the deterministic confession rule runs
+            # before the judge. A line that binds a literal under
+            # a comment confessing it is a placeholder is hollow
+            # by construction, so the node is convicted on the
+            # line itself and never put to the judge.
+            confession = deterministic_hollow_evidence(shown)
+            if confession is not None:
+                line, marker = confession
+                verdicts.append(
+                    CriticVerdict(
+                        node_id=node.id,
+                        substantive=False,
+                        reason=(
+                            "deterministic: the content binds a literal "
+                            "value under a comment confessing it is a "
+                            f"placeholder ({marker!r}) — the value is "
+                            "admitted invented, not computed or measured"
+                        ),
+                        evidence=line,
+                    )
+                )
+                continue
             response = call_llm(
                 CRITIC_SYSTEM_PROMPT,
                 _critic_prompt(goal_text, plan, node),
                 settings=effective,
             )
-            # The evidence check runs against exactly what the
-            # prompt showed the critic for this node — the same
-            # bounded content _critic_prompt rendered.
-            shown = _bounded(_node_content(node) or "", _CONTENT_MAX_CHARS)
             verdict, void = _parse_verdict(node.id, response, shown)
             verdicts.append(verdict)
             if void is not None:

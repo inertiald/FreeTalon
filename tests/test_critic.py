@@ -38,6 +38,7 @@ from freetalon.orchestrator.critic import (
     CriticSettings,
     critic_settings_from_env,
     critic_verdict_schema,
+    deterministic_hollow_evidence,
     review_write_nodes,
 )
 from freetalon.orchestrator.intake import LLMBackendError, LLMSettings
@@ -129,6 +130,20 @@ FILLED_MODULE = MODULE_SOURCE.replace(
     "                    except Exception:\n"
     '                        payload["gpu_temperature"] = None\n'
     "                    return self._send(200, payload)\n",
+)
+
+# The corpus retry28-4 shape: a payload dict whose measured
+# fields are literal constants, each carrying a comment that
+# confesses it is a placeholder ("Replace with actual check.").
+CONFESSING_MODULE = MODULE_SOURCE.replace(
+    '                    return self._send(200, {"ok": True, "status": "ready"})\n',
+    '                    payload = {\n'
+    '                        "ok": True,\n'
+    '                        "status": "ready",\n'
+    "                        'ollama_reachable': True,  # Replace with actual check.\n"
+    "                        'gpu_temperature': 'N/A'  # Replace with actual check.\n"
+    '                    }\n'
+    '                    return self._send(200, payload)\n',
 )
 
 TEST_SOURCE = (
@@ -558,6 +573,129 @@ class TestCriticReview(unittest.TestCase):
         mock.assert_not_called()
 
 
+class TestDeterministicConfessionRule(unittest.TestCase):
+    """Cycle 18: the deterministic confession rule — a line that
+    binds a literal value under a comment confessing placeholder
+    status is hollow by construction. Either half alone (a literal
+    binding, a confession comment) must NOT fire: the confession
+    requirement is the safety."""
+
+    def test_fires_on_the_recorded_confession_lines(self) -> None:
+        found = deterministic_hollow_evidence(CONFESSING_MODULE)
+        self.assertIsNotNone(found)
+        line, marker = found
+        self.assertEqual(
+            line, "'ollama_reachable': True,  # Replace with actual check."
+        )
+        self.assertEqual(marker, "replace with actual")
+
+    def test_fires_on_an_assignment_binding(self) -> None:
+        content = "gpu_temperature = 42  # placeholder until the probe lands\n"
+        found = deterministic_hollow_evidence(content)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[1], "placeholder")
+
+    def test_silent_on_the_substantive_fixtures(self) -> None:
+        # The filled-slots module binds literals too — a fixed
+        # status label, fallback initializers in front of real
+        # probes — but no line confesses, so the rule is silent.
+        # The Ellipsis module's defect is not a literal binding.
+        for content in (
+            MODULE_SOURCE,
+            ELLIPSIS_MODULE,
+            FILLED_MODULE,
+            TEST_SOURCE,
+        ):
+            self.assertIsNone(deterministic_hollow_evidence(content))
+
+    def test_silent_on_a_literal_binding_with_an_innocent_comment(self) -> None:
+        content = 'service_status = "ready"  # the label the goal fixes\n'
+        self.assertIsNone(deterministic_hollow_evidence(content))
+
+    def test_silent_on_a_confession_without_a_literal_binding(self) -> None:
+        content = (
+            "# TODO: replace this sketch with the real module\n"
+            "reading = probe_temperature()  # placeholder wiring for now\n"
+        )
+        self.assertIsNone(deterministic_hollow_evidence(content))
+
+    def test_review_convicts_by_rule_without_a_judge_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = str(Path(tmp) / "api.py")
+            Path(target).write_text(MODULE_SOURCE, encoding="utf-8")
+            node = PlanNode(
+                id="write-confessing",
+                objective="Extend the endpoint",
+                assigned_claw="scaffold",
+                inputs={"file_path": target, "content": CONFESSING_MODULE},
+            )
+            plan = ExecutionPlan(
+                plan_id="plan-critic-rule",
+                intent=TaskIntent(goal=HEALTH_GOAL),
+                nodes=[node],
+            )
+            with patch(
+                "freetalon.orchestrator.critic.call_llm",
+                side_effect=AssertionError("the rule must not call the judge"),
+            ):
+                review = review_write_nodes(
+                    plan, HEALTH_GOAL, CriticSettings(), settings=LLMSettings()
+                )
+            self.assertIsNone(review.degraded)
+            self.assertEqual(
+                [v.node_id for v in review.hollow], ["write-confessing"]
+            )
+            verdict = review.hollow[0]
+            self.assertTrue(verdict.reason.startswith("deterministic:"))
+            self.assertEqual(
+                verdict.evidence,
+                "'ollama_reachable': True,  # Replace with actual check.",
+            )
+            self.assertEqual(review.voided, [])
+
+    def test_rule_and_judge_verdicts_coexist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = str(Path(tmp) / "api.py")
+            Path(target).write_text(MODULE_SOURCE, encoding="utf-8")
+            nodes = [
+                PlanNode(
+                    id="write-confessing",
+                    objective="Extend the endpoint",
+                    assigned_claw="scaffold",
+                    inputs={"file_path": target, "content": CONFESSING_MODULE},
+                ),
+                PlanNode(
+                    id="write-ellipsis",
+                    objective="Extend the endpoint another way",
+                    assigned_claw="scaffold",
+                    inputs={"file_path": target, "content": ELLIPSIS_MODULE},
+                ),
+            ]
+            plan = ExecutionPlan(
+                plan_id="plan-critic-mixed",
+                intent=TaskIntent(goal=HEALTH_GOAL),
+                nodes=nodes,
+            )
+            with patch(
+                "freetalon.orchestrator.critic.call_llm",
+                side_effect=_stub_client,
+            ) as mock:
+                review = review_write_nodes(
+                    plan, HEALTH_GOAL, CriticSettings(), settings=LLMSettings()
+                )
+            self.assertIsNone(review.degraded)
+            self.assertEqual(
+                [v.node_id for v in review.hollow],
+                ["write-confessing", "write-ellipsis"],
+            )
+            self.assertTrue(
+                review.hollow[0].reason.startswith("deterministic:")
+            )
+            # The judge was consulted only for the node the rule
+            # did not convict.
+            self.assertEqual(mock.call_count, 1)
+
+
 class TestCriticLoop(unittest.TestCase):
     """Loop-level fixtures (i)-(v), in the live plan's shape."""
 
@@ -878,6 +1016,69 @@ class TestCriticLoop(unittest.TestCase):
         audit_text = audit_path.read_text(encoding="utf-8")
         self.assertIn("loop.critic.voided", audit_text)
         self.assertNotIn("loop.critic.hollow", audit_text)
+
+    # (vii) Cycle 18: the deterministic confession rule convicts
+    # in the loop through the same measurement shape as a judge
+    # verdict, its reason marked deterministic — and the judge is
+    # never asked about the convicted node.
+    def test_deterministic_confession_convicts_in_the_loop(self) -> None:
+        runner, store = self._make_runner(critic_settings=CriticSettings())
+        plan = self._health_plan(CONFESSING_MODULE)
+        store.save(plan)
+        briefs: list[dict] = []
+
+        def replan_fn(brief):
+            briefs.append(brief)
+            return [
+                PlanNode(
+                    id="fix",
+                    objective="write a marker file instead",
+                    assigned_claw="bash",
+                    inputs={"command": "echo fixed > fixed.txt"},
+                    criteria=[{"type": "file_exists", "path": "fixed.txt"}],
+                    hypothesis="a marker file proves the step ran",
+                    responds_to="node-1",
+                    differs_by="writes a marker instead of the confessing module",
+                )
+            ]
+
+        contract = GoalContract(
+            objective=HEALTH_GOAL, budget=RunBudget(max_replans=2)
+        )
+        with patch(
+            "freetalon.orchestrator.critic.call_llm", side_effect=_stub_client
+        ) as mock:
+            result = runner.run_plan(plan, contract, replan_fn=replan_fn)
+
+        self.assertEqual(result.goal_verdict, "PASS")
+        self.assertEqual(result.plan_versions, 2)
+        # The convicted version never executed.
+        self.assertEqual(
+            Path(self.module_path).read_text(encoding="utf-8"), MODULE_SOURCE
+        )
+        critic_measurements = [
+            m
+            for m in result.measurements
+            if m.get("node_id") == "node-1" and m.get("plan_version") == 1
+        ]
+        self.assertEqual(len(critic_measurements), 1)
+        self.assertEqual(critic_measurements[0]["verdict"], "FAIL")
+        self.assertEqual(
+            critic_measurements[0]["results"][0]["criterion"]["type"],
+            "critic_review",
+        )
+        detail = critic_measurements[0]["results"][0]["detail"]
+        self.assertIn("critic review (hollow)", detail)
+        self.assertIn("deterministic:", detail)
+        # The re-plan brief carries the deterministic reason as the
+        # failure's diagnostics, like any critic verdict.
+        self.assertEqual(len(briefs), 1)
+        failed = briefs[0]["failed_nodes"]
+        self.assertEqual([f["id"] for f in failed], ["node-1"])
+        self.assertIn("deterministic:", failed[0]["diagnostics"])
+        # The judge was consulted only about node-2 (the test
+        # file); node-1 was convicted by the rule alone.
+        self.assertEqual(mock.call_count, 1)
 
 
 if __name__ == "__main__":
