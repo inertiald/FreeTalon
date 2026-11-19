@@ -9,6 +9,12 @@ The honesty rule is load-bearing: Pat's blurb and the media list are
 the ONLY facts the model gets, and every prompt says so. A thin blurb
 earns a post about the scene and the feeling, never invented specs,
 names, dates, or people.
+
+Slice 1c adds one more grounded source: a vision description of
+each photo (media dicts may carry a 'vision' key). It renders as its
+own block in entry_context, fenced by a sentence that holds it to
+the same rule - use it as given, never extend it. Entries without
+vision descriptions produce byte-identical prompts to slice 1b.
 """
 
 from __future__ import annotations
@@ -47,12 +53,37 @@ def describe_media(media: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def describe_vision(media: list[dict[str, Any]]) -> list[str]:
+    """One prompt line per media item that carries a vision
+    description ('vision' key, filled by the generator's vision
+    pass); items without one contribute nothing."""
+    lines = []
+    for item in media:
+        vision = item.get("vision")
+        if isinstance(vision, str) and vision.strip():
+            name = item.get("originalName") or item.get("filename", "")
+            lines.append(f"- {name}: {vision.strip()}")
+    return lines
+
+
 def entry_context(entry: dict[str, Any]) -> str:
     blurb = str(entry.get("blurb") or "").strip()
     lines = ["Pat's notes (the source of truth):", blurb if blurb else "(no notes provided)"]
-    media_lines = describe_media(list(entry.get("media") or []))
+    media = list(entry.get("media") or [])
+    media_lines = describe_media(media)
     if media_lines:
         lines += ["", "Attached media:", *media_lines]
+    vision_lines = describe_vision(media)
+    if vision_lines:
+        lines += [
+            "",
+            "What the photos show (from vision):",
+            *vision_lines,
+            "The vision notes above are observations of the attached "
+            "photos themselves: treat them as given facts like the "
+            "notes, and do not extend them with details they do not "
+            "state.",
+        ]
     return "\n".join(lines)
 
 

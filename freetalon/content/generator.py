@@ -5,6 +5,13 @@ each in turn, drafts every output the entry selected, and submits.
 Any failure on an entry returns it to 'received' with the error
 noted and moves on - a bad entry never wedges the queue, and no
 entry is ever left parked at 'processing' by a crash in this code.
+
+Slice 1c: before drafting, each still image also goes through a
+vision pass (freetalon.content.vision) whose description joins the
+draft prompts as grounded observation. The vision callable is
+optional and its failures are never fatal: an image the vision
+model cannot describe is drafted from its metadata alone, with the
+fallback noted in the log.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from ..orchestrator.intake import LLMSettings, _normalize_base_url, _post_json
 from .media_info import image_dimensions
 from .prompts import PROMPT_BUILDERS, VOICE_SYSTEM_PROMPT
 from .queue_client import ContentQueueClient, ContentQueueError
+from .vision import VisionFn, make_ollama_vision
 
 log = logging.getLogger("freetalon.content")
 
@@ -27,6 +35,7 @@ ChatFn = Callable[[str, str], str]
 
 _DEFAULT_SITE_BASE_URL = "http://100.87.140.12:3000"
 _DEFAULT_MODEL = "qwen3.8:27b"
+_DEFAULT_VISION_MODEL = "gemma3:27b"
 
 
 def clean_draft(text: str) -> str:
@@ -96,28 +105,68 @@ class EntryResult:
 
 
 class ContentGenerator:
-    def __init__(self, client: ContentQueueClient, chat: ChatFn) -> None:
+    def __init__(
+        self,
+        client: ContentQueueClient,
+        chat: ChatFn,
+        vision: VisionFn | None = None,
+    ) -> None:
         self._client = client
         self._chat = chat
+        self._vision = vision
 
     def _enrich_media(self, entry: dict[str, Any]) -> dict[str, Any]:
-        """Attach image dimensions (parsed from the stored bytes) to
-        the entry's media dicts, best effort: any fetch/parse failure
-        just leaves that item dimensionless."""
+        """Attach image dimensions (parsed from the stored bytes)
+        and, when a vision callable is configured, a vision
+        description to the entry's media dicts - best effort
+        throughout: a fetch failure leaves the item dimensionless,
+        and a vision failure leaves it metadata-only. Neither ever
+        fails the entry; both are noted in the log."""
         enriched = dict(entry)
         media = []
         for item in entry.get("media") or []:
             item = dict(item)
             if item.get("kind") == "image" and item.get("filename"):
+                raw: bytes | None = None
                 try:
                     raw = self._client.fetch_media(entry["id"], item["filename"])
                     item["dimensions"] = image_dimensions(raw)
                 except ContentQueueError as exc:
                     log.warning("media fetch failed for %s: %s", entry["id"], exc)
                     item["dimensions"] = None
+                if raw is not None and self._vision is not None:
+                    item["vision"] = self._describe(
+                        self._vision, entry["id"], item["filename"], raw
+                    )
             media.append(item)
         enriched["media"] = media
         return enriched
+
+    @staticmethod
+    def _describe(
+        vision: VisionFn, entry_id: str, filename: str, raw: bytes
+    ) -> str | None:
+        """One vision call, failure-isolated: any error or an empty
+        description degrades this image to metadata-only grounding."""
+        try:
+            description = vision(raw)
+        except Exception as exc:  # vision is advisory, never fatal
+            log.warning(
+                "vision failed for %s/%s (%s: %s); drafting from metadata only",
+                entry_id,
+                filename,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        if not description or not description.strip():
+            log.warning(
+                "vision returned no description for %s/%s; drafting from metadata only",
+                entry_id,
+                filename,
+            )
+            return None
+        return description.strip()
 
     def generate_drafts(self, entry: dict[str, Any]) -> dict[str, Any]:
         """One chat call per selected output; raises on any failure so
@@ -178,6 +227,19 @@ def settings_from_env() -> LLMSettings:
     )
 
 
+def vision_settings_from_env() -> LLMSettings:
+    """Vision settings: gemma3:27b (multimodal, already on the box)
+    at a factual-description temperature. think stays unset (None):
+    gemma3 has no thinking mode to switch off, so the payload omits
+    the field entirely."""
+    return LLMSettings(
+        model=os.environ.get("CONTENT_VISION_MODEL", _DEFAULT_VISION_MODEL),
+        timeout_seconds=600.0,
+        temperature=0.2,
+        num_ctx=8192,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="freetalon-content",
@@ -197,7 +259,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     client = ContentQueueClient(args.base_url, token)
-    generator = ContentGenerator(client, make_ollama_chat(settings_from_env()))
+    generator = ContentGenerator(
+        client,
+        make_ollama_chat(settings_from_env()),
+        vision=make_ollama_vision(vision_settings_from_env()),
+    )
     try:
         results = generator.run_once()
     except ContentQueueError as exc:

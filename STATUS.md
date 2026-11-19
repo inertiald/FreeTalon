@@ -5179,3 +5179,44 @@ Deliberately left out:
   llama3:latest and qwen2.5-coder:7b both present).
   Log: logs/critic-cycle18-2026-11-18.log. Committed
   locally on dev/critic-experiment, NOT pushed.
+
+## Update - 2026-11-18 (Content pipeline slice 1c: vision pass - drafts grounded in what the photos show)
+
+- Slice 1b grounded drafts in the blurb + media metadata only.
+  1c adds the missing sense: for each still image on an entry,
+  gemma3:27b describes what the photo actually shows, and the
+  description joins the draft prompts as grounded observation
+  under the same honesty rules as the blurb.
+- FreeTalon side only (no site change): freetalon/content/
+  vision.py (visible-only description prompt - subjects,
+  setting, action, colors, light, mood; model years, names,
+  locations, and specs expressly forbidden; 120-word
+  deterministic cap), generator enrichment fetches each image's
+  bytes once and reuses them for dimensions + vision, prompts
+  render a "What the photos show (from vision):" block fenced
+  by a do-not-extend sentence. The house chat path cannot carry
+  images, so the vision call posts to Ollama /api/chat with the
+  images field via intake's _post_json - the deviation is
+  documented in the code, same pattern as 1b's format-pin drop.
+- Failure discipline unchanged in spirit: a failed or empty
+  vision call degrades that image to metadata-only grounding
+  with a warning in the log; it never fails the entry (proven
+  against the live stack with a bogus model: 404 -> warning ->
+  metadata-only). Videos stay metadata-only - no frame
+  extraction this slice.
+- Verified end-to-end with one synthetic entry through the
+  real admin intake: a programmatically drawn red coupe in a
+  pit lane (ground truth known exactly) plus a deliberately
+  vague blurb ("Shakedown day at the home track."). The drafts
+  used vision-only facts throughout - "It's a red coupe", two
+  orange cones either side of the car, the gray structure with
+  evenly spaced dark openings, the dark windshield - and
+  invented nothing beyond them: no names, specs, dates, or
+  places. Entry discarded via the lifecycle and removed; the
+  queue file is byte-identical to how it was found.
+- Tests: 15 new in tests/test_content_vision.py (payload
+  shaping, prompt byte-identity without vision, fallback
+  behavior); full suite 1215/1215 OK (1200 baseline + 15).
+  GPU peaked at 61C during generation; fans 85% during, auto
+  after (verified). Log:
+  freetalon-workspace/logs/content-1c-2026-11-18.log.
