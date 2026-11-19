@@ -44,6 +44,23 @@ diversity, but the ruler must not move with it), and the verdict is
 constrained by a small JSON Schema (critic_verdict_schema), the
 cycle-2 two-channel shape: the verdict is data, so it travels
 through the grammar; code never does.
+
+A third choice lands with cycle 16: a hollow verdict must carry
+EVIDENCE — the exact line(s) from the shown content that assign
+the alleged invented constant, quoted verbatim — and the harness
+verifies the quote against the content the critic was shown
+before the verdict may block anything. The live enable test
+(2026-11-18) showed why: llama3 hollow-flagged both write nodes
+of a plan whose code genuinely computed both measured values,
+and its reason restated the rubric line for the goal's shape
+instead of anything in the content — a judge matching the goal
+instead of reading the code. An unquotable suspicion is not a
+verdict: a hollow verdict whose evidence is missing, empty, or
+not found verbatim in the shown content is VOID — the node is
+treated as substantive, the voiding is audit-logged
+(loop.critic.voided), and the review continues with the
+remaining nodes. Voiding is not degradation: the critic
+answered; its verdict simply carried no checkable evidence.
 """
 
 from __future__ import annotations
@@ -116,13 +133,17 @@ def critic_verdict_schema() -> dict[str, Any]:
     """The critic verdict as a JSON Schema for Ollama's ``format``.
 
     Kept shallow like the plan envelope (small models degrade on
-    deeply nested schemas): one verdict word and one reason line.
+    deeply nested schemas): one verdict word, one reason line, and
+    the evidence quote a hollow verdict must produce — the harness
+    verifies the quote against the shown content (see
+    _parse_verdict); the schema only makes the field speakable.
     """
     return {
         "type": "object",
         "properties": {
             "verdict": {"type": "string", "enum": ["substantive", "hollow"]},
             "reason": {"type": "string"},
+            "evidence": {"type": "string"},
         },
         "required": ["verdict", "reason"],
     }
@@ -130,11 +151,38 @@ def critic_verdict_schema() -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class CriticVerdict:
-    """One write node's substance verdict."""
+    """One write node's substance verdict.
+
+    ``evidence`` carries the verified verbatim quote(s) behind a
+    hollow verdict (empty for substantive verdicts, and for
+    verdicts the harness voided — those are recorded separately
+    on the review as VoidedVerdict records).
+    """
 
     node_id: str
     substantive: bool
     reason: str
+    evidence: str = ""
+
+
+@dataclass(frozen=True)
+class VoidedVerdict:
+    """A hollow verdict the harness voided for lack of evidence.
+
+    The critic answered, but its hollow verdict quoted nothing
+    checkable from the shown content — no evidence field, an
+    empty quote, or a quote the content does not contain. The
+    verdict is void: the node is treated as substantive, and the
+    voiding is recorded here so the caller can audit-log it
+    (loop.critic.voided). A voided verdict never marks a node
+    FAILED, and it does not degrade the review: the remaining
+    nodes' verdicts stand on their own evidence.
+    """
+
+    node_id: str
+    reason: str
+    evidence: str
+    detail: str
 
 
 @dataclass
@@ -150,6 +198,7 @@ class CriticReview:
     """
 
     verdicts: list[CriticVerdict] = field(default_factory=list)
+    voided: list[VoidedVerdict] = field(default_factory=list)
     degraded: str | None = None
 
     @property
@@ -258,12 +307,44 @@ def _critic_prompt(goal_text: str, plan: ExecutionPlan, node: PlanNode) -> str:
     return "\n".join(lines)
 
 
-def _parse_verdict(node_id: str, response_text: str) -> CriticVerdict:
+def _evidence_quotes(value: Any) -> list[str] | None:
+    """The verdict's evidence as a list of quotes, or None.
+
+    The contract asks for one string quoting the offending line(s)
+    verbatim; a list of strings (one quote per line) is accepted
+    too. Anything else — absent, a number, an empty list, a list
+    holding non-strings — is no usable evidence.
+    """
+    if isinstance(value, str):
+        return [value]
+    if (
+        isinstance(value, list)
+        and value
+        and all(isinstance(item, str) for item in value)
+    ):
+        return list(value)
+    return None
+
+
+def _parse_verdict(
+    node_id: str, response_text: str, shown_content: str
+) -> tuple[CriticVerdict, VoidedVerdict | None]:
     """Parse one verdict; any defect raises (the review degrades).
 
     A verdict the harness cannot parse is not a verdict — trusting
     half of one would let a malformed reply block real work, so the
     whole review degrades to no-critic instead (see CriticReview).
+
+    A HOLLOW verdict is additionally checked, not trusted: it must
+    quote, verbatim, the line(s) of the shown content that assign
+    the alleged invented constant. A hollow verdict that quotes
+    nothing checkable is VOID — returned here as a substantive
+    verdict plus a VoidedVerdict record — because the failure this
+    guards against is a judge restating the rubric for the goal's
+    shape while the content it was shown computes the value. The
+    only normalization applied to a quote is stripping its
+    surrounding whitespace; the rest must match the shown content
+    character for character.
     """
     data = json.loads(response_text.strip())
     if not isinstance(data, dict):
@@ -273,10 +354,51 @@ def _parse_verdict(node_id: str, response_text: str) -> CriticVerdict:
         raise ValueError(f"critic verdict has no usable verdict field: {verdict!r}")
     reason = data.get("reason")
     reason = reason.strip() if isinstance(reason, str) else ""
-    if verdict == "hollow" and not reason:
+    if verdict == "substantive":
+        return CriticVerdict(node_id=node_id, substantive=True, reason=reason), None
+    if not reason:
         reason = "the critic judged this content hollow (no reason given)"
-    return CriticVerdict(
-        node_id=node_id, substantive=(verdict == "substantive"), reason=reason
+    raw_evidence = data.get("evidence")
+    quotes = _evidence_quotes(raw_evidence)
+    if isinstance(raw_evidence, str):
+        offered = raw_evidence
+    elif raw_evidence is None:
+        offered = ""
+    else:
+        offered = json.dumps(raw_evidence)
+    void_detail: str | None = None
+    if quotes is None:
+        void_detail = "hollow verdict carried no usable evidence quote"
+    else:
+        stripped = [quote.strip() for quote in quotes]
+        if any(not quote for quote in stripped):
+            void_detail = "hollow verdict's evidence quote is empty"
+        else:
+            missing = [quote for quote in stripped if quote not in shown_content]
+            if missing:
+                void_detail = (
+                    "hollow verdict's evidence is not in the shown content: "
+                    f"{missing[0][:120]!r}"
+                )
+    if void_detail is not None:
+        return (
+            CriticVerdict(node_id=node_id, substantive=True, reason=reason),
+            VoidedVerdict(
+                node_id=node_id,
+                reason=reason,
+                evidence=offered,
+                detail=void_detail,
+            ),
+        )
+    assert quotes is not None  # for the type checker; void_detail is None here
+    return (
+        CriticVerdict(
+            node_id=node_id,
+            substantive=False,
+            reason=reason,
+            evidence="\n".join(quote.strip() for quote in quotes),
+        ),
+        None,
     )
 
 
@@ -307,6 +429,7 @@ def review_write_nodes(
         num_ctx=_CRITIC_NUM_CTX,
     )
     verdicts: list[CriticVerdict] = []
+    voided: list[VoidedVerdict] = []
     try:
         for node in targets:
             response = call_llm(
@@ -314,7 +437,14 @@ def review_write_nodes(
                 _critic_prompt(goal_text, plan, node),
                 settings=effective,
             )
-            verdicts.append(_parse_verdict(node.id, response))
+            # The evidence check runs against exactly what the
+            # prompt showed the critic for this node — the same
+            # bounded content _critic_prompt rendered.
+            shown = _bounded(_node_content(node) or "", _CONTENT_MAX_CHARS)
+            verdict, void = _parse_verdict(node.id, response, shown)
+            verdicts.append(verdict)
+            if void is not None:
+                voided.append(void)
     except Exception as exc:  # noqa: BLE001 - any critic failure degrades the review
         return CriticReview(degraded=f"{type(exc).__name__}: {exc}")
-    return CriticReview(verdicts=verdicts)
+    return CriticReview(verdicts=verdicts, voided=voided)

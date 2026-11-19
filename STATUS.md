@@ -3292,3 +3292,78 @@ Deliberately left out:
   checkout verified untouched at 7abb936, clean.
   This entry is committed locally on
   dev/critic-experiment, NOT pushed.
+- Critic cycle 16 (2026-11-18): evidence-then-verdict.
+  A hollow verdict must now quote, in an "evidence"
+  field, the exact line(s) from the shown content
+  that assign the alleged invented constant;
+  critic._parse_verdict verifies every quote as a
+  literal substring of the content the critic was
+  shown (surrounding-whitespace strip only). A
+  hollow verdict whose evidence is missing, empty,
+  or not found is VOID: the node is treated as
+  substantive, the review continues, and the loop
+  audit-logs loop.critic.voided. The prompt now
+  demands the quote, states that an unquotable
+  suspicion is not a verdict, and states that
+  literal labels are not invented constants. Seam
+  otherwise identical (measurement shape,
+  measured=False, brief propagation, degraded
+  behavior, temperature pin). Critic tests 20/20
+  (5 new: verbatim evidence fires, no-evidence
+  voided, fabricated-evidence voided, substantive
+  ignores evidence, loop-level void-executes).
+  Full suite: 1103 ran, exactly the 6 pre-existing
+  test_retry16 failures (stash control: identical
+  at pristine 36b8f4a — those fixtures pin a line
+  in the MAIN checkout api.py, which grew when
+  the /health success landed; cycle 13 decoupled
+  them on main and this branch predates the fix).
+- Offline battery (production critic path against
+  seeker88; no live loop run this cycle): cases =
+  the live test plan-237682b2adf9 (positive
+  control, 2 write nodes), corpus retry33-3
+  (Ellipsis hollow), corpus retry28-4 (literal-
+  constant hollow), and the banked success node-1
+  (borderline: literal status "ready" plus both
+  values computed). llama3:latest: 3/4 — control
+  PASS (its node-2 hollow verdict was VOIDED:
+  empty evidence, the reason again the verbatim
+  rubric line — the cycle-16 check caught the
+  exact live-test failure mode), borderline PASS
+  (hollow verdict on the "ready" label VOIDED,
+  empty evidence), Ellipsis PASS (hollow;
+  evidence "...", a verbatim substring — minimal
+  but valid under the specified check), literals
+  FAIL (judged substantive outright; a false
+  negative). qwen2.5-coder:7b (pulled onto
+  seeker88 for this trial; llama3 untouched): 3/4
+  — control PASS clean (grounded reasons, no
+  voids needed), borderline PASS, literals FAIL
+  (the same false negative), Ellipsis FAIL on
+  quote mechanics: the verdict was hollow with
+  the correct reason and quoted all three
+  offending lines, but as one dedented multi-line
+  string — the content lines carry 8-space
+  indentation, so the joined quote is not a
+  literal substring and the check voided it (each
+  line individually, stripped, IS a substring;
+  the list form would have verified).
+- Verdict: NO judge is fully green, so the battery
+  acceptance is not met and no live confirmation
+  follows from this cycle. What the cycle proved:
+  the evidence mechanism voided every ungrounded
+  hollow verdict offered to it (3 voids across
+  both judges, all correct), and both judges
+  share one remaining failure — the false
+  negative on retry28-4, a full-module rewrite
+  whose payload dict neither judge read closely.
+  Open levers for the next critic cycle: steer
+  the judge to quote one line per evidence item
+  (or verify quotes per line), and whatever makes
+  a judge read a full-module rewrite payload.
+  seeker88 after: models [qwen2.5-coder:7b,
+  llama3:latest], site answering 200, services
+  untouched. This entry is committed locally on
+  dev/critic-experiment, NOT pushed. Log:
+  logs/critic-cycle16-2026-11-18.log, battery
+  JSONs alongside it.

@@ -445,6 +445,12 @@ class LoopRunner:
         unparseable) degrades to no-critic: returns False, the
         version executes, and the degradation is audit-logged. The
         second model's availability never blocks the loop.
+
+        A hollow verdict without verbatim evidence is neither of
+        those: it is VOID (cycle 16) — the node is treated as
+        substantive, the version is not blocked on it, and the
+        voiding is audit-logged (loop.critic.voided) with the
+        reason the evidence check failed.
         """
         try:
             review = review_write_nodes(plan, contract.objective, critic)
@@ -471,6 +477,15 @@ class LoopRunner:
                 version=version,
                 reviewed=len(review.verdicts),
                 hollow=len(review.hollow),
+            )
+        for voided in review.voided:
+            self._log(
+                "loop.critic.voided",
+                run_id=run_id,
+                plan_id=plan.plan_id,
+                version=version,
+                node_id=voided.node_id,
+                detail=voided.detail,
             )
         nodes = plan.node_map()
         for verdict in review.hollow:

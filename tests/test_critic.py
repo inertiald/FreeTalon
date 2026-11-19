@@ -18,7 +18,10 @@ byte-identical behavior — the same Ellipsis plan executes exactly
 as it did before the critic existed; (iv) a critic that raises
 degrades to no-critic, the version executes, and the degradation
 is audit-logged; (v) a critic-triggered re-plan consumes exactly
-one unit of the existing re-plan budget.
+one unit of the existing re-plan budget; (vi) a hollow verdict
+with no quotable evidence is VOID (cycle 16) — the version
+executes, the node is never marked FAILED, and the voiding is
+audit-logged as loop.critic.voided.
 """
 
 from __future__ import annotations
@@ -158,9 +161,18 @@ def _critic_env(**overrides: str) -> dict[str, str]:
 def _stub_client(system_prompt: str, user_prompt: str, settings=None) -> str:
     """A stubbed critic: hollow exactly when the content carries the
     Ellipsis assignments, substantive otherwise — keyed on the same
-    hollowness marker the live defect carries."""
+    hollowness marker the live defect carries. The hollow verdict
+    quotes its evidence verbatim, as the cycle-16 contract demands:
+    the quoted line appears in the Ellipsis content the prompt
+    carries, so the harness's evidence check passes it."""
     if "= ..." in user_prompt:
-        return json.dumps({"verdict": "hollow", "reason": HOLLOW_REASON})
+        return json.dumps(
+            {
+                "verdict": "hollow",
+                "reason": HOLLOW_REASON,
+                "evidence": 'payload["gpu_temperature"] = ...',
+            }
+        )
     return json.dumps(
         {"verdict": "substantive", "reason": "the content computes the fields"}
     )
@@ -198,6 +210,10 @@ class TestCriticSettingsFromEnv(unittest.TestCase):
         self.assertEqual(
             schema["properties"]["verdict"]["enum"], ["substantive", "hollow"]
         )
+        # Cycle 16: the evidence field is speakable (a hollow
+        # verdict must fill it) but not required — a substantive
+        # verdict has nothing to quote.
+        self.assertIn("evidence", schema["properties"])
 
 
 class TestCriticReview(unittest.TestCase):
@@ -305,7 +321,13 @@ class TestCriticReview(unittest.TestCase):
             plan = self._plan(tmp)
             with patch(
                 "freetalon.orchestrator.critic.call_llm",
-                return_value=json.dumps({"verdict": "hollow", "reason": ""}),
+                return_value=json.dumps(
+                    {
+                        "verdict": "hollow",
+                        "reason": "",
+                        "evidence": 'payload["gpu_temperature"] = ...',
+                    }
+                ),
             ):
                 review = review_write_nodes(
                     plan, HEALTH_GOAL, CriticSettings(), settings=LLMSettings()
@@ -339,6 +361,110 @@ class TestCriticReview(unittest.TestCase):
                 )
             self.assertEqual(review.verdicts, [])
             self.assertIsNotNone(review.degraded)
+
+    def test_hollow_with_verbatim_evidence_fires(self) -> None:
+        """Cycle 16: a hollow verdict quoting real content lines —
+        here in list form, one quote per offending line — stands,
+        and the verified quotes ride on the verdict."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._plan(tmp)
+            with patch(
+                "freetalon.orchestrator.critic.call_llm",
+                return_value=json.dumps(
+                    {
+                        "verdict": "hollow",
+                        "reason": HOLLOW_REASON,
+                        "evidence": [
+                            'payload["ollama_reachable"] = ...',
+                            'payload["gpu_temperature"] = ...',
+                        ],
+                    }
+                ),
+            ):
+                review = review_write_nodes(
+                    plan, HEALTH_GOAL, CriticSettings(), settings=LLMSettings()
+                )
+            self.assertIsNone(review.degraded)
+            # Only the Ellipsis node carries those lines; the note
+            # node's identical reply quotes lines its content does
+            # not contain, so that verdict is void (checked below).
+            self.assertEqual([v.node_id for v in review.hollow], ["write-ellipsis"])
+            self.assertIn(
+                'payload["gpu_temperature"] = ...', review.hollow[0].evidence
+            )
+            self.assertEqual([v.node_id for v in review.voided], ["write-note"])
+
+    def test_hollow_without_evidence_is_voided(self) -> None:
+        """Cycle 16: a hollow verdict with no evidence field at all
+        is void — the nodes are treated as substantive, the review
+        is not degraded, and each voiding is recorded."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._plan(tmp)
+            with patch(
+                "freetalon.orchestrator.critic.call_llm",
+                return_value=json.dumps(
+                    {"verdict": "hollow", "reason": HOLLOW_REASON}
+                ),
+            ):
+                review = review_write_nodes(
+                    plan, HEALTH_GOAL, CriticSettings(), settings=LLMSettings()
+                )
+            self.assertIsNone(review.degraded)
+            self.assertEqual(review.hollow, [])
+            self.assertTrue(all(v.substantive for v in review.verdicts))
+            self.assertEqual(
+                [v.node_id for v in review.voided],
+                ["write-ellipsis", "write-note"],
+            )
+            self.assertIn("no usable evidence", review.voided[0].detail)
+
+    def test_hollow_with_fabricated_evidence_is_voided(self) -> None:
+        """Cycle 16: a hollow verdict quoting a line the shown
+        content does not contain is void — the quote is checked
+        against the content, not trusted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._plan(tmp)
+            with patch(
+                "freetalon.orchestrator.critic.call_llm",
+                return_value=json.dumps(
+                    {
+                        "verdict": "hollow",
+                        "reason": HOLLOW_REASON,
+                        "evidence": "gpu_temperature = 42",
+                    }
+                ),
+            ):
+                review = review_write_nodes(
+                    plan, HEALTH_GOAL, CriticSettings(), settings=LLMSettings()
+                )
+            self.assertIsNone(review.degraded)
+            self.assertEqual(review.hollow, [])
+            self.assertEqual(len(review.voided), 2)
+            self.assertIn("not in the shown content", review.voided[0].detail)
+            self.assertIn("gpu_temperature = 42", review.voided[0].detail)
+
+    def test_substantive_verdict_ignores_evidence(self) -> None:
+        """Cycle 16: evidence is a hollow verdict's burden only —
+        a substantive verdict stands whatever the field holds."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._plan(tmp)
+            with patch(
+                "freetalon.orchestrator.critic.call_llm",
+                return_value=json.dumps(
+                    {
+                        "verdict": "substantive",
+                        "reason": "the content computes the fields",
+                        "evidence": "gpu_temperature = 42",
+                    }
+                ),
+            ):
+                review = review_write_nodes(
+                    plan, HEALTH_GOAL, CriticSettings(), settings=LLMSettings()
+                )
+            self.assertIsNone(review.degraded)
+            self.assertEqual(review.hollow, [])
+            self.assertEqual(review.voided, [])
+            self.assertTrue(all(v.substantive for v in review.verdicts))
 
     def test_no_write_nodes_makes_no_calls(self) -> None:
         plan = ExecutionPlan(
@@ -642,6 +768,46 @@ class TestCriticLoop(unittest.TestCase):
         self.assertEqual(
             Path(self.module_path).read_text(encoding="utf-8"), MODULE_SOURCE
         )
+
+    # (vi) Cycle 16: a hollow verdict with no quotable evidence is
+    # void — the Ellipsis version executes exactly as it would
+    # with no critic, no node is marked FAILED by the critic, and
+    # the voiding is recorded in the run's audit log.
+    def test_unquoted_hollow_verdict_is_void_and_executes(self) -> None:
+        audit_path = self.tmp_root / "audit.jsonl"
+        runner, store = self._make_runner(
+            critic_settings=CriticSettings(),
+            audit_logger=AuditLogger(audit_path),
+        )
+        plan = self._health_plan(ELLIPSIS_MODULE)
+        store.save(plan)
+        contract = GoalContract(
+            objective=HEALTH_GOAL, budget=RunBudget(max_replans=2)
+        )
+
+        def unquoted(system_prompt, user_prompt, settings=None):
+            return json.dumps({"verdict": "hollow", "reason": HOLLOW_REASON})
+
+        with patch(
+            "freetalon.orchestrator.critic.call_llm", side_effect=unquoted
+        ):
+            result = runner.run_plan(plan, contract)
+        self.assertEqual(result.goal_verdict, "PASS")
+        self.assertEqual(result.plan_versions, 1)
+        self.assertEqual(
+            Path(self.module_path).read_text(encoding="utf-8"), ELLIPSIS_MODULE
+        )
+        self.assertFalse(
+            [
+                m
+                for m in result.measurements
+                if (m.get("results") or [{}])[0].get("criterion", {}).get("type")
+                == "critic_review"
+            ]
+        )
+        audit_text = audit_path.read_text(encoding="utf-8")
+        self.assertIn("loop.critic.voided", audit_text)
+        self.assertNotIn("loop.critic.hollow", audit_text)
 
 
 if __name__ == "__main__":
