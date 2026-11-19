@@ -5240,3 +5240,71 @@ Deliberately left out:
   reviewed=1, hollow=0, and no degraded or voided events.
   GPU peaked at 61C; fans restored to auto. Log:
   freetalon-workspace/logs/critic-enable-2026-11-18.log.
+
+## Update - 2026-11-19 (Content pipeline slice 1d: photo standard - PLATE, Pat's pick)
+
+- Pat picked the house look from generated samples on
+  2026-11-19: PLATE (muted, deep blacks). Every still image on
+  an entry is now finished to that standard before the entry
+  lands at drafts-ready; Documentary Clean, Warm Film, Mono,
+  and a PLATE 4:5 crop ride along as alternates. Originals are
+  never modified.
+- freetalon/content/photos.py ports the approved samples script
+  (seeker88 /home/seeker/logs/photo-samples/make_samples.py)
+  exactly: PLATE = black-point 14 levels into an a=0.35 S-curve
+  (one composed LUT), saturation x0.80, highlight warm shift
+  R+5/G+1/B-5 scaled by (lum/255)^2; Clean = gray-world WB,
+  contrast x1.06, UnsharpMask(2, 60, 2); Warm Film = R x1.05 /
+  B x0.93, contrast x0.94, shadow lift to output black 16,
+  saturation x0.88; Mono = ITU-R 601-2 luma, levels 8->0 /
+  247->255, contrast x1.20. EXIF orientation applied first;
+  output JPEG q88, max edge 1600 (Lanczos). One deliberate
+  deviation: Clean's gray-world gain guards a zero channel mean
+  (the samples would divide by zero on a single-channel image).
+  Pillow 10.2.0 added to requirements.txt (pip-compile format,
+  full hash set) and installed in the project venv.
+- Generator wiring mirrors the 1c vision pattern: the photo
+  callable is injected (photos=process_photo in main; deferred
+  import - photos.py is the package's only Pillow consumer),
+  runs on the same fetched ORIGINAL bytes vision sees (vision
+  behavior unchanged), and is failure-isolated per photo: a
+  treatment failure ships that photo untreated with a log
+  warning, and uploads are advisory (a failed upload logs an
+  error and never holds the drafts back). Videos untouched.
+  Treated versions upload while the entry is claimed, via the
+  new queue-client PUT, before the drafts submit.
+- Site side (inertiald-com bcbfb02, deploy run 44547165694
+  SUCCESS): PUT /api/internal/content/[id]/treated/[look]/
+  [filename] - bearer token, entry must be 'processing' (409
+  otherwise), look in {standard, clean, warm-film, mono,
+  plate-4x5}, filename must equal the treated name (stem +
+  .jpg) of one of the entry's image records, JPEG only, 10 MB
+  cap. Files land in content/<id>/treated/ and
+  content/<id>/alternates/<look>/ and are recorded on the media
+  item. Admin CONTENT tab shows the PLATE version as the
+  primary photo with a PHOTO STANDARD: PLATE caption and links
+  to the original + all alternates.
+- Verified end-to-end with a throwaway entry carrying a COPY
+  of the approved entry's Rot Tao photo (Pat's entry never
+  touched): generator run 47s -> drafts-ready with all three
+  drafts; all five treated files stored and recorded; nginx
+  serves them at the admin's URLs (200). The pipeline's PLATE
+  output is pixel-identical to the samples script's approved
+  output on the same photo (mean abs diff 0.0 per channel;
+  the 4:5 crop identical too) and clearly distinct from the
+  original (channel means 132.9/130.5/119.6 -> 125.7/122.5/
+  111.0). Admin rendering verified at 390px against a
+  throwaway instance of the deployed image with test-only
+  credentials (the production session secret was never used):
+  PLATE primary, caption + all links present; screenshot at
+  seeker88 /home/seeker/logs/photo-standard-admin-390.png.
+  Test entry removed; the queue is byte-equivalent to its
+  pre-E2E state and Pat's entry is still 'approved'. One
+  pre-existing note: the public Cloudflare tunnel 404s
+  /downloads/ for originals and treated alike; the tailnet
+  nginx path serves both (200) - unchanged by this slice.
+- Tests: 23 new in tests/test_content_photos.py (spec-derived
+  pixel pins per treatment, crop anchor, EXIF orientation,
+  determinism, treated-name rule, upload client shape, and the
+  generator wiring incl. degradation paths). Suite 1238/1238.
+  Log: freetalon-workspace/logs/photo-standard-2026-11-19.log.

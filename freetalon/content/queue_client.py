@@ -46,7 +46,7 @@ def _urllib_transport(
 
 
 class ContentQueueClient:
-    """Thin wrapper over the internal content API's four operations."""
+    """Thin wrapper over the internal content API's five operations."""
 
     def __init__(
         self,
@@ -122,6 +122,44 @@ class ContentQueueClient:
             f"/api/internal/content/{entry_id}",
             {"action": "submit", "drafts": drafts},
         )
+
+    def submit_treated_media(
+        self, entry_id: str, look: str, filename: str, data: bytes
+    ) -> dict[str, Any]:
+        """Upload one treated version of an entry photo (slice 1d):
+        the PLATE standard (look 'standard') or one alternate look.
+        The entry must be claimed ('processing'); the site stores the
+        bytes under the entry's treated/ or alternates/<look>/ folder
+        and records them on the media item."""
+        path = (
+            f"/api/internal/content/{entry_id}/treated/"
+            f"{urllib.parse.quote(look, safe='')}/"
+            f"{urllib.parse.quote(filename, safe='')}"
+        )
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "image/jpeg",
+        }
+        status, raw = self._transport("PUT", f"{self._base_url}{path}", headers, data)
+        if status == 401:
+            raise ContentQueueError("content queue rejected the pipeline token (401)")
+        if not 200 <= status < 300:
+            detail = ""
+            try:
+                detail = str(json.loads(raw.decode("utf-8")).get("error", ""))
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                detail = ""
+            suffix = f": {detail}" if detail else ""
+            raise ContentQueueError(f"content queue PUT {path} -> {status}{suffix}")
+        try:
+            decoded = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ContentQueueError(
+                f"content queue returned non-JSON for {path}"
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise ContentQueueError(f"content queue returned a non-object for {path}")
+        return decoded
 
     def fetch_media(self, entry_id: str, filename: str) -> bytes:
         """Raw bytes of one media file stored on an entry."""

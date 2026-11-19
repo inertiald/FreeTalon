@@ -12,6 +12,13 @@ draft prompts as grounded observation. The vision callable is
 optional and its failures are never fatal: an image the vision
 model cannot describe is drafted from its metadata alone, with the
 fallback noted in the log.
+
+Slice 1d: each still image is also finished to the house photo
+standard (freetalon.content.photos - PLATE, Pat's pick on
+2026-11-19) and the treated versions upload alongside the drafts.
+The photo callable is optional and advisory in the same way vision
+is: a treatment failure ships that photo untreated, and an upload
+failure never holds the drafts back.
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from ..orchestrator.intake import LLMSettings, _normalize_base_url, _post_json
 from .media_info import image_dimensions
@@ -29,9 +36,17 @@ from .prompts import PROMPT_BUILDERS, VOICE_SYSTEM_PROMPT
 from .queue_client import ContentQueueClient, ContentQueueError
 from .vision import VisionFn, make_ollama_vision
 
+if TYPE_CHECKING:
+    from .photos import TreatedPhoto
+
 log = logging.getLogger("freetalon.content")
 
 ChatFn = Callable[[str, str], str]
+
+# process(image_bytes) -> TreatedPhoto. The photos module is the
+# pipeline's only Pillow consumer, so it is imported lazily in
+# main() and injected here; the generator itself stays Pillow-free.
+PhotoFn = Callable[[bytes], "TreatedPhoto"]
 
 _DEFAULT_SITE_BASE_URL = "http://100.87.140.12:3000"
 _DEFAULT_MODEL = "qwen3.8:27b"
@@ -61,6 +76,14 @@ def parse_youtube_draft(text: str) -> dict[str, str]:
     if not title or not description:
         raise ValueError("youtube draft did not yield a title and a description")
     return {"title": title, "description": description}
+
+
+def treated_filename(filename: str) -> str:
+    """Stored name for a photo's treated versions: the original's
+    stem with a .jpg extension (treated output is always JPEG). The
+    site derives the same name to validate treated-media uploads."""
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    return f"{stem}.jpg"
 
 
 def make_ollama_chat(settings: LLMSettings) -> ChatFn:
@@ -110,20 +133,32 @@ class ContentGenerator:
         client: ContentQueueClient,
         chat: ChatFn,
         vision: VisionFn | None = None,
+        photos: PhotoFn | None = None,
     ) -> None:
         self._client = client
         self._chat = chat
         self._vision = vision
+        self._photos = photos
 
-    def _enrich_media(self, entry: dict[str, Any]) -> dict[str, Any]:
+    def _enrich_media(
+        self, entry: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, TreatedPhoto]]:
         """Attach image dimensions (parsed from the stored bytes)
         and, when a vision callable is configured, a vision
         description to the entry's media dicts - best effort
         throughout: a fetch failure leaves the item dimensionless,
         and a vision failure leaves it metadata-only. Neither ever
-        fails the entry; both are noted in the log."""
+        fails the entry; both are noted in the log.
+
+        Also returns the treated photos (slice 1d), keyed by media
+        filename: when a photo callable is configured, each fetched
+        still is finished to the house standard from the same bytes
+        vision saw - the ORIGINAL image; vision behavior is
+        unchanged. A treatment failure degrades that photo to
+        untreated, exactly like a vision failure."""
         enriched = dict(entry)
         media = []
+        treated: dict[str, TreatedPhoto] = {}
         for item in entry.get("media") or []:
             item = dict(item)
             if item.get("kind") == "image" and item.get("filename"):
@@ -138,9 +173,35 @@ class ContentGenerator:
                     item["vision"] = self._describe(
                         self._vision, entry["id"], item["filename"], raw
                     )
+                if raw is not None and self._photos is not None:
+                    result = self._treat(
+                        self._photos, entry["id"], item["filename"], raw
+                    )
+                    if result is not None:
+                        treated[item["filename"]] = result
             media.append(item)
         enriched["media"] = media
-        return enriched
+        return enriched, treated
+
+    @staticmethod
+    def _treat(
+        photos: PhotoFn, entry_id: str, filename: str, raw: bytes
+    ) -> TreatedPhoto | None:
+        """One photo-standard pass, failure-isolated (mirrors
+        _describe): any treatment error degrades this photo to
+        untreated; the entry still drafts and the photo ships as
+        submitted."""
+        try:
+            return photos(raw)
+        except Exception as exc:  # the standard is advisory, never fatal
+            log.warning(
+                "photo treatment failed for %s/%s (%s: %s); photo ships untreated",
+                entry_id,
+                filename,
+                type(exc).__name__,
+                exc,
+            )
+            return None
 
     @staticmethod
     def _describe(
@@ -168,10 +229,14 @@ class ContentGenerator:
             return None
         return description.strip()
 
-    def generate_drafts(self, entry: dict[str, Any]) -> dict[str, Any]:
+    def generate_drafts(
+        self, entry: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, TreatedPhoto]]:
         """One chat call per selected output; raises on any failure so
-        the caller can fail the whole entry back cleanly."""
-        enriched = self._enrich_media(entry)
+        the caller can fail the whole entry back cleanly. Also returns
+        the treated photos gathered during enrichment (possibly
+        empty), keyed by the media filename they came from."""
+        enriched, treated = self._enrich_media(entry)
         drafts: dict[str, Any] = {}
         for output in entry.get("outputs") or []:
             builder = PROMPT_BUILDERS.get(output)
@@ -185,7 +250,7 @@ class ContentGenerator:
                 if not draft:
                     raise ContentQueueError(f"model returned an empty {output} draft")
                 drafts[output] = draft
-        return drafts
+        return drafts, treated
 
     def process_entry(self, entry: dict[str, Any]) -> EntryResult:
         entry_id = str(entry.get("id", ""))
@@ -196,7 +261,8 @@ class ContentGenerator:
             log.info("skip %s: %s", entry_id, exc)
             return EntryResult(entry_id, "skipped", str(exc))
         try:
-            drafts = self.generate_drafts(entry)
+            drafts, treated = self.generate_drafts(entry)
+            self._submit_treated(entry_id, treated)
             self._client.submit_drafts(entry_id, drafts)
         except Exception as exc:  # one bad entry never wedges the queue
             note = f"{type(exc).__name__}: {exc}"[:900]
@@ -208,6 +274,30 @@ class ContentGenerator:
             return EntryResult(entry_id, "failed", note)
         log.info("entry %s -> drafts-ready", entry_id)
         return EntryResult(entry_id, "drafts-ready")
+
+    def _submit_treated(
+        self, entry_id: str, treated: dict[str, TreatedPhoto]
+    ) -> None:
+        """Upload the treated versions of the entry's stills before
+        the drafts land. Advisory, like vision: a failed upload is
+        logged loudly and the drafts still submit - the photo
+        standard enhances an entry, it never gates it."""
+        for filename, result in treated.items():
+            target = treated_filename(filename)
+            uploads: list[tuple[str, bytes]] = [("standard", result.standard)]
+            uploads.extend(result.alternates.items())
+            for look, data in uploads:
+                try:
+                    self._client.submit_treated_media(entry_id, look, target, data)
+                except Exception as exc:  # treated media is advisory
+                    log.error(
+                        "treated upload failed for %s/%s (%s): %s: %s",
+                        entry_id,
+                        target,
+                        look,
+                        type(exc).__name__,
+                        exc,
+                    )
 
     def run_once(self) -> list[EntryResult]:
         entries = self._client.list_received()
@@ -258,11 +348,16 @@ def main(argv: list[str] | None = None) -> int:
         print("CONTENT_PIPELINE_TOKEN is not set; refusing to run unauthenticated.")
         return 2
 
+    # Deferred import: photos is the pipeline's only Pillow
+    # consumer; the rest of the package imports without it.
+    from .photos import process_photo
+
     client = ContentQueueClient(args.base_url, token)
     generator = ContentGenerator(
         client,
         make_ollama_chat(settings_from_env()),
         vision=make_ollama_vision(vision_settings_from_env()),
+        photos=process_photo,
     )
     try:
         results = generator.run_once()
