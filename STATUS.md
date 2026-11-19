@@ -5220,3 +5220,23 @@ Deliberately left out:
   GPU peaked at 61C during generation; fans 85% during, auto
   after (verified). Log:
   freetalon-workspace/logs/content-1c-2026-11-18.log.
+
+## Critic enabled for production runs (2026-11-18)
+
+- Pat approved enabling the GAN critic for production runs.
+  The production config lives outside the repo in
+  freetalon-workspace/critic.env, sourced by production
+  driver runs: FREETALON_CRITIC_ENABLED=1 plus
+  FREETALON_CRITIC_OLLAMA_BASE_URL and
+  FREETALON_CRITIC_OLLAMA_MODEL naming the judge of record,
+  qwen2.5-coder:7b on seeker88. All three are required -
+  ENABLED alone falls back to the planner endpoint/model.
+  Code default remains off; a clean env still resolves to
+  no critic (settings proof recorded both ways).
+- Live proof on the production path (main checkout, planner
+  qwen2.5-coder:14b, critic env sourced): run
+  run-20261119T052528Z-296f1d completed a small scratch-file
+  goal; the audit log shows loop.critic.reviewed with
+  reviewed=1, hollow=0, and no degraded or voided events.
+  GPU peaked at 61C; fans restored to auto. Log:
+  freetalon-workspace/logs/critic-enable-2026-11-18.log.
