@@ -5308,3 +5308,33 @@ Deliberately left out:
   determinism, treated-name rule, upload client shape, and the
   generator wiring incl. degradation paths). Suite 1238/1238.
   Log: freetalon-workspace/logs/photo-standard-2026-11-19.log.
+
+## Update - 2026-11-19 (Branch triage execution, part 1: drop list deleted; hypervisor claw merged)
+
+- Pat approved the 2026-11-17 branch triage recommendations
+  (2026-11-19). Drop list executed: all 14 branches deleted
+  (12 already-merged copilot branches + the 2 superseded
+  docker-compose drafts), each re-verified immediately before
+  deletion (ancestor check against origin/main for the 12;
+  supersession re-confirmed for the drafts: their only unique
+  commits touch docker-compose.yml and the reconciled compose
+  is in the tree). No exceptions. Deleted branch names + tip
+  hashes are recorded in
+  freetalon-workspace/logs/branch-exec-2026-11-19.log.
+- MERGE: copilot/freetalonorchestratorclawshypervisorpy merged
+  (merge commit 5b4fb5e): freetalon/orchestrator/claws/
+  hypervisor.py (libvirt/KVM provisioning claw, ADR 0000
+  Task 3.1) + tests/test_hypervisor.py. The branch carries 15
+  test methods in 5 classes (the triage report said 16 from a
+  read-only count; 15 is the executed count), all passing.
+  Suite 1253/1253 (1238 baseline + 15).
+- Hypervisor claw caveats (from the branch, by design): NO
+  Human-In-The-Loop approval gate - the repo owner scoped
+  Task 3.1 to bounded, validated, fully audit-logged
+  provisioning without an interactive gate (unlike the
+  Netmiko claw, which is hash-bound-gated). The module also
+  exposes no dict -> dict *_claw_handler wrapper, so it is
+  not ToolRegistry-registerable as-is; claws/__init__.py's
+  docstring still lists only network. libvirt itself stays a
+  deferred dependency (lazy import, clear error) until it is
+  vendored + SHA256-pinned, same pattern as netmiko.
