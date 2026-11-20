@@ -6,6 +6,8 @@ A local openclaw hive, security hardened and hardware optimized.
 
 Golden path on a fresh Ubuntu-like machine with Python 3 and Docker available:
 
+Debian/Ubuntu hosts need the venv package for their Python first (`sudo apt install python3.12-venv` on Ubuntu 24.04); venv creation fails without it.
+
 ```bash
 python3 installer.py --yes
 python3 dashboard.py

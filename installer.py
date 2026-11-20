@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import platform
@@ -70,6 +71,11 @@ def _warn(message: str) -> None:
 
 def _fail(message: str) -> None:
     _status("[fail]", message)
+
+
+def _ensurepip_available() -> bool:
+    """True when this Python can bootstrap pip into a new venv."""
+    return importlib.util.find_spec("ensurepip") is not None
 
 
 def _run(
@@ -344,6 +350,13 @@ def ensure_virtualenv(venv_path: Path) -> Path:
         _ok(f"Reusing virtual environment at {venv_path}")
         return python_path
 
+    if not _ensurepip_available():
+        _fail(
+            "This Python has no ensurepip, so the virtual environment cannot "
+            "be created. On Debian/Ubuntu, install the venv package first: "
+            "sudo apt install python3.12-venv (match your Python version)."
+        )
+        raise SystemExit(1)
     _status("[..]", f"Creating virtual environment at {venv_path}")
     venv.EnvBuilder(with_pip=True, clear=False, upgrade=False).create(venv_path)
     python_path = venv_python_path(venv_path)

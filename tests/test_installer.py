@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import yaml
+from unittest import mock
 
 import installer
 from freetalon.bootstrap import missing_module_message, venv_python_path as bootstrap_venv_python_path
@@ -33,6 +34,12 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(ollama["runtime"], "nvidia")
         self.assertEqual(ollama["environment"]["NVIDIA_VISIBLE_DEVICES"], "all")
         self.assertNotIn("deploy", ollama)
+
+    def test_ensure_virtualenv_fails_clearly_without_ensurepip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.object(installer, "_ensurepip_available", return_value=False):
+                with self.assertRaises(SystemExit):
+                    installer.ensure_virtualenv(Path(tmpdir) / ".venv")
 
     def test_generate_env_includes_launch_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
