@@ -5558,3 +5558,40 @@ the loop build's expiry-test seam failure is designed out).
 - Run it: FREETALON_PAIRING_TOKEN=... python -m freetalon.pairing
   (env-only config, see CONTRACT.md). Nothing in the boot chain
   starts it; in Pat's session it binds 10.40.0.1:80.
+
+## Update - 2026-11-20 — Contract pinning: multi-module coherence for the loop
+
+- Why: pairing proof arm 3 (run-20261120T083931Z-6c84e7) planned
+  clean and executed, but its store and its tests disagreed on
+  their shared contract — rec.state vs a confirmed flag, "gone" vs
+  "not-found", a poll dict vs a CodeNotFound raise, an unused
+  now_fn seam — 6 of its 7 tests failed against its own code, and
+  re-plans regenerated the same incoherence: generation is a single
+  LLM call (interfaces drift inside one output), and the re-plan
+  path never shows the planner the previous file contents, so its
+  failure feedback could not bind.
+- Mechanism (planner.py / prompts.py / loop.py): the plan envelope
+  gains an optional top-level "contract" — one entry per NEW module
+  another plan file imports from: {"module", "defines", "statuses"}.
+  Parse shape-validates it (contract_shape) and a deterministic AST
+  validator checks the plan's own contents against it
+  (contract_incoherence: a declared define not defined, an imported
+  name not declared, a state/status literal outside the declared
+  vocabulary); a coupled new module with no entry is rejected
+  (contract_missing). The validated contract is pinned into the
+  plan metadata under the system-owned key "module_contract"; the
+  loop seeds it into the re-plan brief (the seed_forbidden channel),
+  the brief and repair prompts render it as binding, replan parse
+  validates delta contents against the pin and rejects a changed
+  contract (contract_changed), and node-local repair candidates
+  face the pin too. Single-module plans and plans touching only
+  existing modules are unaffected (sentinel-gated validator).
+- Evidence: 17 new tests in tests/test_planner_contract_pinning.py
+  (including a synthetic two-module coherence case mirroring the
+  real failure — a "not-found" status literal against a declared
+  pending/done vocabulary); planner corpus replay (CP1 56 rows +
+  model A/B 22 rows) zero substantive diffs vs the 64306d9
+  baseline; full suite 1373/1373 green.
+- Next: the pairing exam — the loop re-attempts the pairing
+  assignment in an isolated worktree (shipped package deleted
+  there), scored against the shipped reference's E2E behaviors.

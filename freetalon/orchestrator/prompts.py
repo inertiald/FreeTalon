@@ -154,6 +154,38 @@ COVER EVERY STEP — if the goal says write a file, run it, and verify the outpu
 
 NEW DIRECTORIES — if a step writes a file into a directory that does not exist yet (for example a NEW package directory like \"freetalon/pairing/\"), the plan needs a \"bash\" step running \"mkdir -p <absolute directory>\" BEFORE the writes, and every step that writes into that directory MUST list the mkdir step in its \"depends_on\" — a bash heredoc or redirect write fails outright when its directory is missing, and only a mkdir step the writes actually depend on is credited. The \"scaffold\" claw creates parent directories itself, but the explicit mkdir step keeps directory creation ordered and visible, and any bash write into the new directory needs it.
 
+MODULE CONTRACT: when the plan writes two or more NEW Python files
+that import from each other — a new package's modules, or a module
+and the test file that imports it — FIRST declare the shared
+interface as a top-level "contract" array in the plan object,
+BEFORE "nodes". One entry per new module that another file in the
+plan imports from:
+
+  "contract": [
+    {"module": "freetalon/<pkg>/<mod>.py",
+     "defines": ["ClassName", "function_name", "SomeError"],
+     "statuses": ["pending", "done"]}
+  ]
+
+- "defines" lists every public name another file relies on:
+  classes, functions, exceptions — and the methods other modules
+  call on the module's objects.
+- "statuses" lists the exact status/state strings the modules use.
+  Take them from the GOAL's own words: if the goal says a claimed
+  code is "gone", the list contains "gone" and no module may use
+  "not-found" instead. One vocabulary for implementation and tests.
+- The contract is BINDING and it is checked: every imported name
+  must be listed in "defines" AND defined by the module; every
+  status string a coupled file uses must be in a "statuses" list.
+  A plan whose files import from a new module with no contract
+  entry is rejected.
+- Write the contract first, then make every file match it exactly
+  — same public names, same status strings, same return shapes —
+  in the implementation modules and the tests alike.
+- Once a plan version is accepted, its contract is PINNED: a later
+  version's brief carries it as "MODULE CONTRACT — PINNED" and the
+  plan must conform to it exactly. Never re-invent it.
+
 FEW-SHOT EXAMPLES:
 
 [Example 1: File Creation]
@@ -290,6 +322,11 @@ Rules:
 - Nodes carry only the work: id, objective, depends_on, assigned_claw,
   inputs, criteria. "responds_to" / "differs_by" are system-owned
   bookkeeping the repair machinery writes itself — never emit them.
+- If the brief carries a "MODULE CONTRACT — PINNED" block, it is
+  fixed for the whole run: conform every rewritten module and test
+  to it exactly (same public names, same status strings, same
+  return shapes) and do NOT emit a different "contract" — a delta
+  plan that changes the pinned contract is rejected.
 - "depends_on" lists node ids only (e.g. "step_1") — the "id" of an
   earlier node, never an output name, a file path, or a description.
 - Do not repeat a failed approach (same capability and targets). Repeat

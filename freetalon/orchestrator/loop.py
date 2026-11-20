@@ -341,6 +341,16 @@ class LoopRunner:
                 seed = plan.metadata.get("rejected_approaches") or []
                 if seed:
                     brief["seed_forbidden"] = list(seed)
+                # Contract pinning: the accepted plan's module
+                # contract rides the same metadata -> brief channel
+                # as seed_forbidden. The brief renders it as binding
+                # and replan_from_brief passes it back into parse,
+                # which validates the delta plan against the pin —
+                # a re-plan can no longer re-invent the interface
+                # it just failed against.
+                pinned_contract = plan.metadata.get("module_contract")
+                if pinned_contract:
+                    brief["module_contract"] = pinned_contract
                 replan = replan_fn or (lambda b: replan_from_brief(b))
                 new_nodes: list[PlanNode] | None = None
                 if replan_fn is None:

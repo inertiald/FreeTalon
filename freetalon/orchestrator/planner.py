@@ -983,6 +983,7 @@ def parse_planner_response(
     repo_root: str | Path | None = None,
     goal_text: str | None = None,
     workspace: str | None = None,
+    pinned_contract: list[dict[str, Any]] | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Validate raw planner output into normalized PlanNodes plus metadata.
 
@@ -991,7 +992,15 @@ def parse_planner_response(
     plan serves; when it names an existing API route, the plan must engage
     that route (anti-fake rule). ``workspace`` is the run-outputs
     directory; when known, a repo-tree path named under it is rejected
-    as a wrong-location hit.
+    as a wrong-location hit. ``pinned_contract`` is the module
+    contract pinned by an earlier accepted plan version (the re-plan
+    path): when given, it governs — the payload's contents are
+    validated against it, a payload contract that differs from it is
+    rejected (contract_changed), and the returned metadata carries
+    the pin. Without it, the payload's own top-level "contract" (if
+    any) is validated and written into the metadata under
+    "module_contract"; that key is system-owned either way — a
+    model-supplied metadata value under it never survives.
     """
     raw_text = sanitize_llm_output(raw_text)
     print(f"\n--- RAW PLANNER OUTPUT ---\n{raw_text}\n--------------------------\n")
@@ -1178,6 +1187,9 @@ def parse_planner_response(
     # placeholder error named 'node-1' while the plan's id was
     # 'step-1'). Error collection runs on relabeled copies; the
     # returned nodes keep their normalized ids.
+    contract_records, effective_contract = _contract_parse_stage(
+        payload, pinned_contract
+    )
     records, cheap = _collect_plan_error_records(
         _relabel_nodes_for_errors(nodes, id_labels),
         repo_root,
@@ -1185,13 +1197,23 @@ def parse_planner_response(
         workspace,
         index=index,
         modules=_ModuleSourceCache(),
+        contract=effective_contract,
     )
+    records = contract_records + records
     if records:
         raise _numbered_rejection(records, cheap=cheap)
 
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {"estimated_steps": len(nodes)}
+    # The module contract key is system-owned (the status /
+    # differs_by rule): the validated contract — or the pin — is
+    # the only value that may sit under it; a model-supplied one is
+    # discarded, never trusted as a pin.
+    if effective_contract:
+        metadata[CONTRACT_METADATA_KEY] = effective_contract
+    else:
+        metadata.pop(CONTRACT_METADATA_KEY, None)
 
     return nodes, metadata
 
@@ -5357,6 +5379,641 @@ def _repetition_loop_errors(nodes: list[PlanNode]) -> list[str]:
     return errors
 
 
+# ── Module contract pinning ──────────────────────────────────────
+#
+# A plan that writes two or more NEW Python modules coupled by
+# imports (a package's modules, a module and its test file) used to
+# invent each file's interface independently inside one generation:
+# run-20261120T083931Z-6c84e7 wrote a store whose poll returns
+# {"state": "not-found"} and tests that read a .state attribute,
+# expected the goal's word "gone", and demanded a CodeNotFound raise
+# the store never raises — 6 of its 7 tests failed against its own
+# code, and the re-plans, which never see the previous contents,
+# regenerated the same incoherence. The fix is the discipline the
+# hand-built reference (freetalon/pairing/CONTRACT.md) used: ONE
+# contract, written first, that every file answers to.
+#
+# The plan envelope gains an optional top-level "contract": one
+# entry per coupled new module — {"module": repo-relative path,
+# "defines": [public names], "statuses": [status strings]}. Parse
+# shape-validates it and writes the validated form into the plan
+# metadata under "module_contract" (a system-owned key, carried on
+# the same channel as rejected_approaches); the coherence validator
+# below then checks the plan's contents against it deterministically
+# (AST): declared names must be defined, imported names must be
+# declared and defined, and state/status literals must come from
+# the declared vocabulary. A plan-written file importing a
+# plan-written NEW module with no contract entry is rejected
+# (contract_missing) — that import is what makes the contract
+# required, so single-module plans and plans touching only existing
+# modules (the corpus shape) are entirely unaffected.
+#
+# Once a plan is accepted, its contract is PINNED for the run: the
+# loop seeds it into the re-plan brief (plan metadata -> brief, the
+# seed_forbidden flow), the brief renders it as binding, and
+# replan_from_brief passes it back into parse, where a delta plan
+# that declares a different contract is rejected (contract_changed)
+# and its contents are validated against the pin. The pin is what
+# makes the failure feedback binding: a re-plan can no longer
+# re-invent the interface it just failed against.
+
+CONTRACT_METADATA_KEY = "module_contract"
+
+# Sentinel for _collect_plan_error_records' contract parameter: the
+# caller supplied no contract context, so the contract checks do
+# not run at all. parse_planner_response always supplies a context
+# (the effective contract, or None for "no contract declared — the
+# contract_missing trigger still applies"); the other callers (the
+# duplicate-key path's lenient views, the node-local repair's
+# candidate check when the plan predates pinning) keep the
+# pre-contract behavior unless they pass a pin of their own.
+_CONTRACT_UNSUPPLIED: Any = object()
+
+_CONTRACT_MODULE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*\.py$")
+_CONTRACT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Dict keys / attribute names that carry a record's state. The
+# failed pairing store used "state"; the reference contract's
+# public view uses "status". Both are state carriers for the
+# vocabulary check — the contract's "statuses" list is the one
+# vocabulary either spelling must draw from.
+_STATE_KEYS = ("state", "status")
+
+
+def _normalize_contract(
+    raw: Any,
+) -> tuple[list[dict[str, Any]] | None, list[str]]:
+    """Validate and normalize a raw module contract.
+
+    Returns (entries, errors). ``entries`` is None when no usable
+    contract exists — either the value was absent (errors empty:
+    no contract declared) or it was malformed (errors names why).
+    Entries are normalized — repo-relative module paths, defines /
+    statuses deduplicated in declared order, entries sorted by
+    module — so two spellings of the same contract compare equal.
+    """
+    if raw is None:
+        return None, []
+    if not isinstance(raw, list):
+        return None, ['the plan\'s "contract" must be an array of module entries']
+    errors: list[str] = []
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for position, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            errors.append(f"contract entry {position} is not an object")
+            continue
+        module = item.get("module")
+        if isinstance(module, str):
+            module = module.strip().replace("\\", "/")
+            if module.startswith("./"):
+                module = module[2:]
+        if not isinstance(module, str) or not _CONTRACT_MODULE_RE.match(module):
+            errors.append(
+                f"contract entry {position}: \"module\" must be a "
+                "repo-relative .py path (e.g. freetalon/pairing/store.py)"
+            )
+            continue
+        if module in seen:
+            errors.append(f"contract declares module '{module}' twice")
+            continue
+        seen.add(module)
+        defines = item.get("defines")
+        if (
+            not isinstance(defines, list)
+            or not defines
+            or any(
+                not isinstance(name, str) or not _CONTRACT_NAME_RE.match(name)
+                for name in defines
+            )
+        ):
+            errors.append(
+                f"contract entry for '{module}': \"defines\" must be a "
+                "non-empty array of public names (classes, functions, "
+                "exceptions, and the methods other files rely on)"
+            )
+            continue
+        statuses = item.get("statuses") or []
+        if not isinstance(statuses, list) or any(
+            not isinstance(value, str) or not value for value in statuses
+        ):
+            errors.append(
+                f"contract entry for '{module}': \"statuses\" must be "
+                "an array of status strings"
+            )
+            continue
+        entries.append(
+            {
+                "module": module,
+                "defines": list(dict.fromkeys(defines)),
+                "statuses": list(dict.fromkeys(statuses)),
+            }
+        )
+    if errors:
+        return None, errors
+    entries.sort(key=lambda entry: entry["module"])
+    return entries, []
+
+
+def _contract_from_metadata(
+    metadata: dict[str, Any] | None,
+) -> list[dict[str, Any]] | None:
+    """The pinned contract in a plan's metadata, or None.
+
+    Parse wrote the value (system-owned key, already normalized);
+    normalize again defensively — a hand-built plan's metadata is
+    caller input, and an unusable value means no pin, never a crash.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    entries, errors = _normalize_contract(metadata.get(CONTRACT_METADATA_KEY))
+    if errors or not entries:
+        return None
+    return entries
+
+
+def _contracts_equal(
+    left: list[dict[str, Any]], right: list[dict[str, Any]]
+) -> bool:
+    """Set-wise equality of two normalized contracts."""
+
+    def key(
+        entries: list[dict[str, Any]],
+    ) -> dict[str, tuple[set[str], set[str]]]:
+        return {
+            entry["module"]: (set(entry["defines"]), set(entry["statuses"]))
+            for entry in entries
+        }
+
+    return key(left) == key(right)
+
+
+def _contract_diff_summary(
+    declared: list[dict[str, Any]], pinned: list[dict[str, Any]]
+) -> str:
+    """One line naming how a declared contract differs from the pin."""
+    mine = {entry["module"]: entry for entry in declared}
+    theirs = {entry["module"]: entry for entry in pinned}
+    parts: list[str] = []
+    for module in sorted(set(mine) | set(theirs)):
+        if module not in theirs:
+            parts.append(f"{module} is not in the pinned contract")
+        elif module not in mine:
+            parts.append(f"{module} is missing")
+        else:
+            if set(mine[module]["defines"]) != set(theirs[module]["defines"]):
+                parts.append(f"{module} declares different defines")
+            if set(mine[module]["statuses"]) != set(theirs[module]["statuses"]):
+                parts.append(f"{module} declares different statuses")
+    return "; ".join(parts) or "the entries differ"
+
+
+def _render_contract_block(
+    contract: list[dict[str, Any]], *, pinned: bool
+) -> str:
+    """The contract as prompt prose — one line per module.
+
+    Rendered into the re-plan brief and the repair prompts. Prose,
+    never JSON, for the brief-echo reason _format_brief_for_prompt
+    documents: at temperature 0 the model copies JSON it last saw.
+    """
+    if pinned:
+        lines = [
+            "MODULE CONTRACT — PINNED from the accepted plan version. "
+            "These interfaces are fixed for the rest of this run: conform "
+            "every module and test you write to them EXACTLY — same public "
+            "names, same status strings, same return shapes. Do not rename "
+            "a name, do not invent a status string, and do not emit a "
+            "different contract."
+        ]
+    else:
+        lines = ["MODULE CONTRACT (binding):"]
+    for entry in contract:
+        line = f"- {entry['module']}: defines {', '.join(entry['defines'])}"
+        if entry["statuses"]:
+            line += f"; statuses: {', '.join(entry['statuses'])}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _content_defined_names(source: str) -> set[str]:
+    """Every name a module's content binds.
+
+    Defs and classes at any depth, top-level assignment targets, and
+    imported names (an __init__ that re-exports a name binds it for
+    its importers). Empty for unparseable content — the syntax
+    validators own that failure; this check judges names, not syntax.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
+    for node in tree.body:
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        for target in targets:
+            for sub in ast.walk(target):
+                if isinstance(sub, ast.Name):
+                    names.add(sub.id)
+    return names
+
+
+def _dotted_module_candidates(dotted: str) -> list[str]:
+    """Repo-relative .py paths a dotted module name may mean."""
+    base = dotted.replace(".", "/")
+    return [f"{base}.py", f"{base}/__init__.py"]
+
+
+def _content_imports(
+    source: str, importer_rel: str, known_modules: set[str]
+) -> list[tuple[str, list[str]]]:
+    """Imports in a content that resolve to a known module.
+
+    Returns (module repo-relative path, imported names) pairs; an
+    empty names list is a bare module import (``import a.b``, or
+    ``from a import b`` where b is itself a module). Relative
+    imports resolve against the importing file's package. Imports
+    resolving outside known_modules (the stdlib, existing repo
+    modules) are not returned — existing grounding owns those.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    importer_parts = importer_rel.split("/")[:-1]
+    results: list[tuple[str, list[str]]] = []
+
+    def resolve(dotted: str) -> str | None:
+        for candidate in _dotted_module_candidates(dotted):
+            if candidate in known_modules:
+                return candidate
+        return None
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                target = resolve(alias.name)
+                if target is not None:
+                    results.append((target, []))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                keep = len(importer_parts) - (node.level - 1)
+                if keep < 0:
+                    continue
+                base_parts = importer_parts[:keep]
+                tail = node.module.split(".") if node.module else []
+                dotted = ".".join(base_parts + tail)
+            else:
+                dotted = node.module or ""
+            if not dotted:
+                continue
+            names: list[str] = []
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                sub = resolve(f"{dotted}.{alias.name}")
+                if sub is not None:
+                    results.append((sub, []))
+                else:
+                    names.append(alias.name)
+            if names:
+                target = resolve(dotted)
+                if target is not None:
+                    results.append((target, names))
+    return results
+
+
+def _is_state_expr(node: ast.expr) -> bool:
+    """A subscript or attribute that reads a record's state."""
+    if isinstance(node, ast.Subscript):
+        return (
+            isinstance(node.slice, ast.Constant)
+            and node.slice.value in _STATE_KEYS
+        )
+    if isinstance(node, ast.Attribute):
+        return node.attr in _STATE_KEYS
+    return False
+
+
+def _status_literals(source: str) -> list[str]:
+    """The status strings a content uses as state values.
+
+    Two shapes: dict-literal values under a "state"/"status" key
+    ({"state": "pending", ...} — the shape the failed pairing store
+    returned), and string literals compared ==/!= against a
+    state/status subscript or attribute (result["status"] == "gone"
+    — the shape its tests asserted). Assignments and bare literals
+    are not state uses and are not collected.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if (
+                    isinstance(key, ast.Constant)
+                    and key.value in _STATE_KEYS
+                    and isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                ):
+                    found.append(value.value)
+        elif isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+            for position, op in enumerate(node.ops):
+                if not isinstance(op, (ast.Eq, ast.NotEq)):
+                    continue
+                left, right = operands[position], operands[position + 1]
+                for expr, other in ((left, right), (right, left)):
+                    if (
+                        isinstance(other, ast.Constant)
+                        and isinstance(other.value, str)
+                        and _is_state_expr(expr)
+                    ):
+                        found.append(other.value)
+    return found
+
+
+def _plan_written_python_contents(
+    nodes: list[PlanNode], root: Path
+) -> dict[str, tuple[str, str]]:
+    """Repo-relative path -> (content, node id) for the Python files
+    this plan authors in full: scaffold/file_writer contents and
+    bash heredoc/echo code writes (full writes only — an append
+    authors a fragment, not a module's interface). Only .py targets
+    under the repo tree; anything else is not a module this check
+    can judge."""
+    contents: dict[str, tuple[str, str]] = {}
+    for node in nodes:
+        claw = node.assigned_claw or ""
+        if claw in ("scaffold", "file_writer"):
+            target = node.inputs.get("file_path") or node.inputs.get("path")
+            content = node.inputs.get("content")
+            if isinstance(target, str) and isinstance(content, str):
+                rel = _repo_relative_target(target, root)
+                if rel and rel.endswith(".py"):
+                    contents[rel] = (content, node.id)
+        elif claw in ("bash", "shell_exec"):
+            command = node.inputs.get("command") or node.inputs.get("cmd")
+            if isinstance(command, str) and command:
+                for target, content, is_append in _bash_code_writes(command):
+                    if is_append:
+                        continue
+                    rel = _repo_relative_target(target, root)
+                    if rel and rel.endswith(".py"):
+                        contents[rel] = (content, node.id)
+    return contents
+
+
+def _contract_module_content(
+    module: str,
+    contents: dict[str, tuple[str, str]],
+    root: Path,
+) -> str | None:
+    """A contracted module's effective content: the plan's own write
+    when the plan writes it, else the file on disk (a delta plan
+    that leaves a module alone is judged against what is actually
+    there), else None."""
+    if module in contents:
+        return contents[module][0]
+    path = _resolve_plan_target(module, root)
+    try:
+        if path.is_file():
+            return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    return None
+
+
+def _contract_error_records(
+    nodes: list[PlanNode],
+    contract: list[dict[str, Any]] | None,
+    repo_root: str | Path | None,
+) -> list[PlanError]:
+    """Cross-module coherence against the plan's module contract.
+
+    Three checks, all deterministic (AST over the plan's own
+    contents — no model judgment):
+
+    - contract_missing: a plan-written file imports from a
+      plan-written NEW module (target not on disk) that has no
+      contract entry. The import is the coupling that makes the
+      contract required; a plan with no coupled new modules never
+      sees this check fire.
+    - declared-but-undefined: every name in an entry's "defines"
+      must be defined by the module's effective content.
+    - undeclared imports: every name a plan-written file imports
+      from a contracted module must be in that module's "defines"
+      (being defined in the content is checked once, at the module
+      level, above).
+    - status vocabulary: when any entry declares "statuses", the
+      state/status literals used by the coupled files (contracted
+      modules the plan writes, and files importing one) must come
+      from the declared union — one vocabulary for the whole plan.
+    """
+    root = resolve_repo_root(repo_root)
+    contents = _plan_written_python_contents(nodes, root)
+    if not contents:
+        return []
+    known = set(contents)
+    imports_by_file = {
+        rel: _content_imports(content, rel, known)
+        for rel, (content, _node_id) in contents.items()
+    }
+    imported_targets = {
+        target for pairs in imports_by_file.values() for target, _names in pairs
+    }
+    new_modules = {
+        rel for rel in contents if not _path_exists_on_disk(rel, root)
+    }
+    entries = {entry["module"]: entry for entry in contract or []}
+    records: list[PlanError] = []
+
+    for target in sorted(imported_targets & new_modules):
+        if target in entries:
+            continue
+        importers = sorted(
+            rel
+            for rel, pairs in imports_by_file.items()
+            if any(candidate == target for candidate, _names in pairs)
+        )
+        first = importers[0] if importers else target
+        records.append(
+            PlanError(
+                code="contract_missing",
+                message=(
+                    f"Planner node '{contents[first][1]}': this plan "
+                    f"writes new module '{target}' and other files in "
+                    "the plan import from it, but the plan declares "
+                    "no \"contract\" entry for it. Declare the module "
+                    "contract FIRST — a top-level \"contract\" array "
+                    "in the plan object, before \"nodes\": one entry "
+                    "per new module another file imports from, "
+                    "{\"module\": \"<repo-relative path>\", \"defines\": "
+                    "[<every public name another file relies on>], "
+                    "\"statuses\": [<the exact status strings>]}. The "
+                    "contract is what keeps the implementation and "
+                    "its tests describing the same interface."
+                ),
+                node_id=contents[first][1],
+            )
+        )
+    if not entries:
+        return records
+
+    defined_by_module: dict[str, set[str]] = {}
+    for module in sorted(entries):
+        entry = entries[module]
+        content = _contract_module_content(module, contents, root)
+        if content is None:
+            records.append(
+                PlanError(
+                    code="contract_incoherence",
+                    message=(
+                        f"The module contract declares '{module}', but "
+                        "the plan does not write it and it does not "
+                        "exist in the repo — a contract entry must name "
+                        "a module this plan writes (or one already on "
+                        "disk)."
+                    ),
+                )
+            )
+            continue
+        defined = _content_defined_names(content)
+        defined_by_module[module] = defined
+        missing = [name for name in entry["defines"] if name not in defined]
+        if missing:
+            if module in contents:
+                prefix = f"Planner node '{contents[module][1]}'"
+                node_id: str | None = contents[module][1]
+            else:
+                prefix = f"Module '{module}'"
+                node_id = None
+            records.append(
+                PlanError(
+                    code="contract_incoherence",
+                    message=(
+                        f"{prefix}: the module contract for '{module}' "
+                        f"declares defines {missing}, but the module's "
+                        "content does not define them. The contract is "
+                        "binding: define every name it promises, or "
+                        "correct the contract — never let the two "
+                        "describe different interfaces."
+                    ),
+                    node_id=node_id,
+                )
+            )
+
+    for rel in sorted(imports_by_file):
+        for target, names in imports_by_file[rel]:
+            entry = entries.get(target)
+            if entry is None:
+                continue
+            for name in names:
+                if name not in entry["defines"]:
+                    records.append(
+                        PlanError(
+                            code="contract_incoherence",
+                            message=(
+                                f"Planner node '{contents[rel][1]}': "
+                                f"this file imports '{name}' from "
+                                f"'{target}', but the module contract "
+                                "for that module does not declare it "
+                                f"(declares: {', '.join(entry['defines'])}). "
+                                "Every name another file relies on must "
+                                "be in the contract's defines — and "
+                                "defined by the module — before any "
+                                "file may import it."
+                            ),
+                            node_id=contents[rel][1],
+                        )
+                    )
+
+    vocabulary: set[str] = set()
+    for entry in entries.values():
+        vocabulary.update(entry["statuses"])
+    if vocabulary:
+        coupled = {module for module in entries if module in contents}
+        for rel, pairs in imports_by_file.items():
+            if any(target in entries for target, _names in pairs):
+                coupled.add(rel)
+        for rel in sorted(coupled):
+            content, node_id = contents[rel]
+            for literal in sorted(set(_status_literals(content))):
+                if literal not in vocabulary:
+                    records.append(
+                        PlanError(
+                            code="contract_incoherence",
+                            message=(
+                                f"Planner node '{node_id}': this file "
+                                f"uses status \"{literal}\", which is "
+                                "not in the module contract's status "
+                                f"vocabulary ({', '.join(sorted(vocabulary))}). "
+                                "One vocabulary for the whole plan: use "
+                                "only the status strings the contract "
+                                "declares — they come from the goal's "
+                                "own words."
+                            ),
+                            node_id=node_id,
+                        )
+                    )
+    return records
+
+
+def _contract_parse_stage(
+    payload: dict[str, Any],
+    pinned_contract: list[dict[str, Any]] | None,
+) -> tuple[list[PlanError], list[dict[str, Any]] | None]:
+    """The contract half of one parse: (records, effective contract).
+
+    The effective contract is the pin when the caller supplies one
+    (a re-plan: the pin governs, and a payload contract that differs
+    from it is a contract_changed rejection); otherwise the
+    payload's own declared contract, shape-validated. Shape errors
+    are contract_shape records and leave no effective contract —
+    the rejection speaks for itself.
+    """
+    records: list[PlanError] = []
+    declared, shape_errors = _normalize_contract(payload.get("contract"))
+    for message in shape_errors:
+        records.append(PlanError(code="contract_shape", message=message))
+    if pinned_contract is not None:
+        if declared is not None and not _contracts_equal(declared, pinned_contract):
+            records.append(
+                PlanError(
+                    code="contract_changed",
+                    message=(
+                        "The plan declares a module contract that "
+                        "differs from this run's PINNED contract ("
+                        + _contract_diff_summary(declared, pinned_contract)
+                        + "). The pinned contract is binding — conform "
+                        "to it exactly; do not re-invent it.\n"
+                        + _render_contract_block(pinned_contract, pinned=True)
+                    ),
+                )
+            )
+        return records, pinned_contract
+    if shape_errors:
+        return records, None
+    return records, declared
+
+
 def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
@@ -5379,6 +6036,7 @@ def _collect_plan_error_records(
     workspace: str | None = None,
     index: Any | None = None,
     modules: _ModuleSourceCache | None = None,
+    contract: Any = _CONTRACT_UNSUPPLIED,
 ) -> tuple[list[PlanError], bool]:
     """Collect EVERY plan validation error as structured records.
 
@@ -5581,6 +6239,14 @@ def _collect_plan_error_records(
     records.extend(
         _error_records("repetition_loop", _repetition_loop_errors(nodes))
     )
+    # Module contract coherence: runs only when the caller supplies
+    # a contract context (parse_planner_response always does — the
+    # effective contract, or None when none was declared, which
+    # still arms the contract_missing trigger; the node-local
+    # repair passes the plan's pin when it has one). Every other
+    # caller keeps the pre-contract behavior exactly.
+    if contract is not _CONTRACT_UNSUPPLIED:
+        records.extend(_contract_error_records(nodes, contract, repo_root))
     # Cheap rejection (retry #12): the only errors are stand-in /
     # code-overwrite fakes, so re-prompting costs the model nothing to
     # fix and must not spend the repair budget. A rejection whose only
@@ -6227,6 +6893,12 @@ def _format_brief_for_prompt(brief: dict[str, Any]) -> str:
     lines.append(
         f"Plan: {brief.get('plan_id', '')} (version {brief.get('plan_version', '')})"
     )
+    pinned_contract, _pin_errors = _normalize_contract(
+        brief.get("module_contract")
+    )
+    if pinned_contract:
+        lines.append("")
+        lines.append(_render_contract_block(pinned_contract, pinned=True))
     for node in brief.get("failed_nodes") or []:
         if not isinstance(node, dict):
             continue
@@ -8061,6 +8733,15 @@ def plan_envelope_schema() -> dict[str, Any]:
     loop — with zero code consumers ever reading their content, so
     the model is no longer asked to produce them; parse strips them
     if they appear anyway (parse_planner_response).
+
+    The optional top-level ``contract`` (the module contract: one
+    entry per new module another file in the plan imports from) is
+    the inverse case — the model IS asked to declare it, parse
+    validates its shape and the plan's contents against it, and the
+    validated form is pinned into the plan metadata under
+    ``module_contract`` for the run's re-plans (see the module
+    contract pinning section). It stays out of "required": most
+    plans write no coupled new modules and need no contract.
     """
     node_properties: dict[str, Any] = {
         "id": {"type": "string"},
@@ -8088,6 +8769,23 @@ def plan_envelope_schema() -> dict[str, Any]:
                     "type": "object",
                     "properties": node_properties,
                     "required": ["id", "objective"],
+                },
+            },
+            "contract": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "module": {"type": "string"},
+                        "defines": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "statuses": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
                 },
             },
             "metadata": {"type": "object"},
@@ -8158,7 +8856,8 @@ def reformat_plan_output(
     prompt = (
         "Re-emit the plan below as ONE JSON object with a \"nodes\" "
         "array. Keep every node's id, objective, depends_on, "
-        "assigned_claw, inputs, outputs, acceptance and criteria "
+        "assigned_claw, inputs, outputs, acceptance and criteria, plus any "
+        "top-level \"contract\" array, "
         "exactly as given — change only the form, never the content "
         "or the meaning.\n\n"
         f"NODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n\n"
@@ -8390,6 +9089,7 @@ def _call_llm_with_repair(
     workspace: str | None = None,
     repo_root: str | Path | None = None,
     seed_forbidden: list[str] | None = None,
+    pinned_contract: list[dict[str, Any]] | None = None,
     formatter: FormatterSettings | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
@@ -8431,6 +9131,12 @@ def _call_llm_with_repair(
     rejected inside this call. The accumulated list is returned in the
     metadata under "rejected_approaches" so the caller can carry it
     into the next planning call.
+
+    ``pinned_contract`` is the module contract an earlier accepted
+    plan version pinned (module contract pinning): it is rendered
+    into every repair prompt as binding and passed to parse, which
+    validates each candidate against it and rejects a candidate
+    that declares a different contract.
 
     A run of empty plans is answered with a concrete grounded skeleton
     (retry #16): after any empty reply the next repair prompt carries a
@@ -8575,6 +9281,7 @@ def _call_llm_with_repair(
                 goal_text=goal_text,
                 workspace=workspace,
                 repo_root=repo_root,
+                pinned_contract=pinned_contract,
             )
             if baseline_paths is not None:
                 # Steal #5 scope lock: a repair that parses is still
@@ -8722,10 +9429,16 @@ def _call_llm_with_repair(
             task_block = (
                 f"THE TASK IS UNCHANGED: {goal_text}\n" if goal_text else ""
             )
+            contract_block = (
+                _render_contract_block(pinned_contract, pinned=True) + "\n"
+                if pinned_contract
+                else ""
+            )
             prompt = (
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
                 f"{task_block}"
+                f"{contract_block}"
                 f"Rejection reason: {exc}\n"
                 f"Previous output: {_describe_failed_output(response_text)}\n"
                 f"{_dropped_fields_note(prev_response_text, response_text)}"
@@ -8894,6 +9607,15 @@ def replan_from_brief(
     seed_block = _seed_forbidden_block(
         merged_seed, _goal_text_from_brief(brief), repo_root
     )
+    # Contract pinning: the loop seeds the accepted plan's module
+    # contract into the brief (plan metadata -> brief, the
+    # seed_forbidden channel). A malformed value cannot occur from
+    # that channel (parse wrote it normalized); if one arrives
+    # anyway it is treated as no pin rather than crashing the
+    # re-plan.
+    pinned_contract, _pin_errors = _normalize_contract(
+        brief.get("module_contract")
+    )
     # Retry #22: as in plan_task_intent, the ROUTE GOAL shape goes
     # last (after the node shape and the instruction), immediately
     # before "JSON Output:" — it is the decision, not preamble. The
@@ -8915,6 +9637,7 @@ def replan_from_brief(
         workspace=brief.get("workspace"),
         repo_root=repo_root,
         seed_forbidden=merged_seed or None,
+        pinned_contract=pinned_contract,
         formatter=formatter_settings_from_env(),
     )
     brief["rejected_approaches"] = metadata.get("rejected_approaches", seed or [])
@@ -9434,6 +10157,7 @@ def _try_local_repair(
     settings: LLMSettings | None,
 ) -> list[PlanNode] | None:
     metadata = plan.metadata or {}
+    pinned_contract = _contract_from_metadata(metadata)
     stamped = metadata.get("repo_root")
     root = (
         Path(stamped)
@@ -9492,6 +10216,11 @@ def _try_local_repair(
         workspace,
         index=build_repo_index(root),
         modules=_ModuleSourceCache(),
+        contract=(
+            pinned_contract
+            if pinned_contract is not None
+            else _CONTRACT_UNSUPPLIED
+        ),
     )
     if records:
         return None
