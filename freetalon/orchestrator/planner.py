@@ -6651,6 +6651,15 @@ def _static_standin_errors(
        the values it reports are fabricated, because those fields
        exist only by probing. See _bash_payload_standin_errors
        (retry #25 attempt 3).
+    4. A literal write (bash or scaffold) whose JSON binds measured
+       fields to constants, into a non-code file shapes 1-2 do not
+       claim: a fabricated measurement is manufactured evidence in a
+       data file too, under any criterion — shape 3's principle
+       applied to the literal writes shapes 1-2 own (gap closure,
+       2026-11-20). Ordinary literal data stays legitimate file
+       production under the data-file exemption (a JSON config states
+       settings; it does not report probe results): only the measured
+       bindings fire.
     The escape hatch is the scaffold claw for real files, or a node that
     runs the real code and checks ITS output. When the goal names an
     existing route, the rejection also names the grounded move (extend
@@ -6701,24 +6710,39 @@ def _static_standin_errors(
                     f"it by running the tests and curling the live service.{grounded}"
                 )
                 continue
-            if claw not in ("bash", "shell_exec"):
+            claimed = False
+            if claw in ("bash", "shell_exec"):
+                for criterion in node.criteria or []:
+                    if (
+                        isinstance(criterion, dict)
+                        and criterion.get("type") == CRITERION_FILE_EXISTS
+                        and isinstance(criterion.get("path"), str)
+                        and _same_path(criterion["path"], target)
+                    ):
+                        errors.append(
+                            f"Planner node '{node.id}' writes a static file {target!r} "
+                            "containing a hardcoded answer and then claims it exists — "
+                            "that manufactures the deliverable instead of producing it. "
+                            "Run the real code or service and check ITS output instead "
+                            "(implement the endpoint in its module, run the tests, "
+                            f"curl the live service).{grounded}"
+                        )
+                        claimed = True
+                        break
+            if claimed:
                 continue
-            for criterion in node.criteria or []:
-                if (
-                    isinstance(criterion, dict)
-                    and criterion.get("type") == CRITERION_FILE_EXISTS
-                    and isinstance(criterion.get("path"), str)
-                    and _same_path(criterion["path"], target)
-                ):
-                    errors.append(
-                        f"Planner node '{node.id}' writes a static file {target!r} "
-                        "containing a hardcoded answer and then claims it exists — "
-                        "that manufactures the deliverable instead of producing it. "
-                        "Run the real code or service and check ITS output instead "
-                        "(implement the endpoint in its module, run the tests, "
-                        f"curl the live service).{grounded}"
-                    )
-                    break
+            bindings = _hardcoded_measured_bindings(literal)
+            if bindings:
+                errors.append(
+                    f"Planner node '{node.id}' writes a hardcoded answer into "
+                    f"{target!r}: the literal binds measured fields to "
+                    f"constants ({', '.join(bindings)}) instead of measuring "
+                    f"them — whether a service is reachable and what a sensor "
+                    f"reads exist only by probing (call the service, run "
+                    f"nvidia-smi), so a constant is a fabricated measurement. "
+                    f"Produce the file from a real probe instead (run the "
+                    f"check and write ITS output).{grounded}"
+                )
         if claw in ("bash", "shell_exec"):
             command = node.inputs.get("command") or node.inputs.get("cmd")
             if isinstance(command, str):

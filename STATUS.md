@@ -5623,3 +5623,24 @@ the loop build's expiry-test seam failure is designed out).
   harness lives on seeker7 (down); the pinned-fixture suite is the
   substitute arbitration here and the 78-row replay should be
   re-run on seeker7 when it returns.
+
+
+## Update - 2026-11-20 (planner validator gaps 2/4: fabricated measurements in literal data writes)
+
+The literal-JSON -> new non-code file + exit_code-only shape was
+investigated against the cycle-12 record. The general form is the
+deliberate exemption standing in _static_standin_errors ("writing a
+JSON config to a new file is legitimate file production") and is NOT
+reversed: a literal carrying no measured claim still passes, pinned
+by tests. The sub-shape the exemption rationale never covered is
+closed: a literal that binds MEASURED keys (the _is_measured_key
+set — reachability/temperature) to constants is a fabricated
+measurement in any file under any criterion, shape 3's principle
+applied to literal writes. _static_standin_errors now checks
+_hardcoded_measured_bindings on the literal when no other shape
+fired for that write and names the bindings. Exit-code-only bash and
+scaffold writes of {"ollama_reachable": true, "gpu_temperature": 25}
+are rejected; a computed write (curl > report.json) and a plain
+status literal stay accepted. Five new tests in
+tests/test_planner_validator_gaps.py; planner module 746/746 with
+zero existing-test changes.

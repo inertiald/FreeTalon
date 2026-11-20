@@ -29,7 +29,9 @@ import unittest
 
 from freetalon.orchestrator.intake import LLMResponseError
 from freetalon.orchestrator.planner import (
+    CheapRejectionError,
     _bash_code_writes,
+    _hardcoded_measured_bindings,
     _literal_write,
     parse_planner_response,
 )
@@ -115,6 +117,117 @@ class TestEchoWriteQuotedRedirect(unittest.TestCase):
             parse_planner_response(_dag(nodes))
         self.assertIn("hardcoded answer", str(caught.exception))
         self.assertIn("report.json", str(caught.exception))
+
+
+class TestMeasuredBindingDataWrite(unittest.TestCase):
+    """Gap 4: a literal binding measured fields to constants is a
+    fabricated measurement in any file, under any criterion.
+
+    The boundary is deliberate: the general literal-JSON-to-data-file
+    shape stays allowed (the recorded data-file exemption — writing a
+    JSON config is legitimate file production). Only the measured
+    bindings fire, extending shape 3's principle to literal writes.
+    """
+
+    BINDINGS_JSON = (
+        '{"status": "ok", "ollama_reachable": true, "gpu_temperature": 42}'
+    )
+
+    def _bash_node(self, criteria: list[dict]) -> list[dict]:
+        return [
+            {
+                "id": "step-1",
+                "objective": "Produce the status report file",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "inputs": {
+                    "command": f"echo '{self.BINDINGS_JSON}' > report.json"
+                },
+                "outputs": ["report.json"],
+                "acceptance": ["report written"],
+                "criteria": criteria,
+            }
+        ]
+
+    def test_detector_names_constants_and_ignores_computed(self) -> None:
+        self.assertEqual(
+            _hardcoded_measured_bindings('{"gpu_temperature": 42}'),
+            ['"gpu_temperature": 42'],
+        )
+        self.assertEqual(
+            _hardcoded_measured_bindings(
+                '{"ollama_reachable": check_reachable()}'
+            ),
+            [],
+        )
+
+    def test_bash_bindings_to_data_file_rejected_under_exit_code(self) -> None:
+        with self.assertRaises(CheapRejectionError) as caught:
+            parse_planner_response(
+                _dag(self._bash_node([{"type": "exit_code", "equals": 0}]))
+            )
+        message = str(caught.exception)
+        self.assertIn("fabricated measurement", message)
+        self.assertIn('"ollama_reachable": true', message)
+        self.assertIn('"gpu_temperature": 42', message)
+        self.assertIn("report.json", message)
+
+    def test_scaffold_bindings_to_data_file_rejected(self) -> None:
+        nodes = [
+            {
+                "id": "step-1",
+                "objective": "Produce the status report file",
+                "depends_on": [],
+                "assigned_claw": "scaffold",
+                "inputs": {
+                    "file_path": "report.json",
+                    "content": self.BINDINGS_JSON,
+                },
+                "outputs": ["report.json"],
+                "acceptance": ["report written"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            }
+        ]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        self.assertIn("fabricated measurement", str(caught.exception))
+
+    def test_file_exists_claim_keeps_the_shape1_error(self) -> None:
+        # A claimed write is shape 1's, exactly as before: the
+        # bindings error must not displace or duplicate it.
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                _dag(
+                    self._bash_node(
+                        [{"type": "file_exists", "path": "report.json"}]
+                    )
+                )
+            )
+        message = str(caught.exception)
+        self.assertIn("writes a static file", message)
+        self.assertNotIn("fabricated measurement", message)
+
+    def test_literal_data_without_measured_bindings_still_accepted(self) -> None:
+        # The exemption boundary: static metadata and config literals
+        # are legitimate file production, even under exit_code only.
+        for content in (
+            '{"status": "ok", "service": "freetalon"}',
+            '{"port": 8765, "host": "localhost"}',
+        ):
+            nodes = [
+                {
+                    "id": "step-1",
+                    "objective": "Write the data file",
+                    "depends_on": [],
+                    "assigned_claw": "bash",
+                    "inputs": {"command": f"echo '{content}' > report.json"},
+                    "outputs": ["report.json"],
+                    "acceptance": ["report written"],
+                    "criteria": [{"type": "exit_code", "equals": 0}],
+                }
+            ]
+            parsed, _ = parse_planner_response(_dag(nodes))
+            self.assertEqual(len(parsed), 1)
 
 
 if __name__ == "__main__":
