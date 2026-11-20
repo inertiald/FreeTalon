@@ -223,15 +223,18 @@ class TestMissingDirectoryAlignment(unittest.TestCase):
     def test_proof_arm_plan_shape_is_accepted(self) -> None:
         # The pairing proof arm's plan shape: a mkdir step, then the
         # new package's scaffold writes depending on it — including
-        # the two dunder files duplicate_code used to reject.
+        # the two dunder files duplicate_code used to reject. The
+        # module stem is probe_store, not store: freetalon/pairing/
+        # store.py exists now, and a second store.py anywhere is a
+        # genuine stem collision duplicate_code is right to reject.
         mkdir = _bash("step_1", f"mkdir -p {PKG}")
         init = _scaffold(
             "step_2", PKG / "__init__.py",
-            '"""Probe package."""\n\n__all__ = ["store"]\n',
+            '"""Probe package."""\n\n__all__ = ["probe_store"]\n',
             deps=["step_1"],
         )
         store = _scaffold(
-            "step_3", PKG / "store.py",
+            "step_3", PKG / "probe_store.py",
             '"""Store."""\n\n\nclass Store:\n    def get(self):\n        return None\n',
             deps=["step_1"],
         )

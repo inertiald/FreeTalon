@@ -5502,3 +5502,59 @@ baseline — CP1 56 rows + model-A/B 22 rows, ZERO substantive
 diffs; test_orchestrator_llm 746/746 with ZERO re-pins (the
 retry-18 counts and the bash freetalon/tests/ fixture reject
 exactly as before); full suite 1321/1321 (1305 + 16 new).
+
+## Update - 2026-11-20 (M6 pairing server endpoint: freetalon/pairing)
+
+The server side of the DESIGN.md section 6 pairing-join protocol,
+built directly (the loop's three attempts are recorded in the
+pairing track log). freetalon/pairing/CONTRACT.md pins the module
+contract first: one status vocabulary (pending / confirmed /
+claimed / expired), the record fields, the public view (never the
+nonce, never the credentials), the exception behavior, and the
+clock seam (PairingStore now_fn — nothing reads time.time directly;
+the loop build's expiry-test seam failure is designed out).
+
+- store.py: file-backed JSON store under one lock; atomic writes
+  (temp file mode 0600 + fsync + os.replace, directory fsync); a
+  corrupt store file raises StoreCorruptError and is never silently
+  reset (a reset would resurrect burned codes). Polling a confirmed
+  record returns the bundle and burns the record in the same locked
+  operation; claimed records never expire; expired codes wipe their
+  bundle and may re-register fresh for the same node identity.
+- server.py: stdlib threaded HTTP mirroring api.py's shape. Node
+  endpoints are capability-by-code (the section 6 physical-presence
+  model); operator endpoints (confirm, list) require the
+  FREETALON_PAIRING_TOKEN bearer, compared via
+  freetalon.security.authorize (hmac.compare_digest), fail-closed
+  when unset, one indistinguishable 401 for every refusal. Poll
+  mapping is section 6 exactly: 404 = pending (unknown codes answer
+  identically — no existence oracle), 200 = the bundle exactly
+  once, 410 = claimed or expired. api.py untouched.
+- Two defects found in the unverified first draft during the
+  completion pass and fixed: (1) a non-ASCII bearer token made
+  compare_digest raise TypeError inside the auth check and kill
+  the handler thread — the client saw a dropped connection instead
+  of the contract's 401; such tokens are now refused like any bad
+  token. (2) Method routing: PUT/DELETE on unknown paths answered
+  405 and PATCH/HEAD fell through to the stdlib 501 HTML page;
+  routing now dispatches on a single route table — unknown route
+  404, known path with the wrong method 405, every response JSON.
+- One existing-test fix the new package forced: the validator-
+  alignment proof-arm fixture scaffolded a module named store.py;
+  with freetalon/pairing/store.py real, that stem is a genuine
+  duplicate_code collision, so the fixture now uses probe_store.py
+  (the validator itself was right and is unchanged).
+- Evidence: 35 pairing tests (24 store + 11 server, real HTTP)
+  green; a 17-step curl E2E against three real server processes
+  (register -> poll pending 404 with no credentials -> confirm
+  refused 401 without/with a wrong token -> confirm 200 -> claim
+  200 exactly once -> 410 after the claim; TTL expiry for confirmed
+  and pending codes; a no-token server fail-closed while the node
+  flow still works) passed with 0 failures; the store file was
+  verified mode 0600 with the burned bundle's bytes absent from
+  disk and the token absent from the server log; the
+  provisioning/http payloads were grepped — no secret material.
+  Full suite 1356/1356 green.
+- Run it: FREETALON_PAIRING_TOKEN=... python -m freetalon.pairing
+  (env-only config, see CONTRACT.md). Nothing in the boot chain
+  starts it; in Pat's session it binds 10.40.0.1:80.
