@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Generator
 
 from .measure import measurement_failed_detail
+from .state_store import default_db_path
 
 _DEFAULT_DB_PATH = Path.home() / "freetalon-workspace" / "freetalon_state.db"
 
@@ -369,7 +370,9 @@ class ExperimentStore:
     """
 
     def __init__(self, db_path: Path | str | None = None) -> None:
-        self._db_path = Path(db_path) if db_path is not None else _DEFAULT_DB_PATH
+        self._db_path = (
+            Path(db_path) if db_path is not None else default_db_path(_DEFAULT_DB_PATH)
+        )
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.Lock()
         with self._connect() as conn:

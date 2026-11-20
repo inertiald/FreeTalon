@@ -25,6 +25,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from freetalon.api import HiveAPIServer
+from freetalon.orchestrator.gates import GateStore
 from freetalon.audit import (
     AuditLogger,
     clear_request_id,
@@ -130,7 +131,9 @@ class APIServerTests(unittest.TestCase):
         )
         self.controller = HiveController(self.config)
         self.controller.start()
-        self.server = HiveAPIServer(self.controller, _TOKEN)
+        self.server = HiveAPIServer(
+            self.controller, _TOKEN, gate_store=GateStore(base / "freetalon_state.db")
+        )
         self.server.start("127.0.0.1", 0)
         self.port = self.server._httpd.server_address[1]
         self.base = f"http://127.0.0.1:{self.port}"

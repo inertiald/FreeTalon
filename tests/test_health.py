@@ -11,6 +11,7 @@ from pathlib import Path
 from freetalon.api import HiveAPIServer
 from freetalon.config import HiveConfig
 from freetalon.hive import HiveController
+from freetalon.orchestrator.gates import GateStore
 
 _TOKEN = "test-api-token-abc"
 
@@ -29,7 +30,9 @@ class HealthEndpointTests(unittest.TestCase):
         )
         self.controller = HiveController(self.config)
         self.controller.start()
-        self.server = HiveAPIServer(self.controller, _TOKEN)
+        self.server = HiveAPIServer(
+            self.controller, _TOKEN, gate_store=GateStore(base / "freetalon_state.db")
+        )
         self.server.start("127.0.0.1", 0)
         port = self.server._httpd.server_address[1]
         self.base = f"http://127.0.0.1:{port}"

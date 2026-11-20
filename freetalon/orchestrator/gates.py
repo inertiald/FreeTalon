@@ -29,6 +29,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .state_store import default_db_path
+
 DEFAULT_GATE_TTL_S = 3600  # 1 hour; expired packets deny on timeout
 
 _DEFAULT_DB_PATH = Path.home() / "freetalon-workspace" / "freetalon_state.db"
@@ -153,7 +155,9 @@ class GateStore:
     def __init__(
         self, db_path: Path | str | None = None, audit_logger: Any | None = None
     ) -> None:
-        self._db_path = Path(db_path) if db_path is not None else _DEFAULT_DB_PATH
+        self._db_path = (
+            Path(db_path) if db_path is not None else default_db_path(_DEFAULT_DB_PATH)
+        )
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._audit = audit_logger
         with sqlite3.connect(str(self._db_path)) as conn:
