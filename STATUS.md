@@ -5705,3 +5705,66 @@ corpus replay still lives only on seeker7 and is owed on its
 return; the substitute discipline (full suite green, per-gap
 before/after fixture profiles, one argued intended pin change in
 gap 3/4) is recorded in the run log.
+
+
+## Update - 2026-11-20 (seeker88 user-system install test + five install fixes)
+
+- FreeTalon installed clean on seeker88 as a user-system test (clone
+  @ 7e9d8d7): full suite 1373/1373 with zero skips — no test depends
+  on seeker7. Isolated Ollama on 127.0.0.1:11435 (never the site's
+  11434); API smoke green (health ready, /status 200 with token, 401
+  without). New footprint ~29.7 GB; the weight is models (qwen3.8:27b
+  17.7 GB). qwen3.8:27b is not feasible on the 3060 Ti's 8 GB:
+  1.79 tok/s at ~97% CPU (the model cannot fit the card).
+- Five findings fixed the same day, one commit each (dev head
+  de8c2ee; suite 1392/1392; hosted CI green): the venv prerequisite
+  is declared and the installer fails with the exact apt command
+  (8bf479f); Ollama pinned to 0.40.16 by tag and digest (230086c);
+  the six global CLI flags are accepted after the subcommand too
+  (5c2d118); /health reports planner-model VRAM fit (model_fit:
+  fits / partial_offload / exceeds_vram / unknown) (139bff3); the
+  suite no longer writes state to the production default path
+  (FREETALON_STATE_DB_PATH override) (de8c2ee).
+
+
+## Update - 2026-11-20 (pairing exam: preliminary arms 88B/88C on seeker88)
+
+- Arm 88B (planner + judge qwen2.5-coder:7b through the site's
+  Ollama — routing approved by Pat 2026-11-20): the speed gate
+  passed easily (26.27 tok/s; the model was already VRAM-resident),
+  but planning failed. The goal text, built from CONTRACT.md,
+  contained "method/path/status"; the planner's route-goal capture
+  read /status as a named route and the injected ROUTE GOAL shape
+  hijacked all three attempts into an api.py /status plan. No plan,
+  no code, the critic never ran — unscoreable, and CONTRACT.md's own
+  text trips the capture.
+- Arm 88C (same arm, goal sanitized; pre-flight ran the planner's
+  own route detector over the goal text and asserted it names no
+  routes — now the standard procedure for spec-derived goals): all
+  three outputs were pairing-shaped, and the plan was rejected by
+  contract pinning (contract_missing x2). The 7B planner never
+  emitted the envelope-level contract array; told verbatim what to
+  emit, it invented contract-writing nodes instead. Pinning refused
+  the uncontracted plan at plan time — proof-arm-3's was accepted
+  pre-pinning and failed downstream in code. The coherence question
+  stays unscoreable on a 7B planner; the definitive qwen3.8 arm
+  waits for seeker7.
+
+
+## Update - 2026-11-20 (seeker7 down — GPU fault, awaiting power cycle)
+
+- 2026-11-20 ~02:38 PST the RTX 3090 fell off the bus again (Xid 79
+  + Xid 154), ~5 min into the exam arm's first planning call. The
+  box itself stayed up; all GPU work stopped. Pat directed a reboot
+  at 06:36 and the shutdown hung (the same failure as 2026-11-16
+  and 2026-11-19 17:00); the box is dark on every path. Pat is out
+  for the weekend — the physical power cycle waits on his return.
+  A watch cron probes every 10 minutes and will read logs and
+  health the moment the box answers.
+- Paused with the box: the market and OSINT collectors, the equity
+  and crypto paper trackers (strategy B's November month-end
+  decision needs a catch-up run), the dashboard pusher, the content
+  generator, and the GPU CI queue. All data legs are backfillable;
+  no permanent loss expected. On return: pull dev (the clone sits
+  at 7e9d8d7), record the LAN IP (never recorded), backfill the
+  data legs, and push the staged dashboard update.
