@@ -378,5 +378,146 @@ class TestParseErrorDoesNotMaskStandin(unittest.TestCase):
         self.assertIn("hardcoded answer", message)
 
 
+class TestSchemaPathMergesValidNodeErrors(unittest.TestCase):
+    """Gap 1: the schema-error path merges the valid nodes' records.
+
+    A plan with one schema-broken node and one schema-valid node
+    carrying a real defect used to name only the schema error (plus
+    lenient-view fakes); the valid node's defect surfaced a repair
+    round later. The scoped merge names both in one rejection, while
+    the all-broken fixtures keep their exact pinned counts.
+    """
+
+    @staticmethod
+    def _broken_node() -> dict:
+        # Missing "objective": exactly one schema error, otherwise a
+        # computable bash write of report.json.
+        return {
+            "id": "step-1",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": (
+                    "curl -s http://localhost:11434/api/tags "
+                    "> report.json"
+                )
+            },
+            "outputs": ["report.json"],
+            "acceptance": ["report fetched"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+
+    @staticmethod
+    def _codes(caught) -> list[str]:
+        return [record.code for record in caught.exception.plan_errors]
+
+    def test_valid_siblings_sed_ban_is_named_with_the_schema_error(
+        self,
+    ) -> None:
+        nodes = [
+            self._broken_node(),
+            {
+                "id": "step-2",
+                "objective": "Patch the planner module in place",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "inputs": {
+                    "command": (
+                        "sed -i 's/old/new/' "
+                        "freetalon/orchestrator/planner.py"
+                    )
+                },
+                "outputs": [],
+                "acceptance": ["module patched"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        codes = self._codes(caught)
+        self.assertIn("node_schema", codes)
+        self.assertIn("sed_ban", codes)
+        self.assertIn("step-2", str(caught.exception))
+
+    def test_unknown_claw_on_a_valid_node_is_named(self) -> None:
+        nodes = [
+            self._broken_node(),
+            {
+                "id": "step-2",
+                "objective": "Teleport the report into place",
+                "depends_on": [],
+                "assigned_claw": "teleport",
+                "inputs": {},
+                "outputs": [],
+                "acceptance": ["report placed"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        codes = self._codes(caught)
+        self.assertIn("node_schema", codes)
+        self.assertIn("unknown_claw", codes)
+
+    def test_clean_valid_sibling_adds_no_records(self) -> None:
+        nodes = [
+            self._broken_node(),
+            {
+                "id": "step-2",
+                "objective": "Show the report",
+                "depends_on": ["step-1"],
+                "assigned_claw": "bash",
+                "inputs": {"command": "cat report.json"},
+                "outputs": [],
+                "acceptance": ["report shown"],
+                "criteria": [{"type": "exit_code", "equals": 0}],
+            },
+        ]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        self.assertEqual(self._codes(caught), ["node_schema"])
+
+    def test_all_broken_plan_gains_no_merged_records(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag([self._broken_node()]))
+        self.assertEqual(self._codes(caught), ["node_schema"])
+
+    def _file_exists_sibling(self) -> dict:
+        return {
+            "id": "step-2",
+            "objective": "Check the report landed",
+            "depends_on": [],
+            "assigned_claw": "bash",
+            "inputs": {"command": "ls -la"},
+            "outputs": [],
+            "acceptance": ["report present"],
+            "criteria": [{"type": "file_exists", "path": "report.json"}],
+        }
+
+    def test_criteria_artifact_from_broken_sibling_is_filtered(
+        self,
+    ) -> None:
+        # step-1 (broken) demonstrably writes report.json, so step-2's
+        # file_exists criterion IS credited in the whole plan; the
+        # subset view must not blame step-2 for it.
+        nodes = [self._broken_node(), self._file_exists_sibling()]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        self.assertEqual(self._codes(caught), ["node_schema"])
+
+    def test_criteria_record_survives_when_nobody_writes_the_path(
+        self,
+    ) -> None:
+        broken = self._broken_node()
+        broken["inputs"] = {"command": "true"}
+        broken["outputs"] = []
+        nodes = [broken, self._file_exists_sibling()]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        codes = self._codes(caught)
+        self.assertIn("node_schema", codes)
+        self.assertIn("criteria", codes)
+
+
 if __name__ == "__main__":
     unittest.main()

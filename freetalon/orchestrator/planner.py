@@ -399,9 +399,19 @@ def _validate_raw_nodes(
     sentence; ``repo_root`` is the repo root for the placeholder
     scaffold's exists-on-disk check. All three are optional
     (hand-built plans pass none of them).
+
+    The nodes that DID validate also contribute their own per-node
+    validation records (gap closure, 2026-11-20): a valid sibling's
+    real defect — a banned command, an unknown claw, a placeholder
+    value — was invisible until the schema round was fixed, spending
+    a second repair round to surface what the first rejection
+    already knew. The merge is scoped (per-node codes only,
+    deduplicated, subset artifacts filtered); see
+    _schema_path_merged_records.
     """
     nodes: list[PlanNode] = []
     errors: list[str] = []
+    failed_positions: set[int] = set()
     for position, raw in enumerate(raw_nodes, start=1):
         if isinstance(raw, dict) and isinstance(raw.get("id"), str):
             label = f"'{raw['id']}'"
@@ -410,6 +420,7 @@ def _validate_raw_nodes(
         try:
             nodes.append(PlanNode.model_validate(raw))
         except ValidationError as exc:
+            failed_positions.add(position)
             errors.extend(_schema_error_text(label, err) for err in exc.errors())
     if errors:
         views = [
@@ -441,7 +452,11 @@ def _validate_raw_nodes(
         # for a missing criteria field), which would change the pinned
         # counts for the retry-#7/#11 invented-schema fixtures — the
         # placeholder/stand-in checks are the fake-naming checks that
-        # belong in the schema path.
+        # belong in the schema path. The collector DOES now run on the
+        # nodes that validated (gap closure, 2026-11-20) and their
+        # per-node records merge in below — scoped so the duplication
+        # and count objections above do not apply; see
+        # _schema_path_merged_records.
         placeholder_records = _placeholder_scaffold_error_records(
             views, repo_root, index=repo_index, goal_text=goal_text
         )
@@ -457,12 +472,131 @@ def _validate_raw_nodes(
             + standin_records
             + _error_records("node_schema", errors, stage=STAGE_SCHEMA)
         )
+        all_records = all_records + _schema_path_merged_records(
+            nodes,
+            raw_nodes,
+            failed_positions,
+            repo_index,
+            goal_text,
+            repo_root,
+            {record.message for record in all_records},
+        )
         raise _numbered_rejection(
             all_records,
             cheap=bool(standin_records or placeholder_records),
             suffix=f"\n{_NODE_SHAPE_EXAMPLE}",
         )
     return nodes
+
+
+# Per-node codes that may merge into a schema-error rejection. The
+# plan-level codes (unwritten_file, route_engagement,
+# missing_directory, contract_*) are computed against the whole plan
+# and would misfire on the valid subset, so they never merge.
+_SCHEMA_PATH_MERGED_CODES = frozenset(
+    {
+        "unknown_claw",
+        "criteria",
+        "command",
+        "prose_command",
+        "duplicate_code",
+        "heredoc_parse",
+        "code_append",
+        "scaffold_parse",
+        "static_standin",
+        "scaffold_overwrite",
+        "elision",
+        "placeholder_value",
+        "sed_noop",
+        "sed_ban",
+        "placeholder_scaffold",
+        "placeholder_stub",
+        "placeholder_bash",
+        "tmp_write",
+        "framework",
+        "wrong_location",
+        "missing_target",
+        "suite_criterion_command",
+        "field_too_long",
+        "repetition_loop",
+    }
+)
+
+_CRITERION_UNWRITTEN_PATH_RE = re.compile(
+    r"file_(?:exists|matches) path (.+?) is not a file this node "
+    r"writes or runs"
+)
+
+
+def _schema_path_merged_records(
+    nodes: list[PlanNode],
+    raw_nodes: list[Any],
+    failed_positions: set[int],
+    repo_index: Any | None,
+    goal_text: str | None,
+    repo_root: str | Path | None,
+    seen_messages: set[str],
+) -> list[PlanError]:
+    """The valid nodes' own defects, collected on the schema-error path.
+
+    When one node failed schema validation, _validate_raw_nodes named
+    the schema errors plus the stand-in/placeholder fakes (lenient
+    views) — and nothing else, so a sibling that DID validate but
+    carried a real defect was invisible until the schema round was
+    fixed. The full collector now runs on the nodes that validated
+    and their per-node records merge into the schema rejection.
+
+    The merge is scoped, on the recorded retry-#21 evidence (a naive
+    merge duplicates the schema errors and moves the pinned
+    retry-#7/#11 counts): (a) only per-node codes merge — plan-level
+    records are computed against the whole plan and misfire on a
+    subset; (b) a record whose message already appears (the
+    lenient-view stand-in/placeholder records) is dropped; (c) a
+    criteria record blaming a valid node for a file-criterion path a
+    schema-BROKEN sibling demonstrably writes is an artifact of the
+    subset view and is dropped — fixing the broken node's schema
+    restores the credit. When no node validated there is nothing to
+    merge, so the pinned all-broken fixtures are untouched. A
+    collector failure falls back to no merge: enrichment must never
+    mask the schema rejection. The cheap flag is the caller's and is
+    unchanged — it is computed from the stand-in/placeholder records
+    exactly as before.
+    """
+    if not nodes:
+        return []
+    try:
+        records, _cheap = _collect_plan_error_records(
+            nodes, repo_root, goal_text, None, index=repo_index
+        )
+    except Exception:
+        return []
+    broken_written: set[str] = set()
+    for position, raw in enumerate(raw_nodes, start=1):
+        if position not in failed_positions:
+            continue
+        view = _lenient_node_view(raw, position)
+        if view is not None:
+            broken_written.update(_node_written_paths(view))
+    merged: list[PlanError] = []
+    for record in records:
+        if record.code not in _SCHEMA_PATH_MERGED_CODES:
+            continue
+        if record.message in seen_messages:
+            continue
+        if record.code == "criteria" and broken_written:
+            match = _CRITERION_UNWRITTEN_PATH_RE.search(record.message)
+            if match is not None:
+                try:
+                    claimed = ast.literal_eval(match.group(1))
+                except (SyntaxError, ValueError):
+                    claimed = None
+                if isinstance(claimed, str) and any(
+                    _same_path(claimed, target) for target in broken_written
+                ):
+                    continue
+        seen_messages.add(record.message)
+        merged.append(record)
+    return merged
 
 
 def _coerce_nodes(

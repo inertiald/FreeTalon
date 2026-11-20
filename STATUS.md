@@ -5676,3 +5676,32 @@ comment history shows the same treatment for earlier namings
 and green (746/746). The pure JSON-syntax failure has no node
 structure to scan and stays a bare rejection (recorded, not fixed).
 Seven new tests in tests/test_planner_validator_gaps.py.
+
+
+## Update - 2026-11-20 (planner validator gaps 4/4: schema-error path merges the valid nodes' errors)
+
+_validate_raw_nodes' schema-error path named the schema errors plus
+the lenient-view stand-in/placeholder fakes — and nothing else, so a
+schema-VALID sibling carrying a real defect (a sed-ban command, an
+unknown claw, a placeholder value) was invisible until the schema
+round was fixed, spending a second repair round to surface what the
+first rejection already knew. The full collector now runs on the
+nodes that DID validate and their per-node records merge into the
+schema rejection (_schema_path_merged_records). The merge is scoped
+against the recorded retry-#21 objections: only per-node codes
+merge (plan-level records — unwritten_file, route_engagement,
+missing_directory, contract — are computed against the whole plan
+and misfire on a subset); records duplicating the lenient-view
+messages are dropped; and a criteria record blaming a valid node
+for a file-criterion path a schema-broken sibling demonstrably
+writes is filtered as a subset artifact. The cheap flag is computed
+exactly as before, and when no node validates there is nothing to
+merge — the pinned retry-#7/#11 all-broken fixtures keep their
+exact counts (module 746/746, full suite 1419/1419). Six new tests
+in tests/test_planner_validator_gaps.py (27 total for the four
+gaps). This closes the four-gap planner validator series
+(01d1acd, 03c9032, 0803b02, this commit). The official 78-row
+corpus replay still lives only on seeker7 and is owed on its
+return; the substitute discipline (full suite green, per-gap
+before/after fixture profiles, one argued intended pin change in
+gap 3/4) is recorded in the run log.
