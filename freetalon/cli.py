@@ -232,24 +232,49 @@ def cmd_resources(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_connection_args(parser: argparse.ArgumentParser, *, suppress: bool = False) -> None:
+    """Attach the global connection flags to a parser.
+
+    Subcommand copies pass ``suppress=True``: their defaults become
+    argparse.SUPPRESS, so a flag typed after the subcommand lands in the
+    namespace (and wins), while an absent one leaves the value given
+    before the subcommand untouched. Without this, ``freetalon serve
+    --port 8765`` was a cryptic argparse error.
+    """
+
+    def _default(value: Any) -> Any:
+        return argparse.SUPPRESS if suppress else value
+
+    parser.add_argument("--host", default=_default("127.0.0.1"))
+    parser.add_argument("--port", type=int, default=_default(8765))
+    parser.add_argument("--workspace", default=_default(str(Path.home() / "freetalon-workspace")))
+    parser.add_argument(
+        "--state-path",
+        default=_default(str(Path.home() / "freetalon-workspace" / "hive-state.json")),
+    )
+    parser.add_argument(
+        "--audit-log-path",
+        default=_default(str(Path.home() / "freetalon-workspace" / "audit.log")),
+    )
+    parser.add_argument("--token-file", default=_default(None))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="freetalon")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--workspace", default=str(Path.home() / "freetalon-workspace"))
-    p.add_argument("--state-path", default=str(Path.home() / "freetalon-workspace" / "hive-state.json"))
-    p.add_argument("--audit-log-path", default=str(Path.home() / "freetalon-workspace" / "audit.log"))
-    p.add_argument("--token-file", default=None)
+    _add_connection_args(p)
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("start")
-    sub.add_parser("serve")
-    sub.add_parser("stop")
-    sub.add_parser("status").add_argument("--token", default=None)
-    sub.add_parser("health")
+    _add_connection_args(sub.add_parser("start"), suppress=True)
+    _add_connection_args(sub.add_parser("serve"), suppress=True)
+    _add_connection_args(sub.add_parser("stop"), suppress=True)
+    status_p = sub.add_parser("status")
+    _add_connection_args(status_p, suppress=True)
+    status_p.add_argument("--token", default=None)
+    _add_connection_args(sub.add_parser("health"), suppress=True)
 
     submit = sub.add_parser("submit")
+    _add_connection_args(submit, suppress=True)
     submit.add_argument("--token", default=None)
     submit.add_argument("--action", choices=["echo", "sum", "sleep", "docker_claw"], required=True)
     submit.add_argument("--text", default="")
@@ -263,19 +288,23 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--requires-gpu", action="store_true")
 
     cancel = sub.add_parser("cancel")
+    _add_connection_args(cancel, suppress=True)
     cancel.add_argument("--token", default=None)
     cancel.add_argument("task_id")
 
     tasks_p = sub.add_parser("tasks")
+    _add_connection_args(tasks_p, suppress=True)
     tasks_p.add_argument("--token", default=None)
     tasks_p.add_argument("--status", dest="status_filter", default=None,
                          choices=["queued", "running", "retrying", "succeeded", "failed", "cancelled"])
 
     task_p = sub.add_parser("task")
+    _add_connection_args(task_p, suppress=True)
     task_p.add_argument("--token", default=None)
     task_p.add_argument("task_id")
 
     resources_p = sub.add_parser("resources")
+    _add_connection_args(resources_p, suppress=True)
     resources_p.add_argument("--token", default=None)
 
     return p
