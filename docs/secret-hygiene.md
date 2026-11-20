@@ -19,7 +19,16 @@ Secrets live in layer (b) or (c), never in layer (a).
 
 Secrets by that rule today: `FREETALON_API_TOKEN`,
 `CONTENT_PIPELINE_TOKEN`, `FREETALON_OPENAI_API_KEY` (optional
-backend). Everything else in `.env.example` is a parameter.
+backend), `FREETALON_DASHBOARD_STORAGE_SECRET`. Everything else in
+`.env.example` is a parameter.
+
+One rotation has already been done under this rule: the dashboard
+storage secret, hardcoded in dashboard.py until 2026-11-19, now
+lives only in `<workspace>/dashboard.env` (0600). dashboard.py
+resolves `FREETALON_DASHBOARD_STORAGE_SECRET` from the process
+environment, then that file, then an ephemeral per-process fallback
+with a startup warning. The pre-rotation value remains in git
+history and is useless.
 
 ## Enforcement
 

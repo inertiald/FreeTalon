@@ -16,6 +16,7 @@ import json as _json
 import logging
 import os
 import random
+import secrets
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -165,6 +166,45 @@ except ValueError as exc:
     ) from exc
 
 Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Dashboard storage secret -- resolved from the process environment first,
+# then <WORKSPACE>/dashboard.env (the workspace env-file convention: runtime
+# secrets live in the workspace, never in the repo). If neither provides a
+# value, fall back to an ephemeral per-process secret with a loud warning:
+# dashboard sessions then do not survive restarts, but no secret literal is
+# ever hardcoded here.
+# ---------------------------------------------------------------------------
+
+_dashboard_env: dict[str, str] = {}
+_dashboard_env_path = Path(WORKSPACE) / "dashboard.env"
+if _dashboard_env_path.exists():
+    if dotenv_values is not None:
+        _dashboard_env = {
+            _key: _value
+            for _key, _value in dotenv_values(_dashboard_env_path).items()
+            if _key is not None and _value is not None
+        }
+    else:
+        for _line in _dashboard_env_path.read_text(encoding="utf-8").splitlines():
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _key, _value = _line.split("=", 1)
+            _dashboard_env[_key.strip()] = _value.strip()
+
+STORAGE_SECRET = os.environ.get(
+    "FREETALON_DASHBOARD_STORAGE_SECRET",
+    _dashboard_env.get("FREETALON_DASHBOARD_STORAGE_SECRET", ""),
+)
+if not STORAGE_SECRET:
+    STORAGE_SECRET = secrets.token_urlsafe(32)
+    logging.getLogger(__name__).warning(
+        "FREETALON_DASHBOARD_STORAGE_SECRET is not set (checked the process "
+        "environment and %s); using an ephemeral per-process storage secret. "
+        "Dashboard sessions will not survive restarts.",
+        _dashboard_env_path,
+    )
 
 # Screenshot directory — created here and served as static files so ui.image()
 # can reference them by URL path (/screenshots/<filename>).
@@ -1159,5 +1199,5 @@ if __name__ in {"__main__", "__mp_main__"}:
         dark=True,
         favicon="🦅",
         reload=False,
-        storage_secret="freetalon-local-only",
+        storage_secret=STORAGE_SECRET,
     )
