@@ -51,6 +51,16 @@ class HealthEndpointTests(unittest.TestCase):
         self.assertIn("ollama_reachable", data)
         self.assertIsInstance(data["ollama_reachable"], bool)
 
+    def test_health_has_model_fit_key(self) -> None:
+        with urllib.request.urlopen(f"{self.base}/health", timeout=3) as resp:
+            data = json.loads(resp.read())
+        self.assertIn("model_fit", data)
+        fit = data["model_fit"]
+        self.assertIsInstance(fit["model"], str)
+        self.assertIn(
+            fit["status"], {"fits", "partial_offload", "exceeds_vram", "unknown"}
+        )
+
     def test_health_has_gpu_key(self) -> None:
         with urllib.request.urlopen(f"{self.base}/health", timeout=3) as resp:
             data = json.loads(resp.read())

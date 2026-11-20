@@ -74,11 +74,14 @@ class HiveAPIServer:
                     except (OSError, ValueError):
                         pass
 
+                    from .model_fit import model_fit_report
+
                     return self._send(200, {
                         "ok": True,
                         "status": "ready",
                         "ollama_reachable": ollama_reachable,
                         "gpu_temperature": gpu_temp,
+                        "model_fit": model_fit_report(),
                     })
 
                 if path == "/status":
