@@ -165,11 +165,20 @@ class PlanNode(BaseModel):
     )
     responds_to: str = Field(
         default="",
-        description="Failed node id this node answers (delta plans, M1)",
+        description=(
+            "System-owned: failed node id the repair path's splice "
+            "answers (delta plans, M1). Never model-emitted — the "
+            "planner schema omits it and parse strips it."
+        ),
     )
     differs_by: str = Field(
         default="",
-        description="What this node does differently from the failed attempt (M1)",
+        description=(
+            "System-owned repair note: what the repair path changed "
+            "vs the failed attempt (M1). Never model-emitted — the "
+            "planner schema omits it and parse strips it; the repeat "
+            "checks read only this system-written value."
+        ),
     )
     measurement: dict[str, Any] = Field(
         default_factory=dict,

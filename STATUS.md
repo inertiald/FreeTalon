@@ -5402,3 +5402,52 @@ Deliberately left out:
   codes, soundness) -- no corpus re-pins; the corpus contains
   no sed -i. Suite 1276/1276 (fecca12). Full log:
   freetalon-workspace/logs/branch-exec-2026-11-19.log.
+
+## Update - 2026-11-19 (planner schema redesign)
+
+- PLANNER SCHEMA REDESIGN (assessment option (b) with (a)'s
+  enforcement folded in; spec:
+  freetalon-workspace/logs/planner-assessment-2026-11-19.md,
+  which measured the model-emitted differs_by at 93.6% of the
+  pairing run's planner output -- one value of 29,358 chars
+  degenerating into a repetition loop, zero complete nodes --
+  with zero code consumers reading its content):
+  differs_by and responds_to are removed from the model-facing
+  envelope schema (plan_envelope_schema), the re-plan prompt
+  (prompts.py), and the judge's brief instruction; status is
+  removed from the schema too (materialization already forced
+  DRAFT). The PlanNode fields stay, system-owned: parse strips
+  model-emitted differs_by / responds_to at the raw-dict seam in
+  parse_planner_response, so the two repeat checks
+  (judge.validate_delta_plan, loop._find_repeated_approach) can
+  only ever read the repair path's own note -- repeat-rejection
+  is now purely signature-based (memory.approach_signature),
+  and the rejection text reads "without a system repair note".
+  The repair path (node-local repair) still writes the genuine
+  values, and its wave-through is pinned by test.
+  Enforcement: two new parse-time validators registered in
+  _collect_plan_error_records -- field_too_long (objective /
+  hypothesis capped at 400 chars, acceptance entries at 400)
+  and repetition_loop (a clause or word 6-gram repeated >=5x in
+  a prose field over 200 chars; payload inputs are NOT scanned
+  -- repetition there can be legitimate). Neither is cheap.
+  Regression fixture: the pairing run's actual output-1
+  differs_by, extracted from the driver log to
+  tests/fixtures/pairing_output1_differs_by.txt (29,357 chars;
+  top clause "no 7zr" x898), with
+  tests/test_planner_schema_redesign.py (11 tests) proving the
+  detector rejects it. Generation fuse: LLMSettings.num_predict
+  (env FREETALON_LLM_NUM_PREDICT, tolerant knob), planner
+  default _PLANNER_NUM_PREDICT = 8192 substituted in
+  _call_llm_with_repair under the num_ctx rule (caller-set
+  respected), sent on the Ollama payload only when configured.
+  Evidence gates: corpus replay against a pristine d95a6bb
+  worktree -- CP1 56 rows and model-A/B 22 rows, ZERO
+  substantive diffs (verdict, stage, error count, codes,
+  soundness all identical). Test re-pins: ZERO -- the
+  assessment's ~83 estimate assumed the suite pinned
+  model-emitted prose; in fact every differs_by / responds_to
+  reference in the suite is either PlanNode-level system-note
+  semantics (preserved by design) or a raw fixture whose
+  verdicts are unchanged. Suite 1305/1305 (1294 + 11 new).
+  Full log: freetalon-workspace/logs/planner-redesign-2026-11-19.log.

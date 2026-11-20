@@ -155,7 +155,7 @@ class LoopRunner:
 
         # M2: before executing, the planner's retrieval — a second run of
         # the same goal must not repeat a measured-failed approach. A node
-        # that repeats one without a stated differs_by escalates before
+        # that repeats one without a system repair note escalates before
         # anything runs; the earlier failure is cited, not repeated.
         goal_key = goal_key_for(contract.objective)
         domain = plan.intent.project_type
@@ -819,8 +819,11 @@ class LoopRunner:
         and only against approaches that were actually tried (executed
         and measured FAIL; see ExperimentStore.failed_approaches).
         Plumbing nodes (test runs, live checks, server starts) have no
-        signature and can never be a repeat. A node with a stated
-        ``differs_by`` is not a repeat — the change is acknowledged.
+        signature and can never be a repeat. A node carrying the
+        system's repair note (``differs_by``, written only by the
+        repair path when it splices a measured fix; parse strips any
+        model-emitted value) is not a repeat — the change is
+        acknowledged by the system itself.
         """
         known = self._memory_store.failed_approaches(goal_key, domain)
         if not known:

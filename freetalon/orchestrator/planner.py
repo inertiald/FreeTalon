@@ -3,6 +3,7 @@
 from __future__ import annotations
 import ast
 from dataclasses import dataclass, replace as dataclass_replace
+from collections import Counter
 import json
 import os
 import re
@@ -1104,6 +1105,24 @@ def parse_planner_response(
                 # repair budget. The coerced object still has no "type",
                 # so _usable_criterion_error rejects it by name below.
                 node["criteria"] = [node["criteria"]]
+
+    # System-owned delta fields (planner schema redesign,
+    # 2026-11-19): "responds_to" / "differs_by" are dropped from the
+    # raw nodes here, at the same raw-dict seam as the
+    # normalizations above. They are the repair path's own
+    # bookkeeping — it writes them onto materialized PlanNodes when
+    # it splices a repair — and the two repeat checks
+    # (judge.validate_delta_plan, loop's _find_repeated_approach)
+    # read them as the system's note. Letting model text land in
+    # them made both checks pass on any prose the model cared to
+    # write, and the fields were the pairing run's degeneration
+    # site (one value: 29,358 chars of negation loop, zero complete
+    # nodes). The envelope schema no longer declares them; a model
+    # that emits them anyway has them stripped, not judged.
+    for node in nodes_raw:
+        if isinstance(node, dict):
+            node.pop("responds_to", None)
+            node.pop("differs_by", None)
 
     # Deterministic interpreter normalization (retry #27): rewrite
     # the model-spelled interpreter tokens in the plan's bash
@@ -5087,6 +5106,136 @@ def _missing_target_errors(nodes: list[PlanNode]) -> list[str]:
     return errors
 
 
+
+# --- Planner schema redesign (2026-11-19): prose bounds ---------------
+#
+# The assessment (planner-assessment-2026-11-19.md) measured the
+# model-facing schema's free-text fields as the planner's one
+# unbounded cost: a single differs_by value ran to 87,415 chars
+# (~21,850 tokens, ~260 s of generation) and died in a repetition
+# loop, and across all 41 curated outputs degeneration occurred ONLY
+# inside free-text justification fields. differs_by / responds_to are
+# system-owned now (parse strips them; see parse_planner_response),
+# and the two validators registered in _collect_plan_error_records
+# bound what remains: hard length caps on the prose fields, and a
+# deterministic repetition-loop detector over the same fields.
+# Payload (inputs: commands, code) is deliberately NOT scanned —
+# repetition there can be legitimate, and payload hollowness is the
+# payload validators' and the critic's job, not this guard's.
+
+#: Hard caps (chars) for the model-emitted scalar prose fields,
+#: enforced at parse time. The healthy objective distribution tops
+#: out at 312 chars across the curated corpora (209 in the replay
+#: sets); 400 leaves headroom without leaving a field unbounded.
+#: hypothesis is capped at the same bound — it feeds approach
+#: signatures and is a sentence by contract, not an essay.
+_PROSE_FIELD_CAPS: dict[str, int] = {
+    "objective": 400,
+    "hypothesis": 400,
+}
+
+#: Cap for each free-text acceptance entry: human-readable one-line
+#: checks by contract (the legacy channel; criteria carry the
+#: machine-evaluated substance).
+_ACCEPTANCE_ENTRY_CAP = 400
+
+#: A prose string at or under this length cannot be the runaway the
+#: detector exists for; longer strings are judged (the assessment's
+#: measurement gate was the same 200 chars).
+_LOOP_MIN_CHARS = 200
+
+#: A clause (semicolon split) or word 6-gram repeated at least this
+#: many times in one prose string is a degeneration loop, not
+#: emphasis. The pairing field's top clause repeated 898 times and
+#: its top 6-gram 896 times; across the 41 curated outputs no
+#: legitimate prose field trips this threshold.
+_LOOP_MIN_REPEATS = 5
+_LOOP_NGRAM = 6
+
+
+def _repetition_loop_detail(text: str) -> str | None:
+    """Describe the repetition loop in ``text``, or None if sound.
+
+    Deterministic and cheap: clause frequency over ';' splits plus
+    word n-gram frequency — the assessment's two detectors, which
+    between them flagged every observed degeneration and nothing
+    else. Returns a short description of the worst offender for the
+    rejection text.
+    """
+    if len(text) <= _LOOP_MIN_CHARS:
+        return None
+    clauses = [part.strip() for part in text.split(";")]
+    clauses = [part for part in clauses if part]
+    if clauses:
+        clause, count = Counter(clauses).most_common(1)[0]
+        if count >= _LOOP_MIN_REPEATS and len(clause) <= 60:
+            return f"clause {clause!r} repeats {count} times"
+    words = text.split()
+    if len(words) >= _LOOP_NGRAM * _LOOP_MIN_REPEATS:
+        grams = Counter(
+            " ".join(words[i : i + _LOOP_NGRAM])
+            for i in range(len(words) - _LOOP_NGRAM + 1)
+        )
+        gram, count = grams.most_common(1)[0]
+        if count >= _LOOP_MIN_REPEATS:
+            return f"word sequence {gram!r} repeats {count} times"
+    return None
+
+
+def _node_prose_fields(node: PlanNode) -> list[tuple[str, str, int]]:
+    """A node's model-emitted prose as (field label, value, cap)."""
+    fields: list[tuple[str, str, int]] = [
+        (
+            "objective",
+            getattr(node, "objective", "") or "",
+            _PROSE_FIELD_CAPS["objective"],
+        ),
+        (
+            "hypothesis",
+            getattr(node, "hypothesis", "") or "",
+            _PROSE_FIELD_CAPS["hypothesis"],
+        ),
+    ]
+    fields.extend(
+        (f"acceptance[{index}]", entry, _ACCEPTANCE_ENTRY_CAP)
+        for index, entry in enumerate(getattr(node, "acceptance", None) or [])
+        if isinstance(entry, str)
+    )
+    return fields
+
+
+def _prose_length_errors(nodes: list[PlanNode]) -> list[str]:
+    """Prose fields over their hard caps, one message per defect."""
+    errors: list[str] = []
+    for node in nodes:
+        for field, value, cap in _node_prose_fields(node):
+            if len(value) > cap:
+                errors.append(
+                    f"Planner node '{node.id}' field '{field}' is "
+                    f"{len(value)} chars, over the {cap}-char cap for "
+                    f"planner prose — state the work in one short "
+                    f"passage; extended justification is not part of "
+                    f"the plan contract."
+                )
+    return errors
+
+
+def _repetition_loop_errors(nodes: list[PlanNode]) -> list[str]:
+    """Prose fields degenerated into repetition loops, per node."""
+    errors: list[str] = []
+    for node in nodes:
+        for field, value, _cap in _node_prose_fields(node):
+            detail = _repetition_loop_detail(value)
+            if detail is not None:
+                errors.append(
+                    f"Planner node '{node.id}' field '{field}' "
+                    f"degenerates into a repetition loop ({detail}) "
+                    f"— the generation repeated itself instead of "
+                    f"stating the work; write the field once, plainly."
+                )
+    return errors
+
+
 def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
@@ -5301,6 +5450,16 @@ def _collect_plan_error_records(
         _suite_criterion_command_errors(nodes),
     )
     records.extend(suite_criterion_records)
+    # Planner schema redesign (2026-11-19): the prose bounds. Not
+    # cheap — a degenerate or bloated generation is a real defect
+    # the repair round must regenerate against, not a mechanical
+    # relocation it can re-prompt for free.
+    records.extend(
+        _error_records("field_too_long", _prose_length_errors(nodes))
+    )
+    records.extend(
+        _error_records("repetition_loop", _repetition_loop_errors(nodes))
+    )
     # Cheap rejection (retry #12): the only errors are stand-in /
     # code-overwrite fakes, so re-prompting costs the model nothing to
     # fix and must not spend the repair budget. A rejection whose only
@@ -7695,6 +7854,20 @@ def _seed_forbidden_block(
 # if VRAM runs short, which is a speed cost, not a failure.
 _PLANNER_NUM_CTX = 12288
 
+# Generation ceiling for planner/replan calls (Ollama num_predict).
+# Planner schema redesign (2026-11-19): the pairing run's planner
+# spent ~260 s and ~21,850 tokens generating a single degenerate
+# schema field before the stream died at the context wall — the
+# failure the parse-time loop detector now rejects after the fact,
+# but only the ceiling bounds the generation itself. Sized from the
+# recorded evidence base: the largest healthy planner output on
+# record is 14,300 chars (~3,600 tokens, model-A/B corpus), so 8192
+# leaves ~2.3x headroom over any legitimate plan while cutting a
+# runaway at ~37% of the pairing output's length. A caller that set
+# num_predict (or FREETALON_LLM_NUM_PREDICT) keeps their value —
+# the same rule as num_ctx above.
+_PLANNER_NUM_PREDICT = 8192
+
 
 # --- Cycle 2 (2026-11-17): constrained envelope, repair discipline,
 # formatter plumbing ---
@@ -7755,6 +7928,18 @@ def plan_envelope_schema() -> dict[str, Any]:
     the schema guarantees the envelope, the validators judge the
     rest, and an over-tight grammar would only trade repairable
     rejections for degenerate compliance.
+
+    ``status``, ``responds_to`` and ``differs_by`` are deliberately
+    absent: all three are system-owned. Status is forced to DRAFT at
+    materialization; responds_to / differs_by are written only by
+    the repair path (the node-local repair in this module) as the
+    system's own repair note, and the repeat checks read them as
+    exactly that. The 2026-11-19 assessment measured the
+    model-emitted versions at 93.6% of one run's entire planner
+    output — one value degenerating into a 29,358-char repetition
+    loop — with zero code consumers ever reading their content, so
+    the model is no longer asked to produce them; parse strips them
+    if they appear anyway (parse_planner_response).
     """
     node_properties: dict[str, Any] = {
         "id": {"type": "string"},
@@ -7768,13 +7953,10 @@ def plan_envelope_schema() -> dict[str, Any]:
         "outputs": {"type": "array", "items": {"type": "string"}},
         "acceptance": {"type": "array", "items": {"type": "string"}},
         "criteria": {"type": "array", "items": {"type": "object"}},
-        "status": {"type": "string"},
         "reversible": {"type": "boolean"},
         "timeout_s": {"type": "number"},
         "max_retries": {"type": "integer"},
         "hypothesis": {"type": "string"},
-        "responds_to": {"type": "string"},
-        "differs_by": {"type": "string"},
     }
     return {
         "type": "object",
@@ -8203,6 +8385,15 @@ def _call_llm_with_repair(
     if effective_settings.num_ctx is None:
         effective_settings = dataclass_replace(
             effective_settings, num_ctx=_PLANNER_NUM_CTX
+        )
+    # Planner schema redesign (2026-11-19): the generation ceiling,
+    # same rule as num_ctx — a caller that already set num_predict
+    # keeps their value. The fuse exists because an unbounded
+    # generation is the one planner failure parse-time checks
+    # cannot bound: they judge the output only after it exists.
+    if effective_settings.num_predict is None:
+        effective_settings = dataclass_replace(
+            effective_settings, num_predict=_PLANNER_NUM_PREDICT
         )
     # Cycle 2 (steal #1): the plan envelope is grammar-constrained at
     # decode time on the Ollama path, so the envelope's shape is

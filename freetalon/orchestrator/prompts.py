@@ -285,12 +285,15 @@ Rules:
   sandbox_analyze, backtest, train_model, paper_trade, invest,
   engage_kill_switch, can_capture, verify_backup, tune_surface, flash_ecu.
   Never invent a claw name.
-- Every node must name "responds_to" (the failed node id it answers) and
-  "differs_by" (what it does differently from the failed attempt).
+- Nodes carry only the work: id, objective, depends_on, assigned_claw,
+  inputs, criteria. "responds_to" / "differs_by" are system-owned
+  bookkeeping the repair machinery writes itself — never emit them.
 - "depends_on" lists node ids only (e.g. "step_1") — the "id" of an
   earlier node, never an output name, a file path, or a description.
-- Do not repeat a failed approach (same capability and hypothesis) without
-  a stated differs_by — the judge rejects such plans.
+- Do not repeat a failed approach (same capability and targets). Repeat
+  detection is structural — the judge compares what a node does, never
+  what it says — and rejects a repeat outright; change the mechanism or
+  the targets instead of rewording the same approach.
 - Ground in the repo: if an endpoint or module already exists, extend it;
   never create a new file duplicating it. The FreeTalon API runs on port
   8765; do not use port 8000 for service checks.

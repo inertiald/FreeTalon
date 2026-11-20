@@ -339,10 +339,11 @@ class Judge:
             "memory": memory,
             "remaining_budget": self.remaining_budget(),
             "instruction": (
-                "Produce a delta plan: name which failed hypothesis each new "
-                "node responds to (responds_to) and what it does differently "
-                "(differs_by). Do not repeat a recorded failed approach "
-                "without a stated reason. Shrink scope before growing it."
+                "Produce a delta plan. Do not repeat a recorded failed "
+                "approach: repeats are detected structurally, by "
+                "capability and targets, never by wording — if you "
+                "revisit a failed node's ground, change the mechanism "
+                "or the targets. Shrink scope before growing it."
             ),
         }
 
@@ -357,8 +358,13 @@ class Judge:
         Returns an error string when the delta plan is rejected, else None.
         A node repeats a failed approach when its approach signature
         (memory.approach_signature — mechanism and targets, never the
-        node's wording) matches a failed node's and it states no
-        ``differs_by``. Plumbing nodes (test runs, live checks, server
+        node's wording) matches a failed node's and it carries no
+        system repair note. The note is the PlanNode ``differs_by``
+        field, written only by the repair path when it splices a
+        measured fix into a copied node; parse strips any
+        model-emitted value, so a note read here is the system's
+        own, never model prose. Plumbing nodes (test runs, live
+        checks, server
         starts) have no signature and can never repeat. The brief's
         failed nodes all executed in this run, so their failures are
         executed-stage by construction. ``known_failures`` adds the
@@ -392,6 +398,6 @@ class Judge:
                 return (
                     f"re-plan repeats failed approach "
                     f"({describe_signature(signature)}) "
-                    f"without a stated differs_by"
+                    f"without a system repair note"
                 )
         return None

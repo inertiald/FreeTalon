@@ -52,6 +52,15 @@ class LLMSettings:
     # it instead of substituting its own default (cycle 14:
     # qwen3.8's plan verbosity overflows the 12288 planner window).
     num_ctx: int | None = None
+    # Ollama per-call generation ceiling (num_predict). None means no
+    # ceiling is sent — generation ends only at the context window,
+    # which is how the pairing run's planner call burned ~21,850
+    # tokens (89% of its window) inside one schema field before the
+    # stream was cut. The planner substitutes its own default
+    # (_PLANNER_NUM_PREDICT) for plan calls. FREETALON_LLM_NUM_PREDICT
+    # sets it from the environment under the same tolerant-knob rule
+    # as num_ctx: unset/unparsable/non-positive leaves it None.
+    num_predict: int | None = None
     format_schema: dict[str, Any] | None = None
     # Ollama thinking control (the top-level "think" chat field).
     # None — the default, and what an unset or unrecognized
@@ -117,6 +126,22 @@ class LLMSettings:
             if parsed_num_ctx > 0:
                 num_ctx = parsed_num_ctx
 
+        # Num_predict is a tuning knob like num_ctx: an unset,
+        # unparsable, or non-positive value leaves it None — no
+        # ceiling sent, the planner's own default in force — never
+        # an error that bricks intake.
+        num_predict_text = os.environ.get(
+            "FREETALON_LLM_NUM_PREDICT", ""
+        ).strip()
+        num_predict: int | None = None
+        if num_predict_text:
+            try:
+                parsed_num_predict = int(num_predict_text)
+            except ValueError:
+                parsed_num_predict = 0
+            if parsed_num_predict > 0:
+                num_predict = parsed_num_predict
+
         if backend == "ollama":
             return cls(
                 backend="ollama",
@@ -126,6 +151,7 @@ class LLMSettings:
                 temperature=temperature,
                 think=think,
                 num_ctx=num_ctx,
+                num_predict=num_predict,
             )
         if backend == "openai_compatible":
             api_key = os.environ.get("FREETALON_OPENAI_API_KEY")
@@ -141,6 +167,7 @@ class LLMSettings:
                 temperature=temperature,
                 think=think,
                 num_ctx=num_ctx,
+                num_predict=num_predict,
             )
         raise ValueError(
             "Unsupported FREETALON_LLM_BACKEND. Expected 'ollama' or 'openai_compatible'."
@@ -290,6 +317,12 @@ def _call_ollama(settings: LLMSettings, system_prompt: str, user_prompt: str) ->
         # "options" entry. Sent only when configured: at the default
         # the payload is identical to the pre-cycle-13 one.
         payload["think"] = settings.think
+    if settings.num_predict is not None:
+        # The generation ceiling IS an "options" entry. Sent only
+        # when configured: at the default the payload is identical
+        # to the pre-redesign one. A generation cut by the ceiling
+        # fails parse cheaply instead of filling the context window.
+        payload["options"]["num_predict"] = settings.num_predict
     response = _post_json(
         f"{_normalize_base_url(settings.base_url)}/api/chat",
         payload,
