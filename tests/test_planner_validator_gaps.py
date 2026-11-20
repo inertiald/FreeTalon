@@ -230,5 +230,153 @@ class TestMeasuredBindingDataWrite(unittest.TestCase):
             self.assertEqual(len(parsed), 1)
 
 
+class TestParseErrorDoesNotMaskStandin(unittest.TestCase):
+    """Gap 2: a parse failure must not mask stand-in detection.
+
+    Two seams: scaffold content that fails to parse still has its
+    hardcoded measured bindings named (retry #24's recorded
+    weakness), and normalize's structural raises (duplicate ids,
+    self-dependency, dependency cycle) carry the plan's collected
+    content errors instead of naming the structure alone.
+    """
+
+    BINDING_CONTENT = (
+        "import json\n\n"
+        "def health():\n"
+        "    status = {\"ollama_reachable\": True, \"gpu_temperature\": 25}\n"
+        "    return json.dumps(status)\n"
+        "def broken(:\n"
+    )
+
+    def _scaffold_plan(self, content: str) -> str:
+        return _dag(
+            [
+                {
+                    "id": "step-1",
+                    "objective": "Add the health probe module",
+                    "depends_on": [],
+                    "assigned_claw": "scaffold",
+                    "inputs": {
+                        "file_path": "freetalon/health_probe.py",
+                        "content": content,
+                    },
+                    "outputs": ["freetalon/health_probe.py"],
+                    "acceptance": ["module written"],
+                    "criteria": [{"type": "exit_code", "equals": 0}],
+                }
+            ]
+        )
+
+    def test_unparseable_scaffold_names_measured_bindings(self) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(self._scaffold_plan(self.BINDING_CONTENT))
+        message = str(caught.exception)
+        self.assertIn("does not parse as Python", message)
+        self.assertIn("binds measured fields to constants", message)
+        self.assertIn('"ollama_reachable": True', message)
+        self.assertIn('"gpu_temperature": 25', message)
+
+    def test_unparseable_scaffold_without_bindings_names_only_parse(
+        self,
+    ) -> None:
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(
+                self._scaffold_plan("def broken(:\n    pass\n")
+            )
+        message = str(caught.exception)
+        self.assertIn("does not parse as Python", message)
+        self.assertNotIn("binds measured fields", message)
+
+    def test_parseable_scaffold_bindings_are_not_the_parse_check(
+        self,
+    ) -> None:
+        # Scoped deliberately: a constant inside WORKING code is the
+        # execution layer's judgment, not this check's. The plan is
+        # accepted at plan time.
+        content = (
+            "import json\n\n"
+            "def health():\n"
+            "    status = {\"ollama_reachable\": True}\n"
+            "    return json.dumps(status)\n"
+        )
+        parsed, _ = parse_planner_response(self._scaffold_plan(content))
+        self.assertEqual(len(parsed), 1)
+
+    @staticmethod
+    def _fake_node(node_id: str, depends_on: list[str]) -> dict:
+        return {
+            "id": node_id,
+            "objective": "Produce the health report",
+            "depends_on": depends_on,
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": "echo '{\"status\": \"ok\"}' > report.json"
+            },
+            "outputs": ["report.json"],
+            "acceptance": ["report exists"],
+            "criteria": [{"type": "file_exists", "path": "report.json"}],
+        }
+
+    @staticmethod
+    def _clean_node(node_id: str, depends_on: list[str]) -> dict:
+        return {
+            "id": node_id,
+            "objective": "Show the report",
+            "depends_on": depends_on,
+            "assigned_claw": "bash",
+            "inputs": {"command": "cat report.json"},
+            "outputs": [],
+            "acceptance": ["report shown"],
+            "criteria": [{"type": "exit_code", "equals": 0}],
+        }
+
+    def test_cycle_rejection_also_names_the_fake(self) -> None:
+        nodes = [
+            self._fake_node("step-1", ["step-2"]),
+            self._clean_node("step-2", ["step-1"]),
+        ]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        message = str(caught.exception)
+        self.assertIn("dependency cycle", message)
+        self.assertIn("hardcoded answer", message)
+
+    def test_cycle_without_a_fake_keeps_the_bare_rejection(self) -> None:
+        nodes = [
+            self._clean_node("step-1", ["step-2"]),
+            self._clean_node("step-2", ["step-1"]),
+        ]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        self.assertEqual(
+            str(caught.exception),
+            "Planner response contained a dependency cycle.",
+        )
+        records = caught.exception.plan_errors
+        self.assertEqual([r.code for r in records], ["dependency_cycle"])
+
+    def test_duplicate_ids_rejection_also_names_the_fake(self) -> None:
+        nodes = [
+            self._fake_node("step-1", []),
+            self._clean_node("step-1", []),
+        ]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        message = str(caught.exception)
+        self.assertIn("duplicate node ids", message)
+        self.assertIn("hardcoded answer", message)
+
+    def test_self_dependency_rejection_also_names_the_fake(self) -> None:
+        nodes = [
+            self._clean_node("step-1", ["step-1"]),
+            self._fake_node("step-2", []),
+        ]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        message = str(caught.exception)
+        self.assertIn("cannot depend on itself", message)
+        self.assertIn("hardcoded answer", message)
+
+
 if __name__ == "__main__":
     unittest.main()

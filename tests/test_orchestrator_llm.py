@@ -13069,18 +13069,24 @@ class TestPlannerFrameworkGuardFix(unittest.TestCase):
         self.assertNotIn("bare `python`", message)
         self.assertIn("string_matches", message)
 
-    def test_retry23_output2_rejected_with_four_errors(self) -> None:
+    def test_retry23_output2_rejected_with_five_errors(self) -> None:
         # Was REJECTED live (restored probe) with 2 errors (Flask
         # step-1 + step-2). Then the unparseable scaffolds and the
         # bare `python` in step-3 were named too (5 errors). Step-4's
         # ./freetalon/api.py exists in the repo, so no interpreter
         # error fires there. Interpreter normalization (retry #27
-        # fix): the bare `python` is rewritten at parse time -- now
-        # 4 errors.
+        # fix): the bare `python` is rewritten at parse time -- 4
+        # errors. Gap closure (2026-11-20): the measured bindings
+        # inside step-1's unparseable scaffold (ollama_reachable True,
+        # gpu_temperature 'N/A') are named too -- the parse error no
+        # longer masks the stand-in -- 5 errors.
         message = self._reject(self._retry23_output2_nodes())
-        self.assertIn("was rejected with 4 errors", message)
+        self.assertIn("was rejected with 5 errors", message)
         self.assertEqual(message.count("writes a Flask app"), 2)
         self.assertEqual(message.count("does not parse as Python"), 2)
+        self.assertEqual(
+            message.count("binds measured fields to constants"), 1
+        )
         self.assertNotIn("bare `python`", message)
 
     def test_is_placeholder_stub(self) -> None:

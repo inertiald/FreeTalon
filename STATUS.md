@@ -5644,3 +5644,35 @@ are rejected; a computed write (curl > report.json) and a plain
 status literal stay accepted. Five new tests in
 tests/test_planner_validator_gaps.py; planner module 746/746 with
 zero existing-test changes.
+
+
+## Update - 2026-11-20 (planner validator gaps 3/4: parse failures no longer mask stand-in detection)
+
+Two masking seams closed. (a) Scaffold content that fails to parse
+now has its hardcoded measured bindings named alongside the parse
+error: _scaffold_unparseable_binding_errors applies the textual
+_hardcoded_measured_bindings scan to unparseable scaffold writes
+(parseable content untouched — a constant in working code is the
+execution layer's judgment; whole-literal content stays shape 2's).
+This is retry #24 attempt 2's recorded weakness, closed for the
+scaffold form. (b) normalize_plan_nodes' structural raises —
+duplicate ids, self-dependency, dependency cycle — now go through
+_structural_rejection, which enriches the rejection with the plan's
+collected content errors when any exist (retry #15's
+unknown-dependency precedent, same function) and returns the bare
+structural rejection unchanged otherwise; the collector is safe on
+cyclic plans (_ancestor_node_ids is visited-set based) and an
+enrichment failure falls back to the bare raise.
+
+ONE intended corpus-pin change: the captured retry-#23 output-2
+fixture now rejects with 5 errors, not 4 — step-1's unparseable
+api.py scaffold binds "ollama_reachable": True and
+"gpu_temperature": 'N/A', and that fabricated measurement is exactly
+what seam (a) exists to name. The pin
+(test_retry23_output2_rejected_with_four_errors, renamed
+..._with_five_errors) was updated with the new assertion; its own
+comment history shows the same treatment for earlier namings
+(2 -> 5 -> 4 -> 5). Every other planner-module test is unchanged
+and green (746/746). The pure JSON-syntax failure has no node
+structure to scan and stays a bare rejection (recorded, not fixed).
+Seven new tests in tests/test_planner_validator_gaps.py.

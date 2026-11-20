@@ -509,6 +509,45 @@ def _unknown_dependency_error(
     )
 
 
+def _structural_rejection(
+    structural: PlanError,
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    goal_text: str | None,
+    workspace: str | None,
+    repo_index: Any | None,
+) -> LLMResponseError:
+    """A structural rejection, enriched with the plan's content errors.
+
+    Duplicate ids, a self-dependency, and a dependency cycle raise in
+    normalize_plan_nodes before _collect_plan_errors can run, so a
+    plan carrying BOTH a structural defect and a stand-in/placeholder
+    fake was rejected for the structure alone — the repair round
+    fixed the structure and returned the same fake (the masking
+    family; retry #15 fixed exactly this for unknown dependencies in
+    the same function, and this helper gives the other three raises
+    the same treatment). When the collected content records are
+    non-empty, the rejection is the numbered form with the structural
+    record first; when they are empty, the bare structural rejection
+    is returned unchanged. A failure inside the enrichment falls
+    back to the bare rejection — enrichment must never mask the
+    structural error with a crash. (_ancestor_node_ids is
+    visited-set based, so the collector is safe on the cyclic plans
+    this helper exists for.)
+    """
+    try:
+        records, _cheap = _collect_plan_error_records(
+            nodes, repo_root, goal_text, workspace, index=repo_index
+        )
+    except Exception:
+        records = []
+    if not records:
+        return _attach_plan_errors(
+            LLMResponseError(structural.message), [structural]
+        )
+    return _numbered_rejection([structural] + records)
+
+
 def normalize_plan_nodes(
     nodes: list[PlanNode] | list[dict[str, Any]],
     repo_index: Any | None = None,
@@ -550,10 +589,17 @@ def normalize_plan_nodes(
 
     node_map = {node.id: node for node in nodes}
     if len(node_map) != len(nodes):
-        raise _single_error_rejection(
-            "duplicate_node_ids",
-            "Planner response contained duplicate node ids.",
-            STAGE_SCHEMA,
+        raise _structural_rejection(
+            PlanError(
+                code="duplicate_node_ids",
+                message="Planner response contained duplicate node ids.",
+                stage=STAGE_SCHEMA,
+            ),
+            nodes,
+            repo_root,
+            goal_text,
+            workspace,
+            repo_index,
         )
 
     # Unknown dependencies are a repairable rejection, not a structural
@@ -568,18 +614,18 @@ def normalize_plan_nodes(
     for node in nodes:
         for dependency in node.depends_on:
             if dependency == node.id:
-                raise _attach_plan_errors(
-                    LLMResponseError(
-                        f"Planner node '{node.id}' cannot depend on itself."
+                raise _structural_rejection(
+                    PlanError(
+                        code="self_dependency",
+                        message=f"Planner node '{node.id}' cannot depend on itself.",
+                        node_id=node.id,
+                        stage=STAGE_SCHEMA,
                     ),
-                    [
-                        PlanError(
-                            code="self_dependency",
-                            message=f"Planner node '{node.id}' cannot depend on itself.",
-                            node_id=node.id,
-                            stage=STAGE_SCHEMA,
-                        )
-                    ],
+                    nodes,
+                    repo_root,
+                    goal_text,
+                    workspace,
+                    repo_index,
                 )
             if dependency not in node_map:
                 unknown_dep_errors.append(
@@ -631,10 +677,17 @@ def normalize_plan_nodes(
                 heapq.heappush(ready, (original_order[downstream], downstream))
 
     if len(ordered_ids) != len(nodes):
-        raise _single_error_rejection(
-            "dependency_cycle",
-            "Planner response contained a dependency cycle.",
-            STAGE_SCHEMA,
+        raise _structural_rejection(
+            PlanError(
+                code="dependency_cycle",
+                message="Planner response contained a dependency cycle.",
+                stage=STAGE_SCHEMA,
+            ),
+            nodes,
+            repo_root,
+            goal_text,
+            workspace,
+            repo_index,
         )
 
     original_to_normalized_id = {
@@ -4571,6 +4624,70 @@ def _scaffold_parse_errors(
     return errors
 
 
+def _scaffold_unparseable_binding_errors(
+    nodes: list[PlanNode],
+    goal_text: str | None = None,
+    index: Any | None = None,
+) -> list[str]:
+    """Name fabricated measurements inside scaffold content that does not parse.
+
+    Retry #24 attempt 2: the scaffold content carried hardcoded
+    stand-in values (gpu_temperature 25, ollama_reachable True) inside
+    code that did not parse, and the rejection named only the parse
+    error — the parse failure masked the stand-in detection, so the
+    repair round fixed the syntax and kept the fabrication. The
+    bindings scan (_hardcoded_measured_bindings) is textual, so it
+    runs on unparseable content exactly as on parseable text; this
+    check applies it to scaffold writes whose content fails the
+    Python parse (the parse error itself is _scaffold_parse_errors'
+    to name). Parseable content is untouched: a constant inside
+    working code is the execution layer's judgment (the critic), and
+    expected-value fixtures bind measured keys legitimately. A
+    whole-literal content is skipped — shape 2 owns that defect.
+    """
+    errors: list[str] = []
+    grounded = _grounded_move_text(index, goal_text)
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("scaffold", "file_writer"):
+            continue
+        target = (
+            node.inputs.get("file_path")
+            or node.inputs.get("path")
+            or (node.outputs[0] if node.outputs else "")
+        )
+        content = node.inputs.get("content")
+        if not isinstance(target, str) or not target:
+            continue
+        if not isinstance(content, str):
+            continue
+        if not is_code_path(target):
+            continue
+        if Path(target).suffix.lower() != ".py":
+            continue
+        if _literal_is_answer(content):
+            continue
+        try:
+            ast.parse(content)
+            continue
+        except SyntaxError:
+            pass
+        bindings = _hardcoded_measured_bindings(content)
+        if not bindings:
+            continue
+        errors.append(
+            f"Planner node '{node.id}' scaffolds {target!r} with code "
+            f"that binds measured fields to constants "
+            f"({', '.join(bindings)}) instead of measuring them — "
+            f"whether a service is reachable and what a sensor reads "
+            f"exist only by probing (call the service, run "
+            f"nvidia-smi), so a constant is a fabricated measurement, "
+            f"and the parse error on the same content does not hide "
+            f"it. Write real code that measures the values it "
+            f"reports.{grounded}"
+        )
+    return errors
+
+
 # Elision markers: a comment (or bare statement) that stands in for
 # code the model did not write. The pattern mirrors the planner A/B
 # replay harness's soundness rule verbatim
@@ -6162,6 +6279,12 @@ def _collect_plan_error_records(
         _error_records(
             "scaffold_parse",
             _scaffold_parse_errors(nodes, repo_root, goal_text, index),
+        )
+    )
+    records.extend(
+        _error_records(
+            "static_standin",
+            _scaffold_unparseable_binding_errors(nodes, goal_text, index),
         )
     )
     records.extend(
