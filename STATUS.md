@@ -5595,3 +5595,31 @@ the loop build's expiry-test seam failure is designed out).
 - Next: the pairing exam — the loop re-attempts the pairing
   assignment in an isolated worktree (shipped package deleted
   there), scored against the shipped reference's E2E behaviors.
+
+## Update - 2026-11-20 (Validator gap closure 1 of 4: quote-aware echo-write detection)
+
+- Defect (assessment backlog): the bash echo-write detectors stopped
+  the body at the first ">", so a ">" inside a quoted echo body
+  truncated the write out of detection — `echo '{"status": "ok >
+  fine"}' > report.json` returned no literal write at all, the
+  double-quoted and printf forms returned garbage targets, and the
+  stand-in check never saw the fake. _quoted_segments also paired a
+  double quote with the next double quote, splitting bodies at
+  escaped quotes.
+- Fix (planner.py only): both detectors (_LITERAL_WRITE_RE,
+  _ECHO_WRITE_RE) share a quote-aware body pattern — quoted segments
+  are consumed whole, unquoted runs stop at the redirect; the
+  segment scan treats \" and \\ inside double quotes the way the
+  shell does (consumed escapes), so a double-quoted JSON literal
+  reads as the JSON it is; _literal_write drops a printf format
+  segment (printf '%s' '<literal>' writes the argument, not the
+  format). Pattern benchmarked against the old one on adversarial
+  inputs: no slowdown (faster on long unquoted bodies).
+- Evidence: 9 new tests in tests/test_planner_validator_gaps.py
+  (detector-level pins for single/double quotes, printf forms,
+  append redirects, plain-echo control, plus an end-to-end stand-in
+  rejection of the quoted-">" fake); planner module 746/746 green
+  with zero existing-test changes. Corpus note: the official replay
+  harness lives on seeker7 (down); the pinned-fixture suite is the
+  substitute arbitration here and the 78-row replay should be
+  re-run on seeker7 when it returns.

@@ -4080,8 +4080,18 @@ _ECHO_ESCAPES = {
     "'": "'",
 }
 
+# The body of an echo/printf write, as a pattern fragment shared by
+# the two echo-write detectors (_ECHO_WRITE_RE here, _LITERAL_WRITE_RE
+# at the stand-in check): quoted segments are consumed whole — a ">"
+# inside quotes is content, not the redirect; the old ".*?" body
+# stopped at the first ">", truncating the body mid-quote so the
+# quoted-segment scan found no closed quote and the write escaped
+# detection entirely (or produced a garbage target). Unquoted runs
+# stop at the redirect and at quote characters, which start a segment.
+_ECHO_BODY_PATTERN = r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|[^>\"'])*?"
+
 _ECHO_WRITE_RE = re.compile(
-    r"(?:^|[;&|]\s*)(?:echo|printf)\s+(?P<body>.*?)\s*(?P<op>>{1,2})\s*(?P<target>[^\s;&|]+)",
+    r"(?:^|[;&|]\s*)(?:echo|printf)\s+(?P<body>" + _ECHO_BODY_PATTERN + r")\s*(?P<op>>{1,2})\s*(?P<target>[^\s;&|]+)",
     re.DOTALL,
 )
 
@@ -6277,7 +6287,7 @@ def _collect_plan_error_records(
 # --- Anti-fake validation (retry #2, run-20261117T054715Z-698173) ---
 
 _LITERAL_WRITE_RE = re.compile(
-    r"^\s*(?:echo|printf)\s+(?P<body>.*?)\s*(?:>>|>)\s*(?P<target>\S+)",
+    r"^\s*(?P<verb>echo|printf)\s+(?P<body>" + _ECHO_BODY_PATTERN + r")\s*(?:>>|>)\s*(?P<target>\S+)",
     re.DOTALL,
 )
 _HEREDOC_RE = re.compile(
@@ -6341,12 +6351,44 @@ def _quoted_segments(body: str) -> list[str]:
     index = 0
     while index < len(body):
         quote = body[index]
-        if quote in ("'", '"'):
+        if quote == "'":
+            # Single quotes have no escapes in shell: the next single
+            # quote closes the segment.
             close = body.find(quote, index + 1)
             if close == -1:
                 break
             segments.append(body[index + 1 : close])
             index = close + 1
+        elif quote == '"':
+            # Double quotes: a \" is an escaped quote, not the end of
+            # the segment (and \\ escapes the backslash) — the old
+            # next-quote pairing split a body like
+            # "{\"status\": \"ok\"}" at the first escaped quote and
+            # lost the write. The shell consumes those two escapes
+            # itself, so the segment carries the unescaped character
+            # (a JSON literal written this way becomes valid JSON);
+            # every other backslash is the shell's literal text and
+            # stays for the echo-escape interpreter downstream.
+            chars: list[str] = []
+            cursor = index + 1
+            while cursor < len(body):
+                ch = body[cursor]
+                if (
+                    ch == "\\"
+                    and cursor + 1 < len(body)
+                    and body[cursor + 1] in ('"', "\\")
+                ):
+                    chars.append(body[cursor + 1])
+                    cursor += 2
+                    continue
+                if ch == '"':
+                    break
+                chars.append(ch)
+                cursor += 1
+            if cursor >= len(body):
+                break
+            segments.append("".join(chars))
+            index = cursor + 1
         else:
             index += 1
     return segments
@@ -6377,6 +6419,16 @@ def _literal_write(command: str) -> tuple[str, str] | None:
     if not match:
         return None
     segments = _quoted_segments(match.group("body"))
+    if (
+        match.group("verb") == "printf"
+        and len(segments) > 1
+        and "%" in segments[0]
+    ):
+        # printf's first argument is the FORMAT, not written content:
+        # printf '%s' '<literal>' writes the argument. (A printf whose
+        # format carries no directives, or that has no argument
+        # segments, writes the format itself and keeps it.)
+        segments = segments[1:]
     if not segments:
         return None
     return match.group("target"), " ".join(segments)

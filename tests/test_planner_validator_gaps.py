@@ -1,0 +1,121 @@
+"""Tests for the planner validator gap closures (2026-11-20).
+
+Four known gaps from the planner assessment backlog, one section each:
+
+1. The schema-error path in _validate_raw_nodes skipped the full
+   _collect_plan_errors run, so a schema-valid node carrying a real
+   defect was invisible whenever a sibling node failed schema
+   validation. The path now runs the full collector on the nodes that
+   DID validate and merges their per-node records.
+2. Parse failures masked stand-in detection: scaffold content that
+   failed to parse never had its hardcoded measured bindings named,
+   and normalize's structural raises (duplicate ids, self-dependency,
+   dependency cycle) named only the structural defect. Both seams now
+   run the detection independently.
+3. The bash echo-write detectors (_LITERAL_WRITE_RE / _ECHO_WRITE_RE)
+   stopped the body at the first ">", so a ">" inside a quoted echo
+   body truncated the write out of detection.
+4. A literal write binding measured fields to constants is a
+   fabricated measurement in any file: the stand-in check now names
+   it for non-code targets too (the general literal-JSON-to-data-file
+   shape stays allowed by the recorded data-file exemption — see
+   TestMeasuredBindingDataWrite for the boundary).
+"""
+
+from __future__ import annotations
+
+import json
+import unittest
+
+from freetalon.orchestrator.intake import LLMResponseError
+from freetalon.orchestrator.planner import (
+    _bash_code_writes,
+    _literal_write,
+    parse_planner_response,
+)
+
+
+def _dag(nodes: list[dict]) -> str:
+    return json.dumps({"nodes": nodes, "metadata": {}})
+
+
+class TestEchoWriteQuotedRedirect(unittest.TestCase):
+    """Gap 3: a ">" inside a quoted echo body is content, not the redirect."""
+
+    def test_literal_write_detects_gt_inside_single_quotes(self) -> None:
+        self.assertEqual(
+            _literal_write("echo '{\"status\": \"ok > fine\"}' > out.json"),
+            ("out.json", '{"status": "ok > fine"}'),
+        )
+
+    def test_literal_write_detects_gt_inside_double_quotes(self) -> None:
+        # The shell command as the model writes it: a double-quoted
+        # body whose JSON quotes are backslash-escaped.
+        inner = json.dumps({"status": "ok > fine"}).replace('"', '\\"')
+        written = _literal_write(f'echo "{inner}" > out.json')
+        self.assertIsNotNone(written)
+        target, literal = written
+        self.assertEqual(target, "out.json")
+        # The segment keeps its \" escapes; json.loads reads them as
+        # the JSON literal the model wrote.
+        self.assertEqual(json.loads(literal), {"status": "ok > fine"})
+
+    def test_literal_write_detects_assert_sentence_with_gt(self) -> None:
+        self.assertEqual(
+            _literal_write("echo 'assert health is ok > really' > test.sh"),
+            ("test.sh", "assert health is ok > really"),
+        )
+
+    def test_literal_write_printf_format_is_not_content(self) -> None:
+        # printf's first argument is the format; the written literal is
+        # the argument segment.
+        self.assertEqual(
+            _literal_write("printf '%s' '{\"a\": \">\"}' > out.json"),
+            ("out.json", '{"a": ">"}'),
+        )
+
+    def test_literal_write_printf_format_only_is_content(self) -> None:
+        self.assertEqual(
+            _literal_write("printf '{\"a\": 1}' > out.json"),
+            ("out.json", '{"a": 1}'),
+        )
+
+    def test_literal_write_plain_echo_still_none(self) -> None:
+        self.assertIsNone(_literal_write("echo hello > out.txt"))
+
+    def test_literal_write_append_redirect(self) -> None:
+        self.assertEqual(
+            _literal_write("echo '{\"a\": \">\"}' >> out.json"),
+            ("out.json", '{"a": ">"}'),
+        )
+
+    def test_bash_code_writes_extracts_quoted_gt_body(self) -> None:
+        writes = _bash_code_writes("echo '{\"x\": \"a > b\"}' > probe.py")
+        self.assertEqual(writes, [("probe.py", '{"x": "a > b"}', False)])
+
+    def test_standin_fires_for_quoted_gt_fake(self) -> None:
+        # End to end: the fake the regex gap used to let through — an
+        # echo-written JSON answer whose text contains ">", claimed by
+        # a file_exists criterion on the same path.
+        nodes = [
+            {
+                "id": "step-1",
+                "objective": "Produce the health report",
+                "depends_on": [],
+                "assigned_claw": "bash",
+                "inputs": {
+                    "command": "echo '{\"status\": \"ok > fine\"}' > report.json"
+                },
+                "outputs": ["report.json"],
+                "acceptance": ["report exists"],
+                "criteria": [{"type": "file_exists", "path": "report.json"}],
+            }
+        ]
+        with self.assertRaises(LLMResponseError) as caught:
+            parse_planner_response(_dag(nodes))
+        self.assertIn("hardcoded answer", str(caught.exception))
+        self.assertIn("report.json", str(caught.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()
