@@ -41,6 +41,17 @@ class InstallerTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     installer.ensure_virtualenv(Path(tmpdir) / ".venv")
 
+    def test_generate_compose_pins_ollama_version(self) -> None:
+        for gpu in (installer.GPU_NVIDIA, installer.GPU_AMD):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / "docker-compose.yml"
+                installer.generate_compose(gpu, path)
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            image = data["services"]["ollama"]["image"]
+            self.assertTrue(image.startswith("ollama/ollama:0.40.16"), image)
+            self.assertIn("@sha256:", image)
+            self.assertNotIn(":latest", image)
+
     def test_generate_env_includes_launch_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / ".env"

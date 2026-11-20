@@ -39,11 +39,15 @@ API_PORT = 8765
 REPO_ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_PATH = REPO_ROOT / "requirements.txt"
 DEFAULT_VENV_PATH = REPO_ROOT / ".venv"
+# Pinned to the Ollama version production runs (seeker7). The old digest
+# was a 0.15.x build, which refuses current model manifests (HTTP 412 on
+# pull), so the tag matters, not just the digest: a fresh install must
+# land on a runtime that can pull current models.
 OLLAMA_IMAGE_DEFAULT = (
-    "ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc"
+    "ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592"
 )
 OLLAMA_IMAGE_AMD = (
-    "ollama/ollama:rocm@sha256:c2d5755f1cc3777d2616014516dfe08fa9da214add9fe76f399ffd6a45661f1a"
+    "ollama/ollama:0.40.16-rocm@sha256:85b3c895222b1ddc9d63c40b20fc74f37a37593dcbbdfbf28910a925e43ead00"
 )
 
 

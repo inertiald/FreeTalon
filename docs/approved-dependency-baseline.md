@@ -26,8 +26,8 @@ Approved external image references:
 
 - `python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf`
 - `mcr.microsoft.com/playwright/python:v1.40.0-jammy@sha256:5656288def8576b31903becabac255b19bc01ee961ddb499de3418d52f55ed2a`
-- `ollama/ollama:latest@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc`
-- `ollama/ollama:rocm@sha256:c2d5755f1cc3777d2616014516dfe08fa9da214add9fe76f399ffd6a45661f1a`
+- `ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592`
+- `ollama/ollama:0.40.16-rocm@sha256:85b3c895222b1ddc9d63c40b20fc74f37a37593dcbbdfbf28910a925e43ead00`
 
 Approved local images built from this repository:
 
