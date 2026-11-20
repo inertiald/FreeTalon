@@ -3455,6 +3455,98 @@ def _wrong_location_errors(
     return errors
 
 
+# A mkdir invocation inside a bash command: `mkdir -p <dir>` (also
+# `mkdir <dir>`). Args run to the next shell operator or newline.
+_MKDIR_ARGS_RE = re.compile(r"\bmkdir\b(?P<args>[^;&|\n]*)")
+
+
+def _mkdir_created_targets(command: str) -> set[str]:
+    """Literal directory paths a bash command creates with mkdir.
+
+    Heredoc bodies and quoted strings are stripped first: a mkdir
+    inside file content or an echo string is data, not a command.
+    Only literal targets count — a path carrying shell expansion
+    ($, backtick, glob) expands to a name the validator cannot
+    know, so it is not credited (the same rule _node_written_paths
+    applies to write targets).
+    """
+    shell = _strip_heredoc_bodies(command)
+    unquoted = re.sub(r"'[^']*'|\"[^\"]*\"", "", shell)
+    created: set[str] = set()
+    for match in _MKDIR_ARGS_RE.finditer(unquoted):
+        for token in match.group("args").split():
+            if token.startswith("-"):
+                continue
+            if any(char in token for char in "$`*?[]"):
+                continue
+            created.add(token)
+    return created
+
+
+def _plan_created_directories(
+    nodes: list[PlanNode], root: Path
+) -> dict[str, set[str]]:
+    """Map node id -> repo-relative directories that node creates.
+
+    Only bash/shell_exec nodes can create a directory (a mkdir in
+    their command). Directories outside the repo tree are irrelevant
+    to the missing-directory check and are dropped.
+    """
+    created: dict[str, set[str]] = {}
+    for node in nodes:
+        if getattr(node, "assigned_claw", "") not in ("bash", "shell_exec"):
+            continue
+        inputs = getattr(node, "inputs", None) or {}
+        command = inputs.get("command") or inputs.get("cmd")
+        if not isinstance(command, str) or not command:
+            continue
+        dirs = {
+            rel
+            for target in _mkdir_created_targets(command)
+            if (rel := _repo_relative_target(target, root)) is not None
+        }
+        if dirs:
+            created[node.id] = dirs
+    return created
+
+
+def _ancestor_node_ids(nodes: list[PlanNode]) -> dict[str, set[str]]:
+    """Map node id -> the ids it transitively depends on."""
+    by_id = {node.id: node for node in nodes}
+    ancestors: dict[str, set[str]] = {}
+
+    def collect(node_id: str, seen: set[str]) -> set[str]:
+        found: set[str] = set()
+        node = by_id.get(node_id)
+        if node is None:
+            return found
+        # Lenient node views (the duplicate-keys path) carry no
+        # depends_on: they get no ancestors, hence no mkdir credit —
+        # that path only enriches an already-certain rejection.
+        for dep in getattr(node, "depends_on", None) or []:
+            if dep in by_id and dep not in seen:
+                found.add(dep)
+                found |= collect(dep, seen | {dep})
+        return found
+
+    for node in nodes:
+        ancestors[node.id] = collect(node.id, {node.id})
+    return ancestors
+
+
+def _directory_is_created(parent_rel: str, created: set[str]) -> bool:
+    """True if a credited mkdir creates ``parent_rel``.
+
+    ``mkdir -p D`` creates D and every ancestor of D (but not D's
+    children), so a write is covered when its parent directory is
+    a created directory or an ancestor of one.
+    """
+    return any(
+        parent_rel == directory or directory.startswith(parent_rel + "/")
+        for directory in created
+    )
+
+
 def _missing_directory_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None,
@@ -3478,12 +3570,34 @@ def _missing_directory_errors(
     Disk-independent: the target is resolved to its repo-relative form
     first (an absolute fixture path outside this checkout reads this
     checkout's copy), so the check answers the same on seeker7 and in
-    CI. A directory the plan itself creates (mkdir -p) is not
-    credited — noted, not covered.
+    CI.
+
+    Executor alignment (2026-11-19, the pairing proof arm): the two
+    write claws differ, so the check does too. The scaffold claw
+    creates parent directories itself (tool_registry's scaffold
+    handler runs parent.mkdir(parents=True, exist_ok=True) before
+    writing), so a scaffold write into a new directory LANDS — it is
+    not rejected for a missing parent, except freetalon/tests/ below,
+    which is not merely missing but the wrong location. The bash claw
+    runs a real shell, where a heredoc/redirect into a missing
+    directory fails outright — those writes stay rejected UNLESS the
+    plan itself creates the directory: a mkdir in a step the write
+    transitively depends on (or earlier in the write's own command)
+    is credited, because the executor runs dependencies first. The
+    proof arm's model did exactly that (step_1 mkdir -p, every write
+    depending on it) and was still rejected three times running —
+    the check's own hint said "create the directory first" but the
+    directory the plan created was never credited.
     """
     root = index.root if index is not None else resolve_repo_root(repo_root)
+    created_by = _plan_created_directories(nodes, root)
+    ancestors = _ancestor_node_ids(nodes)
     errors: list[str] = []
     for node in nodes:
+        credited: set[str] = set()
+        for ancestor in ancestors.get(node.id, set()):
+            credited |= created_by.get(ancestor, set())
+        credited |= created_by.get(node.id, set())
         for target in sorted(_node_written_paths(node)):
             rel = _repo_relative_target(target, root)
             if rel is None:
@@ -3491,16 +3605,23 @@ def _missing_directory_errors(
             parent = root / Path(rel).parent
             if parent.exists():
                 continue
+            if _directory_is_created(Path(rel).parent.as_posix(), credited):
+                continue
             if rel.startswith("freetalon/tests/"):
                 test_name = rel[len("freetalon/tests/"):]
                 hint = (
                     f"Repo tests live at {root}/tests/, not freetalon/tests/ — "
                     f"write the test file to {root}/tests/{test_name}."
                 )
+            elif node.assigned_claw in ("scaffold", "file_writer"):
+                # The scaffold claw creates the parent directory at
+                # execution (see docstring), so this write lands.
+                continue
             else:
                 hint = (
-                    f"Create the directory first, or write under an existing "
-                    f"directory in the repo (repo root {root})."
+                    f"Create the directory first — a bash step running "
+                    f"mkdir -p that this step depends on — or write under "
+                    f"an existing directory in the repo (repo root {root})."
                 )
             errors.append(
                 f"Planner node '{node.id}' writes to {target!r}, but its "

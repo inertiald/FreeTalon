@@ -5451,3 +5451,54 @@ Deliberately left out:
   semantics (preserved by design) or a raw fixture whose
   verdicts are unchanged. Suite 1305/1305 (1294 + 11 new).
   Full log: freetalon-workspace/logs/planner-redesign-2026-11-19.log.
+
+
+## Update - 2026-11-19 (Validator alignment: duplicate_code dunder exemption, missing_directory mkdir crediting)
+
+The schema redesign's proof arm produced two complete, valid-shaped
+9-step plans and still failed at planning — (duplicate_code,
+missing_directory) x3 -> StuckRepairError. Investigation
+(freetalon-workspace/logs/validator-fix-2026-11-19.log) showed both
+validators misaligned with executor reality:
+
+- duplicate_code (repo_index.duplicate_scaffold_error) matched a new
+  file's stem against existing module stems, so a NEW package's
+  __init__.py / __main__.py were "duplicates" of the '__init__' /
+  '__main__' stems. Every package directory needs its own dunder
+  files; the check is name-only (content is never compared), so the
+  two exact filenames are now exempt and no protection is lost —
+  substantive stems and route names are still rejected, pinned in
+  both directions.
+- missing_directory (planner._missing_directory_errors) rejected
+  writes whose parent directory does not exist on disk and — by its
+  own docstring's admission — never credited a directory the plan
+  itself creates. Executor truth is per-claw: the scaffold claw
+  creates parents (tool_registry scaffold_handler:
+  parent.mkdir(parents=True, exist_ok=True) before write_text); the
+  bash claw runs a real shell, where a heredoc/redirect into a
+  missing directory fails outright. The check now follows the
+  executor: scaffold writes are not rejected for a missing parent —
+  except freetalon/tests/, which is not merely missing but the
+  WRONG location (a scaffold there would silently create a shadow
+  tree the suite never discovers; the rejection and its hint stay
+  for every claw). Bash writes stay rejected unless the plan
+  creates the directory in a step the write transitively depends
+  on, or earlier in the write's own command (mkdir targets are
+  extracted literally: heredoc bodies and quoted strings are
+  stripped, $-expansion/glob targets are never credited). The
+  planner prompt gained a NEW DIRECTORIES rule teaching the
+  mkdir + depends_on shape. The new helpers read node attributes
+  defensively: _collect_plan_error_records also runs on
+  _lenient_node_view SimpleNamespaces (no depends_on), and the
+  first cut crashed all 15 duplicate-key repair tests before the
+  getattr fix — pinned by a regression test.
+
+Evidence gates: the proof arm's two rejected plans now parse
+ACCEPTED verbatim; tests/test_planner_validator_alignment.py
+(16 tests) pins both directions of both validators, the mkdir
+extraction rules, the proof-arm plan shape, the lenient-view
+contract, and the prompt rule; corpus replay vs the 0112959
+baseline — CP1 56 rows + model-A/B 22 rows, ZERO substantive
+diffs; test_orchestrator_llm 746/746 with ZERO re-pins (the
+retry-18 counts and the bash freetalon/tests/ fixture reject
+exactly as before); full suite 1321/1321 (1305 + 16 new).

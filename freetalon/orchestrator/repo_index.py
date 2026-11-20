@@ -560,10 +560,25 @@ def duplicate_scaffold_error(target_path: str, index: RepoIndex) -> str | None:
     A new file is a duplicate when its stem matches an existing HTTP route
     name (``api/health.py`` duplicates ``GET /health``) or, when the new
     file lives inside the repo, an existing module of the same stem.
+    Package scaffolding files (``__init__.py``, ``__main__.py``) are
+    exempt by exact filename — every package directory needs its own.
     """
     if not target_path:
         return None
     candidate = Path(target_path)
+    # Package scaffolding is exempt by exact filename: every package
+    # directory must carry its OWN __init__.py (and may carry its own
+    # __main__.py), so a new package's dunder files collide with the
+    # existing '__init__' / '__main__' module stems by construction —
+    # "extend freetalon/__init__.py instead" cannot make
+    # freetalon/pairing/ a package. The check is name-only (content
+    # is never compared), so the exemption removes no real
+    # protection: substantive stems keep both branches below in
+    # full. (Pairing proof arm, 2026-11-19: a new standalone package
+    # was unplannable because its __init__.py / __main__.py were
+    # rejected as duplicates of those stems.)
+    if candidate.name in ("__init__.py", "__main__.py"):
+        return None
     # An existing file is an extension, not a duplicate.
     if candidate.is_absolute() and candidate.exists():
         return None
