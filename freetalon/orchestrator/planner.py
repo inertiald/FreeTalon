@@ -30,7 +30,9 @@ from .repo_index import (
     resolve_repo_root,
     duplicate_scaffold_error,
     format_repo_context,
+    format_spec_context,
     framework_in_text,
+    goal_named_specs,
     qualified_def_names,
 )
 from .measure import (
@@ -507,6 +509,7 @@ _SCHEMA_PATH_MERGED_CODES = frozenset(
         "scaffold_overwrite",
         "elision",
         "placeholder_value",
+        "stub_only_module",
         "sed_noop",
         "sed_ban",
         "placeholder_scaffold",
@@ -5208,6 +5211,199 @@ def _placeholder_value_errors(
     return errors
 
 
+def _is_not_implemented_stub_body(body: list[ast.stmt]) -> bool:
+    """True when a definition body is a docstring plus exactly one
+    ``raise NotImplementedError`` statement — the stub shape."""
+    statements = list(body)
+    if (
+        statements
+        and isinstance(statements[0], ast.Expr)
+        and isinstance(statements[0].value, ast.Constant)
+        and isinstance(statements[0].value.value, str)
+    ):
+        statements = statements[1:]
+    if len(statements) != 1:
+        return False
+    statement = statements[0]
+    if not isinstance(statement, ast.Raise) or statement.exc is None:
+        return False
+    exc = statement.exc
+    if isinstance(exc, ast.Call):
+        exc = exc.func
+    return isinstance(exc, ast.Name) and exc.id == "NotImplementedError"
+
+
+def _is_constant_expr(node: ast.AST) -> bool:
+    """A literal or a container of literals (``__all__ = [...]`` is
+    declarative module furniture, not implementation)."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_is_constant_expr(elt) for elt in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            (key is None or _is_constant_expr(key))
+            and _is_constant_expr(value)
+            for key, value in zip(node.keys, node.values)
+        )
+    return False
+
+
+def _stub_only_module(source: str) -> bool:
+    """True when a module's every definition is a NotImplementedError stub.
+
+    The exam re-arm #4 shape (2026-11-23): a new module whose
+    classes and functions carry real-looking signatures over bodies
+    that only ``raise NotImplementedError("Implement per
+    CONTRACT.md")`` — a scaffold deferring the implementation to a
+    synthesis step that does not exist in the plan. Declarations
+    are exempt, mirroring _ellipsis_value_assignments: @overload /
+    @abstractmethod definitions and Protocol members are interface
+    declarations, not implementations, and a module of only those
+    is a typing surface, not a stub scaffold. The rule is strict
+    about "solely": one real definition, or module-level code
+    beyond docstring / imports / constant assignments, disqualifies
+    — partial scaffolds are the critic's judgment call, not this
+    rule's. Unparseable source yields False (the parse checks own
+    that defect).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    saw_impl_def = False
+    saw_real = False
+
+    def visit_def(
+        node: ast.FunctionDef | ast.AsyncFunctionDef, exempt: bool
+    ) -> None:
+        nonlocal saw_impl_def, saw_real
+        if exempt or any(
+            _dotted_name_tail(decorator) in _ELLIPSIS_STUB_DECORATORS
+            for decorator in node.decorator_list
+        ):
+            return
+        saw_impl_def = True
+        if not _is_not_implemented_stub_body(node.body):
+            saw_real = True
+
+    def visit_class(node: ast.ClassDef, exempt: bool) -> None:
+        nonlocal saw_real
+        inner_exempt = exempt or any(
+            _dotted_name_tail(base) == "Protocol" for base in node.bases
+        )
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit_def(child, inner_exempt)
+            elif isinstance(child, ast.ClassDef):
+                visit_class(child, inner_exempt)
+            elif (
+                isinstance(child, ast.Expr)
+                and isinstance(child.value, ast.Constant)
+                and isinstance(child.value.value, str)
+            ):
+                continue  # class docstring
+            elif isinstance(child, (ast.Assign, ast.AnnAssign)):
+                if child.value is not None and not _is_constant_expr(
+                    child.value
+                ):
+                    saw_real = True
+            else:
+                saw_real = True
+
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            visit_def(statement, False)
+        elif isinstance(statement, ast.ClassDef):
+            visit_class(statement, False)
+        elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+            continue
+        elif (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        ):
+            continue  # module docstring
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            if statement.value is not None and not _is_constant_expr(
+                statement.value
+            ):
+                saw_real = True
+        else:
+            saw_real = True
+    return saw_impl_def and not saw_real
+
+
+def _stub_only_module_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    goal_text: str | None = None,
+    index: Any | None = None,
+) -> list[str]:
+    """Reject a NEW module whose every definition is a stub.
+
+    Exam re-arm #4 (2026-11-23): the accepted plan scaffolded the
+    pairing package as NotImplementedError stubs ("Implement per
+    CONTRACT.md") and deferred the implementation to a later
+    synthesis step; parse passed it, execution spent three nodes
+    writing it, and only the critic's hollow review stopped the
+    writes. The shape is deterministic — an AST fact about the
+    content, like placeholder_value — so it becomes a planning-stage
+    rejection the repair loop iterates on before execution.
+
+    Scope (the boundary is the point, as in _placeholder_value_errors):
+    scaffold/file_writer content for a NON-test Python implementation
+    file that does NOT exist yet. An existing file's rewrite is the
+    overwrite / anchored-edit checks' territory (and a faithful
+    rewrite of a stub module that already exists introduces nothing
+    this rule owns); package scaffolding files (__init__.py,
+    __main__.py) are exempt — a new package's dunder files are
+    legitimately near-empty; content another rule owns is skipped
+    (placeholder content and labeled placeholder stubs — the
+    placeholder check; unparseable content — the parse check).
+    """
+    errors: list[str] = []
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("scaffold", "file_writer"):
+            continue
+        target = (
+            node.inputs.get("file_path")
+            or node.inputs.get("path")
+            or (node.outputs[0] if node.outputs else "")
+        )
+        content = node.inputs.get("content")
+        if not isinstance(target, str) or not target:
+            continue
+        if not isinstance(content, str):
+            continue
+        if not is_code_path(target):
+            continue
+        if Path(target).suffix.lower() != ".py":
+            continue
+        if _is_test_file_path(target):
+            continue
+        if Path(target).name in ("__init__.py", "__main__.py"):
+            continue
+        if is_placeholder_content(content) or _is_placeholder_stub(content):
+            continue
+        if _resolve_plan_target(target, root).exists():
+            continue
+        if _stub_only_module(content):
+            errors.append(
+                f"Planner node '{node.id}' scaffolds {target!r} as a "
+                "module whose every definition only raises "
+                "NotImplementedError — a scaffold that defers the "
+                "implementation to a step that does not exist in the "
+                "plan. Write the real implementation the goal "
+                "requires, in this node: where the goal names a spec "
+                "file, its text is in this prompt — implement what "
+                "it pins, with real bodies that compute and return "
+                "the specified values."
+            )
+    return errors
+
+
 def _scaffold_overwrite_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None,
@@ -5713,6 +5909,16 @@ CONTRACT_METADATA_KEY = "module_contract"
 # it at parse, and the reason was recorded nowhere). System-owned
 # like module_contract — the planner is its only writer.
 CONTRACT_REASK_METADATA_KEY = "contract_reask"
+
+# The goal-named spec record (spec grounding, 2026-11-23): the
+# specs the harness loaded verbatim into this plan's prompts —
+# path, sha256, and byte count per file — stamped by
+# plan_task_intent and mirrored into the re-plan brief by
+# replan_from_brief, so a post-mortem can prove which
+# authoritative text reached the calls instead of inferring it.
+# System-owned like contract_reask: set from the loader's own
+# result, cleared when the goal named no spec.
+SPEC_CONTEXT_METADATA_KEY = "spec_context"
 
 # Sentinel for _collect_plan_error_records' contract parameter: the
 # caller supplied no contract context, so the contract checks do
@@ -6502,7 +6708,8 @@ def _collect_plan_error_records(
     Returns (records, cheap): ``cheap`` is True when every error is a
     stand-in / code-overwrite fake (retry #12) or a placeholder scaffold
     (retry #17), or placeholder values (cycle 6), or a suite run attached
-    to a criterion command (cycle 12) — a rejection the repair
+    to a criterion command (cycle 12), or a stub-only module (2026-11-23)
+    — a rejection the repair
     loop may re-prompt for free, without spending the repair budget.
     """
     if modules is None:
@@ -6609,6 +6816,11 @@ def _collect_plan_error_records(
         ),
     )
     records.extend(placeholder_value_records)
+    stub_only_records = _error_records(
+        "stub_only_module",
+        _stub_only_module_errors(nodes, repo_root, goal_text, index),
+    )
+    records.extend(stub_only_records)
     records.extend(
         _error_records(
             "sed_noop",
@@ -6697,11 +6909,16 @@ def _collect_plan_error_records(
     # placeholder values: the plan is executable as written except
     # that the suite run sits on a criterion instead of the node's
     # own command — a mechanical relocation, fixed in one re-prompt.
+    # A stub-only module rejection (2026-11-23) is cheap by the
+    # placeholder rationale too: the module's shape is complete
+    # except that every definition defers to a step that does not
+    # exist — real code is one re-prompt away.
     cheap = (
         bool(records)
         and len(standin_records)
         + len(placeholder_records)
         + len(placeholder_value_records)
+        + len(stub_only_records)
         + len(suite_criterion_records)
         == len(records)
     )
@@ -10316,9 +10533,22 @@ def plan_task_intent(
     to discover it by trial and error.
     """
     workspace = (intent.constraints or {}).get("workspace")
-    context = format_repo_context(
-        build_repo_index(repo_root), workspace=workspace
+    index = build_repo_index(repo_root)
+    context = format_repo_context(index, workspace=workspace)
+    # Spec grounding (2026-11-23): a spec file the goal names is
+    # loaded verbatim into the prompt (goal_named_specs) — the
+    # goal's prose alone first carried a restated summary the loop
+    # implemented instead of the spec (exam re-arm #3), then,
+    # scrubbed, nothing at all (re-arm #4). An oversized or
+    # unreadable named spec raises here, before any call: planning
+    # fails loudly rather than running ungrounded.
+    specs = goal_named_specs(
+        intent.goal, resolve_repo_root(repo_root), index
     )
+    spec_section = ""
+    if specs:
+        spec_section = f"\n\n{format_spec_context(specs)}"
+
     shape = _route_goal_shape(intent.goal, repo_root, delta=False)
     shape_block = f"\n\n{shape}" if shape else ""
     # Retry #22: the shape sat at ~70% of the initial prompt (offset
@@ -10327,7 +10557,7 @@ def plan_task_intent(
     # immediately before "JSON Output:" — instead of ahead of the
     # instruction. Only ~13 chars ("\n\nJSON Output:") follow it.
     user_prompt = (
-        f"{context}\n\n"
+        f"{context}{spec_section}\n\n"
         f"{_format_intent_for_prompt(intent)}\n\n"
         "Produce a NEW execution plan DAG for the goal above. Your output "
         "must be a JSON object with a \"nodes\" array — do NOT repeat the "
@@ -10356,6 +10586,15 @@ def plan_task_intent(
     # no validation or steering behavior changes.
     metadata = dict(metadata or {})
     metadata.setdefault("repo_root", str(resolve_repo_root(repo_root)))
+    # The spec record is system-owned trail, stamped from the
+    # loader's result like the contract_reask record in
+    # _call_llm_with_repair: cleared first, so a value a model
+    # payload carried under the key never survives.
+    metadata.pop(SPEC_CONTEXT_METADATA_KEY, None)
+    if specs:
+        metadata[SPEC_CONTEXT_METADATA_KEY] = [
+            spec.record() for spec in specs
+        ]
     return build_execution_plan(intent, nodes, metadata, plan_id=plan_id)
 
 
@@ -10386,6 +10625,16 @@ def replan_from_brief(
 
     index = build_repo_index(repo_root)
     context = format_repo_context(index, workspace=brief.get("workspace"))
+    # Spec grounding (2026-11-23), as in plan_task_intent: a fresh
+    # planning call gets the goal-named spec verbatim again — the
+    # initial call's grounding does not transfer through the brief.
+    specs = goal_named_specs(
+        _goal_text_from_brief(brief), resolve_repo_root(repo_root), index
+    )
+    spec_section = ""
+    if specs:
+        spec_section = f"\n\n{format_spec_context(specs)}"
+
     shape = _route_goal_shape(_goal_text_from_brief(brief), repo_root)
     shape_block = f"\n\n{shape}" if shape else ""
     # The replan needs the node shape in front of it, not just as a
@@ -10426,7 +10675,7 @@ def replan_from_brief(
     # before "JSON Output:" — it is the decision, not preamble. The
     # seed block goes BEFORE the shape, so the shape stays last.
     user_prompt = (
-        f"{context}\n\n{_format_brief_for_prompt(brief)}{node_shape_block}\n\n"
+        f"{context}{spec_section}\n\n{_format_brief_for_prompt(brief)}{node_shape_block}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
         "quote, or echo the brief — it is your input, not your output.\n"
         f"{seed_block}"
@@ -10449,6 +10698,10 @@ def replan_from_brief(
     if metadata.get(CONTRACT_REASK_METADATA_KEY) is not None:
         brief[CONTRACT_REASK_METADATA_KEY] = metadata[
             CONTRACT_REASK_METADATA_KEY
+        ]
+    if specs:
+        brief[SPEC_CONTEXT_METADATA_KEY] = [
+            spec.record() for spec in specs
         ]
     return nodes
 
@@ -10808,15 +11061,22 @@ def _local_repair_target_for_entry(
 
 
 def _local_repair_prompts(
-    goal_text: str, target: _LocalRepairTarget
+    goal_text: str, target: _LocalRepairTarget, spec_block: str = ""
 ) -> tuple[str, str]:
     """The focused repair ask: the window as it stands, the failure,
     and cycle 7's demand — complete real code, computed values,
     attempt-and-fallback, no invented constants, no placeholders.
     The window is shown unnumbered, as codebase grounding shows code.
+
+    When the goal names a spec, ``spec_block`` carries its verbatim
+    text (spec grounding, 2026-11-23): the repair is a code-writing
+    call for code the spec governs, so it gets the text directly —
+    the planner's understanding does not transfer through the plan.
     """
+    spec_section = f"{spec_block}\n\n" if spec_block else ""
     user_prompt = (
         f"THE TASK IS UNCHANGED: {goal_text}\n\n"
+        f"{spec_section}"
         f"One step of the current plan (node {target.culprit_id}) wrote "
         f"{target.target_path}, and a later step (node {target.failed_id}) "
         f"measured the result and failed: {target.criterion_detail}.\n\n"
@@ -10982,7 +11242,15 @@ def _try_local_repair(
     goal_text = plan.intent.goal
     if isinstance(goal, dict) and isinstance(goal.get("objective"), str):
         goal_text = goal["objective"]
-    system_prompt, user_prompt = _local_repair_prompts(goal_text, target)
+    # Spec grounding (2026-11-23): a goal-named spec reaches the
+    # repair call verbatim too (see _local_repair_prompts). An
+    # unloadable named spec raises SpecContextError, which
+    # try_local_repair's blanket fallback turns into a whole-task
+    # re-plan — where the same loader raises it loudly at planning.
+    specs = goal_named_specs(goal_text, root)
+    system_prompt, user_prompt = _local_repair_prompts(
+        goal_text, target, format_spec_context(specs)
+    )
     effective = settings or LLMSettings.from_env()
     if effective.num_ctx is None:
         effective = dataclass_replace(effective, num_ctx=_PLANNER_NUM_CTX)

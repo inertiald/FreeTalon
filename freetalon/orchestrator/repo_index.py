@@ -19,6 +19,7 @@ moves; tests may point it at a synthetic tree instead.
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 import re
 import subprocess
@@ -213,6 +214,14 @@ class RepoIndex:
     # followed the skeleton shape but filled it with placeholder
     # comments). Empty for a route with no recorded branch.
     route_branches: dict[str, str] = field(default_factory=dict)
+    # Repo documents: rel-path (posix) -> size in bytes, for every
+    # *.md under the root outside .git/.venv/caches. The code walks
+    # below never surfaced a document, so a goal naming a spec file
+    # (freetalon/pairing/CONTRACT.md) grounded nothing — the planner
+    # planned from the goal's prose alone (exam re-arms #3/#4,
+    # 2026-11-23). goal_named_specs matches goal tokens against
+    # this inventory.
+    docs: dict[str, int] = field(default_factory=dict)
 
     def route_names(self) -> set[str]:
         """First path segment of each route ("health", "tasks", ...)."""
@@ -397,9 +406,15 @@ def qualified_def_names(source: str) -> list[str]:
 
 
 def build_repo_index(repo_root: str | Path | None = None) -> RepoIndex:
-    """Walk ``<root>/freetalon/**/*.py`` and index routes, modules, and the API port."""
+    """Walk ``<root>/freetalon/**/*.py`` and index routes, modules, and the API port.
+
+    Also inventories the repo's documents (*.md, rel-path -> size)
+    in ``index.docs`` — the inventory goal_named_specs matches
+    against and format_repo_context lists.
+    """
     root = resolve_repo_root(repo_root)
     index = RepoIndex(root=root)
+    index.docs = _scan_repo_docs(root)
     package = root / "freetalon"
     if not package.is_dir():
         return index
@@ -549,6 +564,16 @@ def format_repo_context(index: RepoIndex, workspace: str | None = None) -> str:
             lines.append(f"- {rel}{detail}")
         if len(index.files) > _MAX_CONTEXT_FILES:
             lines.append(f"- … and {len(index.files) - _MAX_CONTEXT_FILES} more modules.")
+    if index.docs:
+        shown_docs = sorted(index.docs)[:_MAX_CONTEXT_FILES]
+        listing = ", ".join(
+            f"{rel} ({index.docs[rel]} bytes)" for rel in shown_docs
+        )
+        lines.append(f"- Repo documents: {listing}.")
+        if len(index.docs) > _MAX_CONTEXT_FILES:
+            lines.append(
+                f"- … and {len(index.docs) - _MAX_CONTEXT_FILES} more documents."
+            )
     return "\n".join(lines)
 
 
@@ -609,3 +634,206 @@ def duplicate_scaffold_error(target_path: str, index: RepoIndex) -> str | None:
                 "extend that module instead of creating a new file"
             )
     return None
+
+
+# ── Goal-named spec grounding ─────────────────────────────────────
+#
+# The index above answers "what code exists"; it never showed the
+# planner a document. Exam re-arms #3/#4 (2026-11-23) measured what
+# that costs: the goal named freetalon/pairing/CONTRACT.md as the
+# specification, its contents reached no call, and the loop first
+# implemented the goal's own restated summary instead of the spec,
+# then — with the summary scrubbed — wrote NotImplementedError
+# stubs deferring to the file it could not see, and invented a
+# protocol on re-plan. The cross-model consultation's consensus fix
+# (verbatim injection, ranked first by 7 of 8 models consulted):
+# the harness loads a goal-named spec itself and puts its exact
+# text in front of the planner and the code-writing calls. Matching
+# is deterministic — a repo-relative path named in the goal, an
+# absolute path under the root, or a basename unique in the repo.
+
+# A file reference in goal prose: a path-shaped token ending in a
+# spec extension ("freetalon/pairing/CONTRACT.md", "CONTRACT.md",
+# "/abs/root/docs/DESIGN.md"). Sentence punctuation around the
+# token is outside the character class, so it never sticks to the
+# match. A .py file named in a goal is code — the index already
+# grounds it; the gap measured above was documents.
+_SPEC_FILE_RE = re.compile(r"[A-Za-z0-9_./-]+\.(?:md|txt|rst)", re.IGNORECASE)
+
+# Total bytes of goal-named spec text one call carries. CONTRACT.md
+# is 9.6 KB; the cap leaves ~3x headroom for a spec plus companions
+# while keeping the block a bounded part of the prompt. Over the
+# cap the planning call fails loudly (SpecContextError): a
+# truncated spec is a wrong spec, so the normative text is never
+# silently cut (the consultation's "stop or deliberately
+# partition" rule; partitioning is future work).
+_MAX_SPEC_CONTEXT_BYTES = 32768
+
+# Directories the docs walk never enters: VCS internals, the venv
+# (its vendored .md files are not repo documents), caches.
+_DOC_WALK_EXCLUDED = {".git", ".venv", "__pycache__", "node_modules"}
+
+
+class SpecContextError(ValueError):
+    """A goal-named spec cannot be grounded as-is.
+
+    Raised when a named file cannot be read, is not UTF-8 text, or
+    the named specs together exceed _MAX_SPEC_CONTEXT_BYTES.
+    Planning fails loudly rather than proceeding ungrounded or
+    silently truncating the normative text.
+    """
+
+
+@dataclass
+class SpecDocument:
+    """One goal-named spec file, loaded verbatim from disk."""
+
+    path: str  # repo-relative posix path
+    sha256: str
+    byte_count: int
+    text: str
+
+    def record(self) -> dict[str, str | int]:
+        """The audit-trail entry: what was included, provably."""
+        return {
+            "path": self.path,
+            "sha256": self.sha256,
+            "bytes": self.byte_count,
+        }
+
+
+def _scan_repo_docs(root: Path) -> dict[str, int]:
+    """Repo documents (rel-path -> byte size): every *.md under the
+    root outside the excluded directories."""
+    docs: dict[str, int] = {}
+    if not root.is_dir():
+        return docs
+    for path in sorted(root.rglob("*.md")):
+        rel = path.relative_to(root)
+        if any(part in _DOC_WALK_EXCLUDED for part in rel.parts):
+            continue
+        try:
+            docs[rel.as_posix()] = path.stat().st_size
+        except OSError:
+            continue
+    return docs
+
+
+def _match_spec_token(
+    token: str, root: Path, docs: dict[str, int]
+) -> str | None:
+    """The repo-relative path a goal's file token names, or None.
+
+    A token matches when it IS a repo-relative doc path, when it is
+    an absolute path under the root, or when its basename is unique
+    among the repo's docs. An ambiguous basename matches nothing —
+    guessing between two same-named specs would ground the plan in
+    the wrong text.
+    """
+    if token.startswith("/"):
+        try:
+            candidate = Path(token).relative_to(root).as_posix()
+        except ValueError:
+            return None
+    else:
+        candidate = token
+        while candidate.startswith("./"):
+            candidate = candidate[2:]
+    if candidate in docs:
+        return candidate
+    basename = candidate.rsplit("/", 1)[-1]
+    matches = [
+        rel for rel in docs if rel.rsplit("/", 1)[-1] == basename
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def goal_named_specs(
+    goal_text: str | None,
+    root: str | Path,
+    index: RepoIndex | None = None,
+) -> list[SpecDocument]:
+    """The spec files ``goal_text`` names, loaded verbatim.
+
+    Deterministic: goal tokens are matched against the repo's docs
+    (``index``'s inventory when given — it must be the index of the
+    same root — a fresh scan otherwise), each matched file is read
+    once, and the result is sorted by path. A named file that
+    cannot be read or decoded, or a set whose total size exceeds
+    _MAX_SPEC_CONTEXT_BYTES, raises SpecContextError: planning
+    fails loudly rather than running ungrounded or on a truncated
+    spec. A goal naming no existing spec file returns [] and every
+    caller behaves exactly as before this grounding existed.
+    """
+    if not goal_text:
+        return []
+    root_path = Path(root).expanduser().resolve()
+    docs = index.docs if index is not None else _scan_repo_docs(root_path)
+    matched: list[str] = []
+    for token in _SPEC_FILE_RE.findall(goal_text):
+        rel = _match_spec_token(token, root_path, docs)
+        if rel is not None and rel not in matched:
+            matched.append(rel)
+    specs: list[SpecDocument] = []
+    total = 0
+    for rel in sorted(matched):
+        try:
+            raw = (root_path / rel).read_bytes()
+        except OSError as exc:
+            raise SpecContextError(
+                f"goal-named spec {rel!r} could not be read: {exc}"
+            ) from exc
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SpecContextError(
+                f"goal-named spec {rel!r} is not UTF-8 text: {exc}"
+            ) from exc
+        total += len(raw)
+        specs.append(
+            SpecDocument(
+                path=rel,
+                sha256=hashlib.sha256(raw).hexdigest(),
+                byte_count=len(raw),
+                text=text,
+            )
+        )
+    if total > _MAX_SPEC_CONTEXT_BYTES:
+        detail = ", ".join(
+            f"{spec.path} ({spec.byte_count} bytes)" for spec in specs
+        )
+        raise SpecContextError(
+            f"goal-named specs total {total} bytes, over the "
+            f"{_MAX_SPEC_CONTEXT_BYTES}-byte grounding cap: {detail}. "
+            "Name fewer specs, or split the spec deliberately — the "
+            "normative text is never truncated silently."
+        )
+    return specs
+
+
+def format_spec_context(specs: list[SpecDocument]) -> str:
+    """The prompt block carrying goal-named specs, verbatim.
+
+    The framing is the consultation's short form: the spec is
+    authoritative, the plan decomposes it rather than replacing it,
+    and a gap in the spec is named, never filled by invention. The
+    file text itself is reproduced exactly as read — no summary,
+    no excerpt.
+    """
+    if not specs:
+        return ""
+    lines = [
+        "GOAL-NAMED SPEC — the file(s) below are the authoritative "
+        "specification for this goal. The plan decomposes the spec; "
+        "it never replaces it. Where the spec is silent or "
+        "contradictory, name the gap instead of inventing behavior."
+    ]
+    for spec in specs:
+        lines.append(
+            f"--- {spec.path} (sha256 {spec.sha256[:12]}, "
+            f"{spec.byte_count} bytes) ---"
+        )
+        lines.append(spec.text)
+    return "\n".join(lines)
