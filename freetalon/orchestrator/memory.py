@@ -302,6 +302,30 @@ def approach_signature(node: Any) -> tuple[Any, ...] | None:
     return signature_from_approach(approach_for(node))
 
 
+def write_targets_for_node(node: Any) -> tuple[str, ...]:
+    """The files a node writes, read off its approach signature.
+
+    A write-form signature — (claw, "write", (target, ...)) for the
+    write claws, ("bash", "write", targets) for a shell command the
+    extractor proved writes files — carries the targets as its third
+    element. Anything else (a substantive command, a params call,
+    plumbing with no signature) writes nothing this function can
+    prove, so it contributes no targets.
+    """
+    signature = approach_signature(node)
+    if signature is not None and len(signature) >= 3 and signature[1] == "write":
+        return tuple(str(target) for target in signature[2])
+    return ()
+
+
+def write_targets_for_nodes(nodes: Any) -> list[str]:
+    """The sorted union of write targets across a node list."""
+    targets: set[str] = set()
+    for node in nodes or []:
+        targets.update(write_targets_for_node(node))
+    return sorted(targets)
+
+
 def describe_signature(signature: tuple[Any, ...]) -> str:
     """A human description of an approach signature, for messages."""
     capability, form = str(signature[0]), str(signature[1])

@@ -7698,6 +7698,49 @@ def _format_brief_for_prompt(brief: dict[str, Any]) -> str:
                 "The previous delta plan did not remove it; change what "
                 "produces this result, not just the steps around it."
             )
+    # Re-plan anchoring (2026-11-23): the judge's computed record —
+    # the failing tests by name, the stagnation verdict when that
+    # set is identical to the previous brief's, and the produced-file
+    # lists. Rendered only when the judge stamped the fields and
+    # they are non-empty: a brief without them (every brief shape
+    # before this change) renders byte-identically to before.
+    failing_tests = brief.get("failing_tests") or []
+    if failing_tests:
+        lines.append(
+            "Failing tests (named by the system from the failed "
+            "nodes' captured output): "
+            + ", ".join(str(test) for test in failing_tests)
+        )
+    stagnation = brief.get("stagnation")
+    if isinstance(stagnation, dict) and stagnation.get("failing_tests"):
+        last_change = stagnation.get("last_change_files") or []
+        lines.append(
+            "Stagnation (system): the failing tests above are "
+            "IDENTICAL to the failing tests briefed for plan version "
+            f"{stagnation.get('unchanged_since_version', '')} — they "
+            "failed before the last change and they failed after it. "
+            "The last change modified: "
+            + (", ".join(str(target) for target in last_change) or "(no files)")
+            + ". A further change confined to those same files is "
+            "unlikely to move them. Widen the suspect set — the "
+            "modules the failing tests exercise, the tests "
+            "themselves, and the files listed below — instead of "
+            "rewriting the same files again."
+        )
+    never_revised = brief.get("never_revised_files") or []
+    if never_revised:
+        lines.append(
+            "Files produced by earlier plan versions that the most "
+            "recent version did not revise: "
+            + ", ".join(str(target) for target in never_revised)
+        )
+    missing_declared = brief.get("missing_declared_files") or []
+    if missing_declared:
+        lines.append(
+            "Files declared as write targets by an earlier plan "
+            "version but missing on disk (declared, never produced): "
+            + ", ".join(str(target) for target in missing_declared)
+        )
     measurements = brief.get("measurements") or []
     if measurements:
         lines.append("Measurements so far:")
@@ -10612,6 +10655,282 @@ def plan_task_intent(
     return build_execution_plan(intent, nodes, metadata, plan_id=plan_id)
 
 
+# ── Re-plan diagnostics: suspect map + precedence (2026-11-23) ─────
+#
+# Exam re-arm #8: with a failure named only as a node-level
+# criterion miss, the planner attributed every failing test to the
+# module it had most recently rewritten — three re-plans rewrote
+# store.py while the defects sat in server.py (produced in v1,
+# never revised) and in a produced test that contradicted the
+# contract. The block built here is the mechanical counterpart to
+# the judge's stagnation record: for each failing test the system
+# locates the test's own source in the file on disk and names the
+# produced modules that file exercises, then states the precedence
+# rule — a produced test is a derived artifact; the spec (or,
+# without one, the goal) outranks it. Everything is computed from
+# the brief's system-stamped fields and the files on disk, never
+# from model output. The suspect map is returned alongside the
+# block so the caller can stamp it back into the brief (the
+# rejected_approaches write-back channel), where the judge's
+# stagnation gate reads it for its repair note.
+
+_SUSPECT_TEST_CAP = 10
+_SUSPECT_METHOD_LINES = 40
+_SUSPECT_METHOD_CHARS = 1600
+_SUSPECT_SEARCH_FILE_CAP = 400
+_SUSPECT_SEARCH_SKIP_DIRS = frozenset(
+    {".git", ".venv", "__pycache__", "node_modules", "models"}
+)
+
+
+def _root_relative(path_text: str, root: Path) -> str:
+    """A path as a repo-relative posix string, when it is under root."""
+    path = Path(path_text)
+    if path.is_absolute():
+        try:
+            return path.relative_to(root).as_posix()
+        except ValueError:
+            return path.as_posix()
+    return path.as_posix()
+
+
+def _is_test_file_name(path: Path) -> bool:
+    name = path.name
+    return name.endswith(".py") and (
+        name.startswith("test_")
+        or name.endswith("_test.py")
+        or "tests" in path.parts
+    )
+
+
+def _test_id_candidates(test_id: str, root: Path) -> list[tuple[Path, str]]:
+    """(file, method) candidates for a failing test identifier.
+
+    pytest nodeids name the file outright ("tests/test_x.py::C::test_m");
+    unittest identifiers are dotted ("pkg.mod.Class.test_m") — the
+    method is the last component and the module is a prefix of the
+    rest, tried longest-first (the class name is not a module).
+    Existence and content are the caller's check.
+    """
+    if "::" in test_id:
+        file_part, _, rest = test_id.partition("::")
+        method = rest.split("::")[-1]
+        return [(root / file_part, method)] if method else []
+    parts = test_id.split(".")
+    if len(parts) < 2:
+        return []
+    method = parts[-1]
+    candidates: list[tuple[Path, str]] = []
+    for cut in range(len(parts) - 1, 0, -1):
+        base = root.joinpath(*parts[:cut])
+        candidates.append((base.with_suffix(".py"), method))
+        candidates.append((base / "__init__.py", method))
+    return candidates
+
+
+def _test_method_source(path: Path, method: str) -> str | None:
+    """The source lines of one test method in a file, bounded.
+
+    AST-located (module level or inside a class), sliced by line
+    numbers, then capped by lines and by characters like every
+    other excerpt the brief carries. None when the file does not
+    parse or defines no such method.
+    """
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+        return None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == method
+            and node.end_lineno is not None
+        ):
+            lines = source.splitlines()[node.lineno - 1 : node.end_lineno]
+            text = "\n".join(lines[:_SUSPECT_METHOD_LINES])
+            if len(text) > _SUSPECT_METHOD_CHARS:
+                text = text[: _SUSPECT_METHOD_CHARS - 3] + "..."
+            return text
+    return None
+
+
+def _locate_failing_test(
+    test_id: str, root: Path
+) -> tuple[Path, str] | None:
+    """Locate a failing test's (file, method) on disk, or None.
+
+    Direct candidates first (nodeid path / dotted module path); the
+    fallback is a bounded search of the repo's test files for a
+    definition of the method name, in sorted path order so the
+    result is deterministic.
+    """
+    for candidate, method in _test_id_candidates(test_id, root):
+        if candidate.is_file() and _test_method_source(candidate, method):
+            return candidate, method
+    method = test_id.replace("::", ".").split(".")[-1]
+    if not method.startswith("test"):
+        return None
+    scanned = 0
+    for path in sorted(root.rglob("*.py")):
+        if any(part in _SUSPECT_SEARCH_SKIP_DIRS for part in path.parts):
+            continue
+        if not _is_test_file_name(path):
+            continue
+        scanned += 1
+        if scanned > _SUSPECT_SEARCH_FILE_CAP:
+            break
+        if _test_method_source(path, method):
+            return path, method
+    return None
+
+
+def _produced_module_form(rel_path: str) -> str:
+    """The dotted module form of a produced .py path."""
+    form = rel_path[:-3] if rel_path.endswith(".py") else rel_path
+    if form.endswith("/__init__"):
+        form = form[: -len("/__init__")]
+    return form.replace("/", ".")
+
+
+def _test_file_exercised_modules(
+    test_path: Path, root: Path, produced_files: Collection[str]
+) -> list[str]:
+    """Produced non-test modules a test file imports or names.
+
+    Import statements are the primary evidence: absolute imports
+    match by dotted prefix in either direction, and relative imports
+    are resolved against the test file's own package. A produced
+    module whose name appears as a word in the source also counts —
+    plans name modules in strings (importlib, subprocess commands)
+    as well as imports. Produced test files are never exercised
+    modules: the suspect is the code under test, not another test.
+    """
+    try:
+        source = test_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+        return []
+    try:
+        package_parts = list(test_path.parent.relative_to(root).parts)
+    except ValueError:
+        package_parts = []
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                keep = len(package_parts) - (node.level - 1)
+                base = package_parts[:keep] if keep > 0 else []
+                module = ".".join(base + ([node.module] if node.module else []))
+            else:
+                module = node.module or ""
+            if module:
+                imported.add(module)
+                for alias in node.names:
+                    imported.add(f"{module}.{alias.name}")
+    exercised: list[str] = []
+    for produced in produced_files:
+        rel = _root_relative(str(produced), root)
+        if not rel.endswith(".py") or _is_test_file_name(Path(rel)):
+            continue
+        if rel == _root_relative(str(test_path), root):
+            continue
+        form = _produced_module_form(rel)
+        stem = Path(rel).stem
+        # An import names the module itself, or something under it
+        # ("from pkg.store import CodeConflict"). Importing a parent
+        # package alone does not mark every produced submodule as
+        # exercised — that access shows up as a name in the source,
+        # which by_name below catches.
+        by_import = any(
+            name == form or name.startswith(form + ".") for name in imported
+        )
+        by_name = len(stem) >= 3 and (
+            re.search(rf"\b{re.escape(stem)}\b", source) is not None
+        )
+        if by_import or by_name:
+            exercised.append(rel)
+    return sorted(exercised)
+
+
+def _replan_diagnostics(
+    brief: dict[str, Any],
+    root: Path,
+    *,
+    has_spec: bool,
+    spec_paths: Collection[str] = (),
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    """The re-plan prompt's diagnostics block + the suspect map.
+
+    ("", {}) when the brief names no failing tests — a re-plan
+    whose failure was not a test run prompts exactly as before. The
+    suspect map (per failing test: its file on disk, the produced
+    modules it exercises) is returned for the caller to stamp back
+    into the brief; the block renders the same facts plus the
+    test's bounded source and the precedence rule.
+    """
+    failing = [str(test) for test in brief.get("failing_tests") or []]
+    if not failing:
+        return "", {}
+    produced = brief.get("produced_files") or []
+    suspect_map: dict[str, dict[str, Any]] = {}
+    lines = [
+        "Re-plan diagnostics (system — computed from this run's "
+        "measurements and the files on disk, not from a model's "
+        "account of them):"
+    ]
+    for test_id in failing[:_SUSPECT_TEST_CAP]:
+        entry: dict[str, Any] = {"file": None, "modules": []}
+        located = _locate_failing_test(test_id, root)
+        lines.append(f"Failing test {test_id}:")
+        if located is not None:
+            path, method = located
+            entry["file"] = _root_relative(str(path), root)
+            entry["modules"] = _test_file_exercised_modules(
+                path, root, produced
+            )
+            lines.append(f"  defined in {entry['file']}:")
+            excerpt = _test_method_source(path, method)
+            if excerpt:
+                lines.extend(
+                    f"    {line}" for line in excerpt.splitlines()
+                )
+            modules = entry["modules"]
+            lines.append(
+                "  exercises produced modules: "
+                + (", ".join(modules) if modules else "(none identified)")
+            )
+        else:
+            lines.append(
+                "  (its source was not located in this repo — it may "
+                "live outside the produced files)"
+            )
+        suspect_map[test_id] = entry
+    if has_spec:
+        names = ", ".join(spec_paths) or "the goal-named spec"
+        lines.append(
+            f"Precedence (system): {names} is the authoritative "
+            "specification for this goal. Tests produced during this "
+            "run are derived artifacts: where a produced test "
+            "contradicts the spec, the test is wrong — fix the test, "
+            "not the code. Where a failing test exercises a module, "
+            "the module AND the test are both suspects."
+        )
+    else:
+        lines.append(
+            "Precedence (system): no external spec governs this run; "
+            "the goal text governs. Tests produced during this run "
+            "are derived artifacts and can themselves be wrong: where "
+            "a produced test contradicts the goal, fix the test, not "
+            "the code. Where a failing test exercises a module, the "
+            "module AND the test are both suspects."
+        )
+    return "\n".join(lines), suspect_map
+
+
 def replan_from_brief(
     brief: dict[str, Any],
     settings: LLMSettings | None = None,
@@ -10648,6 +10967,22 @@ def replan_from_brief(
     spec_section = ""
     if specs:
         spec_section = f"\n\n{format_spec_context(specs)}"
+    # Re-plan diagnostics (2026-11-23): the suspect map + precedence
+    # block, computed from the brief's judge-stamped failing tests
+    # and the files on disk. The map is stamped back into the brief
+    # on the same write-back channel as rejected_approaches, so the
+    # loop's delta validation can name the exercised modules in a
+    # stagnation rejection. Empty for a brief without failing tests:
+    # the prompt then renders exactly as before.
+    diagnostics_text, suspect_map = _replan_diagnostics(
+        brief,
+        resolve_repo_root(repo_root),
+        has_spec=bool(specs),
+        spec_paths=[spec.path for spec in specs],
+    )
+    if suspect_map:
+        brief["suspect_map"] = suspect_map
+    diagnostics_block = f"\n\n{diagnostics_text}" if diagnostics_text else ""
 
     shape = _route_goal_shape(_goal_text_from_brief(brief), repo_root)
     shape_block = f"\n\n{shape}" if shape else ""
@@ -10689,7 +11024,7 @@ def replan_from_brief(
     # before "JSON Output:" — it is the decision, not preamble. The
     # seed block goes BEFORE the shape, so the shape stays last.
     user_prompt = (
-        f"{context}{spec_section}\n\n{_format_brief_for_prompt(brief)}{node_shape_block}\n\n"
+        f"{context}{spec_section}\n\n{_format_brief_for_prompt(brief)}{diagnostics_block}{node_shape_block}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
         "quote, or echo the brief — it is your input, not your output.\n"
         f"{seed_block}"

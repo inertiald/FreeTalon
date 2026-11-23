@@ -423,5 +423,219 @@ class TestBriefDiagnostics(unittest.TestCase):
         self.assertIn(_NODE3_ASSERTION, brief["failed_nodes"][0]["diagnostics"])
 
 
+# The re-arm #8 failure shape (2026-11-23): a unittest run whose
+# failures are identical across plan versions while the re-plans
+# rewrite only the store. The judge now names the failing tests,
+# stamps a stagnation record when the set repeats, tracks the run's
+# write history, and gates a delta plan that re-attacks the same
+# set through the same files.
+_PAIRING_STDERR = """..F
+======================================================================
+FAIL: test_re_register_claimed_noop (tests.test_pairing.PairingStoreTests.test_re_register_claimed_noop)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/repo/tests/test_pairing.py", line 140, in test_re_register_claimed_noop
+    with self.assertRaises(CodeConflict):
+AssertionError: CodeConflict not raised
+
+======================================================================
+FAIL: test_register_idempotent (tests.test_pairing.PairingHttpTests.test_register_idempotent)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/repo/tests/test_pairing.py", line 96, in test_register_idempotent
+    self.assertEqual(resp.status, 200)
+AssertionError: 201 != 200
+
+----------------------------------------------------------------------
+Ran 33 tests in 7.268s
+
+FAILED (failures=2)
+"""
+
+_PAIRING_FAILING = [
+    "tests.test_pairing.PairingHttpTests.test_register_idempotent",
+    "tests.test_pairing.PairingStoreTests.test_re_register_claimed_noop",
+]
+
+_OTHER_STDERR = """F
+======================================================================
+FAIL: test_wrong_method (tests.test_pairing.PairingHttpTests.test_wrong_method)
+----------------------------------------------------------------------
+AssertionError: 501 != 405
+
+----------------------------------------------------------------------
+Ran 33 tests in 7.301s
+
+FAILED (failures=1)
+"""
+
+
+def _writer(node_id, target, status=PlanStatus.COMPLETED, **kw):
+    fields = {
+        "assigned_claw": "file_writer",
+        "inputs": {"file_path": target, "content": "x = 1\n"},
+    }
+    fields.update(kw)
+    return _node(node_id, status=status, **fields)
+
+
+def _test_runner(stderr):
+    return _node(
+        "node-test",
+        measurement=_executed_measurement(),
+        error="failed criterion: exit_code 1 != 0",
+        inputs={
+            "command": "./.venv/bin/python -m unittest tests.test_pairing",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": stderr,
+        },
+    )
+
+
+class TestReplanAnchoring(unittest.TestCase):
+    def _brief(self, judge, nodes, plan_version, plan=None):
+        from freetalon.orchestrator.models import GoalContract
+
+        plan = plan if plan is not None else _plan(nodes)
+        return judge.build_replan_brief(
+            GoalContract(objective="g"), plan, [_measurement()], [], plan_version
+        )
+
+    def _v1_nodes(self, stderr=_PAIRING_STDERR):
+        return [
+            _writer("w-store", "pkg/store.py"),
+            _writer("w-server", "pkg/server.py"),
+            _test_runner(stderr),
+        ]
+
+    def _v2_nodes(self, stderr=_PAIRING_STDERR):
+        return [_writer("w-store", "pkg/store.py"), _test_runner(stderr)]
+
+    def test_failing_tests_named_from_unittest_output(self):
+        judge = Judge(RunBudget())
+        brief = self._brief(judge, self._v1_nodes(), 1)
+        self.assertEqual(brief["failing_tests"], _PAIRING_FAILING)
+        self.assertNotIn("stagnation", brief)
+        self.assertEqual(brief["never_revised_files"], [])
+
+    def test_failing_tests_named_from_pytest_output(self):
+        judge = Judge(RunBudget())
+        stderr = (
+            "FAILED tests/test_pairing.py::PairingStoreTests::test_x - "
+            "AssertionError: boom\n"
+            "FAILED tests/test_pairing.py::test_y\n"
+        )
+        brief = self._brief(judge, [_test_runner(stderr)], 1)
+        self.assertEqual(
+            brief["failing_tests"],
+            [
+                "tests/test_pairing.py::PairingStoreTests::test_x",
+                "tests/test_pairing.py::test_y",
+            ],
+        )
+
+    def test_failing_tests_bare_unittest_header(self):
+        judge = Judge(RunBudget())
+        brief = self._brief(judge, [_test_runner("FAIL: test_lonely\n")], 1)
+        self.assertEqual(brief["failing_tests"], ["test_lonely"])
+
+    def test_stagnation_stamped_when_set_repeats(self):
+        judge = Judge(RunBudget())
+        first = self._brief(judge, self._v1_nodes(), 1)
+        self.assertNotIn("stagnation", first)
+        second = self._brief(judge, self._v2_nodes(), 2)
+        self.assertEqual(second["failing_tests"], _PAIRING_FAILING)
+        stagnation = second["stagnation"]
+        self.assertEqual(stagnation["failing_tests"], _PAIRING_FAILING)
+        self.assertEqual(stagnation["unchanged_since_version"], 1)
+        self.assertEqual(stagnation["last_change_files"], ["pkg/store.py"])
+        # server.py was produced by v1 and not revised by v2.
+        self.assertEqual(second["never_revised_files"], ["pkg/server.py"])
+
+    def test_stagnation_absent_when_set_changes(self):
+        judge = Judge(RunBudget())
+        self._brief(judge, self._v1_nodes(), 1)
+        second = self._brief(judge, self._v2_nodes(stderr=_OTHER_STDERR), 2)
+        self.assertEqual(
+            second["failing_tests"],
+            ["tests.test_pairing.PairingHttpTests.test_wrong_method"],
+        )
+        self.assertNotIn("stagnation", second)
+
+    def test_missing_declared_and_never_revised(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pkg").mkdir()
+            (root / "pkg" / "store.py").write_text("x = 1\n", encoding="utf-8")
+            judge = Judge(RunBudget())
+            plan1 = _plan(self._v1_nodes())
+            plan1.metadata["repo_root"] = tmp
+            first = self._brief(judge, [], 1, plan=plan1)
+            # server.py was declared by v1 but never produced.
+            self.assertEqual(first["missing_declared_files"], ["pkg/server.py"])
+            self.assertEqual(first["produced_files"], ["pkg/store.py"])
+            self.assertEqual(first["never_revised_files"], [])
+            plan2 = _plan(self._v2_nodes())
+            plan2.metadata["repo_root"] = tmp
+            second = self._brief(judge, [], 2, plan=plan2)
+            self.assertEqual(second["never_revised_files"], ["pkg/server.py"])
+            self.assertEqual(second["missing_declared_files"], ["pkg/server.py"])
+
+    def _stagnant_brief(self):
+        judge = Judge(RunBudget())
+        self._brief(judge, self._v1_nodes(), 1)
+        return judge, self._brief(judge, self._v2_nodes(), 2)
+
+    def test_gate_fires_on_subset_targets_with_stagnant_set(self):
+        judge, brief = self._stagnant_brief()
+        repeat = _writer(
+            "n1", "pkg/store.py", status=PlanStatus.DRAFT
+        )
+        error = judge.validate_delta_plan(brief, [repeat])
+        self.assertIsNotNone(error)
+        self.assertIn("repeats failed approach", error)
+        self.assertIn("stagnation", error)
+        # The unexamined suspect is named: server.py, never revised.
+        self.assertIn("pkg/server.py", error)
+        self.assertIn("fix the test", error)
+
+    def test_gate_silent_when_targets_widen(self):
+        judge, brief = self._stagnant_brief()
+        widened = [
+            _writer("n1", "pkg/store.py", status=PlanStatus.DRAFT),
+            _writer("n2", "pkg/server.py", status=PlanStatus.DRAFT),
+        ]
+        self.assertIsNone(judge.validate_delta_plan(brief, widened))
+
+    def test_gate_silent_on_first_replan(self):
+        judge = Judge(RunBudget())
+        first = self._brief(judge, self._v1_nodes(), 1)
+        repeat = _writer("n1", "pkg/store.py", status=PlanStatus.DRAFT)
+        self.assertIsNone(judge.validate_delta_plan(first, [repeat]))
+
+    def test_gate_silent_with_system_repair_note(self):
+        judge, brief = self._stagnant_brief()
+        repaired = _writer(
+            "n1",
+            "pkg/store.py",
+            status=PlanStatus.DRAFT,
+            differs_by="splices the measured fix into the definition",
+        )
+        self.assertIsNone(judge.validate_delta_plan(brief, [repaired]))
+
+    def test_gate_silent_without_write_targets(self):
+        judge, brief = self._stagnant_brief()
+        plumbing = _node(
+            "n1",
+            status=PlanStatus.DRAFT,
+            inputs={"command": "./.venv/bin/python -m unittest tests.test_pairing"},
+        )
+        self.assertIsNone(judge.validate_delta_plan(brief, [plumbing]))
+
+
 if __name__ == "__main__":
     unittest.main()

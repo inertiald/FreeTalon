@@ -19,13 +19,20 @@ Changing the contract is a human act, done between runs, in the open.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from .measure import VERDICT_UNMEASURABLE
-from .memory import approach_signature, describe_signature
+from .memory import (
+    approach_signature,
+    describe_signature,
+    write_targets_for_node,
+    write_targets_for_nodes,
+)
 from .models import ExecutionPlan, GoalContract, PlanNode, PlanStatus, RunBudget
 
 
@@ -157,6 +164,74 @@ def _diagnostic_fingerprint(diagnostics: str) -> str | None:
     return fingerprint
 
 
+# ── Failing tests + stagnation (re-plan anchoring, 2026-11-23) ──────
+#
+# The brief used to carry a failed test-run node only as a criterion
+# line ("exit_code 1 != 0") plus a bounded diagnostics tail. Exam
+# re-arm #8 showed what that costs: the same three tests failed in
+# all four plan versions, every re-plan rewrote the one file it had
+# already rewritten, and nothing in the brief ever said the failure
+# set had not moved. The judge therefore names the failing tests
+# themselves — extracted mechanically from the failed nodes' captured
+# output — and tracks the set across the briefs it issues, so
+# stagnation is a computed fact in the brief, not a pattern the
+# planner is left to notice. (The cross-model consultation of
+# 2026-11-23 ranked this signal first, near-unanimously.)
+
+_UNITTEST_FAILURE_RE = re.compile(
+    r"^(?:FAIL|ERROR):\s+(\w+)\s+\(([^)]+)\)", re.MULTILINE
+)
+_UNITTEST_BARE_FAILURE_RE = re.compile(
+    r"^(?:FAIL|ERROR):\s+(\w+)\s*$", re.MULTILINE
+)
+# A pytest nodeid always carries "::"; requiring it keeps
+# unittest's own summary line ("FAILED (failures=2)") out of the set.
+_PYTEST_FAILURE_RE = re.compile(r"^FAILED\s+(\S+::\S+)", re.MULTILINE)
+
+# A failing-test set is evidence, not a transcript: cap it so a
+# catastrophic run cannot flood the brief. The set is sorted before
+# the cap, so the cap is deterministic.
+_FAILING_TESTS_CAP = 50
+
+
+def _failing_test_ids(node: PlanNode) -> set[str]:
+    """Failing test identifiers in a node's captured output.
+
+    unittest prints a header per failure — "FAIL: test_x
+    (pkg.mod.Class.test_x)" — whose parenthesised part is the
+    test's dotted identity (module and class alone in older shapes,
+    completed here with the method name); pytest's short summary
+    prints "FAILED path::test", already an identity. A bare unittest
+    header (no parenthesised class) contributes the method name
+    alone, and is read only when no fuller form matched. Returns an
+    empty set when the node captured no test-runner output: such
+    failures ride the brief exactly as before, untracked here.
+    """
+    inputs = node.inputs or {}
+    text = ""
+    for key in ("stderr", "stdout"):
+        value = inputs.get(key)
+        if isinstance(value, str) and value.strip():
+            text += value + "\n"
+    ids: set[str] = set()
+    for match in _UNITTEST_FAILURE_RE.finditer(text):
+        method, qualified = match.group(1), match.group(2)
+        # The parenthesised form is usually the full dotted id,
+        # method included ("pkg.mod.Class.test_x"); when it names
+        # only module and class, the method completes it.
+        ids.add(
+            qualified
+            if qualified.endswith("." + method)
+            else f"{qualified}.{method}"
+        )
+    for match in _PYTEST_FAILURE_RE.finditer(text):
+        ids.add(match.group(1))
+    if not ids:
+        for match in _UNITTEST_BARE_FAILURE_RE.finditer(text):
+            ids.add(match.group(1))
+    return ids
+
+
 class Judge:
     """Stateful per-run judge: budget accounting, decisions, re-plan briefs."""
 
@@ -173,6 +248,16 @@ class Judge:
         # version first briefed — a later brief whose failed node
         # reproduces one names the repeat (see build_replan_brief).
         self._briefed_diagnostics: dict[str, int] = {}
+        # Re-plan anchoring state (2026-11-23): the failing-test set
+        # of the previous brief this judge issued and the plan
+        # version that set was first briefed at, plus the run's
+        # write history — each declared target's last-writing plan
+        # version, and every target ever declared — from which the
+        # brief's stagnation record and file lists are computed.
+        self._previous_failing_tests: frozenset[str] | None = None
+        self._failing_tests_since: int | None = None
+        self._file_last_written: dict[str, int] = {}
+        self._declared_targets: set[str] = set()
 
     # ── Bookkeeping ──────────────────────────────────────────────────────
 
@@ -330,7 +415,7 @@ class Judge:
                 new_fingerprints.setdefault(fingerprint, plan_version)
             failed_entries.append(entry)
         self._briefed_diagnostics.update(new_fingerprints)
-        return {
+        brief = {
             "goal": contract.model_dump(mode="json"),
             "plan_id": plan.plan_id,
             "plan_version": plan_version,
@@ -346,6 +431,85 @@ class Judge:
                 "or the targets. Shrink scope before growing it."
             ),
         }
+        brief.update(self._anchoring_fields(plan, plan_version, failed))
+        return brief
+
+    def _anchoring_fields(
+        self,
+        plan: ExecutionPlan,
+        plan_version: int,
+        failed: list[PlanNode],
+    ) -> dict[str, Any]:
+        """The brief's anchoring record: failing tests + write history.
+
+        Computed from the executed plan and this judge's own brief
+        history, never from model output. "failing_tests" names the
+        tests the failed nodes' captured output reports.
+        "stagnation" is present only when that set is identical to
+        the previous brief's — the signal exam re-arm #8 lacked while
+        three re-plans rewrote the same file against the same three
+        failures. The file lists name what the run has produced:
+        targets the most recent version did not revise, and targets
+        declared by some version but missing on disk.
+        """
+        failing: set[str] = set()
+        for node in failed:
+            failing |= _failing_test_ids(node)
+        failing_tests = sorted(failing)[:_FAILING_TESTS_CAP]
+        current_targets = write_targets_for_nodes(plan.nodes)
+        for target in current_targets:
+            self._file_last_written[target] = plan_version
+            self._declared_targets.add(target)
+        never_revised = sorted(
+            target
+            for target, version in self._file_last_written.items()
+            if version < plan_version
+        )
+        missing = self._missing_declared_targets(plan)
+        missing_set = set(missing)
+        fields: dict[str, Any] = {
+            "failing_tests": failing_tests,
+            "produced_files": sorted(
+                target
+                for target in self._declared_targets
+                if target not in missing_set
+            ),
+            "never_revised_files": never_revised,
+            "missing_declared_files": missing,
+        }
+        current_set = frozenset(failing_tests)
+        if current_set and current_set == self._previous_failing_tests:
+            fields["stagnation"] = {
+                "failing_tests": failing_tests,
+                "unchanged_since_version": self._failing_tests_since,
+                "last_change_files": current_targets,
+            }
+        elif current_set != self._previous_failing_tests:
+            self._failing_tests_since = plan_version if current_set else None
+        self._previous_failing_tests = current_set
+        return fields
+
+    def _missing_declared_targets(self, plan: ExecutionPlan) -> list[str]:
+        """Declared write targets that do not exist on disk.
+
+        Resolved against the plan's recorded repo root (plan
+        metadata, stamped at planning time); without a root there is
+        no base to judge existence against and the list is empty. An
+        unresolvable path is not evidence of absence.
+        """
+        root_value = (plan.metadata or {}).get("repo_root")
+        if not root_value:
+            return []
+        root = Path(str(root_value))
+        missing = []
+        for target in sorted(self._declared_targets):
+            try:
+                exists = (root / target).exists()
+            except OSError:
+                exists = True
+            if not exists:
+                missing.append(target)
+        return missing
 
     def validate_delta_plan(
         self,
@@ -386,6 +550,9 @@ class Judge:
                 failed_signatures.add(signature)
         if known_failures:
             failed_signatures |= set(known_failures)
+        stagnation_error = self._stagnation_gate_error(brief, new_nodes)
+        if stagnation_error is not None:
+            return stagnation_error
         if not failed_signatures:
             return None
         for node in new_nodes:
@@ -401,3 +568,74 @@ class Judge:
                     f"without a system repair note"
                 )
         return None
+
+    def _stagnation_gate_error(
+        self, brief: dict[str, Any], new_nodes: list[PlanNode]
+    ) -> str | None:
+        """Reject a delta plan re-attacking a stagnant failure set
+        through the same files the last change already wrote.
+
+        Fires only when the brief carries this judge's stagnation
+        record — the failing-test set identical to the previous
+        brief's, which by construction means this is at least the
+        second re-plan — and the delta plan's write targets are a
+        non-empty subset of the last change's targets. A write node
+        carrying a system repair note (``differs_by``, the local
+        repair path's splice) exempts the plan, exactly as in the
+        repeat-approach check: the note is the system's own evidence
+        the mechanism changed. A changed failure set, a widened
+        target set, or a first re-plan leaves the gate silent. The
+        rejection names the unexamined suspects — files produced by
+        earlier versions and never revised, and (when the planner's
+        suspect map rode back into the brief) the modules the
+        failing tests exercise — and states the precedence rule.
+        """
+        stagnation = brief.get("stagnation")
+        if not isinstance(stagnation, dict):
+            return None
+        failing = [str(t) for t in stagnation.get("failing_tests") or []]
+        if not failing:
+            return None
+        last_change = {
+            str(t) for t in stagnation.get("last_change_files") or []
+        }
+        new_targets = set(write_targets_for_nodes(new_nodes))
+        if not new_targets or not new_targets <= last_change:
+            return None
+        for node in new_nodes:
+            if write_targets_for_node(node) and node.differs_by:
+                return None
+        message = (
+            "re-plan repeats failed approach (stagnation: the failing "
+            f"tests {', '.join(failing)} are unchanged since plan "
+            f"version {stagnation.get('unchanged_since_version', '?')}, "
+            "and the delta plan writes only files the last change "
+            f"already wrote: {', '.join(sorted(new_targets))}) "
+            "without a system repair note"
+        )
+        suspects = [str(t) for t in brief.get("never_revised_files") or []]
+        if suspects:
+            message += (
+                "; unexamined suspects — files produced by earlier "
+                "plan versions and not revised since: "
+                + ", ".join(suspects)
+            )
+        modules: set[str] = set()
+        suspect_map = brief.get("suspect_map")
+        if isinstance(suspect_map, dict):
+            for entry in suspect_map.values():
+                if isinstance(entry, dict):
+                    modules.update(
+                        str(m) for m in entry.get("modules") or []
+                    )
+        if modules:
+            message += (
+                "; the failing tests exercise: "
+                + ", ".join(sorted(modules))
+            )
+        message += (
+            "; tests produced during this run are derived artifacts, "
+            "not ground truth — where one contradicts the governing "
+            "spec or goal, fix the test, not the code"
+        )
+        return message
