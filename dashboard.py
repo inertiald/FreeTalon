@@ -1135,9 +1135,9 @@ def index() -> None:
                 "color:#64748b;"
             )
 
-        def _handle_upload(e: events.UploadEventArguments) -> None:
+        async def _handle_upload(e: events.UploadEventArguments) -> None:
             # Strip directory components to prevent path traversal
-            safe_name = Path(e.name).name
+            safe_name = Path(e.file.name).name
             if not safe_name:
                 ui.notify("Invalid filename.", type="negative", position="top-right")
                 return
@@ -1152,7 +1152,7 @@ def index() -> None:
                 return
 
             # Enforce file size limit
-            data = e.content.read()
+            data = await e.file.read()
             if len(data) > _MAX_UPLOAD_BYTES:
                 ui.notify(
                     f"File exceeds 100 MB limit: '{safe_name}'",
