@@ -31,6 +31,7 @@ from freetalon.orchestrator import planner as planner_module
 from freetalon.orchestrator.intake import LLMSettings
 from freetalon.orchestrator.planner import (
     _call_llm_with_repair,
+    _contract_constrained_reask,
     _contract_omitted_modules,
     parse_planner_response,
     plan_envelope_schema,
@@ -354,5 +355,155 @@ class TestConstrainedReask(unittest.TestCase):
         self.assertEqual(metadata["module_contract"], DERIVED_CONTRACT)
 
 
+
+DOTTED_CONTRACT = [
+    {
+        "module": "freetalon/probe_reask/endpoint.py",
+        "defines": ["PairingServer"],
+        "statuses": ["not-found"],
+    },
+    {
+        "module": "freetalon/probe_reask/registry.py",
+        "defines": [
+            "CodeNotFound",
+            "PairingStore",
+            "PairingStore.get",
+            "PairingStore.register",
+        ],
+        "statuses": ["pending"],
+    },
+]
+
+
+class TestReaskOutcomeRecord(unittest.TestCase):
+    """The re-ask's outcome lands in the plan metadata.
+
+    Exam re-arm #3's post-mortem had to replay the raw re-ask
+    output against a reconstructed tree to learn why the richer
+    declared contract was not adopted — every rejection path
+    returned a bare None and the reason was recorded nowhere.
+    These tests pin the record for each gate.
+    """
+
+    def test_adopted_outcome_recorded(self) -> None:
+        fake = _ScriptedLLM(
+            [
+                _dag(_coupled_nodes()),
+                _dag(_coupled_nodes(), contract=DECLARED_CONTRACT),
+            ]
+        )
+        _nodes, metadata = _plan_with(fake)
+        self.assertEqual(metadata["contract_reask"], {"outcome": "adopted"})
+
+    def test_parse_rejection_recorded(self) -> None:
+        fake = _ScriptedLLM([_dag(_coupled_nodes()), "this is not json"])
+        _nodes, metadata = _plan_with(fake)
+        record = metadata["contract_reask"]
+        self.assertEqual(record["outcome"], "rejected")
+        self.assertEqual(record["gate"], "parse")
+        self.assertTrue(record["errors"])
+        # The non-JSON rejection is a bare LLMResponseError with no
+        # structured records attached (parse's own behavior), so the
+        # record names the exception type and carries its message.
+        self.assertEqual(record["errors"][0]["code"], "LLMResponseError")
+        self.assertIn("not valid JSON", record["errors"][0]["message"])
+
+    def test_contract_shape_rejection_recorded(self) -> None:
+        # The re-arm #3 shape exactly: the re-ask declares the
+        # contract with DOTTED method spellings ("PairingStore.get"),
+        # which _normalize_contract rejects — the whole declaration
+        # is discarded and both coupled modules read as missing.
+        # The record must name the gate and the codes.
+        fake = _ScriptedLLM(
+            [
+                _dag(_coupled_nodes()),
+                _dag(_coupled_nodes(), contract=DOTTED_CONTRACT),
+            ]
+        )
+        _nodes, metadata = _plan_with(fake)
+        record = metadata["contract_reask"]
+        self.assertEqual(record["outcome"], "rejected")
+        self.assertEqual(record["gate"], "parse")
+        codes = [error["code"] for error in record["errors"]]
+        self.assertIn("contract_shape", codes)
+        self.assertIn("contract_missing", codes)
+        # The accepted plan still stands on the derived contract.
+        self.assertEqual(metadata["module_contract"], DERIVED_CONTRACT)
+
+    def test_still_omitted_rejection_recorded(self) -> None:
+        fake = _ScriptedLLM([_dag(_coupled_nodes()), _dag(_coupled_nodes())])
+        _nodes, metadata = _plan_with(fake)
+        record = metadata["contract_reask"]
+        self.assertEqual(record["outcome"], "rejected")
+        self.assertEqual(record["gate"], "omitted_modules")
+        self.assertEqual(record["modules"], COUPLED_MODULES)
+
+    def test_no_record_when_reask_does_not_fire(self) -> None:
+        fake = _ScriptedLLM([_simple_dag()])
+        with mock.patch.object(planner_module, "call_llm", fake):
+            _nodes, metadata = _call_llm_with_repair(
+                "system",
+                "user",
+                LLMSettings(),
+                goal_text="Write a standalone probe script.",
+            )
+        self.assertNotIn("contract_reask", metadata)
+
+
+class TestReaskDirectGates(unittest.TestCase):
+    """The gates a scripted _call_llm_with_repair cannot reach —
+    a scope baseline (set only by an earlier rejection) and a
+    dead backend — are exercised against the re-ask directly."""
+
+    def _direct(self, fake, **overrides):
+        params = dict(
+            omitted=COUPLED_MODULES,
+            goal_text=GOAL,
+            workspace=None,
+            repo_root=None,
+            formatter=None,
+            baseline_paths=None,
+            baseline_installs=False,
+            endorsed_paths=set(),
+        )
+        params.update(overrides)
+        with mock.patch.object(planner_module, "call_llm", fake):
+            return _contract_constrained_reask(
+                "system", "user", LLMSettings(), **params
+            )
+
+    def test_call_failure_recorded(self) -> None:
+        def boom(system_prompt, user_prompt, settings=None):
+            raise RuntimeError("backend down")
+
+        adopted, record = self._direct(boom)
+        self.assertIsNone(adopted)
+        self.assertEqual(record["outcome"], "rejected")
+        self.assertEqual(record["gate"], "call")
+        self.assertEqual(record["errors"][0]["code"], "RuntimeError")
+        self.assertIn("backend down", record["errors"][0]["message"])
+
+    def test_scope_lock_rejection_recorded(self) -> None:
+        baseline_paths, baseline_installs = (
+            planner_module._response_write_scope(_dag(_coupled_nodes()))
+        )
+        widening_nodes = _coupled_nodes() + [
+            _scaffold(
+                "step_5",
+                PKG / "extra.py",
+                '"""Extra module outside the accepted scope."""\n\nVALUE = 1\n',
+                ["step_1"],
+            )
+        ]
+        fake = _ScriptedLLM([_dag(widening_nodes, contract=DECLARED_CONTRACT)])
+        adopted, record = self._direct(
+            fake,
+            baseline_paths=baseline_paths,
+            baseline_installs=baseline_installs,
+        )
+        self.assertIsNone(adopted)
+        self.assertEqual(record["outcome"], "rejected")
+        self.assertEqual(record["gate"], "scope_lock")
+        self.assertEqual(record["errors"][0]["code"], "scope_widening")
 if __name__ == "__main__":
     unittest.main()

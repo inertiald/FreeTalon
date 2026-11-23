@@ -5706,6 +5706,14 @@ def _repetition_loop_errors(nodes: list[PlanNode]) -> list[str]:
 
 CONTRACT_METADATA_KEY = "module_contract"
 
+# The L1 re-ask's outcome record: written by _call_llm_with_repair
+# into the accepted plan's metadata whenever the re-ask fired, so
+# a non-adoption is never silent again (exam re-arm #3: the re-ask
+# produced a richer declared contract, the adoption gates rejected
+# it at parse, and the reason was recorded nowhere). System-owned
+# like module_contract — the planner is its only writer.
+CONTRACT_REASK_METADATA_KEY = "contract_reask"
+
 # Sentinel for _collect_plan_error_records' contract parameter: the
 # caller supplied no contract context, so the contract checks do
 # not run at all. parse_planner_response always supplies a context
@@ -9645,6 +9653,35 @@ def _stuck_repair_error(
     )
 
 
+def _rejection_error_dicts(exc: BaseException) -> list[dict[str, Any]]:
+    """A rejection exception as plain record dicts for the trail.
+
+    Structured PlanError records keep their code / node / stage /
+    message; an exception carrying no records (a backend failure,
+    a formatter crash) becomes one record naming its type, so the
+    recorded reason always says something concrete.
+    """
+    records = getattr(exc, "plan_errors", None) or []
+    if records:
+        return [
+            {
+                "code": record.code,
+                "node_id": record.node_id,
+                "stage": record.stage,
+                "message": record.message,
+            }
+            for record in records
+        ]
+    return [
+        {
+            "code": type(exc).__name__,
+            "node_id": None,
+            "stage": None,
+            "message": str(exc),
+        }
+    ]
+
+
 def _contract_constrained_reask(
     system_prompt: str,
     user_prompt: str,
@@ -9658,7 +9695,7 @@ def _contract_constrained_reask(
     baseline_paths: set[str] | None,
     baseline_installs: bool,
     endorsed_paths: set[str],
-) -> tuple[list[PlanNode], dict[str, Any]] | None:
+) -> tuple[tuple[list[PlanNode], dict[str, Any]] | None, dict[str, Any]]:
     """One contract-required re-ask (L1, 2026-11-23).
 
     The cross-model consultation's top mechanism, in the shape
@@ -9680,6 +9717,20 @@ def _contract_constrained_reask(
     guarantees presence, not quality: the declaration is judged
     by the same validators as any other, and a hollow or
     incoherent one fails parse like any other plan.
+
+    Returns (adopted, record): ``adopted`` is the (nodes,
+    metadata) pair when the re-asked plan qualifies, else None.
+    ``record`` is the outcome either way — {"outcome":
+    "adopted"} or {"outcome": "rejected", "gate": <the gate
+    that stopped it>, ...} carrying the concrete failing detail
+    (the parse rejection's structured errors, the still-omitted
+    module list, or the scope lock's records). The caller writes
+    the record into the accepted plan's metadata under
+    CONTRACT_REASK_METADATA_KEY, which the plan state store
+    persists. Before the record existed, every rejection path
+    below returned a bare None and exam re-arm #3's non-adoption
+    was recoverable only by replaying the raw output against a
+    reconstructed tree.
     """
     module_list = ", ".join(omitted)
     reask_prompt = (
@@ -9709,6 +9760,13 @@ def _contract_constrained_reask(
             reask_text = reformat_plan_output(
                 reask_text, settings, formatter
             )
+    except Exception as exc:
+        return None, {
+            "outcome": "rejected",
+            "gate": "call",
+            "errors": _rejection_error_dicts(exc),
+        }
+    try:
         new_nodes, new_metadata = parse_planner_response(
             reask_text,
             goal_text=goal_text,
@@ -9716,22 +9774,37 @@ def _contract_constrained_reask(
             repo_root=repo_root,
             pinned_contract=None,
         )
-        if _contract_omitted_modules(new_nodes, reask_text, repo_root):
-            return None
-        if baseline_paths is not None:
-            scope_error = _scope_widening_error(
-                new_nodes,
-                baseline_paths,
-                baseline_installs,
-                endorsed_paths,
-                repo_root,
-                workspace=workspace,
-            )
-            if scope_error is not None:
-                return None
-        return new_nodes, new_metadata
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, {
+            "outcome": "rejected",
+            "gate": "parse",
+            "errors": _rejection_error_dicts(exc),
+        }
+    still_omitted = _contract_omitted_modules(
+        new_nodes, reask_text, repo_root
+    )
+    if still_omitted:
+        return None, {
+            "outcome": "rejected",
+            "gate": "omitted_modules",
+            "modules": still_omitted,
+        }
+    if baseline_paths is not None:
+        scope_error = _scope_widening_error(
+            new_nodes,
+            baseline_paths,
+            baseline_installs,
+            endorsed_paths,
+            repo_root,
+            workspace=workspace,
+        )
+        if scope_error is not None:
+            return None, {
+                "outcome": "rejected",
+                "gate": "scope_lock",
+                "errors": _rejection_error_dicts(scope_error),
+            }
+    return (new_nodes, new_metadata), {"outcome": "adopted"}
 
 
 def _call_llm_with_repair(
@@ -9867,7 +9940,10 @@ def _call_llm_with_repair(
     clean, declares every coupled module itself, and passes
     the same scope lock; otherwise the accepted plan stands,
     its contract completed by derivation
-    (_contract_constrained_reask). The re-ask fires at most
+    (_contract_constrained_reask). Either outcome is recorded
+    in the returned metadata under CONTRACT_REASK_METADATA_KEY
+    — a non-adoption names its gate and the concrete failing
+    detail, never a bare None. The re-ask fires at most
     once per planning call, only when no contract pin governs,
     and only under the planner-owned schema — a caller-supplied
     schema is respected, never replaced.
@@ -9976,6 +10052,7 @@ def _call_llm_with_repair(
                 )
                 if scope_error is not None:
                     raise scope_error
+            reask_record: dict[str, Any] | None = None
             if (
                 not contract_reask_done
                 and pinned_contract is None
@@ -9986,7 +10063,7 @@ def _call_llm_with_repair(
                     nodes, response_text, repo_root
                 )
                 if omitted:
-                    upgraded = _contract_constrained_reask(
+                    upgraded, reask_record = _contract_constrained_reask(
                         system_prompt,
                         prompt,
                         effective_settings,
@@ -10002,6 +10079,15 @@ def _call_llm_with_repair(
                     if upgraded is not None:
                         nodes, metadata = upgraded
             metadata = dict(metadata)
+            # The re-ask record is system-owned trail, set from
+            # this call's own outcome like rejected_approaches
+            # below — never carried in from the payload: a call
+            # in which the re-ask did not fire clears any value
+            # a model-supplied metadata carried.
+            if reask_record is not None:
+                metadata[CONTRACT_REASK_METADATA_KEY] = reask_record
+            else:
+                metadata.pop(CONTRACT_REASK_METADATA_KEY, None)
             metadata["rejected_approaches"] = list(rejected_approaches)
             return nodes, metadata
         except LLMResponseError as exc:
@@ -10340,6 +10426,10 @@ def replan_from_brief(
         formatter=formatter_settings_from_env(),
     )
     brief["rejected_approaches"] = metadata.get("rejected_approaches", seed or [])
+    if metadata.get(CONTRACT_REASK_METADATA_KEY) is not None:
+        brief[CONTRACT_REASK_METADATA_KEY] = metadata[
+            CONTRACT_REASK_METADATA_KEY
+        ]
     return nodes
 
 
