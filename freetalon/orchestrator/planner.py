@@ -9426,14 +9426,28 @@ _PLANNER_NUM_CTX = 12288
 # spent ~260 s and ~21,850 tokens generating a single degenerate
 # schema field before the stream died at the context wall — the
 # failure the parse-time loop detector now rejects after the fact,
-# but only the ceiling bounds the generation itself. Sized from the
-# recorded evidence base: the largest healthy planner output on
-# record is 14,300 chars (~3,600 tokens, model-A/B corpus), so 8192
-# leaves ~2.3x headroom over any legitimate plan while cutting a
-# runaway at ~37% of the pairing output's length. A caller that set
-# num_predict (or FREETALON_LLM_NUM_PREDICT) keeps their value —
-# the same rule as num_ctx above.
-_PLANNER_NUM_PREDICT = 8192
+# but only the ceiling bounds the generation itself. Originally
+# sized from the recorded evidence base: the largest healthy
+# planner output on record was 14,300 chars (~3,600 tokens,
+# model-A/B corpus), so 8192 left ~2.3x headroom over any
+# legitimate plan while cutting a runaway at ~37% of the pairing
+# output's length.
+# Raised to 16384 (2026-11-23, exam re-arm #6): plans that embed
+# full file contents inline outgrew 8192 once spec grounding put
+# the completed CONTRACT.md in front of the planner — all three
+# responses truncated mid-JSON at 31,760 / 31,763 / 33,519 bytes,
+# inside the final node's contents, and no plan ever parsed
+# (StuckRepairError). The truncated contents were substantively
+# correct; the envelope legitimately needed more room. 16384
+# leaves ~2x headroom over that near-complete ~33.5 KB envelope
+# while still cutting a runaway at ~75% of the pairing output's
+# length, and the repetition-loop detector plus the per-field
+# prose caps remain the degeneration guards — the ceiling only
+# bounds how long a bad generation runs before they judge it,
+# and the client timeout bounds the wall-clock regardless. A
+# caller that set num_predict (or FREETALON_LLM_NUM_PREDICT)
+# keeps their value — the same rule as num_ctx above.
+_PLANNER_NUM_PREDICT = 16384
 
 
 # --- Cycle 2 (2026-11-17): constrained envelope, repair discipline,

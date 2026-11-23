@@ -238,6 +238,16 @@ class TestGenerationFuse(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             self.assertIsNone(LLMSettings.from_env().num_predict)
 
+    def test_fuse_value_covers_content_embedding_plans(self) -> None:
+        # Exam re-arm #6 (2026-11-23): three planner responses
+        # against the completed CONTRACT.md truncated mid-JSON at
+        # 31,760 / 31,763 / 33,519 bytes under the old 8192
+        # ceiling — a legitimate plan embedding full file
+        # contents no longer fit. The raised value is pinned so
+        # a silent shrink back below that envelope fails here
+        # first.
+        self.assertEqual(planner_module._PLANNER_NUM_PREDICT, 16384)
+
     def test_planner_call_carries_the_fuse(self) -> None:
         captured: dict = {}
 
