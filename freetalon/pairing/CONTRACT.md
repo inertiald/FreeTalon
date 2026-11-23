@@ -36,6 +36,12 @@ No other status string may appear anywhere. (The loop's failed draft
 used `confirmed: bool`, `"gone"`, and `"not-found"` in different modules;
 that incoherence is what this contract exists to prevent.)
 
+The four strings are the module constants `STATUS_PENDING = "pending"`,
+`STATUS_CONFIRMED = "confirmed"`, `STATUS_CLAIMED = "claimed"`,
+`STATUS_EXPIRED = "expired"` in `freetalon.pairing.store`, re-exported
+from `freetalon.pairing`. Outside the store, code and tests name the
+constants, never the literals.
+
 ## Record fields
 
 Stored per code in one JSON file: `{"version": 1, "records": {...}}`.
@@ -67,18 +73,25 @@ the single claiming poll.
   hardcode the node's word list.
 - `nonce` must be 32 hex chars; stored lowercased.
 - `machine_id` is required text (≤128 chars, no control characters);
-  `hostname` / `mac` are optional text under the same rules.
+  `hostname` / `mac` are optional text under the same rules. Text
+  fields are stripped of surrounding whitespace before validation and
+  storage: a required field that is empty after stripping is invalid
+  (`""` and `"   "` are both rejected), and the length cap applies to
+  the stripped text.
 - A credential bundle must be a non-empty JSON object, JSON-serializable,
   ≤ 32768 bytes serialized. The server never inspects bundle contents
   (per §6: a Tailscale auth key + SSH management key material).
 
 ## Clock seam
 
-`PairingStore(path, ttl_seconds=1800, now_fn=time.time)`. **Every** time
-read in the store goes through `now_fn` — nothing calls `time.time`
-directly. Tests inject a fake clock; there is no other time source to
-patch. Default TTL is 1800 s, overridable via
-`FREETALON_PAIRING_TTL_SECONDS`.
+`PairingStore(path, ttl_seconds=1800, now_fn=time.time)` — `path` may
+be a `str` or a `pathlib.Path`. `ttl_seconds` must be positive; a
+non-positive value raises `ValueError` from the constructor. **Every**
+time read in the store goes through `now_fn` — nothing calls
+`time.time` directly. Tests inject a fake clock; there is no other
+time source to patch. Default TTL is 1800 s, overridable via
+`FREETALON_PAIRING_TTL_SECONDS` (read by the server entry point, not
+by the store).
 
 ## Expiry
 
@@ -92,7 +105,10 @@ node is still standing there with the same code on its screen; §6 step
 
 ## Store API (`store.py`) and exceptions
 
-All errors derive from `PairingError`.
+All errors derive from `PairingError`. `store.py` exports
+`PairingStore`, `PollOutcome`, the four `STATUS_*` constants, and
+every exception named in this section; `freetalon.pairing` re-exports
+all of them from the package root.
 
 - `register(code, nonce, machine_id, hostname=None, mac=None)` →
   public view. New code → `pending`. Same code + same nonce +
@@ -102,7 +118,8 @@ All errors derive from `PairingError`.
 - `confirm(code, credentials)` → public view. Unknown → `CodeNotFound`;
   expired → `CodeExpired`; claimed → `CodeAlreadyClaimed`; already
   confirmed → `CodeAlreadyConfirmed`; bad bundle → `InvalidBundle`.
-- `poll(code)` → `PollOutcome(status, credentials)`. Unknown →
+- `poll(code)` → `PollOutcome(status, credentials)` — a frozen
+  dataclass; `.credentials` is the bundle dict or `None`. Unknown →
   `CodeNotFound` (raised, never a dict). `pending` → credentials None.
   `confirmed` → returns the bundle **and burns the record in the same
   locked operation** (status `claimed`, credentials wiped,
@@ -150,10 +167,32 @@ bundle, 410 = gone (the console's own message for 410 is "expired or
 already used", so expired → 410 matches the shipped client).
 
 `401` is identical for missing header, wrong token, and no token
-configured — an attacker cannot distinguish them.
+configured — an attacker cannot distinguish them. Its body is exactly
+`{"error": "unauthorized"}` in every refusal case (including a bearer
+token that cannot be compared, e.g. one carrying non-ASCII characters:
+that is a refusal, never a dropped connection).
 
 Unknown routes → `404 {"error": "not found"}`; a known path with the
-wrong method → `405`.
+wrong method → `405`. A confirm refused with `410` returns the
+poll-style body `{"code", "status"}` (`"expired"` or `"claimed"`), so
+a client reads the terminal state the same way it does from a poll.
+
+## Server construction (`server.py`)
+
+- `make_server(store, token, host="127.0.0.1", port=0)` → a threaded
+  `http.server` instance, already bound to `(host, port)`. The caller
+  runs `serve_forever()` (typically in a thread) and stops it with
+  `shutdown()` + `server_close()`; `port=0` binds an ephemeral port,
+  read back from `server_address`. `token` is this instance's operator
+  bearer token: `token=None` (or empty) closes the operator API —
+  every operator request is `401` — while the node endpoints keep
+  working.
+- `python -m freetalon.pairing` runs `server.main()`: the standalone
+  entry. Configuration comes from the environment only (next section);
+  it constructs the store at the configured path and serves via
+  `make_server` until interrupted. The factory defaults above are the
+  library defaults — the standalone entry's bind defaults are the
+  Configuration table's.
 
 ## Configuration (env only)
 
