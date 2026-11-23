@@ -505,5 +505,103 @@ class TestReaskDirectGates(unittest.TestCase):
         self.assertEqual(record["outcome"], "rejected")
         self.assertEqual(record["gate"], "scope_lock")
         self.assertEqual(record["errors"][0]["code"], "scope_widening")
+BARE_METHOD_CONTRACT = [
+    {
+        "module": "freetalon/probe_reask/endpoint.py",
+        "defines": ["PairingServer", "poll"],
+        "statuses": ["not-found"],
+    },
+    {
+        "module": "freetalon/probe_reask/registry.py",
+        "defines": ["CodeNotFound", "PairingStore", "get", "register"],
+        "statuses": ["pending"],
+    },
+]
+
+
+class TestContractNamePattern(unittest.TestCase):
+    """The envelope schema constrains defines spellings.
+
+    Re-arm #3's re-ask declared its contract with dotted method
+    spellings ("PairingStore.register") and lost the whole
+    declaration to one contract_shape error: the require-contract
+    schema constrained defines items only to {"type": "string"},
+    so constrained decoding never constrained the spelling. The
+    schema now carries the validator's own pattern on the shared
+    entry definition, and the re-ask prompt asks for bare names
+    in words.
+    """
+
+    def test_both_schema_variants_carry_the_name_pattern(self) -> None:
+        for schema in (
+            plan_envelope_schema(),
+            plan_envelope_schema(require_contract=True),
+        ):
+            items = schema["properties"]["contract"]["items"]
+            defines_items = items["properties"]["defines"]["items"]
+            self.assertEqual(defines_items["type"], "string")
+            # Referenced from the validator's own regex, so the
+            # schema and _normalize_contract cannot drift.
+            self.assertEqual(
+                defines_items["pattern"],
+                planner_module._CONTRACT_NAME_RE.pattern,
+            )
+            self.assertEqual(
+                defines_items["pattern"], "^[A-Za-z_][A-Za-z0-9_]*$"
+            )
+            # "module" deliberately carries no pattern: the
+            # validator normalizes the spelling (whitespace,
+            # backslashes, a leading "./") before its path check,
+            # so a schema pattern would forbid spellings the
+            # validator accepts.
+            self.assertNotIn("pattern", items["properties"]["module"])
+
+    def test_dotted_reask_rejected_and_recorded(self) -> None:
+        # The mocked call bypasses the decoder, so the dotted
+        # output still reaches parse — where it is rejected, with
+        # the rejection recorded as before. What changed is the
+        # schema the re-ask ran under: its defines items carry
+        # the bare-name pattern, so a real constrained decoder
+        # could not have emitted the dotted spellings at all.
+        fake = _ScriptedLLM(
+            [
+                _dag(_coupled_nodes()),
+                _dag(_coupled_nodes(), contract=DOTTED_CONTRACT),
+            ]
+        )
+        _nodes, metadata = _plan_with(fake)
+        reask_schema = fake.calls[1]["settings"].format_schema
+        defines_items = reask_schema["properties"]["contract"]["items"][
+            "properties"
+        ]["defines"]["items"]
+        self.assertEqual(
+            defines_items["pattern"],
+            planner_module._CONTRACT_NAME_RE.pattern,
+        )
+        self.assertIn("BARE names only", fake.calls[1]["prompt"])
+        record = metadata["contract_reask"]
+        self.assertEqual(record["outcome"], "rejected")
+        self.assertEqual(record["gate"], "parse")
+        codes = [error["code"] for error in record["errors"]]
+        self.assertIn("contract_shape", codes)
+        self.assertIn("contract_missing", codes)
+        self.assertEqual(metadata["module_contract"], DERIVED_CONTRACT)
+
+    def test_bare_method_names_adopt(self) -> None:
+        # Methods declared by their bare names — the spelling
+        # the re-ask prompt now demands and the pattern allows —
+        # parse clean and the re-asked plan is adopted with its
+        # own declaration pinned.
+        fake = _ScriptedLLM(
+            [
+                _dag(_coupled_nodes()),
+                _dag(_coupled_nodes(), contract=BARE_METHOD_CONTRACT),
+            ]
+        )
+        _nodes, metadata = _plan_with(fake)
+        self.assertEqual(metadata["contract_reask"], {"outcome": "adopted"})
+        self.assertEqual(metadata["module_contract"], BARE_METHOD_CONTRACT)
+
+
 if __name__ == "__main__":
     unittest.main()

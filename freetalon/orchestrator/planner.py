@@ -9303,13 +9303,28 @@ def plan_envelope_schema(*, require_contract: bool = False) -> dict[str, Any]:
     ``require_contract`` is the constrained re-ask variant (L1,
     2026-11-23): the same schema with ``contract`` promoted into
     "required" at minItems 1, each entry requiring ``module``
-    plus a non-empty ``defines`` — exactly what
-    _normalize_contract demands of an entry. It exists for the
-    single re-ask _call_llm_with_repair makes after an accepted
-    plan couples new modules its declaration omitted: under the
+    plus a non-empty ``defines``. It exists for the single
+    re-ask _call_llm_with_repair makes after an accepted plan
+    couples new modules its declaration omitted: under the
     variant the decoder cannot emit the envelope without the
     array. It is never the default schema, so plans that couple
     nothing are not forced to invent hollow contract entries.
+
+    The contract entry shape is defined once, below, and shared
+    by both variants. Its ``defines`` items carry the
+    bare-identifier pattern — ``_CONTRACT_NAME_RE.pattern``,
+    referenced rather than copied, so the schema cannot drift
+    from the pattern _normalize_contract enforces: contract
+    names are bare identifiers end to end, and a dotted
+    "Class.method" spelling is un-emittable under the
+    constraint instead of merely rejected after the fact (exam
+    re-arm #3's re-ask was discarded for exactly that spelling).
+    ``module`` carries no pattern on purpose: _normalize_contract
+    normalizes the spelling (whitespace, backslashes, a leading
+    "./") before applying its own path check, so a schema
+    pattern would forbid spellings the validator accepts.
+    ``statuses`` items stay plain strings — the validator
+    demands only non-empty strings there.
     """
     node_properties: dict[str, Any] = {
         "id": {"type": "string"},
@@ -9347,7 +9362,10 @@ def plan_envelope_schema(*, require_contract: bool = False) -> dict[str, Any]:
                         "module": {"type": "string"},
                         "defines": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {
+                                "type": "string",
+                                "pattern": _CONTRACT_NAME_RE.pattern,
+                            },
                         },
                         "statuses": {
                             "type": "array",
@@ -9741,9 +9759,11 @@ def _contract_constrained_reask(
         "top-level \"contract\" array, placed BEFORE \"nodes\": "
         "one entry per NEW module another file in the plan "
         "imports from, each with \"module\", \"defines\" (every "
-        "public name other files rely on, including the methods "
-        "they call) and \"statuses\" (the exact status strings "
-        "the modules use). Declare the contract for the modules "
+        "public name other files rely on, as BARE names only: a "
+        "method another file calls is listed by its bare method "
+        "name — \"register\", never \"PairingStore.register\") "
+        "and \"statuses\" (the exact status strings the modules "
+        "use). Declare the contract for the modules "
         "YOUR plan couples, then make every file match it "
         "exactly.\n\n"
         "JSON Output:"
