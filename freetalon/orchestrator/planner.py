@@ -7009,13 +7009,64 @@ def _static_standin_errors(
     return errors
 
 
-def _routes_named_in_goal(goal_text: str, index: Any) -> list[tuple[str, str]]:
-    """Existing routes the goal names, as (route, serving module) pairs.
+# Verbs that, aimed at a path literal from earlier in the same sentence,
+# make that literal the goal's subject (endpoint work the goal asks for).
+_ROUTE_SUBJECT_VERBS = (
+    "add",
+    "build",
+    "change",
+    "create",
+    "delete",
+    "extend",
+    "fix",
+    "implement",
+    "introduce",
+    "modify",
+    "remove",
+    "update",
+)
 
-    A route is named when the goal contains its path literal (``/health``)
-    or the route name with ``endpoint``/``route`` (``health endpoint``).
-    Bare words like ``status`` or ``metrics`` do not count on their own —
-    they are too common to mean the API route.
+
+def _path_literal_is_route_subject(text: str, match: re.Match[str]) -> bool:
+    """Whether a path literal in a goal is the goal's subject.
+
+    The check is local to the sentence (or line) enclosing the literal:
+    the sentence must frame the literal as endpoint work — call it an
+    endpoint/route, or direct a build/change verb at it from earlier in
+    the same sentence. Spec prose that merely contains the literal (a
+    contract's ``- POST /x: 201`` listing, ``method/path/status``) frames
+    nothing, so the literal is not a route subject.
+    """
+    start = max(
+        text.rfind(".", 0, match.start()), text.rfind("\n", 0, match.start())
+    ) + 1
+    ends = [
+        pos
+        for pos in (text.find(".", match.end()), text.find("\n", match.end()))
+        if pos != -1
+    ]
+    end = min(ends) if ends else len(text)
+    sentence = text[start:end]
+    if re.search(r"\b(endpoint|route)\b", sentence):
+        return True
+    before = sentence[: match.start() - start]
+    return any(
+        re.search(rf"\b{verb}\b", before) for verb in _ROUTE_SUBJECT_VERBS
+    )
+
+
+def _routes_named_in_goal(goal_text: str, index: Any) -> list[tuple[str, str]]:
+    """Existing routes the goal makes its subject, as (route, module) pairs.
+
+    A route is captured only when the goal makes it the subject: the
+    route name with ``endpoint``/``route`` (``health endpoint``), or a
+    standalone path literal (``/health``) in a sentence that frames it
+    as endpoint work (see _path_literal_is_route_subject). A path-like
+    token that merely appears inside spec prose — ``method/path/status``
+    in a contract description, a ``- POST /pairing/register: 201``
+    contract listing, a file path like ``freetalon/pairing/server.py`` —
+    captures nothing. Bare words like ``status`` or ``metrics`` do not
+    count on their own — they are too common to mean the API route.
     """
     text = (goal_text or "").lower()
     named: list[tuple[str, str]] = []
@@ -7023,8 +7074,14 @@ def _routes_named_in_goal(goal_text: str, index: Any) -> list[tuple[str, str]]:
         name = route.strip("/").split("/", 1)[0]
         if not name:
             continue
-        path_hit = re.search(rf"{re.escape('/' + name)}(?![A-Za-z0-9_.\-])", text)
         word_hit = re.search(rf"\b{re.escape(name)}\s+(endpoint|route)\b", text)
+        path_hit = any(
+            _path_literal_is_route_subject(text, match)
+            for match in re.finditer(
+                rf"(?<![A-Za-z]){re.escape('/' + name)}(?![A-Za-z0-9_.\-])",
+                text,
+            )
+        )
         if path_hit or word_hit:
             named.append((route, index.routes[route]))
     return named
