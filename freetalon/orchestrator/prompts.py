@@ -289,6 +289,91 @@ Output DAG:
   ],
   "metadata": {"estimated_steps": 3}
 }
+
+[Example 4: New Package With A Module Contract]
+Input Goal: "Create a new package freetalon/ledger with a store module, a report module that builds on the store, and tests for both"
+Output DAG:
+{
+  "contract": [
+    {"module": "freetalon/ledger/store.py", "defines": ["Entry", "LedgerStore", "UnknownEntry"], "statuses": ["open", "closed"]},
+    {"module": "freetalon/ledger/report.py", "defines": ["summarize"], "statuses": ["open", "closed"]}
+  ],
+  "nodes": [
+    {
+      "id": "step_1",
+      "objective": "Create the ledger package directory",
+      "depends_on": [],
+      "assigned_claw": "bash",
+      "status": "draft",
+      "inputs": {"command": "mkdir -p /home/seeker/projects/FreeTalon/freetalon/ledger"},
+      "outputs": ["result"],
+      "acceptance": ["Command exits with code 0"],
+      "criteria": [{"type": "exit_code", "equals": 0}],
+      "error": null
+    },
+    {
+      "id": "step_2",
+      "objective": "Write the ledger store module",
+      "depends_on": ["step_1"],
+      "assigned_claw": "scaffold",
+      "status": "draft",
+      "inputs": {"file_path": "/home/seeker/projects/FreeTalon/freetalon/ledger/store.py", "content": "# Ledger store module.\\nclass UnknownEntry(Exception):\\n    pass\\n\\nclass Entry:\\n    def __init__(self, entry_id, amount):\\n        self.entry_id = entry_id\\n        self.amount = amount\\n        self.status = 'open'\\n\\nclass LedgerStore:\\n    def __init__(self):\\n        self.entries = {}\\n    def add(self, entry):\\n        self.entries[entry.entry_id] = entry\\n        return entry\\n    def get(self, entry_id):\\n        if entry_id not in self.entries:\\n            raise UnknownEntry(entry_id)\\n        return self.entries[entry_id]\\n    def close(self, entry_id):\\n        entry = self.get(entry_id)\\n        entry.status = 'closed'\\n        return entry\\n"},
+      "outputs": ["/home/seeker/projects/FreeTalon/freetalon/ledger/store.py"],
+      "acceptance": ["File exists"],
+      "criteria": [{"type": "file_exists", "path": "/home/seeker/projects/FreeTalon/freetalon/ledger/store.py"}],
+      "error": null
+    },
+    {
+      "id": "step_3",
+      "objective": "Write the ledger report module",
+      "depends_on": ["step_2"],
+      "assigned_claw": "scaffold",
+      "status": "draft",
+      "inputs": {"file_path": "/home/seeker/projects/FreeTalon/freetalon/ledger/report.py", "content": "# Ledger report module.\\nfrom freetalon.ledger.store import LedgerStore\\n\\ndef summarize(store):\\n    counts = {'open': 0, 'closed': 0}\\n    for entry in store.entries.values():\\n        counts[entry.status] += 1\\n    return counts\\n"},
+      "outputs": ["/home/seeker/projects/FreeTalon/freetalon/ledger/report.py"],
+      "acceptance": ["File exists"],
+      "criteria": [{"type": "file_exists", "path": "/home/seeker/projects/FreeTalon/freetalon/ledger/report.py"}],
+      "error": null
+    },
+    {
+      "id": "step_4",
+      "objective": "Write the ledger package init",
+      "depends_on": ["step_3"],
+      "assigned_claw": "scaffold",
+      "status": "draft",
+      "inputs": {"file_path": "/home/seeker/projects/FreeTalon/freetalon/ledger/__init__.py", "content": "# Ledger package.\\nfrom freetalon.ledger.store import Entry, LedgerStore, UnknownEntry\\nfrom freetalon.ledger.report import summarize\\n\\n__all__ = ['Entry', 'LedgerStore', 'UnknownEntry', 'summarize']\\n"},
+      "outputs": ["/home/seeker/projects/FreeTalon/freetalon/ledger/__init__.py"],
+      "acceptance": ["File exists"],
+      "criteria": [{"type": "file_exists", "path": "/home/seeker/projects/FreeTalon/freetalon/ledger/__init__.py"}],
+      "error": null
+    },
+    {
+      "id": "step_5",
+      "objective": "Write the ledger tests",
+      "depends_on": ["step_4"],
+      "assigned_claw": "scaffold",
+      "status": "draft",
+      "inputs": {"file_path": "/home/seeker/projects/FreeTalon/tests/test_ledger.py", "content": "# Tests for the ledger package.\\nimport unittest\\nfrom freetalon.ledger.store import Entry, LedgerStore, UnknownEntry\\nfrom freetalon.ledger.report import summarize\\n\\nclass TestLedger(unittest.TestCase):\\n    def test_close_moves_status(self):\\n        store = LedgerStore()\\n        store.add(Entry('e1', 10))\\n        store.close('e1')\\n        self.assertEqual(store.get('e1').status, 'closed')\\n        self.assertEqual(summarize(store), {'open': 0, 'closed': 1})\\n    def test_unknown_entry_raises(self):\\n        store = LedgerStore()\\n        with self.assertRaises(UnknownEntry):\\n            store.get('nope')\\n\\nif __name__ == '__main__':\\n    unittest.main()\\n"},
+      "outputs": ["/home/seeker/projects/FreeTalon/tests/test_ledger.py"],
+      "acceptance": ["File exists"],
+      "criteria": [{"type": "file_exists", "path": "/home/seeker/projects/FreeTalon/tests/test_ledger.py"}],
+      "error": null
+    },
+    {
+      "id": "step_6",
+      "objective": "Run the ledger tests",
+      "depends_on": ["step_5"],
+      "assigned_claw": "bash",
+      "status": "draft",
+      "inputs": {"command": "cd /home/seeker/projects/FreeTalon && python3 -m unittest tests.test_ledger"},
+      "outputs": ["verification"],
+      "acceptance": ["Command exits with code 0"],
+      "criteria": [{"type": "exit_code", "equals": 0}],
+      "error": null
+    }
+  ],
+  "metadata": {"estimated_steps": 6}
+}
 """
 
 

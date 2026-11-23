@@ -1188,6 +1188,10 @@ def parse_planner_response(
     any) is validated and written into the metadata under
     "module_contract"; that key is system-owned either way — a
     model-supplied metadata value under it never survives.
+    When no pin governs and the payload declares no contract
+    (or omits an entry), the missing entries are derived from
+    the plan's own coupling (_derive_contract_entries) and
+    pinned the same way.
     """
     raw_text = sanitize_llm_output(raw_text)
     print(f"\n--- RAW PLANNER OUTPUT ---\n{raw_text}\n--------------------------\n")
@@ -1377,6 +1381,17 @@ def parse_planner_response(
     contract_records, effective_contract = _contract_parse_stage(
         payload, pinned_contract
     )
+    if pinned_contract is None and not contract_records:
+        # Contract derivation (2026-11-23): no pin governs and
+        # the payload's declaration (if any) was shape-clean —
+        # fill the entries it omitted from the plan's own
+        # coupling before validation, so the coherence checks
+        # judge a contract on every coupled plan instead of
+        # planning dying on a declaration the models
+        # measurably do not emit.
+        effective_contract = _derive_contract_entries(
+            nodes, effective_contract, repo_root
+        )
     records, cheap = _collect_plan_error_records(
         _relabel_nodes_for_errors(nodes, id_labels),
         repo_root,
@@ -5677,6 +5692,17 @@ def _repetition_loop_errors(nodes: list[PlanNode]) -> list[str]:
 # and its contents are validated against the pin. The pin is what
 # makes the failure feedback binding: a re-plan can no longer
 # re-invent the interface it just failed against.
+#
+# Derivation (2026-11-23): the declaration itself measured as a
+# capability failure — prompt section, worked example, schema
+# key and exact-shape repair feedback were all already in
+# place, and two models (the 7B in arm 88C, qwen3.8:27b in exam
+# re-arm #2) emitted the array zero times across every
+# candidate. Per the differs_by precedent, the skeleton is now
+# system-derived at parse (_derive_contract_entries): a
+# declared contract still governs where present, derivation
+# fills only omitted entries, and the result pins exactly like
+# a declared one.
 
 CONTRACT_METADATA_KEY = "module_contract"
 
@@ -6273,6 +6299,139 @@ def _contract_parse_stage(
     if shape_errors:
         return records, None
     return records, declared
+
+
+def _derive_contract_entries(
+    nodes: list[PlanNode],
+    declared: list[dict[str, Any]] | None,
+    repo_root: str | Path | None,
+) -> list[dict[str, Any]] | None:
+    """System-derived contract entries for coupled NEW modules.
+
+    Contract derivation (2026-11-23): the declaration requirement
+    measured as a capability failure, not a prompt failure — the
+    MODULE CONTRACT section and a worked example were already in
+    the system prompt, the key was already in the envelope schema,
+    and the repair feedback already spelled out the exact shape,
+    yet qwen3.8:27b emitted the array zero times across three
+    candidate plans (exam re-arm #2, 2026-11-22) and the 7B did
+    the same in arm 88C. The differs_by precedent (2026-11-19)
+    takes a field the model emits unreliably out of the model's
+    hands; the contract's skeleton is the same case, because
+    every part of it is already determined by the plan itself:
+
+    - module: the contract_missing trigger set — plan-written NEW
+      modules another plan file imports from;
+    - defines: the names plan files actually import from the
+      module (the reliance set the undeclared-import check
+      judges). A name in it that the module never defines still
+      fails, as contract_incoherence naming the name — the
+      proof-arm-3 failure class, now reachable instead of masked
+      behind an unfixable contract_missing. When a module is
+      only ever bare-imported, its content's public defined
+      names stand in.
+    - statuses: the module's OWN status literals, so the
+      vocabulary check keeps its direction — implementation
+      modules set the vocabulary, importing files (the tests)
+      must draw from it.
+
+    A model-declared contract still governs: derivation fills
+    only the entries the declaration omitted, and a declared
+    entry is never rewritten (it can promise names imports do
+    not show — methods relied on by attribute access). Returns
+    the declared contract unchanged when nothing needed filling.
+    """
+    root = resolve_repo_root(repo_root)
+    contents = _plan_written_python_contents(nodes, root)
+    if not contents:
+        return declared
+    known = set(contents)
+    imports_by_file = {
+        rel: _content_imports(content, rel, known)
+        for rel, (content, _node_id) in contents.items()
+    }
+    imported_targets = {
+        target
+        for pairs in imports_by_file.values()
+        for target, _names in pairs
+    }
+    new_modules = {
+        rel for rel in contents if not _path_exists_on_disk(rel, root)
+    }
+    entries = {entry["module"]: entry for entry in declared or []}
+    filled = False
+    for module in sorted(imported_targets & new_modules):
+        if module in entries:
+            continue
+        defines = {
+            name
+            for pairs in imports_by_file.values()
+            for target, names in pairs
+            if target == module
+            for name in names
+        }
+        if not defines:
+            defines = {
+                name
+                for name in _content_defined_names(contents[module][0])
+                if not name.startswith("_")
+            }
+        if not defines:
+            # Nothing importable can be named for this module —
+            # leave it entry-less; contract_missing remains the
+            # honest rejection for it.
+            continue
+        entries[module] = {
+            "module": module,
+            "defines": sorted(defines),
+            "statuses": sorted(
+                set(_status_literals(contents[module][0]))
+            ),
+        }
+        filled = True
+    if not filled:
+        return declared
+    merged, errors = _normalize_contract(
+        [entries[module] for module in sorted(entries)]
+    )
+    if errors or merged is None:
+        return declared
+    return merged
+
+
+def _contract_omitted_modules(
+    nodes: list[PlanNode],
+    response_text: str,
+    repo_root: str | Path | None,
+) -> list[str]:
+    """Coupled NEW modules the payload's own contract omitted.
+
+    The L1 trigger (2026-11-23): the set derivation can fill —
+    every coupled new module, computed with no declared entries
+    at all — minus the modules the payload actually declared.
+    Empty when the plan couples no new modules or the
+    declaration covered the coupling. Best-effort by design:
+    any failure to re-read the payload reads as no omission,
+    because the accepted plan already carries the derived
+    contract — the re-ask this feeds is an improvement attempt,
+    never a gate on planning.
+    """
+    try:
+        derivable = _derive_contract_entries(nodes, None, repo_root)
+        if not derivable:
+            return []
+        payload = parse_json_object(sanitize_llm_output(response_text))
+        declared_entries, _errors = _normalize_contract(
+            payload.get("contract") if isinstance(payload, dict) else None
+        )
+        declared = {entry["module"] for entry in declared_entries or []}
+        return sorted(
+            entry["module"]
+            for entry in derivable
+            if entry["module"] not in declared
+        )
+    except Exception:
+        return []
 
 
 def _collect_plan_errors(
@@ -9096,7 +9255,7 @@ _PLANNER_NUM_PREDICT = 8192
 #    planning path is byte-for-byte the one the suite pins today.
 
 
-def plan_envelope_schema() -> dict[str, Any]:
+def plan_envelope_schema(*, require_contract: bool = False) -> dict[str, Any]:
     """The plan envelope as a JSON Schema for Ollama's ``format``.
 
     Derived from the PlanNode contract, kept shallow on purpose
@@ -9132,6 +9291,17 @@ def plan_envelope_schema() -> dict[str, Any]:
     ``module_contract`` for the run's re-plans (see the module
     contract pinning section). It stays out of "required": most
     plans write no coupled new modules and need no contract.
+
+    ``require_contract`` is the constrained re-ask variant (L1,
+    2026-11-23): the same schema with ``contract`` promoted into
+    "required" at minItems 1, each entry requiring ``module``
+    plus a non-empty ``defines`` — exactly what
+    _normalize_contract demands of an entry. It exists for the
+    single re-ask _call_llm_with_repair makes after an accepted
+    plan couples new modules its declaration omitted: under the
+    variant the decoder cannot emit the envelope without the
+    array. It is never the default schema, so plans that couple
+    nothing are not forced to invent hollow contract entries.
     """
     node_properties: dict[str, Any] = {
         "id": {"type": "string"},
@@ -9150,7 +9320,7 @@ def plan_envelope_schema() -> dict[str, Any]:
         "max_retries": {"type": "integer"},
         "hypothesis": {"type": "string"},
     }
-    return {
+    schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "nodes": {
@@ -9182,6 +9352,13 @@ def plan_envelope_schema() -> dict[str, Any]:
         },
         "required": ["nodes"],
     }
+    if require_contract:
+        schema["required"] = ["nodes", "contract"]
+        contract_schema = schema["properties"]["contract"]
+        contract_schema["minItems"] = 1
+        contract_schema["items"]["required"] = ["module", "defines"]
+        contract_schema["items"]["properties"]["defines"]["minItems"] = 1
+    return schema
 
 
 @dataclass(frozen=True)
@@ -9468,6 +9645,95 @@ def _stuck_repair_error(
     )
 
 
+def _contract_constrained_reask(
+    system_prompt: str,
+    user_prompt: str,
+    settings: LLMSettings,
+    *,
+    omitted: list[str],
+    goal_text: str | None,
+    workspace: str | None,
+    repo_root: str | Path | None,
+    formatter: FormatterSettings | None,
+    baseline_paths: set[str] | None,
+    baseline_installs: bool,
+    endorsed_paths: set[str],
+) -> tuple[list[PlanNode], dict[str, Any]] | None:
+    """One contract-required re-ask (L1, 2026-11-23).
+
+    The cross-model consultation's top mechanism, in the shape
+    this stack can enforce: the same planning prompt plus a
+    declaration demand, under the envelope schema variant that
+    makes "contract" a required key (minItems 1), so Ollama's
+    constrained decoding cannot produce the envelope without
+    the array. The prompt names the modules the accepted plan
+    coupled without declaring — system-computed facts about the
+    plan's own coupling, not the model's rejected text (the
+    repair loop's no-echo rule stands: the failed output itself
+    is never re-shown).
+
+    The re-asked plan is adopted ONLY when it parses clean,
+    declares every coupled module itself (no derivation fill),
+    and passes the same scope lock the accepted plan passed.
+    Anything else returns None and the accepted plan — its
+    contract completed by derivation — stands. Constraint
+    guarantees presence, not quality: the declaration is judged
+    by the same validators as any other, and a hollow or
+    incoherent one fails parse like any other plan.
+    """
+    module_list = ", ".join(omitted)
+    reask_prompt = (
+        f"{user_prompt}\n\n"
+        "CONTRACT DECLARATION REQUIRED: a previous attempt at "
+        "this plan coupled NEW Python modules without declaring "
+        f"them ({module_list}). Your plan object MUST include a "
+        "top-level \"contract\" array, placed BEFORE \"nodes\": "
+        "one entry per NEW module another file in the plan "
+        "imports from, each with \"module\", \"defines\" (every "
+        "public name other files rely on, including the methods "
+        "they call) and \"statuses\" (the exact status strings "
+        "the modules use). Declare the contract for the modules "
+        "YOUR plan couples, then make every file match it "
+        "exactly.\n\n"
+        "JSON Output:"
+    )
+    try:
+        reask_settings = dataclass_replace(
+            settings,
+            format_schema=plan_envelope_schema(require_contract=True),
+        )
+        reask_text = call_llm(
+            system_prompt, reask_prompt, settings=reask_settings
+        )
+        if formatter is not None:
+            reask_text = reformat_plan_output(
+                reask_text, settings, formatter
+            )
+        new_nodes, new_metadata = parse_planner_response(
+            reask_text,
+            goal_text=goal_text,
+            workspace=workspace,
+            repo_root=repo_root,
+            pinned_contract=None,
+        )
+        if _contract_omitted_modules(new_nodes, reask_text, repo_root):
+            return None
+        if baseline_paths is not None:
+            scope_error = _scope_widening_error(
+                new_nodes,
+                baseline_paths,
+                baseline_installs,
+                endorsed_paths,
+                repo_root,
+                workspace=workspace,
+            )
+            if scope_error is not None:
+                return None
+        return new_nodes, new_metadata
+    except Exception:
+        return None
+
+
 def _call_llm_with_repair(
     system_prompt: str,
     user_prompt: str,
@@ -9590,6 +9856,21 @@ def _call_llm_with_repair(
     StuckRepairError and escalates (steal #5 stuck detection);
     and when ``formatter`` is configured, each response first
     passes through the formatter re-emission (steal #7 plumbing).
+
+    L1 (2026-11-23): when an accepted plan couples NEW modules
+    its own "contract" declaration omitted — the omission the
+    definitive exam measured at zero emissions across every
+    candidate on two models — one extra call re-asks for the
+    plan under the contract-required schema variant, so the
+    decoder cannot emit the envelope without the array. The
+    re-asked plan replaces the accepted one only if it parses
+    clean, declares every coupled module itself, and passes
+    the same scope lock; otherwise the accepted plan stands,
+    its contract completed by derivation
+    (_contract_constrained_reask). The re-ask fires at most
+    once per planning call, only when no contract pin governs,
+    and only under the planner-owned schema — a caller-supplied
+    schema is respected, never replaced.
     """
     # Retry #22: derive the effective settings once, before the loop,
     # so every call in this planning call (initial + repairs) gets
@@ -9617,6 +9898,7 @@ def _call_llm_with_repair(
     # guaranteed by the decoder instead of repaired after the fact.
     # A caller-supplied schema is respected, never overridden — the
     # same rule as num_ctx above.
+    planner_schema_owned = False
     if (
         effective_settings.format_schema is None
         and effective_settings.backend == "ollama"
@@ -9624,6 +9906,7 @@ def _call_llm_with_repair(
         effective_settings = dataclass_replace(
             effective_settings, format_schema=plan_envelope_schema()
         )
+        planner_schema_owned = True
     prompt = user_prompt
     last_error: LLMResponseError | None = None
     prev_response_text: str | None = None
@@ -9651,6 +9934,7 @@ def _call_llm_with_repair(
         if isinstance(seeded, str) and seeded and seeded not in rejected_approaches:
             rejected_approaches.append(seeded)
     spent_repair = False
+    contract_reask_done = False
     while True:
         endorsed_paths |= _prompt_named_paths(prompt)
         response_text = call_llm(
@@ -9692,6 +9976,31 @@ def _call_llm_with_repair(
                 )
                 if scope_error is not None:
                     raise scope_error
+            if (
+                not contract_reask_done
+                and pinned_contract is None
+                and planner_schema_owned
+            ):
+                contract_reask_done = True
+                omitted = _contract_omitted_modules(
+                    nodes, response_text, repo_root
+                )
+                if omitted:
+                    upgraded = _contract_constrained_reask(
+                        system_prompt,
+                        prompt,
+                        effective_settings,
+                        omitted=omitted,
+                        goal_text=goal_text,
+                        workspace=workspace,
+                        repo_root=repo_root,
+                        formatter=formatter,
+                        baseline_paths=baseline_paths,
+                        baseline_installs=baseline_installs,
+                        endorsed_paths=endorsed_paths,
+                    )
+                    if upgraded is not None:
+                        nodes, metadata = upgraded
             metadata = dict(metadata)
             metadata["rejected_approaches"] = list(rejected_approaches)
             return nodes, metadata

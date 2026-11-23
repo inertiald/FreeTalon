@@ -18,8 +18,11 @@ pinning"):
   "contract" (per module: public "defines", the "statuses"
   vocabulary); parse validates the plan's contents against it
   deterministically — declared names defined, imported names
-  declared, status literals inside the vocabulary — and a coupled
-  new module with no entry is rejected (contract_missing);
+  declared, status literals inside the vocabulary — and since
+  2026-11-23 the entries a plan omits are derived from the plan's
+  own coupling at parse (_derive_contract_entries), so
+  contract_missing survives only for a module no entry can be
+  derived for;
 - the validated contract is written into the plan metadata under
   "module_contract" (system-owned) and PINNED for the run: the
   loop seeds it into the re-plan brief, the brief renders it as
@@ -200,10 +203,34 @@ class TestContractValidation(unittest.TestCase):
         self.assertEqual(len(nodes), 5)
         self.assertEqual(metadata["module_contract"], CONTRACT)
 
-    def test_coupled_new_modules_without_contract_rejected(self) -> None:
-        error = _rejection(_dag(_probe_nodes()))
-        self.assertIn("contract_missing", _codes(error))
-        self.assertIn("freetalon/probe_contract/alpha.py", str(error))
+    def test_coupled_new_modules_without_contract_get_derived_contract(
+        self,
+    ) -> None:
+        # Derivation (2026-11-23): the declaration's skeleton
+        # is system-owned now — a coherent coupled plan that
+        # omits "contract" is accepted and the derived
+        # contract is pinned. Alpha's derived defines are
+        # exactly the names beta and the tests import from it;
+        # its statuses are its own status literals.
+        nodes, metadata = parse_planner_response(
+            _dag(_probe_nodes()), goal_text=GOAL
+        )
+        self.assertEqual(len(nodes), 5)
+        self.assertEqual(
+            metadata["module_contract"],
+            [
+                {
+                    "module": "freetalon/probe_contract/alpha.py",
+                    "defines": ["ProbeError", "Thing", "make_thing"],
+                    "statuses": ["done"],
+                },
+                {
+                    "module": "freetalon/probe_contract/beta.py",
+                    "defines": ["build"],
+                    "statuses": [],
+                },
+            ],
+        )
 
     def test_undeclared_import_rejected(self) -> None:
         tests = TESTS.replace(
