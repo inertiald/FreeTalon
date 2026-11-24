@@ -53,6 +53,7 @@ from .models import (
 )
 from .planner import (
     build_execution_plan,
+    drain_pending_planner_attempts,
     planner_attempt_sink,
     replan_from_brief,
     try_local_repair,
@@ -187,6 +188,16 @@ class LoopRunner:
         sink is observability only: the planner guards sink
         failures, so persistence can never fail a run. An injected
         replan_fn makes no planner calls and records nothing.
+
+        Campaign build #10: the run's plan was usually produced
+        by an initial planning call that ran BEFORE this entry
+        point installed any sink (the driver flow plans first,
+        then runs), so its attempts — plan_skeleton and
+        content_fill — never reached the jsonl (arm #19: the
+        jsonl held only the run's 3 re-plan records). Those
+        records wait in the planner's pending buffer; drain them
+        into this run's sink first, so the run's trail opens
+        with the planning that produced its plan.
         """
         run_id = run_id or new_run_id()
 
@@ -194,6 +205,7 @@ class LoopRunner:
             self._run_store.append_planner_attempt(run_id, record)
 
         with planner_attempt_sink(_attempt_sink):
+            drain_pending_planner_attempts(_attempt_sink)
             return self._run_plan(
                 plan, contract, run_id=run_id, replan_fn=replan_fn
             )

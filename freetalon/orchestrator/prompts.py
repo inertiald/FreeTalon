@@ -124,6 +124,19 @@ then the file contents, then "EOF" on its own line, then any follow-up
 command (for example, "python3 <path>"). A heredoc body is file content,
 not a shell command.
 
+LIVE CHECKS - a bash "command" is one shell command, not a program:
+an inline "python -c" carrying multiple statements (imports plus
+logic, on separate lines or joined by semicolons) is rejected as
+glued words, exactly like the multi-line echo above. A live check
+that needs real code — boot a service, POST to it, poll it — is
+two nodes: a "scaffold" node writing the check as a script file,
+then a "bash" node running "python3 <path>". For contract goals,
+skip the hand-rolled live check entirely: the system's own probes
+re-verify the executed tree after every pass (declared files, the
+HTTP method surface, a live smoke pass over the contract's
+flows), so the plan's own test nodes are the verification it
+needs.
+
 A bash "command" must be an executable shell command, never a prose
 description of the work ("Add a /health branch to the do_GET method")
 and never a comment alone ("# Define a test command ..."). A scaffold
@@ -456,6 +469,15 @@ Rules:
 - To write a multi-line file, use the "scaffold" claw or a bash heredoc
   (cat > <path> <<'EOF' ... EOF). Never use single-line echo for
   multi-line content - it is rejected as glued words.
+- A bash "command" is one shell command, not a program: an inline
+  "python -c" with multiple statements is rejected as glued words.
+  A live check that needs real code is two nodes — a scaffold
+  node writing the check as a script file, then a bash node
+  running "python3 <path>". For contract goals, skip the
+  hand-rolled live check: the system's own probes re-verify the
+  executed tree (declared files, the HTTP method surface, a live
+  smoke pass over the contract's flows), so the delta's test
+  nodes are the verification it needs.
 - A bash "command" must be executable shell, never prose or a comment
   alone; a scaffold "content" overwriting an existing code file must be
   real code, never a comment-only placeholder.

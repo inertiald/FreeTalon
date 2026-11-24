@@ -68,6 +68,7 @@ from .measure import (
     custom_checkers,
     measurement_failed_detail,
 )
+from .memory import node_payload, normalize_payload
 from .models import ExecutionPlan, PlanNode, PlanStatus, TaskIntent
 from .prompts import (
     FORMATTER_SYSTEM_PROMPT,
@@ -7246,7 +7247,11 @@ def _collect_plan_error_records(
     were judged at acceptance (its culprit's content is an edit
     product by construction), and an enrichment call serves a plan
     already under rejection — in both cases the plan is not the
-    otherwise-acceptable plan these rules exist to steer.
+    otherwise-acceptable plan these rules exist to steer. The
+    clause-coverage rule (clause_coverage) is gated differently
+    (campaign build #10): authored plan + a supplied clause list
+    is its whole gate, and it contributes its records alongside
+    any others — see its block below for the arm #19 evidence.
 
     Returns (records, cheap): ``cheap`` is True when every error is a
     stand-in / code-overwrite fake (retry #12) or a placeholder scaffold
@@ -7451,8 +7456,11 @@ def _collect_plan_error_records(
     # a real regeneration, not a mechanical relocation. The modify
     # rule runs first; when it fires, the suite rule waits for the
     # next round, for the same one-class-at-a-time reason. Campaign
-    # build #3 adds a third rule behind both — clause coverage —
-    # under the identical gate.
+    # build #3 added a third rule behind both — clause coverage —
+    # under the identical gate; campaign build #10 moved it out
+    # (see its own block below): the gate starved it — arm #19's
+    # re-plan attempts each carried an unrelated 'command' record,
+    # so the clause slot never ran at all.
     if skeleton:
         # Campaign build #5: content-dependent validators judge a
         # write node's payload; a skeleton write node has none yet
@@ -7484,8 +7492,9 @@ def _collect_plan_error_records(
             # "whole_file" intent without the justification +
             # impact-check pair the modify rule demands. It takes
             # the modify rule's slot in the gated sequence; the
-            # suite-placement and clause-coverage rules behind it
-            # run on the skeleton exactly as on a full plan.
+            # suite-placement rule behind it, and the independent
+            # clause-coverage slot below, run on the skeleton
+            # exactly as on a full plan.
             modify_records = _error_records(
                 "skeleton_intent",
                 _skeleton_intent_errors(nodes, repo_root, index, modules),
@@ -7502,44 +7511,61 @@ def _collect_plan_error_records(
                 _suite_placement_errors(nodes, repo_root, index),
             )
             records.extend(suite_records)
-            if not suite_records and clauses is not _CLAUSES_UNSUPPLIED:
-                # Campaign build #3: the clause-coverage rule —
-                # every frozen contract clause must be implemented
-                # by at least one node and verified by at least one
-                # node (the panel's requirement-to-node binding).
-                # Third in the gated sequence, same discipline: it
-                # fires only on an otherwise-acceptable authored
-                # plan, and only when the caller supplied the
-                # clause list extracted from the goal-named spec.
-                # Not cheap: completing a coverage map is a real
-                # regeneration of the plan's declarations.
-                #
-                # Campaign build #7: a re-plan parse is marked
-                # clause_mode="delta" and judged by the delta rule
-                # in the same slot, under the same code — every
-                # emitted node must declare its mapping, and the
-                # brief's open clauses (clause_required) must be
-                # implemented and verified within the delta. Full
-                # coverage of the frozen list is the initial
-                # planner's burden, not a repair delta's (arm #16:
-                # the full rule rejected the re-plan wholesale and
-                # no v2 ever landed). The delta branch requires a
-                # non-empty frozen list: with no contract there is
-                # nothing to declare against, and the empty-list
-                # full rule below is exactly the pre-build-#7
-                # behavior for contract-less plans.
-                if clause_mode == "delta" and clauses:
-                    clause_errors = clause_delta_errors(
-                        nodes, clauses, clause_required or ()
-                    )
-                else:
-                    clause_errors = clause_coverage_errors(nodes, clauses)
-                records.extend(
-                    _error_records(
-                        "clause_coverage",
-                        clause_errors,
-                    )
-                )
+    if plan_context == "authored" and clauses is not _CLAUSES_UNSUPPLIED:
+        # Campaign build #3: the clause-coverage rule — every
+        # frozen contract clause must be implemented by at least
+        # one node and verified by at least one node (the panel's
+        # requirement-to-node binding). It fires only on an
+        # authored plan, and only when the caller supplied the
+        # clause list extracted from the goal-named spec (the
+        # sentinel keeps corpus and other clause-less callers
+        # byte-identical). Not cheap: completing a coverage map
+        # is a real regeneration of the plan's declarations.
+        #
+        # Campaign build #7: a re-plan parse is marked
+        # clause_mode="delta" and judged by the delta rule in the
+        # same slot, under the same code — every emitted node
+        # must declare its mapping, and the brief's open clauses
+        # (clause_required) must be implemented and verified
+        # within the delta. Full coverage of the frozen list is
+        # the initial planner's burden, not a repair delta's
+        # (arm #16: the full rule rejected the re-plan wholesale
+        # and no v2 ever landed). The delta branch requires a
+        # non-empty frozen list: with no contract there is
+        # nothing to declare against, and the empty-list full
+        # rule below is exactly the pre-build-#7 behavior for
+        # contract-less plans.
+        #
+        # Campaign build #10: the clause slot is INDEPENDENT of
+        # the gated sequence above. Through build #9 it sat
+        # behind both authorship rules AND behind an empty
+        # record set, so any other rejection — however unrelated
+        # — suppressed it entirely: in arm #19 all three re-plan
+        # attempts carried a 'command' record, the slot never
+        # ran, and the delta rule went a third arm without ever
+        # judging a live delta (one attempt's dropped
+        # declarations went unflagged for the same reason).
+        # Clause coverage is a judgment about the contract, not
+        # about how the author expressed the work, so it does
+        # not belong to the one-defect-class rhythm: it now runs
+        # whenever its own gate (authored plan, clauses
+        # supplied) holds and contributes its records alongside
+        # whatever else the plan is rejected for, so one repair
+        # round can fix every defect at once. The modify/suite
+        # pair keeps the gated rhythm between themselves,
+        # unchanged.
+        if clause_mode == "delta" and clauses:
+            clause_errors = clause_delta_errors(
+                nodes, clauses, clause_required or ()
+            )
+        else:
+            clause_errors = clause_coverage_errors(nodes, clauses)
+        records.extend(
+            _error_records(
+                "clause_coverage",
+                clause_errors,
+            )
+        )
     # Cheap rejection (retry #12): the only errors are stand-in /
     # code-overwrite fakes, so re-prompting costs the model nothing to
     # fix and must not spend the repair budget. A rejection whose only
@@ -10918,13 +10944,62 @@ def _scope_widening_error(
 _STUCK_REPEAT_LIMIT = 3
 
 
+def _rejection_signature(
+    response_text: str,
+    records: Collection[PlanError],
+) -> frozenset:
+    """A rejection's stuck-detector identity: (code, node, payload).
+
+    Campaign build #10: the signature keys on payload identity,
+    not on the error code alone — the principle the judge's
+    repeat-approach gate established (92448dc): a signature match
+    escalates to a substance check, and only an identical payload
+    convicts. Each record contributes its code, its node, and the
+    whitespace-normalized payload that node carried in THIS
+    response (memory.node_payload / normalize_payload — a write
+    node's content, a bash node's command), read leniently from
+    the raw output, since a rejected output may not validate.
+    Same code on a materially different payload is iteration —
+    the model is working the defect, however unsuccessfully —
+    and must not accumulate toward the stuck threshold; the same
+    code on the same payload is the repetition the detector
+    exists to name. A record whose node's payload cannot be
+    extracted (the node is absent from the output, its claw
+    carries no payload, the output does not parse) contributes
+    None: no payload comparison is possible, and the record keys
+    on code + node exactly as before this build.
+    """
+    payloads: dict[str, str] = {}
+    try:
+        payload = parse_json_object(sanitize_llm_output(response_text))
+    except Exception:
+        payload = None
+    nodes_raw = payload.get("nodes") if isinstance(payload, dict) else None
+    if isinstance(nodes_raw, list):
+        for position, raw in enumerate(nodes_raw, start=1):
+            view = _lenient_node_view(raw, position)
+            if view is None:
+                continue
+            text = node_payload(view)
+            if text is not None:
+                payloads[view.id] = normalize_payload(text)
+    return frozenset(
+        (
+            record.code,
+            record.node_id,
+            payloads.get(record.node_id) if record.node_id else None,
+        )
+        for record in records
+    )
+
+
 def _stuck_repair_error(
     exc: LLMResponseError,
     signature: frozenset,
     count: int,
 ) -> StuckRepairError:
     """The escalation raised when a repair loop is stuck (steal #5)."""
-    codes = sorted({code for code, _node_id in signature})
+    codes = sorted({code for code, _node_id, _payload in signature})
     stuck = StuckRepairError(
         "Repair loop stuck: the same rejection "
         f"({', '.join(codes)}) has now occurred {count} times in "
@@ -11570,11 +11645,41 @@ def _existing_files_section(
 # volume is bounded by the attempt budgets themselves (plan-sized
 # texts, a handful per planning call); the recorded error text is
 # capped for the same reason.
+#
+# Campaign build #10: the sink's installation ordering left the
+# INITIAL planning phases (plan_skeleton, content_fill) out of
+# the run's jsonl — the driver flow plans first and only then
+# calls run_plan, which is what installs the sink (arm #19's
+# jsonl held the 3 replan_skeleton records and none of the 8
+# initial-planning attempts; those stood in the driver log's
+# stdout blocks only). Records from the initial phases made
+# while NO sink is installed now wait in a bounded pending
+# buffer, and LoopRunner.run_plan drains the buffer into its
+# run sink on entry (drain_pending_planner_attempts), so a
+# loop-driven run's trail covers the planning that produced
+# its plan, ahead of the run's own re-plan records, in the
+# order the attempts were made. Only the initial phases
+# buffer: re-plan attempts are made inside a run (a sink is
+# installed) or by a direct caller with its own capture —
+# buffering them would misattribute one caller's attempts to
+# whatever run happened to start next. Direct callers without
+# a sink keep the stdout record exactly as before.
 
 _ATTEMPT_ERROR_CAP = 4000
 
 #: The installed attempt sink, if any (see planner_attempt_sink).
 _ATTEMPT_SINK: Callable[[dict[str, Any]], None] | None = None
+
+#: The phases whose records buffer when no sink is installed —
+#: the initial planning phases (campaign build #10, above).
+_INITIAL_PLANNING_PHASES = frozenset({"plan_skeleton", "content_fill"})
+
+#: Initial-planning records awaiting a run's sink, oldest first.
+#: Bounded like everything else in this section: a planning
+#: call's attempts are a handful of plan-sized texts, and the
+#: cap holds the most recent ones when no run ever claims them.
+_PENDING_ATTEMPTS: list[dict[str, Any]] = []
+_PENDING_ATTEMPT_LIMIT = 128
 
 
 @contextmanager
@@ -11595,6 +11700,39 @@ def planner_attempt_sink(
         yield
     finally:
         _ATTEMPT_SINK = previous
+
+
+def drain_pending_planner_attempts(
+    sink: Callable[[dict[str, Any]], None],
+) -> int:
+    """Hand the buffered initial-planning records to ``sink``.
+
+    Campaign build #10: LoopRunner.run_plan calls this with its
+    run sink on entry — the initial planning that produced the
+    run's plan happened before that sink existed (the driver
+    flow plans first, then runs), and its records waited in the
+    pending buffer (see the section above). Returns the number
+    of records delivered. The buffer is cleared either way: the
+    records were offered to the run that claimed them, and a
+    later run must not inherit them. A sink failure on one
+    record is noted on stdout and the drain continues —
+    persistence is observability, never a gate.
+    """
+    global _PENDING_ATTEMPTS
+    pending = _PENDING_ATTEMPTS
+    _PENDING_ATTEMPTS = []
+    delivered = 0
+    for record in pending:
+        try:
+            sink(record)
+            delivered += 1
+        except Exception as exc:  # noqa: BLE001 — observability, not a gate
+            print(
+                "planner attempt drain failed "
+                f"({type(exc).__name__}: {exc}); the attempt record "
+                "stands in the log only."
+            )
+    return delivered
 
 
 def _record_planner_attempt(
@@ -11658,6 +11796,14 @@ def _record_planner_attempt(
                 f"({type(exc).__name__}: {exc}); the attempt record "
                 "above stands in the log only."
             )
+    elif phase in _INITIAL_PLANNING_PHASES:
+        # Campaign build #10: no sink is installed — in the
+        # driver flow this is the initial planning, which runs
+        # before LoopRunner.run_plan installs the run's sink.
+        # Hold the record for that sink (see the section above);
+        # the stdout block above already stands either way.
+        _PENDING_ATTEMPTS.append(record)
+        del _PENDING_ATTEMPTS[:-_PENDING_ATTEMPT_LIMIT]
 
 
 def _call_llm_with_repair(
@@ -12073,12 +12219,20 @@ def _call_llm_with_repair(
             # the remaining attempts re-asking for a fix the model
             # is not producing. Empty plans are exempt: they carry
             # their own grounded escalation below.
+            #
+            # Campaign build #10: the signature carries payload
+            # identity (see _rejection_signature). Arm #19's
+            # re-plan died here on three 'command' rejections of
+            # step_5 whose commands were materially different
+            # attempts (a multi-line inline script, then two
+            # semicolon one-liners): same code, different payload
+            # is iteration, and the repair budget — not the stuck
+            # detector — is what ends it.
             if not isinstance(exc, EmptyPlanError):
-                signature = frozenset(
-                    (record.code, record.node_id)
-                    for record in getattr(exc, "plan_errors", None)
-                    or []
-                ) or frozenset({(type(exc).__name__, None)})
+                signature = _rejection_signature(
+                    response_text,
+                    getattr(exc, "plan_errors", None) or [],
+                ) or frozenset({(type(exc).__name__, None, None)})
                 if signature == last_signature:
                     signature_streak += 1
                 else:
