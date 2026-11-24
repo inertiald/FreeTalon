@@ -305,6 +305,199 @@ def format_clauses_block(clauses: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+# ── Re-plan (delta) coverage ────────────────────────────────────────
+#
+# Campaign build #7: the initial planner's coverage rule is a
+# full-plan rule — every clause implemented and verified across the
+# whole node set. A re-plan is a delta aimed at the clauses the
+# brief names as open; judging it by the full rule demands it
+# re-declare the whole contract (arm #16: the re-plan died on 24
+# full-coverage errors and no v2 ever landed). The delta rule is
+# narrower and stricter where it applies:
+#
+# (a) every emitted node DECLARES its mapping — inputs.clauses is
+#     present (empty lists are a declaration; an absent key is
+#     not), so no node rides along unaccounted;
+# (b) every clause the brief names as failed/uncovered is
+#     implemented by at least one node in the delta and verified
+#     by at least one (the same declaration semantics as the full
+#     rule — the verdict gate and the probes judge the claim);
+# (c) declared clause IDs must exist in the frozen list.
+#
+# Malformed declarations are errors under both rules (the shared
+# node_clause_declaration check).
+
+
+def _node_declares_clauses(node: "PlanNode") -> bool:
+    """True when the node carries an inputs.clauses value at all.
+
+    Presence is the delta rule's declaration test: a present dict
+    (even with both lists empty) is a declaration; an absent key —
+    or an explicit null, which node_clause_declaration also reads
+    as absent — is not.
+    """
+    return (node.inputs or {}).get("clauses") is not None
+
+
+def clause_delta_errors(
+    nodes: list["PlanNode"],
+    clauses: list[dict[str, Any]],
+    required_ids: Any,
+) -> list[str]:
+    """Plan errors for the re-plan delta coverage rule (build #7).
+
+    ``required_ids`` is the brief's open-clause set (the judge's
+    uncovered clauses plus the probe-failed clauses), intersected
+    with the frozen list — an ID the frozen list does not carry
+    cannot be required of the delta. Runs under the same authored
+    gating as the full rule, in its place, when the caller marks
+    the parse as a re-plan delta.
+    """
+    errors: list[str] = []
+    known = {str(clause["id"]) for clause in clauses}
+    headings = {str(clause["id"]): clause.get("heading") for clause in clauses}
+    required = [
+        str(clause["id"])
+        for clause in clauses
+        if str(clause["id"]) in set(required_ids or ())
+    ]
+    for node in nodes:
+        implements, verifies, error = node_clause_declaration(node)
+        if error is not None:
+            errors.append(error)
+            continue
+        if not _node_declares_clauses(node):
+            errors.append(
+                f"node '{node.id}' declares no contract-clause "
+                "mapping — every node in a re-plan must declare "
+                'inputs.clauses = {"implements": [...], "verifies": '
+                "[...]} (empty lists are a declaration that the node "
+                "covers nothing; an absent mapping is not)"
+            )
+            continue
+        for clause_id in implements + verifies:
+            if clause_id not in known:
+                errors.append(
+                    f"node '{node.id}' declares contract clause "
+                    f"{clause_id!r}, which is not in the frozen clause "
+                    f"list ({', '.join(sorted(known))}) — clause ids "
+                    "are system-extracted from the contract and cannot "
+                    "be invented"
+                )
+    coverage = coverage_map(nodes)
+    for clause_id in required:
+        entry = coverage.get(clause_id) or {"implement": [], "verify": []}
+        if not entry["implement"]:
+            errors.append(
+                f"open contract clause {clause_id} "
+                f"({headings.get(clause_id)}) is not implemented by "
+                "any node in this re-plan — the brief names it as "
+                "still open; declare it in the \"implements\" list of "
+                "the node that repairs it (inputs.clauses)"
+            )
+        if not entry["verify"]:
+            errors.append(
+                f"open contract clause {clause_id} "
+                f"({headings.get(clause_id)}) is not verified by "
+                "any node in this re-plan — declare it in the "
+                '"verifies" list of the node whose tests or checks '
+                "prove it (inputs.clauses); the system's own probes "
+                "independently check the mechanically checkable "
+                "clauses"
+            )
+    return errors
+
+
+def delta_clause_coverage(
+    nodes: list["PlanNode"], clauses: list[dict[str, Any]]
+) -> dict[str, list[str]]:
+    """The clauses a re-plan delta declares it addresses.
+
+    {"implements": [...], "verifies": [...], "addressed": [...]}
+    — frozen-list IDs only, in frozen-list order. Recorded into
+    the brief by replan_from_brief and stamped by the loop into
+    the new plan version's metadata (build #7), so the delta's
+    coverage claim is part of the run record the verdict gate's
+    per-version accounting is checked against.
+    """
+    coverage = coverage_map(nodes)
+    implements: list[str] = []
+    verifies: list[str] = []
+    for clause in clauses:
+        clause_id = str(clause["id"])
+        entry = coverage.get(clause_id)
+        if not entry:
+            continue
+        if entry["implement"]:
+            implements.append(clause_id)
+        if entry["verify"]:
+            verifies.append(clause_id)
+    return {
+        "implements": implements,
+        "verifies": verifies,
+        "addressed": sorted(set(implements) | set(verifies)),
+    }
+
+
+def format_replan_clauses_block(
+    clauses: list[dict[str, Any]], required_ids: Any
+) -> str:
+    """The CONTRACT CLAUSES block for a re-plan prompt (build #7).
+
+    The frozen list, the delta declaration rule, and the brief's
+    open clauses as the delta's assigned targets. Unlike the
+    initial planner's block, full-plan coverage is NOT demanded:
+    clauses the brief does not name as open keep the standing the
+    current plan version gave them, and the verdict gate
+    re-derives every clause's state from the new version's nodes —
+    a clause whose declarations this delta drops re-opens in the
+    next brief rather than passing silently.
+    """
+    required = [
+        clause
+        for clause in clauses
+        if str(clause["id"]) in set(required_ids or ())
+    ]
+    lines = [
+        "CONTRACT CLAUSES (re-plan) — the goal-named contract, "
+        "compiled by the system into a frozen requirement list. "
+        "You cannot add, remove, or rename clauses. This is a "
+        "delta plan, judged by the delta rule:",
+        "- EVERY node you emit must declare its clause mapping: "
+        'inputs.clauses = {"implements": ["<clause id>", ...], '
+        '"verifies": ["<clause id>", ...]}. A node with no '
+        "inputs.clauses key is rejected; empty lists are allowed "
+        "for a node that genuinely implements and verifies "
+        "nothing.",
+        "- Each OPEN clause below must be implemented by at least "
+        "one node in this delta and verified by at least one node "
+        "in this delta. Declare \"verifies\" on the node whose "
+        "tests or checks prove the clause — the system's own "
+        "probes independently check the mechanically checkable "
+        "clauses (declared files exist; the HTTP method surface; "
+        "the live request flows), so a declaration is a claim the "
+        "probes and the run will judge.",
+        "- Clauses NOT listed as open need no coverage in this "
+        "delta.",
+        "",
+        "Frozen clause list:",
+    ]
+    for clause in clauses:
+        lines.append(f"- {clause['id']}: {clause.get('heading')}")
+    lines.append("")
+    if required:
+        lines.append("OPEN clauses this re-plan must address:")
+        for clause in required:
+            lines.append(f"- {clause['id']}: {clause.get('heading')}")
+    else:
+        lines.append(
+            "OPEN clauses this re-plan must address: none named by "
+            "the brief — the per-node declaration rule above still "
+            "applies to every node."
+        )
+    return "\n".join(lines)
+
+
 # ── Deterministic probes ────────────────────────────────────────────
 
 

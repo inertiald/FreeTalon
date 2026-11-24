@@ -657,6 +657,27 @@ class LoopRunner:
                     metadata["rejected_approaches"] = list(
                         brief["rejected_approaches"]
                     )
+                if brief.get("replan_clause_coverage"):
+                    # Campaign build #7: the accepted re-plan's
+                    # declared clause coverage (the brief write-back
+                    # from replan_from_brief: the open clauses it was
+                    # assigned and the implements/verifies it
+                    # declared), appended per version next to the
+                    # frozen clause list the wholesale metadata copy
+                    # above already carries. The record is the
+                    # delta's claim; the verdict gate's per-version
+                    # clause accounting and the probes judge the
+                    # new version's actual state independently.
+                    coverage_history = metadata.get("replan_clause_coverage")
+                    coverage_history = (
+                        list(coverage_history)
+                        if isinstance(coverage_history, list)
+                        else []
+                    )
+                    coverage_record = dict(brief["replan_clause_coverage"])
+                    coverage_record["plan_version"] = version
+                    coverage_history.append(coverage_record)
+                    metadata["replan_clause_coverage"] = coverage_history
                 if judge.repeat_warnings:
                     # Cross-run signature matches the substance check
                     # cleared: the historical warnings ride into the

@@ -20,8 +20,11 @@ from pydantic import ValidationError
 from .contract_clauses import (
     CLAUSES_METADATA_KEY,
     clause_coverage_errors,
+    clause_delta_errors,
     clauses_for_specs,
+    delta_clause_coverage,
     format_clauses_block,
+    format_replan_clauses_block,
     node_clause_declaration,
 )
 from .executor import _command_runs_full_suite
@@ -1208,8 +1211,19 @@ def parse_planner_response(
     pinned_contract: list[dict[str, Any]] | None = None,
     clauses: list[dict[str, Any]] | None = None,
     skeleton: bool = False,
+    clause_mode: str = "full",
+    clause_required: Collection[str] | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Validate raw planner output into normalized PlanNodes plus metadata.
+
+    ``clause_mode`` (campaign build #7) selects the clause rule
+    the collector applies when ``clauses`` is supplied: "full"
+    (the initial planner's rule — every clause implemented and
+    verified across the plan) or "delta" (the re-plan rule —
+    every node declares a mapping, and the clauses named in
+    ``clause_required``, the brief's open set, are implemented
+    and verified within the delta). The default is "full", so
+    every existing caller is judged exactly as before.
 
     ``repo_root`` overrides the repo the grounding check reads; by default
     it is the checkout holding this package. ``goal_text`` is the goal the
@@ -1461,6 +1475,8 @@ def parse_planner_response(
         contract=effective_contract,
         clauses=clauses if clauses is not None else _CLAUSES_UNSUPPLIED,
         skeleton=skeleton,
+        clause_mode=clause_mode,
+        clause_required=clause_required,
     )
     records = contract_records + records
     if skeleton:
@@ -7179,6 +7195,8 @@ def _collect_plan_error_records(
     clauses: Any = _CLAUSES_UNSUPPLIED,
     plan_context: str = "authored",
     skeleton: bool = False,
+    clause_mode: str = "full",
+    clause_required: Collection[str] | None = None,
 ) -> tuple[list[PlanError], bool]:
     """Collect EVERY plan validation error as structured records.
 
@@ -7491,10 +7509,31 @@ def _collect_plan_error_records(
                 # clause list extracted from the goal-named spec.
                 # Not cheap: completing a coverage map is a real
                 # regeneration of the plan's declarations.
+                #
+                # Campaign build #7: a re-plan parse is marked
+                # clause_mode="delta" and judged by the delta rule
+                # in the same slot, under the same code — every
+                # emitted node must declare its mapping, and the
+                # brief's open clauses (clause_required) must be
+                # implemented and verified within the delta. Full
+                # coverage of the frozen list is the initial
+                # planner's burden, not a repair delta's (arm #16:
+                # the full rule rejected the re-plan wholesale and
+                # no v2 ever landed). The delta branch requires a
+                # non-empty frozen list: with no contract there is
+                # nothing to declare against, and the empty-list
+                # full rule below is exactly the pre-build-#7
+                # behavior for contract-less plans.
+                if clause_mode == "delta" and clauses:
+                    clause_errors = clause_delta_errors(
+                        nodes, clauses, clause_required or ()
+                    )
+                else:
+                    clause_errors = clause_coverage_errors(nodes, clauses)
                 records.extend(
                     _error_records(
                         "clause_coverage",
-                        clause_coverage_errors(nodes, clauses),
+                        clause_errors,
                     )
                 )
     # Cheap rejection (retry #12): the only errors are stand-in /
@@ -10938,6 +10977,8 @@ def _contract_constrained_reask(
     baseline_installs: bool,
     endorsed_paths: set[str],
     clauses: list[dict[str, Any]] | None = None,
+    clause_mode: str = "full",
+    clause_required: Collection[str] | None = None,
 ) -> tuple[tuple[list[PlanNode], dict[str, Any]] | None, dict[str, Any]]:
     """One contract-required re-ask (L1, 2026-11-23).
 
@@ -11019,6 +11060,8 @@ def _contract_constrained_reask(
             repo_root=repo_root,
             pinned_contract=None,
             clauses=clauses,
+            clause_mode=clause_mode,
+            clause_required=clause_required,
         )
     except Exception as exc:
         return None, {
@@ -11112,6 +11155,7 @@ def _plan_attempt_facts(
     error_records: Collection[PlanError],
     repo_root: str | Path | None,
     clauses: list[dict[str, Any]] | None,
+    clause_required: Collection[str] | None = None,
 ) -> dict[str, Any]:
     """Deterministic shape facts about one rejected plan attempt.
 
@@ -11128,6 +11172,14 @@ def _plan_attempt_facts(
     Never raises: any extraction failure returns the error codes
     alone, so the repair loop's bookkeeping cannot mask the
     rejection it describes.
+
+    Campaign build #7: when the call is a re-plan (``clause_required``
+    given — the brief's open-clause set), the facts also carry the
+    delta measures the delta rule judges: how many of the required
+    clauses the attempt implemented / verified, and how many of its
+    nodes declared a clause mapping at all (nodes_declared of
+    nodes_total). Without them the anchoring could only speak in
+    full-coverage terms a delta is not required to meet.
     """
     facts: dict[str, Any] = {
         "errors": sorted({record.code for record in error_records}),
@@ -11153,6 +11205,14 @@ def _plan_attempt_facts(
     if clauses:
         known_clauses = {str(clause.get("id")) for clause in clauses}
         facts["clauses_total"] = len(known_clauses)
+    # Campaign build #7: delta-attempt tracking (re-plan calls).
+    required_ids: set[str] = set()
+    if clause_required:
+        required_ids = {str(clause_id) for clause_id in clause_required}
+    nodes_total = 0
+    nodes_declared = 0
+    required_implemented: set[str] = set()
+    required_verified: set[str] = set()
     implementation_writes: set[str] = set()
     test_new: set[str] = set()
     test_existing: set[str] = set()
@@ -11161,6 +11221,11 @@ def _plan_attempt_facts(
         view = _lenient_node_view(raw, position)
         if view is None:
             continue
+        nodes_total += 1
+        if clause_required is not None and (
+            view.inputs or {}
+        ).get("clauses") is not None:
+            nodes_declared += 1
         if known_clauses is not None:
             declares_impl, declares_verify, decl_error = (
                 node_clause_declaration(view)
@@ -11175,6 +11240,16 @@ def _plan_attempt_facts(
                     clause_id
                     for clause_id in declares_verify
                     if clause_id in known_clauses
+                )
+                required_implemented.update(
+                    clause_id
+                    for clause_id in declares_impl
+                    if clause_id in required_ids
+                )
+                required_verified.update(
+                    clause_id
+                    for clause_id in declares_verify
+                    if clause_id in required_ids
                 )
         for path in _node_written_paths(view):
             if _is_test_file_path(path):
@@ -11205,6 +11280,16 @@ def _plan_attempt_facts(
     if known_clauses is not None:
         facts["clauses_implemented"] = len(implemented)
         facts["clauses_verified"] = len(verified)
+    if clause_required is not None:
+        facts["required_total"] = (
+            len(required_ids & known_clauses)
+            if known_clauses is not None
+            else 0
+        )
+        facts["required_implemented"] = len(required_implemented)
+        facts["required_verified"] = len(required_verified)
+        facts["nodes_total"] = nodes_total
+        facts["nodes_declared"] = nodes_declared
     facts["implementation_writes"] = sorted(implementation_writes)
     facts["test_writes_new"] = sorted(test_new)
     facts["test_writes_existing"] = sorted(test_existing)
@@ -11255,6 +11340,58 @@ def _attempt_anchoring_constraints(
             f"next plan must declare at least {best}/{total} "
             f"{label} coverage."
         )
+    # Campaign build #7: the delta measures, for re-plan calls
+    # whose attempts carry them. The full-coverage constraints
+    # above judge a delta by a rule it is not under; these judge
+    # it by its own: coverage of the brief's open clauses, and
+    # every node declaring a mapping at all.
+    if latest.get("required_total") is not None:
+        required_total = latest.get("required_total") or 0
+        for key, label in (
+            ("required_implemented", "implementation"),
+            ("required_verified", "verification"),
+        ):
+            best = max(
+                (attempt.get(key) for attempt in earlier),
+                key=lambda value: -1 if value is None else value,
+            )
+            current = latest.get(key)
+            if best is None or current is None or current >= best:
+                continue
+            peak = next(
+                index + 1
+                for index, attempt in enumerate(earlier)
+                if attempt.get(key) == best
+            )
+            constraints.append(
+                f"Open-clause {label} coverage peaked at "
+                f"{best}/{required_total} in attempt {peak}; the "
+                f"latest attempt declared {current}/"
+                f"{required_total}. The clauses the brief names "
+                f"as open are this re-plan's assignment — the next "
+                f"plan must declare at least {best}/"
+                f"{required_total} {label} coverage of them."
+            )
+        full_declaration_seen = any(
+            attempt.get("nodes_total")
+            and attempt.get("nodes_declared") == attempt.get("nodes_total")
+            for attempt in earlier
+        )
+        latest_declared = latest.get("nodes_declared")
+        latest_nodes = latest.get("nodes_total") or 0
+        if (
+            full_declaration_seen
+            and latest_nodes > 0
+            and (latest_declared or 0) < latest_nodes
+        ):
+            constraints.append(
+                "An earlier attempt in this call declared a "
+                "clause mapping on every node it emitted; the "
+                f"latest attempt declared mappings on "
+                f"{latest_declared} of its {latest_nodes} nodes. "
+                "Every node in a re-plan must carry inputs.clauses "
+                "— restore a declaration on every node."
+            )
     if not latest.get("implementation_writes"):
         richest = max(
             earlier, key=lambda attempt: len(attempt["implementation_writes"])
@@ -11329,6 +11466,19 @@ def _attempt_anchoring_block(attempts: list[dict[str, Any]]) -> str:
                 f"{attempt.get('clauses_verified')}/"
                 f"{attempt['clauses_total']}."
             )
+        if attempt.get("required_total") is not None:
+            # Campaign build #7: the delta measures, for re-plan
+            # attempts — coverage of the brief's open clauses and
+            # the declared-node count the delta rule judges.
+            line += (
+                f" Open-clause declarations: implements "
+                f"{attempt.get('required_implemented')}/"
+                f"{attempt['required_total']}, verifies "
+                f"{attempt.get('required_verified')}/"
+                f"{attempt['required_total']}; nodes declaring a "
+                f"clause mapping: {attempt.get('nodes_declared')}/"
+                f"{attempt.get('nodes_total')}."
+            )
         line += (
             f" Implementation writes: "
             f"{_fact_file_list(attempt.get('implementation_writes') or [])}."
@@ -11397,6 +11547,8 @@ def _call_llm_with_repair(
     clauses: list[dict[str, Any]] | None = None,
     formatter: FormatterSettings | None = None,
     skeleton: bool = False,
+    clause_mode: str = "full",
+    clause_required: Collection[str] | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
 
@@ -11535,6 +11687,14 @@ def _call_llm_with_repair(
     so no attempt ever held every validated property at once).
     On success the history rides the returned metadata under
     ATTEMPT_ANCHORING_METADATA_KEY.
+
+    Campaign build #7: ``clause_mode`` / ``clause_required`` are
+    threaded to parse (the delta clause rule for re-plan calls)
+    and to the attempt facts, so a re-plan's anchoring measures
+    the delta properties — open-clause coverage and declared-node
+    counts — alongside the full-list counts. The repair budget
+    semantics are unchanged: clause rejections are not cheap and
+    spend repairs like any other real rejection.
     """
     # Retry #22: derive the effective settings once, before the loop,
     # so every call in this planning call (initial + repairs) gets
@@ -11628,6 +11788,8 @@ def _call_llm_with_repair(
                 pinned_contract=pinned_contract,
                 clauses=clauses,
                 skeleton=skeleton,
+                clause_mode=clause_mode,
+                clause_required=clause_required,
             )
             if baseline_paths is not None:
                 # Steal #5 scope lock: a repair that parses is still
@@ -11680,6 +11842,8 @@ def _call_llm_with_repair(
                         baseline_installs=baseline_installs,
                         endorsed_paths=endorsed_paths,
                         clauses=clauses,
+                        clause_mode=clause_mode,
+                        clause_required=clause_required,
                     )
                     if upgraded is not None:
                         nodes, metadata = upgraded
@@ -11727,6 +11891,7 @@ def _call_llm_with_repair(
                     getattr(exc, "plan_errors", None) or [],
                     repo_root,
                     clauses,
+                    clause_required,
                 )
             )
             for approach in _rejected_approaches(error_codes):
@@ -12737,6 +12902,36 @@ def _replan_diagnostics(
     return "\n".join(lines), suspect_map
 
 
+def _replan_required_clause_ids(
+    brief: dict[str, Any], clauses: list[dict[str, Any]]
+) -> list[str]:
+    """The brief's open-clause set, in frozen-list order (build #7).
+
+    The union of the judge's uncovered clauses (every clause the
+    current plan version leaves unverified or failed) and the
+    clause IDs in the loop-stamped probe failures — both computed
+    by the system from the frozen list, never from model output.
+    Intersected with the frozen list: an ID the list does not
+    carry cannot be required of the delta. This set is the delta
+    rule's assignment: each of these clauses must be implemented
+    and verified somewhere in the re-plan.
+    """
+    named: set[str] = set()
+    for entry in brief.get("uncovered_clauses") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            named.add(entry["id"])
+    for record in brief.get("contract_probe_failures") or []:
+        if isinstance(record, dict) and isinstance(
+            record.get("clause_id"), str
+        ):
+            named.add(record["clause_id"])
+    return [
+        str(clause["id"])
+        for clause in clauses
+        if str(clause["id"]) in named
+    ]
+
+
 def replan_from_brief(
     brief: dict[str, Any],
     settings: LLMSettings | None = None,
@@ -12751,6 +12946,20 @@ def replan_from_brief(
     relevant memory, and the remaining budget. The LLM's response is parsed
     and normalized exactly like an initial plan; the caller (the loop) runs
     the judge's duplicate-approach validation before accepting it.
+
+    Campaign build #7: when the goal named a contract, the parse
+    runs the DELTA clause rule (clause_mode="delta"), not the
+    initial planner's full-coverage rule: every emitted node must
+    declare inputs.clauses, and the brief's open clauses
+    (_replan_required_clause_ids) must be implemented and verified
+    within the delta. The rule runs inside this call's repair
+    cycle, so a clause-blind output is re-asked with the coverage
+    errors named — arm #16's wholesale terminal rejection (24
+    full-coverage errors, no v2) is the failure this removes. On
+    success the delta's declared coverage is written back into
+    the brief under "replan_clause_coverage" (the
+    rejected_approaches channel), for the loop to stamp into the
+    new plan version's metadata.
 
     ``seed_forbidden`` (or the brief's "seed_forbidden" key, which the loop
     fills from the initial plan's metadata) carries the approaches rejected
@@ -12773,19 +12982,29 @@ def replan_from_brief(
     spec_section = ""
     if specs:
         spec_section = f"\n\n{format_spec_context(specs)}"
-    # Contract clauses (campaign build #3), as in plan_task_intent:
+    # Contract clauses (campaign build #3; delta rule, build #7):
     # the frozen list is re-extracted from the same spec text (the
-    # contract does not change mid-run, so the list is identical to
-    # the one stamped into the accepted plan's metadata), the
-    # prompt carries the IDs, and parse validates the delta plan's
-    # coverage declarations against it — every version is a full
-    # node set in this harness, so a delta that drops a clause's
-    # only verification node is a real coverage loss, named at
-    # parse instead of discovered at the verdict gate.
+    # contract does not change mid-run, so the list is identical
+    # to the one stamped into the accepted plan's metadata). The
+    # prompt carries the re-plan block — the frozen list, the
+    # per-node declaration rule, and the brief's open clauses as
+    # the delta's assigned targets — and parse validates the
+    # delta's declarations under the delta rule inside the repair
+    # cycle (see the docstring). Build #3 judged the delta by the
+    # full-coverage rule in this same slot; arm #16 measured what
+    # that costs (a wholesale rejection no repair round could
+    # answer, because the demand itself was the wrong shape for a
+    # delta). The backstop for coverage a delta drops is
+    # per-version and unchanged: the verdict gate and the next
+    # brief recompute every clause's state from the new version's
+    # own nodes, so a dropped clause re-opens instead of passing.
     clauses = clauses_for_specs(specs)
+    required_clause_ids = _replan_required_clause_ids(brief, clauses)
     clauses_section = ""
     if clauses:
-        clauses_section = f"\n\n{format_clauses_block(clauses)}"
+        clauses_section = (
+            f"\n\n{format_replan_clauses_block(clauses, required_clause_ids)}"
+        )
     # Existing-file inventory (campaign build #4), as in
     # plan_task_intent: a re-plan writes into the same tree, and a
     # delta that scaffolds an existing file the brief never named
@@ -12867,8 +13086,20 @@ def replan_from_brief(
         pinned_contract=pinned_contract,
         clauses=clauses,
         formatter=formatter_settings_from_env(),
+        clause_mode="delta",
+        clause_required=required_clause_ids if clauses else None,
     )
     brief["rejected_approaches"] = metadata.get("rejected_approaches", seed or [])
+    if clauses:
+        # Campaign build #7: the accepted delta's declared
+        # coverage, written back on the rejected_approaches
+        # channel — the loop stamps it into the new plan
+        # version's metadata, so which clauses the delta claimed
+        # to address is part of the run record.
+        brief["replan_clause_coverage"] = {
+            "required": required_clause_ids,
+            **delta_clause_coverage(nodes, clauses),
+        }
     if metadata.get(CONTRACT_REASK_METADATA_KEY) is not None:
         brief[CONTRACT_REASK_METADATA_KEY] = metadata[
             CONTRACT_REASK_METADATA_KEY
