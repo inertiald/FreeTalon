@@ -1207,6 +1207,7 @@ def parse_planner_response(
     workspace: str | None = None,
     pinned_contract: list[dict[str, Any]] | None = None,
     clauses: list[dict[str, Any]] | None = None,
+    skeleton: bool = False,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Validate raw planner output into normalized PlanNodes plus metadata.
 
@@ -1449,8 +1450,9 @@ def parse_planner_response(
         effective_contract = _derive_contract_entries(
             nodes, effective_contract, repo_root
         )
+    relabeled_nodes = _relabel_nodes_for_errors(nodes, id_labels)
     records, cheap = _collect_plan_error_records(
-        _relabel_nodes_for_errors(nodes, id_labels),
+        relabeled_nodes,
         repo_root,
         goal_text,
         workspace,
@@ -1458,8 +1460,15 @@ def parse_planner_response(
         modules=_ModuleSourceCache(),
         contract=effective_contract,
         clauses=clauses if clauses is not None else _CLAUSES_UNSUPPLIED,
+        skeleton=skeleton,
     )
     records = contract_records + records
+    if skeleton:
+        # Campaign build #5: a content-less write node must declare
+        # how its content will be filled (the skeleton's content
+        # intent). A write node that already carries content or an
+        # edit form is pre-filled and needs no intent.
+        records = records + _skeleton_intent_basic_records(relabeled_nodes)
     if records:
         raise _numbered_rejection(records, cheap=cheap)
 
@@ -6923,6 +6932,227 @@ def _contract_omitted_modules(
         return []
 
 
+# --- Campaign build #5: split plan emission -------------------------
+#
+# Exam arm #14 (2026-11-24): build #4's anchoring converged the
+# repair loop, but compliant plans died truncated mid-JSON at the
+# generation fuse — a compliant plan carries full contents for
+# every file plus per-node clause declarations in ONE response
+# (A5 cut at 39,034 chars; the largest completed response was
+# 34.1K). Raising the fuse is an arms race; the structural fix is
+# that no single response carries a whole multi-file plan.
+# plan_task_intent therefore emits in two phases: a SKELETON (the
+# DAG without file contents — per write node a content_intent:
+# "create", "edit", or "whole_file") judged by every structural
+# validator, then a CONTENT FILL (one call per write node, only
+# that node's payload) judged per node, then ASSEMBLY through the
+# ordinary full parse so the accepted plan is indistinguishable
+# from a single-shot plan. replan_from_brief keeps the single-shot
+# emission: it does not share _call_llm_with_repair's skeleton
+# flag, and delta plans are small (one repair target), so the
+# truncation pressure the split answers does not arise there.
+
+#: Content intents a skeleton write node may declare.
+SKELETON_CONTENT_INTENTS = ("create", "edit", "whole_file")
+
+#: Plan metadata key for the two-phase emission record.
+PLAN_EMISSION_METADATA_KEY = "plan_emission"
+
+#: Validator codes that judge a write node's payload. At the
+#: skeleton phase their records against a content-less write node
+#: are dropped (see _collect_plan_error_records); at the fill
+#: phase they run per node and bind.
+_SKELETON_CONTENT_CODES = frozenset(
+    {
+        "scaffold_overwrite",
+        "scaffold_parse",
+        "elision",
+        "placeholder_value",
+        "placeholder_scaffold",
+        "stub_only_module",
+        "code_append",
+        "static_standin",
+        "heredoc_parse",
+    }
+)
+
+#: Per-node content codes the fill phase enforces on one node's
+#: filled payload (the plan-level codes — unwritten_file,
+#: route_engagement, missing_directory — judge the assembled plan
+#: at assembly, not a single node in isolation).
+_CONTENT_FILL_CODES = frozenset(
+    _SKELETON_CONTENT_CODES
+    | {
+        "duplicate_code",
+        "criteria",
+        "unknown_claw",
+        "command",
+        "prose_command",
+        "field_too_long",
+        "repetition_loop",
+        "placeholder_bash",
+        "sed_noop",
+        "sed_ban",
+        "missing_target",
+    }
+)
+
+
+def _skeleton_intent_basic_records(
+    nodes: list[PlanNode],
+) -> list[PlanError]:
+    """A content-less write node must declare a valid content intent.
+
+    The basic shape rule (fires on every skeleton, like a schema
+    error): a scaffold/file_writer node carrying neither "content"
+    nor an edit form must carry inputs["content_intent"] naming
+    one of SKELETON_CONTENT_INTENTS. Pre-filled nodes (content or
+    edits present after materialization) need no intent.
+    """
+    records: list[PlanError] = []
+    for node in nodes:
+        if (node.assigned_claw or "") not in ("scaffold", "file_writer"):
+            continue
+        inputs = node.inputs or {}
+        if isinstance(inputs.get("content"), str):
+            continue
+        intent = inputs.get("content_intent")
+        if intent not in SKELETON_CONTENT_INTENTS:
+            records.append(
+                PlanError(
+                    code="skeleton_intent",
+                    message=(
+                        f"Planner node '{node.id}' is a skeleton write "
+                        "node with no content: its inputs must declare "
+                        '"content_intent" as one of "create" (a new '
+                        'file, filled with full content), "edit" (an '
+                        "existing file, filled with scoped/anchored "
+                        'edits), or "whole_file" (an existing file, '
+                        "filled with a justified whole-file rewrite) "
+                        f"— got {intent!r}. The skeleton carries no "
+                        "file contents; each write node's payload is "
+                        "emitted separately after the skeleton is "
+                        "accepted."
+                    ),
+                    node_id=node.id,
+                )
+            )
+    return records
+
+
+def _skeleton_intent_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    index: Any | None = None,
+    modules: Any | None = None,
+) -> list[str]:
+    """Judge skeleton content intents against the tree (gated rule).
+
+    The skeleton-phase analogue of _modify_path_errors, in its
+    gated slot: existence is judged exactly as there (on disk, or
+    written by an earlier node of this same plan; only in-tree
+    targets are judged). "create" against an existing file and
+    "edit" against a missing file are contradictions the fill
+    phase could only fail on; "whole_file" against an existing
+    file must carry the modify rule's gated override (a non-empty
+    overwrite_justification AND a companion impact-check node);
+    "whole_file" against a missing file is a create mislabeled.
+    Pre-filled nodes are exempt — their form was judged by the
+    ordinary rules.
+    """
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    root_resolved = Path(root).resolve()
+    errors: list[str] = []
+    existing: set[str] = set()
+    for node in nodes:
+        target = _node_write_target(node)
+        if target is None:
+            continue
+        resolved_path = _resolve_plan_target(target, root).resolve()
+        if not resolved_path.is_relative_to(root_resolved):
+            continue
+        resolved = str(resolved_path)
+        inputs = node.inputs or {}
+        if modules is not None:
+            on_disk = modules.source(resolved_path) is not None
+        else:
+            on_disk = resolved_path.is_file()
+        prior = resolved in existing or on_disk
+        existing.add(resolved)
+        if isinstance(inputs.get("content"), str):
+            continue
+        intent = inputs.get("content_intent")
+        if intent == "create" and prior:
+            errors.append(
+                f"Planner node '{node.id}' declares content_intent "
+                f'"create" for {target!r}, which already exists — a '
+                "create fills the node with a NEW file's full "
+                "content and would replace the existing file whole. "
+                'Use "edit" (scoped/anchored edits against the '
+                'current file) or "whole_file" with the '
+                "overwrite justification + impact-check pair."
+            )
+        elif intent == "edit" and not prior:
+            errors.append(
+                f"Planner node '{node.id}' declares content_intent "
+                f'"edit" for {target!r}, which does not exist — '
+                "there is no current file for the fill phase to "
+                'edit. Use "create" so the node is filled with the '
+                "new file's full content."
+            )
+        elif intent == "whole_file":
+            if not prior:
+                errors.append(
+                    f"Planner node '{node.id}' declares content_intent "
+                    f'"whole_file" for {target!r}, which does not '
+                    'exist — a whole-file rewrite replaces an '
+                    'existing file; use "create" for a new file.'
+                )
+            else:
+                justification = inputs.get("overwrite_justification")
+                has_justification = isinstance(
+                    justification, str
+                ) and bool(justification.strip())
+                has_impact_check = False
+                for other in nodes:
+                    if other is node:
+                        continue
+                    if node.id not in (other.depends_on or []):
+                        continue
+                    named = (other.inputs or {}).get("impact_check_for")
+                    if not isinstance(named, str) or not named:
+                        continue
+                    if (
+                        str(_resolve_plan_target(named, root).resolve())
+                        == resolved
+                    ):
+                        has_impact_check = True
+                        break
+                if not (has_justification and has_impact_check):
+                    missing: list[str] = []
+                    if not has_justification:
+                        missing.append(
+                            'a non-empty "overwrite_justification" '
+                            "explaining why the change cannot be "
+                            "expressed as edits"
+                        )
+                    if not has_impact_check:
+                        missing.append(
+                            "an impact-check node that depends on "
+                            "this node and carries inputs "
+                            '{"impact_check_for": "'
+                            + target
+                            + '"}'
+                        )
+                    errors.append(
+                        f"Planner node '{node.id}' declares "
+                        f'content_intent "whole_file" for {target!r} '
+                        "without the whole-file override: the node "
+                        "must also carry " + " AND ".join(missing) + "."
+                    )
+    return errors
+
+
 def _collect_plan_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None = None,
@@ -6948,6 +7178,7 @@ def _collect_plan_error_records(
     contract: Any = _CONTRACT_UNSUPPLIED,
     clauses: Any = _CLAUSES_UNSUPPLIED,
     plan_context: str = "authored",
+    skeleton: bool = False,
 ) -> tuple[list[PlanError], bool]:
     """Collect EVERY plan validation error as structured records.
 
@@ -7200,11 +7431,48 @@ def _collect_plan_error_records(
     # next round, for the same one-class-at-a-time reason. Campaign
     # build #3 adds a third rule behind both — clause coverage —
     # under the identical gate.
+    if skeleton:
+        # Campaign build #5: content-dependent validators judge a
+        # write node's payload; a skeleton write node has none yet
+        # (its content arrives in the fill phase, where the same
+        # validators run per node). Their records against a
+        # content-less write node are artifacts of the missing
+        # payload, not defects of the skeleton — drop exactly those.
+        contentless = {
+            node.id
+            for node in nodes
+            if (node.assigned_claw or "") in ("scaffold", "file_writer")
+            and not isinstance((node.inputs or {}).get("content"), str)
+        }
+        if contentless:
+            records = [
+                record
+                for record in records
+                if not (
+                    record.node_id in contentless
+                    and record.code in _SKELETON_CONTENT_CODES
+                )
+            ]
     if plan_context == "authored" and not records:
-        modify_records = _error_records(
-            "whole_file_modify",
-            _modify_path_errors(nodes, repo_root, index, modules),
-        )
+        if skeleton:
+            # Campaign build #5: at the skeleton phase the modify-
+            # path rule's analogue is the content-intent legality
+            # rule — a "create" intent against a file that exists,
+            # an "edit" intent against a file that does not, or a
+            # "whole_file" intent without the justification +
+            # impact-check pair the modify rule demands. It takes
+            # the modify rule's slot in the gated sequence; the
+            # suite-placement and clause-coverage rules behind it
+            # run on the skeleton exactly as on a full plan.
+            modify_records = _error_records(
+                "skeleton_intent",
+                _skeleton_intent_errors(nodes, repo_root, index, modules),
+            )
+        else:
+            modify_records = _error_records(
+                "whole_file_modify",
+                _modify_path_errors(nodes, repo_root, index, modules),
+            )
         records.extend(modify_records)
         if not modify_records:
             suite_records = _error_records(
@@ -11080,6 +11348,7 @@ def _call_llm_with_repair(
     pinned_contract: list[dict[str, Any]] | None = None,
     clauses: list[dict[str, Any]] | None = None,
     formatter: FormatterSettings | None = None,
+    skeleton: bool = False,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
 
@@ -11310,6 +11579,7 @@ def _call_llm_with_repair(
                 repo_root=repo_root,
                 pinned_contract=pinned_contract,
                 clauses=clauses,
+                skeleton=skeleton,
             )
             if baseline_paths is not None:
                 # Steal #5 scope lock: a repair that parses is still
@@ -11335,7 +11605,15 @@ def _call_llm_with_repair(
                 not contract_reask_done
                 and pinned_contract is None
                 and planner_schema_owned
+                and not skeleton
             ):
+                # Campaign build #5: the re-ask derives omitted
+                # contract entries from node CONTENTS (the plan's
+                # coupling); a skeleton has none, so the re-ask
+                # cannot fire at this phase. Contract derivation
+                # and pinning run on the ASSEMBLED plan instead
+                # (plan_task_intent's assembly parse), where the
+                # contents exist.
                 contract_reask_done = True
                 omitted = _contract_omitted_modules(
                     nodes, response_text, repo_root
@@ -11570,6 +11848,382 @@ def _call_llm_with_repair(
     raise last_error
 
 
+# ── Campaign build #5: content fill (phase 2) + assembly ─────────────
+
+_CONTENT_FILL_SYSTEM_PROMPT = (
+    "You fill ONE write node of an already-accepted plan skeleton. "
+    "The skeleton is fixed: do not propose other nodes, do not "
+    "restate the plan, and do not explain. Return ONLY a JSON "
+    "object carrying this node's payload, in the exact form the "
+    "prompt names."
+)
+
+#: Attempts per write node in the fill phase: the initial call plus
+#: two bounded repairs with the validator errors in the prompt.
+_CONTENT_FILL_MAX_ATTEMPTS = 3
+
+
+def _content_fill_settings(
+    settings: LLMSettings | None,
+) -> LLMSettings:
+    """Effective settings for a fill call (planner window/fuse).
+
+    Same derivation as _call_llm_with_repair (a caller-set num_ctx /
+    num_predict is respected), except the format schema: the plan
+    envelope schema constrains the SKELETON phase only — a fill
+    response is one node's payload object, not a plan envelope, so
+    any envelope schema is dropped here.
+    """
+    if settings is None:
+        effective = LLMSettings.from_env()
+    else:
+        effective = settings
+    if effective.num_ctx is None:
+        effective = dataclass_replace(effective, num_ctx=_PLANNER_NUM_CTX)
+    if effective.num_predict is None:
+        effective = dataclass_replace(
+            effective, num_predict=_PLANNER_NUM_PREDICT
+        )
+    if effective.format_schema is not None:
+        effective = dataclass_replace(effective, format_schema=None)
+    return effective
+
+
+def _node_clause_obligations(
+    node: PlanNode, clauses: list[dict[str, Any]] | None
+) -> str:
+    """The node's own clause obligations, with clause text."""
+    if not clauses:
+        return ""
+    implements, verifies, _error = node_clause_declaration(node)
+    wanted = {"implements": implements, "verifies": verifies}
+    if not wanted["implements"] and not wanted["verifies"]:
+        return ""
+    by_id = {str(clause.get("id")): clause for clause in clauses}
+    lines = ["This node's clause obligations (from the frozen contract):"]
+    for kind in ("implements", "verifies"):
+        for clause_id in wanted[kind]:
+            clause = by_id.get(clause_id) or {}
+            text = clause.get("text") or clause.get("heading") or ""
+            lines.append(f"  {kind} {clause_id}: {text}".rstrip())
+    return "\n".join(lines)
+
+
+def _filled_candidate_errors(
+    candidate: dict[str, Any],
+    prior_dicts: list[dict[str, Any]],
+    repo_root: str | Path | None,
+    goal_text: str | None,
+) -> list[str]:
+    """Per-node validators over one filled candidate node.
+
+    The candidate (with every earlier filled node, so an edit
+    against a file an earlier node creates materializes against
+    that content) passes through the ordinary materialization seam
+    — scoped/anchored edit application plus the build #3 edit
+    grounding check — and then the per-node content validators
+    (scaffold preservation, duplicate_code grounding, parse,
+    placeholder, elision, stub-only, ...; _CONTENT_FILL_CODES).
+    A whole-file/create payload for an existing Python file also
+    faces the edit grounding check against the file's prior text:
+    a rewrite may not introduce references the file cannot resolve
+    any more than an edit may. Returns error strings; empty = the
+    payload is valid.
+    """
+    import copy as _copy
+
+    dicts = [_copy.deepcopy(item) for item in prior_dicts]
+    candidate_copy = _copy.deepcopy(candidate)
+    dicts.append(candidate_copy)
+    try:
+        _materialize_plan_edits(dicts, repo_root)
+    except LLMResponseError as exc:
+        return [str(exc)]
+    try:
+        node = PlanNode.model_validate(candidate_copy)
+    except ValidationError as exc:
+        return [f"filled node failed schema validation: {exc}"]
+    records, _cheap = _collect_plan_error_records(
+        [node],
+        repo_root,
+        goal_text,
+        None,
+        plan_context="enrichment",
+    )
+    errors = [
+        record.message
+        for record in records
+        if record.code in _CONTENT_FILL_CODES
+    ]
+    inputs = candidate_copy.get("inputs") or {}
+    content = inputs.get("content")
+    target = _node_write_target(node)
+    if (
+        isinstance(content, str)
+        and target is not None
+        and target.endswith(".py")
+        and inputs.get("_materialized_from")
+        not in ("anchored_edit", "scoped_edits")
+    ):
+        prior_source: str | None = None
+        for prior in prior_dicts:
+            prior_inputs = prior.get("inputs") or {}
+            if _node_write_target(
+                PlanNode.model_validate(prior)
+            ) == target and isinstance(prior_inputs.get("content"), str):
+                prior_source = prior_inputs["content"]
+        if prior_source is None:
+            try:
+                prior_source = _resolve_plan_target(
+                    target, resolve_repo_root(repo_root)
+                ).read_text(encoding="utf-8")
+            except OSError:
+                prior_source = None
+        if prior_source is not None:
+            violations = edit_grounding_violations(prior_source, content)
+            if violations:
+                errors.append(
+                    "the filled content introduces ungrounded "
+                    "references: "
+                    + "; ".join(violations)
+                    + " — reference only attributes the class assigns "
+                    "and names the module defines or imports."
+                )
+    return errors
+
+
+def _fill_node_payload(
+    node: PlanNode,
+    intent: str,
+    *,
+    settings: LLMSettings,
+    skeleton_json: str,
+    obligations: str,
+    spec_section: str,
+    inventory_section: str,
+    existing_source: str | None,
+    prior_dicts: list[dict[str, Any]],
+    repo_root: str | Path | None,
+    goal_text: str | None,
+) -> tuple[dict[str, Any], int]:
+    """Fill one skeleton write node via its own LLM call(s).
+
+    Returns (candidate node dict in unmaterialized form, attempts
+    used). Bounded repair: up to _CONTENT_FILL_MAX_ATTEMPTS calls,
+    each retry carrying the validator errors of the last payload.
+    A node that still fails raises LLMResponseError naming the
+    node, its target, and the last errors — the plan fails with
+    that precise error; nothing is silently accepted.
+    """
+    target = _node_write_target(node) or ""
+    if intent in ("create", "whole_file"):
+        form = (
+            'Return {"content": "<the complete file content>"} — '
+            "the whole file, every definition, no elisions, no "
+            "placeholders."
+        )
+    else:
+        form = (
+            'Return EITHER {"edits": [{"search": "<text copied '
+            'exactly from the current file>", "replace": "<the new '
+            'text>"}]} (scoped edits) OR {"anchor": "<a line copied '
+            'exactly from the current file>", "position": "after" '
+            'or "before", "content": "<the new code>"} (an anchored '
+            "edit). Do NOT return the whole file."
+        )
+    existing_block = ""
+    if existing_source is not None:
+        existing_block = (
+            f"\n\nCurrent content of {target} (the file as it "
+            f"stands before this node):\n{existing_source}"
+        )
+    errors_block = ""
+    last_errors: list[str] = []
+    for attempt in range(1, _CONTENT_FILL_MAX_ATTEMPTS + 1):
+        prompt = (
+            f"CONTENT FILL — node '{node.id}' writes {target} "
+            f"(content_intent: {intent}).\n\n"
+            f"Goal: {goal_text or ''}\n\n"
+            f"Accepted plan skeleton (compact):\n{skeleton_json}\n\n"
+            f"This node's objective: {node.objective}\n"
+            + (f"{obligations}\n" if obligations else "")
+            + f"{spec_section}"
+            + f"{inventory_section}"
+            + f"{existing_block}"
+            + f"{errors_block}\n\n"
+            f"{form}\n"
+            "JSON Output:"
+        )
+        response_text = call_llm(
+            _CONTENT_FILL_SYSTEM_PROMPT, prompt, settings=settings
+        )
+        response_text = sanitize_llm_output(response_text)
+        candidate = node.model_dump(mode="json")
+        candidate_inputs = dict(candidate.get("inputs") or {})
+        candidate_inputs.pop("content_intent", None)
+        shape_errors: list[str] = []
+        try:
+            payload = parse_json_object(response_text)
+        except Exception as exc:  # noqa: BLE001 — named to the repair
+            payload = None
+            shape_errors = [f"payload is not a JSON object: {exc}"]
+        if isinstance(payload, dict):
+            if intent in ("create", "whole_file"):
+                content = payload.get("content")
+                if isinstance(content, str) and content:
+                    candidate_inputs["content"] = content
+                else:
+                    shape_errors = [
+                        'payload must carry a non-empty "content" '
+                        "string with the complete file content"
+                    ]
+            else:
+                edits = payload.get("edits")
+                anchor = payload.get("anchor")
+                if isinstance(edits, list) and edits:
+                    candidate_inputs["edits"] = edits
+                elif isinstance(anchor, str) and anchor:
+                    candidate_inputs["anchor"] = anchor
+                    candidate_inputs["position"] = payload.get(
+                        "position", "after"
+                    )
+                    snippet = payload.get("content")
+                    if isinstance(snippet, str):
+                        candidate_inputs["content"] = snippet
+                    else:
+                        shape_errors = [
+                            'an anchored-edit payload must carry the '
+                            'new code in "content"'
+                        ]
+                else:
+                    shape_errors = [
+                        'payload must carry a non-empty "edits" list '
+                        'or an "anchor" with "content"'
+                    ]
+        elif not shape_errors:
+            shape_errors = ["payload is not a JSON object"]
+        candidate["inputs"] = candidate_inputs
+        if shape_errors:
+            last_errors = shape_errors
+        else:
+            last_errors = _filled_candidate_errors(
+                candidate, prior_dicts, repo_root, goal_text
+            )
+        if not last_errors:
+            return candidate, attempt
+        errors_block = (
+            "\n\nYour previous payload for this node was REJECTED:\n"
+            + "\n".join(f"  - {error}" for error in last_errors)
+            + "\nReturn a corrected payload only."
+        )
+    raise LLMResponseError(
+        f"Content fill for planner node '{node.id}' (target "
+        f"{target!r}, intent {intent!r}) failed after "
+        f"{_CONTENT_FILL_MAX_ATTEMPTS} attempts. Last errors: "
+        + "; ".join(last_errors)
+    )
+
+
+def _fill_plan_contents(
+    nodes: list[PlanNode],
+    *,
+    settings: LLMSettings | None,
+    goal_text: str | None,
+    repo_root: str | Path | None,
+    clauses: list[dict[str, Any]] | None,
+    spec_section: str,
+    inventory_section: str,
+) -> tuple[list[dict[str, Any]], dict[str, int], list[str]] | None:
+    """Phase 2: fill every content-less write node of a skeleton.
+
+    Returns None when no node needs filling (the plan was emitted
+    pre-filled, the legacy single-shot shape — assembly is then
+    unnecessary and the skeleton nodes stand as accepted). Otherwise
+    returns (filled raw node dicts for assembly, per-node content
+    attempt counts, pre-filled node ids). Nodes fill in skeleton
+    (topological) order, so an edit node sees the filled content of
+    every earlier write to its target.
+    """
+    pending = [
+        node
+        for node in nodes
+        if (node.assigned_claw or "") in ("scaffold", "file_writer")
+        and not isinstance((node.inputs or {}).get("content"), str)
+    ]
+    if not pending:
+        return None
+    effective = _content_fill_settings(settings)
+    skeleton_json = json.dumps(
+        [
+            {
+                "id": node.id,
+                "objective": node.objective,
+                "depends_on": list(node.depends_on or []),
+                "assigned_claw": node.assigned_claw,
+                "inputs": {
+                    key: value
+                    for key, value in (node.inputs or {}).items()
+                    if key != "content"
+                },
+            }
+            for node in nodes
+        ]
+    )
+    filled_dicts: list[dict[str, Any]] = []
+    attempts: dict[str, int] = {}
+    prefilled: list[str] = []
+    root = resolve_repo_root(repo_root)
+    for node in nodes:
+        raw = node.model_dump(mode="json")
+        if (node.assigned_claw or "") not in ("scaffold", "file_writer"):
+            filled_dicts.append(raw)
+            continue
+        inputs = node.inputs or {}
+        if isinstance(inputs.get("content"), str):
+            raw_inputs = dict(raw.get("inputs") or {})
+            raw_inputs.pop("content_intent", None)
+            raw["inputs"] = raw_inputs
+            prefilled.append(node.id)
+            filled_dicts.append(raw)
+            continue
+        intent = str(inputs.get("content_intent"))
+        target = _node_write_target(node) or ""
+        existing_source: str | None = None
+        if intent in ("edit", "whole_file"):
+            for prior in filled_dicts:
+                prior_inputs = prior.get("inputs") or {}
+                prior_target = prior_inputs.get(
+                    "file_path"
+                ) or prior_inputs.get("path")
+                if prior_target == target and isinstance(
+                    prior_inputs.get("content"), str
+                ):
+                    existing_source = prior_inputs["content"]
+            if existing_source is None:
+                try:
+                    existing_source = _resolve_plan_target(
+                        target, root
+                    ).read_text(encoding="utf-8")
+                except OSError:
+                    existing_source = None
+        candidate, used = _fill_node_payload(
+            node,
+            intent,
+            settings=effective,
+            skeleton_json=skeleton_json,
+            obligations=_node_clause_obligations(node, clauses),
+            spec_section=spec_section,
+            inventory_section=inventory_section,
+            existing_source=existing_source,
+            prior_dicts=filled_dicts,
+            repo_root=repo_root,
+            goal_text=goal_text,
+        )
+        attempts[node.id] = used
+        filled_dicts.append(candidate)
+    return filled_dicts, attempts, prefilled
+
+
 def build_execution_plan(
     intent: TaskIntent,
     nodes: list[PlanNode] | list[dict[str, Any]],
@@ -11665,6 +12319,20 @@ def plan_task_intent(
         "Produce a NEW execution plan DAG for the goal above. Your output "
         "must be a JSON object with a \"nodes\" array — do NOT repeat the "
         "goal text or any JSON from this prompt.\n"
+        "\nSPLIT EMISSION (campaign build #5): emit the plan SKELETON "
+        "only. Do NOT include any file \"content\", \"edits\", or "
+        "\"anchor\" in any node — file payloads are requested "
+        "separately, one node at a time, after the skeleton is "
+        "accepted. For each scaffold/file_writer node, declare "
+        "inputs \"content_intent\": \"create\" for a NEW file (filled "
+        "with its full content), \"edit\" for an EXISTING file "
+        "(filled with scoped/anchored edits), or \"whole_file\" for "
+        "an existing file that must be rewritten whole (which "
+        "requires the overwrite_justification + impact-check pair "
+        "the modify rules demand). Keep each node's file_path, "
+        "depends_on, criteria, and inputs.clauses declarations "
+        "exactly as a full plan would carry them. Bash/command "
+        "nodes keep their command in the skeleton as usual.\n"
         f"{shape_block}\n\n"
         "JSON Output:"
     )
@@ -11678,7 +12346,44 @@ def plan_task_intent(
         repo_root=repo_root,
         clauses=clauses,
         formatter=formatter_settings_from_env(),
+        skeleton=True,
     )
+    # Campaign build #5, phase 2 + assembly: fill each content-less
+    # write node with its own call, then run the filled plan
+    # through the ordinary full parse — the assembled plan is
+    # indistinguishable in shape from a single-shot plan, and the
+    # contract derivation/pinning the skeleton phase could not
+    # judge (it reads node contents) completes there. A plan the
+    # model emitted pre-filled needs neither step.
+    filled = _fill_plan_contents(
+        nodes,
+        settings=settings,
+        goal_text=intent.goal,
+        repo_root=repo_root,
+        clauses=clauses,
+        spec_section=spec_section,
+        inventory_section=inventory_section,
+    )
+    if filled is not None:
+        filled_dicts, fill_attempts, prefilled_ids = filled
+        assembled_nodes, assembled_metadata = parse_planner_response(
+            json.dumps({"nodes": filled_dicts, "metadata": {}}),
+            goal_text=intent.goal,
+            workspace=workspace,
+            repo_root=repo_root,
+            clauses=clauses,
+        )
+        nodes = assembled_nodes
+        metadata = dict(metadata or {})
+        if assembled_metadata.get(CONTRACT_METADATA_KEY) is not None:
+            metadata[CONTRACT_METADATA_KEY] = assembled_metadata[
+                CONTRACT_METADATA_KEY
+            ]
+        metadata[PLAN_EMISSION_METADATA_KEY] = {
+            "phases": ["skeleton", "content_fill"],
+            "content_attempts": fill_attempts,
+            "prefilled": prefilled_ids,
+        }
     # Cycle 4: record the repo this plan was grounded against in its
     # metadata, so the executor resolves the plan's relative
     # references (./.venv/bin/python, scaffold targets, criterion
