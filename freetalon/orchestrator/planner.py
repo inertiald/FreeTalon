@@ -11651,3 +11651,306 @@ def _try_local_repair(
     if records:
         return None
     return nodes
+
+
+# ── Scoped-edit repair (architecture campaign step 1, 2026-11-23) ────
+#
+# The second node-local seam, tried after cycle 8's single-definition
+# repair and before the whole-task re-plan. Exam re-arms #7-#9 named
+# the failure this answers: a whole-task re-plan's write nodes carry
+# whole file contents, so every version regenerates every file it
+# touches — v2's server.py passed a test that v3's wholesale rewrite
+# broke again, and the score oscillated at 30-31/35. Here the model
+# never re-emits a file: it answers with Aider-style search/replace
+# blocks for ONE suspect file, and the harness applies them
+# mechanically (scoped_edits: exact match, exactly-once, no
+# overlaps, all-or-nothing). Everything outside the blocks is
+# preserved by construction, so a repair cannot regress code it did
+# not touch.
+#
+# Targeting rides the judge's own signals, with cycle 8's
+# all-or-nothing confidence: the brief's failing tests feed
+# _replan_diagnostics, whose suspect map names the produced modules
+# each test exercises. The seam fires only when those modules are
+# EXACTLY ONE file (the failing tests' own files are evidence in
+# the prompt, never the edit target — a seam must not edit the
+# measurement it is judged by; stale tests are the oracle-test
+# step's problem, and the precedence rule in the diagnostics block
+# tells the model when a test, not the code, is wrong), exactly one
+# completed write node in this plan version wrote that file, and
+# the node's content is byte-identical to the file on disk. A
+# suspect map computed over a capped prefix of the failing tests
+# (more tests than _SUSPECT_TEST_CAP) is partial evidence and also
+# declines. Any doubt — ambiguity, drift, oversize, an unparseable
+# or non-applying edit set, a syntax break, any validator record —
+# returns None and the caller runs the whole-task re-plan exactly
+# as before; this seam never raises and never writes anything
+# itself. The attempt rides the caller's re-plan decision, so it
+# consumes exactly one unit of the existing re-plan budget, the
+# same as cycle 8's repair and the whole-task re-plan.
+
+from .prompts import SCOPED_EDIT_REPAIR_SYSTEM_PROMPT as _SCOPED_EDIT_PROMPT
+from .scoped_edits import (
+    ScopedEditError,
+    apply_scoped_edits,
+    parse_scoped_edits,
+    python_syntax_error,
+)
+
+# The model must hold the suspect file verbatim to write exact
+# SEARCH text; beyond this size the seam declines rather than
+# truncating the file it would ask the model to match against.
+_SCOPED_EDIT_MAX_FILE_CHARS = 24_000
+
+
+@dataclass(frozen=True)
+class _ScopedEditTarget:
+    """One confidently identified scoped-edit repair."""
+
+    failed_id: str | None  # first failed node, for responds_to
+    culprit_id: str
+    target_path: str  # resolved on-disk path of the suspect file
+    relative_path: str  # repo-root-relative, as the brief names it
+    content: str  # the file exactly as it stands (node == disk)
+    failing_tests: list[str]  # the brief's failing tests, in order
+    criterion_detail: str  # one-line summary for the differs_by note
+
+
+def _scoped_edit_target(
+    plan: ExecutionPlan,
+    brief: dict[str, Any],
+    root: Path,
+    suspect_map: dict[str, dict[str, Any]],
+) -> _ScopedEditTarget | None:
+    failing = [str(test) for test in brief.get("failing_tests") or []]
+    if not failing or len(failing) > _SUSPECT_TEST_CAP:
+        return None
+    modules: set[str] = set()
+    test_files: set[str] = set()
+    for entry in suspect_map.values():
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("file"), str):
+            test_files.add(entry["file"])
+        for module in entry.get("modules") or []:
+            if isinstance(module, str):
+                modules.add(module)
+    if len(modules) != 1:
+        return None
+    relative = next(iter(modules))
+    if relative in test_files:
+        # The one exercised "module" is a failing test's own file:
+        # editing the measurement is outside this seam.
+        return None
+    writers: dict[str, list[PlanNode]] = {}
+    for node in plan.nodes:
+        target = _node_write_target(node)
+        if target is None or node.status != PlanStatus.COMPLETED:
+            continue
+        resolved = str(_resolve_plan_target(target, root).resolve())
+        writers.setdefault(resolved, []).append(node)
+    resolved_target = str(_resolve_plan_target(relative, root).resolve())
+    culprits = writers.get(resolved_target) or []
+    if len(culprits) != 1:
+        return None
+    culprit = culprits[0]
+    content = (culprit.inputs or {}).get("content")
+    if not isinstance(content, str) or not content:
+        return None
+    if len(content) > _SCOPED_EDIT_MAX_FILE_CHARS:
+        return None
+    try:
+        disk_source = Path(resolved_target).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if disk_source != content:
+        return None
+    failed_id: str | None = None
+    for entry in brief.get("failed_nodes") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            failed_id = entry["id"]
+            break
+    detail = f"{len(failing)} failing test(s): {failing[0]}"
+    if len(failing) > 1:
+        detail += f" (+{len(failing) - 1} more)"
+    return _ScopedEditTarget(
+        failed_id=failed_id,
+        culprit_id=culprit.id,
+        target_path=resolved_target,
+        relative_path=relative,
+        content=content,
+        failing_tests=failing,
+        criterion_detail=detail,
+    )
+
+
+def _scoped_edit_prompts(
+    goal_text: str,
+    target: _ScopedEditTarget,
+    diagnostics_block: str,
+    spec_block: str = "",
+) -> tuple[str, str]:
+    """The scoped-edit ask: the diagnostics, the file as it stands,
+    and the demand — edit blocks only, copied exactly, for this one
+    file. When the goal names a spec, ``spec_block`` carries its
+    verbatim text (spec grounding, as in the other repair paths).
+    """
+    spec_section = f"{spec_block}\n\n" if spec_block else ""
+    user_prompt = (
+        f"THE TASK IS UNCHANGED: {goal_text}\n\n"
+        f"{spec_section}"
+        f"One step of the current plan (node {target.culprit_id}) wrote "
+        f"{target.relative_path}, and later steps measured the result: "
+        f"{target.criterion_detail}.\n\n"
+        f"{diagnostics_block}\n\n"
+        f"The file below is {target.relative_path}, exactly as it "
+        f"stands in the file now:\n\n"
+        f"{target.content}\n\n"
+        "Return ONLY search/replace edit blocks for this one file, "
+        "in the format the system prompt shows — one block per "
+        "change, every SEARCH text copied character-for-character "
+        "from the file above and appearing exactly once in it. Do "
+        "not write the whole file and do not touch any other file."
+    )
+    return _SCOPED_EDIT_PROMPT, user_prompt
+
+
+def _scoped_edit_candidate_nodes(
+    plan: ExecutionPlan, target: _ScopedEditTarget, new_content: str
+) -> list[PlanNode]:
+    """Same plan, one node's content replaced by the edited file.
+
+    Mirrors _local_repair_candidate_nodes (cycle 8): every node is
+    deep-copied with its execution state reset, only the culprit's
+    content changes, and the culprit records what it answers so the
+    judge's delta validation sees a genuine, stated difference.
+    """
+    nodes: list[PlanNode] = []
+    for node in plan.nodes:
+        copied = node.model_copy(deep=True)
+        copied.status = PlanStatus.DRAFT
+        copied.measurement = {}
+        copied.error = None
+        copied.exit_code = None
+        copied.duration_s = None
+        inputs = dict(copied.inputs or {})
+        for key in _EXECUTOR_RESIDUE_INPUT_KEYS:
+            inputs.pop(key, None)
+        copied.inputs = inputs
+        if copied.id == target.culprit_id:
+            copied.inputs = {**inputs, "content": new_content}
+            note = (
+                f"scoped-edit repair: {target.relative_path} edited in "
+                f"response to the measured failure "
+                f"({target.criterion_detail}); search/replace blocks "
+                f"applied mechanically to the file as it stood, the "
+                f"rest of the file preserved by construction"
+            )
+            copied.differs_by = (
+                f"{copied.differs_by}; {note}" if copied.differs_by else note
+            )
+            if target.failed_id is not None:
+                copied.responds_to = target.failed_id
+        nodes.append(copied)
+    return nodes
+
+
+def try_scoped_edit_repair(
+    plan: ExecutionPlan,
+    brief: dict[str, Any],
+    settings: LLMSettings | None = None,
+) -> list[PlanNode] | None:
+    """Attempt a scoped-edit repair of a failed plan version.
+
+    Returns the replacement node list for a new version of the same
+    plan — the one suspect file's content with the model's
+    search/replace blocks applied, every other node preserved — or
+    None when the suspect cannot be identified with confidence, the
+    model's answer carries no applicable edit set, the edited file
+    fails syntax or the full validator stack, or the edit changes
+    nothing. None always means the caller proceeds with the
+    whole-task re-plan exactly as before; this function never
+    raises.
+    """
+    try:
+        return _try_scoped_edit_repair(plan, brief, settings)
+    except Exception:  # noqa: BLE001 - any doubt falls back to whole-task re-plan
+        return None
+
+
+def _try_scoped_edit_repair(
+    plan: ExecutionPlan,
+    brief: dict[str, Any],
+    settings: LLMSettings | None,
+) -> list[PlanNode] | None:
+    metadata = plan.metadata or {}
+    pinned_contract = _contract_from_metadata(metadata)
+    stamped = metadata.get("repo_root")
+    root = (
+        Path(stamped)
+        if isinstance(stamped, str) and stamped
+        else resolve_repo_root(None)
+    )
+    goal = brief.get("goal")
+    goal_text = plan.intent.goal
+    if isinstance(goal, dict) and isinstance(goal.get("objective"), str):
+        goal_text = goal["objective"]
+    # Spec grounding (2026-11-23): a goal-named spec reaches the
+    # repair call verbatim too. An unloadable named spec raises
+    # SpecContextError, which try_scoped_edit_repair's blanket
+    # fallback turns into a whole-task re-plan — where the same
+    # loader raises it loudly at planning.
+    specs = goal_named_specs(goal_text, root)
+    diagnostics_block, suspect_map = _replan_diagnostics(
+        brief,
+        root,
+        has_spec=bool(specs),
+        spec_paths=[spec.path for spec in specs],
+    )
+    if not diagnostics_block:
+        return None
+    target = _scoped_edit_target(plan, brief, root, suspect_map)
+    if target is None:
+        return None
+    system_prompt, user_prompt = _scoped_edit_prompts(
+        goal_text, target, diagnostics_block, format_spec_context(specs)
+    )
+    effective = settings or LLMSettings.from_env()
+    if effective.num_ctx is None:
+        effective = dataclass_replace(effective, num_ctx=_PLANNER_NUM_CTX)
+    if effective.format_schema is not None:
+        # The repair returns edit blocks, not a plan envelope — the
+        # envelope grammar would corrupt the payload (the cycle-2
+        # two-channel finding).
+        effective = dataclass_replace(effective, format_schema=None)
+    response = call_llm(system_prompt, user_prompt, settings=effective)
+    edits = parse_scoped_edits(response)
+    if not edits:
+        return None
+    try:
+        new_content = apply_scoped_edits(target.content, edits)
+    except ScopedEditError:
+        return None
+    if new_content == target.content:
+        return None
+    if target.relative_path.endswith(".py"):
+        if python_syntax_error(new_content) is not None:
+            return None
+    nodes = _scoped_edit_candidate_nodes(plan, target, new_content)
+    workspace = (plan.intent.constraints or {}).get("workspace")
+    records, _cheap = _collect_plan_error_records(
+        nodes,
+        root,
+        goal_text,
+        workspace,
+        index=build_repo_index(root),
+        modules=_ModuleSourceCache(),
+        contract=(
+            pinned_contract
+            if pinned_contract is not None
+            else _CONTRACT_UNSUPPLIED
+        ),
+    )
+    if records:
+        return None
+    return nodes

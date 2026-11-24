@@ -35,7 +35,12 @@ from .models import (
     PlanStatus,
     TaskIntent,
 )
-from .planner import build_execution_plan, replan_from_brief, try_local_repair
+from .planner import (
+    build_execution_plan,
+    replan_from_brief,
+    try_local_repair,
+    try_scoped_edit_repair,
+)
 from .run_store import RunStore, new_run_id
 from .state_store import ExecutionPlanStateStore
 from .tool_registry import ToolRegistry
@@ -377,6 +382,25 @@ class LoopRunner:
                             plan_id=plan.plan_id,
                             version=version,
                         )
+                    if new_nodes is None:
+                        # Scoped-edit repair (campaign step 1): when
+                        # the single-definition seam cannot identify
+                        # its window, try editing the one suspect
+                        # file the failing tests exercise — the
+                        # model returns search/replace blocks, never
+                        # a whole file. Same budget unit (the
+                        # increment above already paid for this
+                        # re-plan decision); any doubt returns None
+                        # and the whole-task re-plan below runs
+                        # exactly as before.
+                        new_nodes = try_scoped_edit_repair(plan, brief)
+                        if new_nodes is not None:
+                            self._log(
+                                "loop.replan.scoped_edit_repair",
+                                run_id=run_id,
+                                plan_id=plan.plan_id,
+                                version=version,
+                            )
                 if new_nodes is None:
                     try:
                         new_nodes = replan(brief)
