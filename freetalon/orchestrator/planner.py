@@ -17,7 +17,14 @@ from typing import Any, Collection
 
 from pydantic import ValidationError
 
+from .contract_clauses import (
+    CLAUSES_METADATA_KEY,
+    clause_coverage_errors,
+    clauses_for_specs,
+    format_clauses_block,
+)
 from .executor import _command_runs_full_suite
+from .grounding import edit_grounding_violations
 from .scoped_edits import (
     ScopedEdit,
     ScopedEditError,
@@ -1196,6 +1203,7 @@ def parse_planner_response(
     goal_text: str | None = None,
     workspace: str | None = None,
     pinned_contract: list[dict[str, Any]] | None = None,
+    clauses: list[dict[str, Any]] | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Validate raw planner output into normalized PlanNodes plus metadata.
 
@@ -1216,7 +1224,11 @@ def parse_planner_response(
     When no pin governs and the payload declares no contract
     (or omits an entry), the missing entries are derived from
     the plan's own coupling (_derive_contract_entries) and
-    pinned the same way.
+    pinned the same way. ``clauses`` (campaign build #3) is the
+    frozen contract-clause list the callers extracted from the
+    goal-named spec: when supplied, the clause-coverage rule
+    judges the plan's per-node inputs.clauses declarations
+    against it; when omitted, that rule does not run at all.
     """
     raw_text = sanitize_llm_output(raw_text)
     print(f"\n--- RAW PLANNER OUTPUT ---\n{raw_text}\n--------------------------\n")
@@ -1442,6 +1454,7 @@ def parse_planner_response(
         index=index,
         modules=_ModuleSourceCache(),
         contract=effective_contract,
+        clauses=clauses if clauses is not None else _CLAUSES_UNSUPPLIED,
     )
     records = contract_records + records
     if records:
@@ -2822,19 +2835,69 @@ def _materialize_plan_edits(
             continue
         raw_id = raw.get("id")
         label = raw_id if isinstance(raw_id, str) else f"position {node_position}"
+        # Campaign build #3: the target's text BEFORE this node's
+        # edit materializes (an earlier node's write in this plan
+        # wins over disk, exactly as in the materializers), kept
+        # for the grounding check below.
+        target_value = inputs.get("file_path") or inputs.get("path")
+        prior_source: str | None = None
+        if isinstance(target_value, str) and target_value.endswith(".py"):
+            resolved_prior = _resolve_plan_target(
+                target_value, resolve_repo_root(repo_root)
+            )
+            if resolved_prior in sources:
+                prior_source = sources[resolved_prior]
+            else:
+                try:
+                    prior_source = resolved_prior.read_text(encoding="utf-8")
+                except OSError:
+                    prior_source = None
         if "edits" in inputs:
             outcome = _materialize_scoped_edit(
                 label, inputs, repo_root, sources
             )
             if outcome is not None:
                 errors.append((outcome[0], "scoped_edit"))
-            continue
-        outcome = _materialize_scaffold_edit(label, inputs, repo_root, sources)
-        if outcome is not None:
-            error, placeholder = outcome
-            errors.append(
-                (error, "placeholder_delta" if placeholder else "anchored_edit")
+                continue
+        else:
+            outcome = _materialize_scaffold_edit(label, inputs, repo_root, sources)
+            if outcome is not None:
+                error, placeholder = outcome
+                errors.append(
+                    (error, "placeholder_delta" if placeholder else "anchored_edit")
+                )
+                continue
+        # Campaign build #3: edit grounding. The edit applied; now
+        # its content must answer to the file it lands in. Arm #11's
+        # anchored edits applied cleanly and then referenced
+        # self.store for self.server.store — form success, content
+        # failure, and the server hung. A reference the edit
+        # INTRODUCES that the target cannot resolve (an attribute
+        # the class never assigns, a call to a name the module does
+        # not define or import) is a plan error here, in the same
+        # rejection, with the same authored gating as every other
+        # materialization defect.
+        materialized_content = inputs.get("content")
+        if prior_source is not None and isinstance(materialized_content, str):
+            violations = edit_grounding_violations(
+                prior_source, materialized_content
             )
+            if violations:
+                errors.append(
+                    (
+                        f"Planner node '{label}' has an edit for "
+                        f"{target_value!r} whose new code introduces "
+                        "ungrounded references: "
+                        + "; ".join(violations)
+                        + " — reference only attributes the class "
+                        "assigns (in any of its methods, or through a "
+                        "base class) and names the module defines or "
+                        "imports; if the reference is the right one, "
+                        "assign the attribute in the class as part of "
+                        "the edit.",
+                        "ungrounded_reference",
+                    )
+                )
     if not errors:
         return
     # Structured records (A/B refactor): a placeholder delta carries
@@ -2850,7 +2913,7 @@ def _materialize_plan_edits(
         for error, code in errors
     ]
     suffix_parts: list[str] = []
-    if any(code != "scoped_edit" for _error, code in errors):
+    if any(code in ("anchored_edit", "placeholder_delta") for _error, code in errors):
         suffix_parts.append(_EDIT_SHAPE_EXAMPLE)
     if any(code == "scoped_edit" for _error, code in errors):
         suffix_parts.append(_SCOPED_EDIT_SHAPE_EXAMPLE)
@@ -6130,6 +6193,15 @@ SPEC_CONTEXT_METADATA_KEY = "spec_context"
 # pre-contract behavior unless they pass a pin of their own.
 _CONTRACT_UNSUPPLIED: Any = object()
 
+# Sentinel for the clauses parameter, same discipline (campaign
+# build #3): the caller supplied no frozen contract-clause list,
+# so the clause-coverage rule does not run at all. Only
+# plan_task_intent and replan_from_brief supply one — extracted
+# deterministically from the goal-named specs they already load —
+# so corpus replay and every other parse caller keep the exact
+# pre-build-#3 behavior.
+_CLAUSES_UNSUPPLIED: Any = object()
+
 _CONTRACT_MODULE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*\.py$")
 _CONTRACT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -6871,6 +6943,7 @@ def _collect_plan_error_records(
     index: Any | None = None,
     modules: _ModuleSourceCache | None = None,
     contract: Any = _CONTRACT_UNSUPPLIED,
+    clauses: Any = _CLAUSES_UNSUPPLIED,
     plan_context: str = "authored",
 ) -> tuple[list[PlanError], bool]:
     """Collect EVERY plan validation error as structured records.
@@ -7121,7 +7194,9 @@ def _collect_plan_error_records(
     # re-expressing a write as edits, or re-tiering a suite run, is
     # a real regeneration, not a mechanical relocation. The modify
     # rule runs first; when it fires, the suite rule waits for the
-    # next round, for the same one-class-at-a-time reason.
+    # next round, for the same one-class-at-a-time reason. Campaign
+    # build #3 adds a third rule behind both — clause coverage —
+    # under the identical gate.
     if plan_context == "authored" and not records:
         modify_records = _error_records(
             "whole_file_modify",
@@ -7129,12 +7204,28 @@ def _collect_plan_error_records(
         )
         records.extend(modify_records)
         if not modify_records:
-            records.extend(
-                _error_records(
-                    "suite_placement",
-                    _suite_placement_errors(nodes, repo_root, index),
-                )
+            suite_records = _error_records(
+                "suite_placement",
+                _suite_placement_errors(nodes, repo_root, index),
             )
+            records.extend(suite_records)
+            if not suite_records and clauses is not _CLAUSES_UNSUPPLIED:
+                # Campaign build #3: the clause-coverage rule —
+                # every frozen contract clause must be implemented
+                # by at least one node and verified by at least one
+                # node (the panel's requirement-to-node binding).
+                # Third in the gated sequence, same discipline: it
+                # fires only on an otherwise-acceptable authored
+                # plan, and only when the caller supplied the
+                # clause list extracted from the goal-named spec.
+                # Not cheap: completing a coverage map is a real
+                # regeneration of the plan's declarations.
+                records.extend(
+                    _error_records(
+                        "clause_coverage",
+                        clause_coverage_errors(nodes, clauses),
+                    )
+                )
     # Cheap rejection (retry #12): the only errors are stand-in /
     # code-overwrite fakes, so re-prompting costs the model nothing to
     # fix and must not spend the repair budget. A rejection whose only
@@ -8255,6 +8346,32 @@ def _format_brief_for_prompt(brief: dict[str, Any]) -> str:
             "version but missing on disk (declared, never produced): "
             + ", ".join(str(target) for target in missing_declared)
         )
+    # Contract clauses (campaign build #3): the judge's computed
+    # list of clauses the frozen contract list still shows as
+    # unverified — obligations no failing test may ever have
+    # exercised. Rendered only when the judge stamped the field
+    # and it is non-empty; a brief without it renders as before.
+    uncovered_clauses = brief.get("uncovered_clauses") or []
+    if uncovered_clauses:
+        lines.append(
+            "Uncovered contract clauses (system): the contract's "
+            "frozen clause list is not yet verified for the clauses "
+            "below. They stay open until a node implements them, a "
+            "verification node proves them, and the system's probes "
+            "pass — whether or not any failing test names them. "
+            "Target them in the delta plan and keep every node's "
+            "inputs.clauses declarations accurate:"
+        )
+        for entry in uncovered_clauses:
+            if not isinstance(entry, dict):
+                continue
+            reasons = "; ".join(
+                str(reason) for reason in entry.get("reasons") or []
+            )
+            lines.append(
+                f"- {entry.get('id', '')} ({entry.get('heading', '')}): "
+                f"{reasons}"
+            )
     measurements = brief.get("measurements") or []
     if measurements:
         lines.append("Measurements so far:")
@@ -10501,6 +10618,7 @@ def _contract_constrained_reask(
     baseline_paths: set[str] | None,
     baseline_installs: bool,
     endorsed_paths: set[str],
+    clauses: list[dict[str, Any]] | None = None,
 ) -> tuple[tuple[list[PlanNode], dict[str, Any]] | None, dict[str, Any]]:
     """One contract-required re-ask (L1, 2026-11-23).
 
@@ -10581,6 +10699,7 @@ def _contract_constrained_reask(
             workspace=workspace,
             repo_root=repo_root,
             pinned_contract=None,
+            clauses=clauses,
         )
     except Exception as exc:
         return None, {
@@ -10627,6 +10746,7 @@ def _call_llm_with_repair(
     repo_root: str | Path | None = None,
     seed_forbidden: list[str] | None = None,
     pinned_contract: list[dict[str, Any]] | None = None,
+    clauses: list[dict[str, Any]] | None = None,
     formatter: FormatterSettings | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
@@ -10840,6 +10960,7 @@ def _call_llm_with_repair(
                 workspace=workspace,
                 repo_root=repo_root,
                 pinned_contract=pinned_contract,
+                clauses=clauses,
             )
             if baseline_paths is not None:
                 # Steal #5 scope lock: a repair that parses is still
@@ -10883,6 +11004,7 @@ def _call_llm_with_repair(
                         baseline_paths=baseline_paths,
                         baseline_installs=baseline_installs,
                         endorsed_paths=endorsed_paths,
+                        clauses=clauses,
                     )
                     if upgraded is not None:
                         nodes, metadata = upgraded
@@ -11119,6 +11241,16 @@ def plan_task_intent(
     spec_section = ""
     if specs:
         spec_section = f"\n\n{format_spec_context(specs)}"
+    # Contract clauses (campaign build #3): the same specs compile
+    # deterministically into the frozen clause list — the prompt
+    # carries the IDs the plan must cover, parse validates the
+    # coverage declarations against the list, and the accepted
+    # plan's metadata carries the list itself (system-owned, below)
+    # for the loop's probes, briefs, and verdict gate.
+    clauses = clauses_for_specs(specs)
+    clauses_section = ""
+    if clauses:
+        clauses_section = f"\n\n{format_clauses_block(clauses)}"
 
     shape = _route_goal_shape(intent.goal, repo_root, delta=False)
     shape_block = f"\n\n{shape}" if shape else ""
@@ -11128,7 +11260,7 @@ def plan_task_intent(
     # immediately before "JSON Output:" — instead of ahead of the
     # instruction. Only ~13 chars ("\n\nJSON Output:") follow it.
     user_prompt = (
-        f"{context}{spec_section}\n\n"
+        f"{context}{spec_section}{clauses_section}\n\n"
         f"{_format_intent_for_prompt(intent)}\n\n"
         "Produce a NEW execution plan DAG for the goal above. Your output "
         "must be a JSON object with a \"nodes\" array — do NOT repeat the "
@@ -11144,6 +11276,7 @@ def plan_task_intent(
         goal_text=intent.goal,
         workspace=workspace,
         repo_root=repo_root,
+        clauses=clauses,
         formatter=formatter_settings_from_env(),
     )
     # Cycle 4: record the repo this plan was grounded against in its
@@ -11166,6 +11299,12 @@ def plan_task_intent(
         metadata[SPEC_CONTEXT_METADATA_KEY] = [
             spec.record() for spec in specs
         ]
+    # The frozen clause list is system-owned trail like the spec
+    # record: cleared first (a model payload value under the key
+    # never survives), then set from this call's own extraction.
+    metadata.pop(CLAUSES_METADATA_KEY, None)
+    if clauses:
+        metadata[CLAUSES_METADATA_KEY] = clauses
     return build_execution_plan(intent, nodes, metadata, plan_id=plan_id)
 
 
@@ -11481,6 +11620,19 @@ def replan_from_brief(
     spec_section = ""
     if specs:
         spec_section = f"\n\n{format_spec_context(specs)}"
+    # Contract clauses (campaign build #3), as in plan_task_intent:
+    # the frozen list is re-extracted from the same spec text (the
+    # contract does not change mid-run, so the list is identical to
+    # the one stamped into the accepted plan's metadata), the
+    # prompt carries the IDs, and parse validates the delta plan's
+    # coverage declarations against it — every version is a full
+    # node set in this harness, so a delta that drops a clause's
+    # only verification node is a real coverage loss, named at
+    # parse instead of discovered at the verdict gate.
+    clauses = clauses_for_specs(specs)
+    clauses_section = ""
+    if clauses:
+        clauses_section = f"\n\n{format_clauses_block(clauses)}"
     # Re-plan diagnostics (2026-11-23): the suspect map + precedence
     # block, computed from the brief's judge-stamped failing tests
     # and the files on disk. The map is stamped back into the brief
@@ -11538,7 +11690,7 @@ def replan_from_brief(
     # before "JSON Output:" — it is the decision, not preamble. The
     # seed block goes BEFORE the shape, so the shape stays last.
     user_prompt = (
-        f"{context}{spec_section}\n\n{_format_brief_for_prompt(brief)}{diagnostics_block}{node_shape_block}\n\n"
+        f"{context}{spec_section}{clauses_section}\n\n{_format_brief_for_prompt(brief)}{diagnostics_block}{node_shape_block}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
         "quote, or echo the brief — it is your input, not your output.\n"
         f"{seed_block}"
@@ -11555,6 +11707,7 @@ def replan_from_brief(
         repo_root=repo_root,
         seed_forbidden=merged_seed or None,
         pinned_contract=pinned_contract,
+        clauses=clauses,
         formatter=formatter_settings_from_env(),
     )
     brief["rejected_approaches"] = metadata.get("rejected_approaches", seed or [])
@@ -12262,6 +12415,14 @@ def _try_local_repair(
             f"the repaired {target.qualified_name} is identical to "
             "the window as it stood",
         )
+    # Campaign build #3: edit grounding — the spliced definition
+    # must answer to the file it lands in. A reference the repair
+    # introduces that the file cannot resolve (self.<attr> the
+    # class never assigns, a call to an undefined name) declines
+    # the candidate like any other doubt in this seam.
+    grounding = edit_grounding_violations(content, new_content)
+    if grounding:
+        return decline("ungrounded_reference", "; ".join(grounding))
     nodes = _local_repair_candidate_nodes(plan, target, new_content)
     workspace = (plan.intent.constraints or {}).get("workspace")
     records, _cheap = _collect_plan_error_records(
@@ -12844,6 +13005,16 @@ def _try_scoped_edit_repair(
             if syntax is not None:
                 return decline(
                     "syntax_error", f"{target.relative_path}: {syntax}"
+                )
+            # Campaign build #3: edit grounding, as in cycle 8's
+            # seam — the edited content must answer to the file it
+            # lands in (arm #11: edits that applied cleanly and
+            # referenced self.store for self.server.store).
+            grounding = edit_grounding_violations(target.content, new_content)
+            if grounding:
+                return decline(
+                    "ungrounded_reference",
+                    f"{target.relative_path}: " + "; ".join(grounding),
                 )
         edited.append((target, new_content))
     nodes = _scoped_edit_candidate_nodes(plan, edited)

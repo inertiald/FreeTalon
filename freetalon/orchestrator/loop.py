@@ -17,11 +17,26 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from .contract_clauses import (
+    PROBE_RESULTS_METADATA_KEY,
+    WAIVERS_METADATA_KEY,
+    clause_states,
+    clauses_from_metadata,
+    probe_failures,
+    run_contract_probes,
+)
 from .critic import CriticSettings, critic_settings_from_env, review_write_nodes
 from .executor import Executor
 from .gates import GateStatus, GateStore, build_packet, compute_packet_hash
-from .judge import Decision, Judge, assess_approach_repeat
-from .measure import VERDICT_FAIL, VERDICT_PASS, VERDICT_UNMEASURABLE, _compare
+from .judge import Decision, Judge, JudgeDecision, assess_approach_repeat
+from .measure import (
+    VERDICT_FAIL,
+    VERDICT_INCONCLUSIVE,
+    VERDICT_PARTIAL,
+    VERDICT_PASS,
+    VERDICT_UNMEASURABLE,
+    _compare,
+)
 from .memory import ExperimentStore, goal_key_for
 from .models import (
     ExecutionPlan,
@@ -256,6 +271,15 @@ class LoopRunner:
                 }
             )
 
+            # Campaign build #3: the deterministic contract probes
+            # run against the tree this version produced — outside
+            # the model's self-written tests — and their results
+            # are stamped into the plan metadata, where the judge's
+            # brief and the verdict gate read them. A completed
+            # plan with failing probes has NOT met the contract,
+            # whatever its own nodes report.
+            probe_failures_now = self._run_contract_probes(run_id, plan, version)
+
             # M4: a node paused at a gate ends this pass — the run waits
             # for a human decision, it does not push through.
             awaiting = [
@@ -305,7 +329,7 @@ class LoopRunner:
                 )
                 break
 
-            if plan.status == PlanStatus.COMPLETED:
+            if plan.status == PlanStatus.COMPLETED and not probe_failures_now:
                 decision_history.append(
                     {"version": version, "decision": "continue", "reason": "all nodes succeeded"}
                 )
@@ -315,6 +339,28 @@ class LoopRunner:
                 break
 
             decision = judge.decide(plan, version_measurements)
+            if decision.decision == Decision.CONTINUE and probe_failures_now:
+                # The plan completed but the contract probes fail:
+                # the judge's CONTINUE judges the plan's own nodes,
+                # and the probes outrank them. While re-plan budget
+                # remains this is a re-plan (its brief carries the
+                # failing clauses); at budget end it is an honest
+                # escalation, and the verdict gate reports the
+                # clause accounting.
+                failed_clause_ids = sorted(
+                    {str(record["clause_id"]) for record in probe_failures_now}
+                )
+                if judge.remaining_budget()["replans"] > 0:
+                    decision = JudgeDecision(
+                        Decision.REPLAN,
+                        "contract probes failing: " + ", ".join(failed_clause_ids),
+                    )
+                else:
+                    decision = JudgeDecision(
+                        Decision.ESCALATE,
+                        "contract probes failing and re-plan budget "
+                        "exhausted: " + ", ".join(failed_clause_ids),
+                    )
             decision_history.append(
                 {
                     "version": version,
@@ -382,6 +428,25 @@ class LoopRunner:
                 # the seams entirely, so the list stays empty then.
                 repair_declines: list[dict[str, Any]] = []
                 declines_logged = 0
+                # Campaign build #3: the bypass itself is now a
+                # recorded fact, not an empty list's silence. Every
+                # exam arm through #11 injected replan_fn and so
+                # never exercised the seams; the firing/decline
+                # accounting is only complete when the bypass is
+                # stamped alongside the declines it replaced.
+                seams_bypassed: dict[str, Any] | None = None
+                if replan_fn is not None:
+                    seams_bypassed = {
+                        "reason": "replan_fn_injected",
+                        "version": version,
+                    }
+                    self._log(
+                        "loop.replan.seams_bypassed",
+                        run_id=run_id,
+                        plan_id=plan.plan_id,
+                        version=version,
+                        reason="replan_fn_injected",
+                    )
                 if replan_fn is None:
                     # Cycle 8: before re-planning the whole task, try
                     # repairing only the node that produced the code a
@@ -474,6 +539,11 @@ class LoopRunner:
                     metadata["repair_declines"] = [
                         dict(record) for record in repair_declines
                     ]
+                if seams_bypassed is not None:
+                    # Campaign build #3: the bypass record rides
+                    # the same channel — a version produced under
+                    # an injected replan_fn says so in its metadata.
+                    metadata["seams_bypassed"] = dict(seams_bypassed)
                 if brief.get("rejected_approaches"):
                     metadata["rejected_approaches"] = list(
                         brief["rejected_approaches"]
@@ -1016,6 +1086,38 @@ class LoopRunner:
 
     # ── Goal evaluation ──────────────────────────────────────────────────
 
+    def _run_contract_probes(
+        self, run_id: str, plan: ExecutionPlan, version: int
+    ) -> list[dict[str, Any]]:
+        """Run the plan's contract probes; stamp + return failures.
+
+        Campaign build #3: the frozen clause list rides the plan
+        metadata (system-stamped at planning); a plan without one
+        has no probes and this is a no-op, exactly as before. The
+        results replace the metadata's previous record — the brief
+        and the verdict gate judge the CURRENT tree, while the
+        audit log keeps every version's outcome.
+        """
+        clauses = clauses_from_metadata(plan.metadata)
+        if not clauses:
+            return []
+        root_value = (plan.metadata or {}).get("repo_root")
+        if not root_value:
+            return []
+        results = run_contract_probes(clauses, str(root_value))
+        plan.metadata[PROBE_RESULTS_METADATA_KEY] = results
+        self._store.save(plan)
+        failures = probe_failures(results)
+        self._log(
+            "loop.contract_probes",
+            run_id=run_id,
+            plan_id=plan.plan_id,
+            version=version,
+            probes=len(results),
+            failing=sorted({str(record["clause_id"]) for record in failures}),
+        )
+        return failures
+
     def _evaluate_goal(
         self,
         contract: GoalContract,
@@ -1024,28 +1126,106 @@ class LoopRunner:
         elapsed_s: float,
         escalation: str | None,
     ) -> tuple[str, str]:
-        """Evaluate the contract's success measures against run measurements.
+        """Evaluate the goal: base measures, then the clause gate.
 
-        A run that passes every node but misses the contract's success
-        measures is a goal failure — and evidence the criteria need
-        strengthening, by a human, between runs.
+        The base evaluation (measures, plan state, escalation) is
+        unchanged from before campaign build #3. When the plan
+        carries a frozen contract-clause list, the clause
+        adjustment then applies: a PASS requires every clause
+        verified or explicitly waived — the loop does not grade
+        its own homework — and the budget-ended and partial
+        outcomes get their own verdict words (PARTIAL /
+        INCONCLUSIVE) instead of being conflated into FAIL.
+        Plans without clauses return the base verdict untouched.
+        """
+        verdict, detail, kind = self._evaluate_goal_base(
+            contract, plan, measurements, elapsed_s, escalation
+        )
+        clauses = clauses_from_metadata(plan.metadata)
+        if not clauses:
+            return verdict, detail
+        waivers_raw = (plan.metadata or {}).get(WAIVERS_METADATA_KEY)
+        waivers = waivers_raw if isinstance(waivers_raw, dict) else None
+        probe_results = (plan.metadata or {}).get(PROBE_RESULTS_METADATA_KEY)
+        states = clause_states(
+            clauses,
+            plan.nodes,
+            probe_results if isinstance(probe_results, list) else [],
+            waivers,
+        )
+        verified = sorted(
+            cid for cid, info in states.items() if info["state"] == "verified"
+        )
+        waived = sorted(
+            cid for cid, info in states.items() if info["state"] == "waived"
+        )
+        failed = sorted(
+            cid for cid, info in states.items() if info["state"] == "failed"
+        )
+        unverified = sorted(
+            cid for cid, info in states.items() if info["state"] == "unverified"
+        )
+        accounting = (
+            f"contract clauses: {len(verified) + len(waived)}/{len(clauses)} "
+            "verified or waived"
+        )
+        if failed:
+            accounting += f"; failed: {', '.join(failed)}"
+        if unverified:
+            accounting += f"; unverified: {', '.join(unverified)}"
+        detail = f"{detail} [{accounting}]"
+        if verdict == VERDICT_PASS:
+            if not failed and not unverified:
+                return VERDICT_PASS, detail
+            if failed and not verified and not waived:
+                return VERDICT_FAIL, detail
+            return VERDICT_PARTIAL, detail
+        if verdict == VERDICT_FAIL and kind in ("escalation", "plan_failed"):
+            if kind == "escalation" and not failed and unverified:
+                return (
+                    VERDICT_INCONCLUSIVE,
+                    detail
+                    + " — the run ended before verification completed",
+                )
+            if (verified or waived) and (failed or unverified):
+                return VERDICT_PARTIAL, detail
+        return verdict, detail
+
+    def _evaluate_goal_base(
+        self,
+        contract: GoalContract,
+        plan: ExecutionPlan,
+        measurements: list[dict[str, Any]],
+        elapsed_s: float,
+        escalation: str | None,
+    ) -> tuple[str, str, str]:
+        """The pre-build-#3 goal evaluation, plus a failure kind.
+
+        The kind names which channel produced a FAIL (wall clock,
+        escalation, plan state, or the contract's own measures) so
+        the clause adjustment can tell a budget-ended run from a
+        verified-unmet one without sniffing the detail text. The
+        base rule stands as before: a run that passes every node
+        but misses the contract's success measures is a goal
+        failure — and evidence the criteria need strengthening, by
+        a human, between runs.
         """
         if elapsed_s > contract.budget.max_wall_clock_s:
             return VERDICT_FAIL, (
                 f"wall-clock budget exceeded: {elapsed_s:.1f}s > "
                 f"{contract.budget.max_wall_clock_s}s"
-            )
+            ), "wall_clock"
         if escalation is not None:
-            return VERDICT_FAIL, f"escalated: {escalation}"
+            return VERDICT_FAIL, f"escalated: {escalation}", "escalation"
         if plan.status == PlanStatus.FAILED:
             failed = [n.id for n in plan.nodes if n.status == PlanStatus.FAILED]
-            return VERDICT_FAIL, f"plan failed; failed nodes: {failed}"
+            return VERDICT_FAIL, f"plan failed; failed nodes: {failed}", "plan_failed"
         if plan.status == PlanStatus.NEEDS_TOOL:
-            return VERDICT_FAIL, "plan needs a tool that does not exist yet"
+            return VERDICT_FAIL, "plan needs a tool that does not exist yet", "needs_tool"
         if plan.status == PlanStatus.AWAITING_APPROVAL:
-            return VERDICT_UNMEASURABLE, "plan paused awaiting approval"
+            return VERDICT_UNMEASURABLE, "plan paused awaiting approval", "awaiting"
         if not contract.success_measures:
-            return VERDICT_PASS, "plan completed; no success measures declared"
+            return VERDICT_PASS, "plan completed; no success measures declared", "pass"
 
         merged: dict[str, Any] = {}
         for measurement in measurements:
@@ -1055,19 +1235,19 @@ class LoopRunner:
                 return VERDICT_UNMEASURABLE, (
                     f"success measure {measure.name!r} unmeasurable: "
                     f"metric {measure.metric!r} not reported"
-                )
+                ), "measure_missing"
             value = merged[measure.metric]
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 return VERDICT_FAIL, (
                     f"success measure {measure.name!r}: metric "
                     f"{measure.metric!r} is not numeric: {value!r}"
-                )
+                ), "measure_unmet"
             if not _compare(measure.op, float(value), float(measure.value)):
                 return VERDICT_FAIL, (
                     f"success measure {measure.name!r}: {measure.metric} "
                     f"{value} {measure.op} {measure.value} is false"
-                )
-        return VERDICT_PASS, "all success measures met"
+                ), "measure_unmet"
+        return VERDICT_PASS, "all success measures met", "pass"
 
     # ── Summary ──────────────────────────────────────────────────────────
 

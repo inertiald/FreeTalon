@@ -26,6 +26,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .contract_clauses import (
+    PROBE_RESULTS_METADATA_KEY,
+    WAIVERS_METADATA_KEY,
+    clauses_from_metadata,
+    uncovered_clauses,
+)
 from .critic import deterministic_hollow_evidence
 from .measure import VERDICT_UNMEASURABLE
 from .memory import (
@@ -564,7 +570,37 @@ class Judge:
             ),
         }
         brief.update(self._anchoring_fields(plan, plan_version, failed))
+        brief.update(self._clause_fields(plan))
         return brief
+
+    def _clause_fields(self, plan: ExecutionPlan) -> dict[str, Any]:
+        """The brief's contract-clause record (campaign build #3).
+
+        Computed from the plan's frozen clause list (plan metadata,
+        system-stamped at planning), the current plan's coverage
+        declarations and node outcomes, and the loop's latest probe
+        results — never from model output. Because the brief is
+        rebuilt from current state at every version, a clause stays
+        listed until it verifies: the re-plan always sees the full
+        open obligation set next to the failing tests, including
+        obligations no test has ever exercised (the arm-#10/#11
+        blindness, where defects outside the loop's own failing
+        tests were never targeted). Empty for plans whose goal
+        named no contract.
+        """
+        clauses = clauses_from_metadata(plan.metadata)
+        if not clauses:
+            return {}
+        probe_results = (plan.metadata or {}).get(PROBE_RESULTS_METADATA_KEY)
+        waivers_raw = (plan.metadata or {}).get(WAIVERS_METADATA_KEY)
+        return {
+            "uncovered_clauses": uncovered_clauses(
+                clauses,
+                plan.nodes,
+                probe_results if isinstance(probe_results, list) else [],
+                waivers_raw if isinstance(waivers_raw, dict) else None,
+            )
+        }
 
     def _anchoring_fields(
         self,

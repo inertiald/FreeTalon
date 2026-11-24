@@ -32,6 +32,14 @@ from typing import Any, Callable
 VERDICT_PASS = "PASS"
 VERDICT_FAIL = "FAIL"
 VERDICT_UNMEASURABLE = "UNMEASURABLE"
+# Goal-level verdicts (campaign build #3): a run whose plan carried
+# a frozen contract-clause list can end PARTIAL — some clauses
+# verified, the run over — or INCONCLUSIVE — the run ended (budget
+# / escalation) before verification completed, with no clause
+# proven failed. Node/criterion verdicts never use these; they are
+# goal verdicts only, assigned by the loop's clause adjustment.
+VERDICT_PARTIAL = "PARTIAL"
+VERDICT_INCONCLUSIVE = "INCONCLUSIVE"
 
 # Criterion types.
 CRITERION_EXIT_CODE = "exit_code"
