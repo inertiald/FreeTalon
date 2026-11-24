@@ -22,6 +22,7 @@ from .contract_clauses import (
     clause_coverage_errors,
     clauses_for_specs,
     format_clauses_block,
+    node_clause_declaration,
 )
 from .executor import _command_runs_full_suite
 from .grounding import edit_grounding_violations
@@ -43,6 +44,8 @@ from .repo_index import (
     build_repo_index,
     resolve_repo_root,
     duplicate_scaffold_error,
+    existing_file_inventory,
+    format_existing_file_inventory,
     format_repo_context,
     format_spec_context,
     framework_in_text,
@@ -10734,6 +10737,335 @@ def _contract_constrained_reask(
     return (new_nodes, new_metadata), {"outcome": "adopted"}
 
 
+# ── Plan-attempt anchoring (campaign build #4) ─────────────────────
+#
+# Exam arm #13 (2026-11-23) isolated the repair loop's failure mode:
+# with the clause layer live, plan_task_intent spent its three
+# attempts fixing each rejection by regressing a different property.
+# Attempt 1 scaffolded with 0/12 clause mappings; attempt 2 added a
+# NEW test file but wrote no implementation and still mapped 0/12;
+# attempt 3 carried the full implementation AND 12/12 mappings — and
+# scaffolded the existing tests/test_pairing.py, dropping 61 of its
+# 65 definitions, so the preservation guard rejected it and the
+# budget was gone. The repair prompt named only the CURRENT
+# rejection; nothing carried forward what earlier attempts had
+# already gotten right, so no single attempt ever held every
+# validated property at once. Arm #12 showed the same shape with
+# two scaffold errors; #13 narrowed it to one. The blocker is
+# convergence, not clause compliance.
+#
+# The anchoring below is the deterministic counterpart: after every
+# rejected attempt the loop records simple plan-shape facts about
+# the attempt (its validator error codes; how many frozen clauses
+# its own declarations implemented / verified; which files it wrote,
+# split into implementation writes, NEW test files, and writes to
+# EXISTING test files; which existing files it targeted with a
+# full-content scaffold). The next repair prompt carries the facts
+# for every prior attempt plus DO-NOT-REGRESS constraints computed
+# comparatively — a property some earlier attempt satisfied and the
+# latest attempt lost — and the standing instruction that the next
+# plan must satisfy all validators simultaneously. Everything is
+# computed from the rejected output and the tree on disk, never
+# from a model's account; extraction is fail-soft, because a facts
+# failure must never mask the rejection it describes. On success
+# the history is stamped into the plan metadata under
+# ATTEMPT_ANCHORING_METADATA_KEY (system-owned trail, like
+# rejected_approaches), so an exam arm can show what the briefs
+# carried.
+
+ATTEMPT_ANCHORING_METADATA_KEY = "attempt_anchoring"
+
+# File lists inside one attempt's fact line / one constraint are
+# capped so a sprawling plan cannot flood the repair prompt; the
+# counts always ride along, so the cap hides names, never facts.
+_ANCHOR_FACT_FILE_CAP = 4
+
+
+def _fact_file_list(paths: list[str]) -> str:
+    """A bounded rendering of a fact's file list ("a, b, +2 more")."""
+    if not paths:
+        return "none"
+    shown = ", ".join(paths[:_ANCHOR_FACT_FILE_CAP])
+    if len(paths) > _ANCHOR_FACT_FILE_CAP:
+        shown += f", +{len(paths) - _ANCHOR_FACT_FILE_CAP} more"
+    return shown
+
+
+def _plan_attempt_facts(
+    response_text: str,
+    error_records: Collection[PlanError],
+    repo_root: str | Path | None,
+    clauses: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Deterministic shape facts about one rejected plan attempt.
+
+    Read leniently from the raw output (the _response_write_scope
+    pattern — the output may be too malformed for PlanNode
+    validation; that is why it was rejected): the error codes come
+    from the rejection's structured records; the clause counts from
+    the nodes' own inputs.clauses declarations, counting only IDs
+    in the frozen list (an invented ID is not coverage); the write
+    split from _node_written_paths, classified by _is_test_file_path
+    and by existence on disk; a full-content scaffold is a scaffold /
+    file_writer node carrying "content" with neither "anchor" nor
+    "edits" (the two edit forms are modifications, not scaffolds).
+    Never raises: any extraction failure returns the error codes
+    alone, so the repair loop's bookkeeping cannot mask the
+    rejection it describes.
+    """
+    facts: dict[str, Any] = {
+        "errors": sorted({record.code for record in error_records}),
+        "clauses_implemented": None,
+        "clauses_verified": None,
+        "clauses_total": 0,
+        "implementation_writes": [],
+        "test_writes_new": [],
+        "test_writes_existing": [],
+        "scaffolded_existing": [],
+    }
+    try:
+        payload = parse_json_object(sanitize_llm_output(response_text))
+    except Exception:
+        return facts
+    nodes_raw = payload.get("nodes") if isinstance(payload, dict) else None
+    if not isinstance(nodes_raw, list):
+        return facts
+    root = resolve_repo_root(repo_root)
+    known_clauses: set[str] | None = None
+    implemented: set[str] = set()
+    verified: set[str] = set()
+    if clauses:
+        known_clauses = {str(clause.get("id")) for clause in clauses}
+        facts["clauses_total"] = len(known_clauses)
+    implementation_writes: set[str] = set()
+    test_new: set[str] = set()
+    test_existing: set[str] = set()
+    scaffolded_existing: set[str] = set()
+    for position, raw in enumerate(nodes_raw, start=1):
+        view = _lenient_node_view(raw, position)
+        if view is None:
+            continue
+        if known_clauses is not None:
+            declares_impl, declares_verify, decl_error = (
+                node_clause_declaration(view)
+            )
+            if decl_error is None:
+                implemented.update(
+                    clause_id
+                    for clause_id in declares_impl
+                    if clause_id in known_clauses
+                )
+                verified.update(
+                    clause_id
+                    for clause_id in declares_verify
+                    if clause_id in known_clauses
+                )
+        for path in _node_written_paths(view):
+            if _is_test_file_path(path):
+                if _path_exists_on_disk(path, repo_root):
+                    test_existing.add(path)
+                else:
+                    test_new.add(path)
+            else:
+                implementation_writes.add(path)
+        if (view.assigned_claw or "") in ("scaffold", "file_writer"):
+            inputs = view.inputs or {}
+            if (
+                isinstance(inputs.get("content"), str)
+                and "anchor" not in inputs
+                and "edits" not in inputs
+            ):
+                target = (
+                    inputs.get("file_path")
+                    or inputs.get("path")
+                    or (view.outputs[0] if view.outputs else "")
+                )
+                if (
+                    isinstance(target, str)
+                    and target
+                    and _resolve_plan_target(target, root).is_file()
+                ):
+                    scaffolded_existing.add(target)
+    if known_clauses is not None:
+        facts["clauses_implemented"] = len(implemented)
+        facts["clauses_verified"] = len(verified)
+    facts["implementation_writes"] = sorted(implementation_writes)
+    facts["test_writes_new"] = sorted(test_new)
+    facts["test_writes_existing"] = sorted(test_existing)
+    facts["scaffolded_existing"] = sorted(scaffolded_existing)
+    return facts
+
+
+def _attempt_anchoring_constraints(
+    attempts: list[dict[str, Any]],
+) -> list[str]:
+    """DO-NOT-REGRESS constraints: properties an earlier attempt
+    satisfied and the latest attempt lost.
+
+    Comparative by construction — each constraint names the attempt
+    that established the property, the latest attempt's regression,
+    and the move that restores it. A monotonically improving history
+    yields no constraints: the anchoring never invents a regression
+    to warn about. Error-code novelty is a constraint too: a code
+    the latest attempt produced that NO earlier attempt produced is
+    the signature of fixing one rejection by creating another.
+    """
+    if len(attempts) < 2:
+        return []
+    earlier, latest = attempts[:-1], attempts[-1]
+    constraints: list[str] = []
+    total = latest.get("clauses_total") or 0
+    for key, label in (
+        ("clauses_implemented", "implementation"),
+        ("clauses_verified", "verification"),
+    ):
+        best = max(
+            (attempt.get(key) for attempt in earlier),
+            key=lambda value: -1 if value is None else value,
+        )
+        current = latest.get(key)
+        if best is None or current is None or current >= best:
+            continue
+        peak = next(
+            index + 1
+            for index, attempt in enumerate(earlier)
+            if attempt.get(key) == best
+        )
+        constraints.append(
+            f"Clause {label} coverage peaked at {best}/{total} in "
+            f"attempt {peak}; the latest attempt declared "
+            f"{current}/{total}. Keep every clause declaration the "
+            f"earlier attempts had and add the missing ones — the "
+            f"next plan must declare at least {best}/{total} "
+            f"{label} coverage."
+        )
+    if not latest.get("implementation_writes"):
+        richest = max(
+            earlier, key=lambda attempt: len(attempt["implementation_writes"])
+        )
+        if richest["implementation_writes"]:
+            peak = earlier.index(richest) + 1
+            constraints.append(
+                f"Attempt {peak} included implementation writes "
+                f"({_fact_file_list(richest['implementation_writes'])}); "
+                "the latest attempt wrote no implementation files at "
+                "all. A plan of tests and reads alone implements "
+                "nothing — the next plan must include the "
+                "implementation writes."
+            )
+    if latest.get("test_writes_existing") and not latest.get(
+        "test_writes_new"
+    ):
+        for index, attempt in enumerate(earlier):
+            if attempt.get("test_writes_new") and not attempt.get(
+                "test_writes_existing"
+            ):
+                constraints.append(
+                    f"Attempt {index + 1} put its tests in NEW "
+                    f"file(s) ({_fact_file_list(attempt['test_writes_new'])}); "
+                    "the latest attempt wrote to existing test "
+                    f"file(s) ({_fact_file_list(latest['test_writes_existing'])}). "
+                    "Do not scaffold or rewrite an existing test "
+                    "file — put new tests in a new file, or extend "
+                    "the existing module with an anchored insert."
+                )
+                break
+    prior_codes: set[str] = set()
+    for attempt in earlier:
+        prior_codes.update(attempt.get("errors") or [])
+    new_codes = sorted(set(latest.get("errors") or []) - prior_codes)
+    if new_codes:
+        constraints.append(
+            "The latest attempt introduced rejection(s) no earlier "
+            f"attempt in this call had: {', '.join(new_codes)}. "
+            "Fixing one rejection must not create another — the "
+            "next plan must avoid these as well as the rejection "
+            "above."
+        )
+    return constraints
+
+
+def _attempt_anchoring_block(attempts: list[dict[str, Any]]) -> str:
+    """The PLAN-ATTEMPT ANCHORING block for a repair prompt.
+
+    "" until a second attempt exists (one attempt has nothing to
+    regress against — the rejection itself is the whole signal).
+    With two or more: one measured line per prior attempt, the
+    DO-NOT-REGRESS constraints (when any fired), and the standing
+    instruction that the next plan must satisfy all validators at
+    once.
+    """
+    if len(attempts) < 2:
+        return ""
+    lines = [
+        "\nPLAN-ATTEMPT ANCHORING (system — what your earlier "
+        "attempts in this planning call got right, measured from "
+        "their outputs and the tree on disk, not from memory):"
+    ]
+    for index, attempt in enumerate(attempts, start=1):
+        errors = ", ".join(attempt.get("errors") or []) or "unstructured"
+        line = f"- Attempt {index}: rejected with {errors}."
+        if attempt.get("clauses_total"):
+            line += (
+                f" Clause declarations: implements "
+                f"{attempt.get('clauses_implemented')}/"
+                f"{attempt['clauses_total']}, verifies "
+                f"{attempt.get('clauses_verified')}/"
+                f"{attempt['clauses_total']}."
+            )
+        line += (
+            f" Implementation writes: "
+            f"{_fact_file_list(attempt.get('implementation_writes') or [])}."
+            f" Test writes: new "
+            f"{_fact_file_list(attempt.get('test_writes_new') or [])}, "
+            f"existing "
+            f"{_fact_file_list(attempt.get('test_writes_existing') or [])}."
+            f" Existing files scaffolded whole: "
+            f"{_fact_file_list(attempt.get('scaffolded_existing') or [])}."
+        )
+        lines.append(line)
+    constraints = _attempt_anchoring_constraints(attempts)
+    if constraints:
+        lines.append("DO NOT REGRESS:")
+        lines.extend(f"- {constraint}" for constraint in constraints)
+    lines.append(
+        "The next plan must satisfy ALL the validators at once: "
+        "fix the rejection above AND keep every property listed "
+        "here. Trading one rejection for another spends the "
+        "remaining budget without progress."
+    )
+    return "\n" + "\n".join(lines) + "\n"
+
+
+def _existing_files_section(
+    specs: list[Any], repo_root: str | Path | None
+) -> str:
+    """The EXISTING FILES prompt section for a planning call.
+
+    Campaign build #4: the deterministic inventory of the tree the
+    plan will write into — the goal-named specs' directories (the
+    package the goal is about), the package root's modules, and the
+    tests tree — each file with its definition count, under the
+    standing rule that existing files are never scaffolded. The
+    repair prompts embed the original prompt, so the section rides
+    into every repair round without a second channel. "" when the
+    tree holds none of the inventoried scopes.
+    """
+    root = resolve_repo_root(repo_root)
+    focus_dirs = sorted(
+        {
+            Path(spec.path).parent.as_posix()
+            for spec in specs
+            if getattr(spec, "path", None)
+            and Path(spec.path).parent.as_posix() not in ("", ".")
+        }
+    )
+    block = format_existing_file_inventory(
+        existing_file_inventory(root, focus_dirs)
+    )
+    return f"\n\n{block}" if block else ""
+
+
 def _call_llm_with_repair(
     system_prompt: str,
     user_prompt: str,
@@ -10875,6 +11207,17 @@ def _call_llm_with_repair(
     once per planning call, only when no contract pin governs,
     and only under the planner-owned schema — a caller-supplied
     schema is respected, never replaced.
+
+    Campaign build #4: every rejected attempt's plan-shape facts
+    are recorded (_plan_attempt_facts) and, from the second
+    repair on, the repair prompt carries the PLAN-ATTEMPT
+    ANCHORING block — the prior attempts' measured facts plus
+    DO-NOT-REGRESS constraints for properties an earlier attempt
+    satisfied and the latest lost (exam arm #13: each attempt
+    fixed the named rejection and regressed a different property,
+    so no attempt ever held every validated property at once).
+    On success the history rides the returned metadata under
+    ATTEMPT_ANCHORING_METADATA_KEY.
     """
     # Retry #22: derive the effective settings once, before the loop,
     # so every call in this planning call (initial + repairs) gets
@@ -10939,6 +11282,12 @@ def _call_llm_with_repair(
             rejected_approaches.append(seeded)
     spent_repair = False
     contract_reask_done = False
+    # Campaign build #4: per-attempt plan-shape facts for the
+    # anchoring block (see the section above this function). One
+    # entry per rejected attempt, in order; the block is rebuilt
+    # from the whole history each round, so a property established
+    # by ANY earlier attempt anchors every later repair.
+    attempt_history: list[dict[str, Any]] = []
     while True:
         endorsed_paths |= _prompt_named_paths(prompt)
         response_text = call_llm(
@@ -11019,6 +11368,20 @@ def _call_llm_with_repair(
             else:
                 metadata.pop(CONTRACT_REASK_METADATA_KEY, None)
             metadata["rejected_approaches"] = list(rejected_approaches)
+            # Campaign build #4: the anchoring trail is system-owned
+            # like rejected_approaches — stamped from this call's own
+            # attempt history when any repair happened, cleared
+            # otherwise (a value a model payload carried under the
+            # key never survives, and a first-attempt acceptance
+            # carries no anchoring record at all).
+            metadata.pop(ATTEMPT_ANCHORING_METADATA_KEY, None)
+            if attempt_history:
+                metadata[ATTEMPT_ANCHORING_METADATA_KEY] = {
+                    "attempts": attempt_history,
+                    "do_not_regress": _attempt_anchoring_constraints(
+                        attempt_history
+                    ),
+                }
             return nodes, metadata
         except LLMResponseError as exc:
             last_error = exc
@@ -11028,6 +11391,18 @@ def _call_llm_with_repair(
                 record.code
                 for record in getattr(exc, "plan_errors", None) or []
             }
+            # Campaign build #4: record this attempt's plan-shape
+            # facts BEFORE the budget decision, so the anchoring
+            # block built below describes every attempt the model
+            # has made in this call, including the one just rejected.
+            attempt_history.append(
+                _plan_attempt_facts(
+                    response_text,
+                    getattr(exc, "plan_errors", None) or [],
+                    repo_root,
+                    clauses,
+                )
+            )
             for approach in _rejected_approaches(error_codes):
                 if approach not in rejected_approaches:
                     rejected_approaches.append(approach)
@@ -11135,6 +11510,10 @@ def _call_llm_with_repair(
             materialization_block = _materialization_steering_block(
                 response_text, error_codes, repo_root
             )
+            # Campaign build #4: the anchoring block — prior
+            # attempts' measured facts + DO-NOT-REGRESS constraints.
+            # Empty until a second attempt exists.
+            anchoring_block = _attempt_anchoring_block(attempt_history)
             # Cycle 2 (steal #5 re-grounding): the repair prompt
             # re-injects the original task verbatim, directly over
             # the rejection — the full original prompt rides along
@@ -11161,6 +11540,7 @@ def _call_llm_with_repair(
                 f"{steering_block}"
                 f"{extension_block}"
                 f"{materialization_block}"
+                f"{anchoring_block}"
                 f"\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n"
                 f"{skeleton_block}\n"
                 "Return ONLY a corrected JSON object with a \"nodes\" array that "
@@ -11207,12 +11587,25 @@ def build_execution_plan(
     )
 
 
+# Campaign build #4: plan_task_intent's repair budget, as a named
+# constant. Total attempts = 1 initial + this many repairs. Raised
+# from 2 repairs (3 attempts) to 4 (5 attempts) — deliberately
+# paired with plan-attempt anchoring (above): arm #13's three
+# attempts each fixed the named rejection and regressed a different
+# property, so the anchoring is the fix and this budget is the room
+# it needs to converge. Arm #8's lesson stands for EXECUTION
+# re-plans (budget alone was not binding there), so
+# replan_from_brief's budget is unchanged; this raise is scoped to
+# initial planning, where the measured exhaustion happened.
+PLAN_TASK_INTENT_MAX_REPAIRS = 4
+
+
 def plan_task_intent(
     intent: TaskIntent,
     settings: LLMSettings | None = None,
     *,
     plan_id: str | None = None,
-    max_repairs: int = 2,
+    max_repairs: int = PLAN_TASK_INTENT_MAX_REPAIRS,
     repo_root: str | Path | None = None,
 ) -> ExecutionPlan:
     """Generate a validated execution plan DAG for a TaskIntent.
@@ -11251,6 +11644,13 @@ def plan_task_intent(
     clauses_section = ""
     if clauses:
         clauses_section = f"\n\n{format_clauses_block(clauses)}"
+    # Existing-file inventory (campaign build #4): the tree's
+    # existing files with their definition counts, under the
+    # standing rule that existing files are never scaffolded. Arm
+    # #13's final attempt scaffolded a 47-test leftover module it
+    # was never told existed; the preservation guard caught the
+    # loss, but only by spending the last repair.
+    inventory_section = _existing_files_section(specs, repo_root)
 
     shape = _route_goal_shape(intent.goal, repo_root, delta=False)
     shape_block = f"\n\n{shape}" if shape else ""
@@ -11260,7 +11660,7 @@ def plan_task_intent(
     # immediately before "JSON Output:" — instead of ahead of the
     # instruction. Only ~13 chars ("\n\nJSON Output:") follow it.
     user_prompt = (
-        f"{context}{spec_section}{clauses_section}\n\n"
+        f"{context}{spec_section}{clauses_section}{inventory_section}\n\n"
         f"{_format_intent_for_prompt(intent)}\n\n"
         "Produce a NEW execution plan DAG for the goal above. Your output "
         "must be a JSON object with a \"nodes\" array — do NOT repeat the "
@@ -11633,6 +12033,11 @@ def replan_from_brief(
     clauses_section = ""
     if clauses:
         clauses_section = f"\n\n{format_clauses_block(clauses)}"
+    # Existing-file inventory (campaign build #4), as in
+    # plan_task_intent: a re-plan writes into the same tree, and a
+    # delta that scaffolds an existing file the brief never named
+    # is the same loss in a later version.
+    inventory_section = _existing_files_section(specs, repo_root)
     # Re-plan diagnostics (2026-11-23): the suspect map + precedence
     # block, computed from the brief's judge-stamped failing tests
     # and the files on disk. The map is stamped back into the brief
@@ -11690,7 +12095,7 @@ def replan_from_brief(
     # before "JSON Output:" — it is the decision, not preamble. The
     # seed block goes BEFORE the shape, so the shape stays last.
     user_prompt = (
-        f"{context}{spec_section}{clauses_section}\n\n{_format_brief_for_prompt(brief)}{diagnostics_block}{node_shape_block}\n\n"
+        f"{context}{spec_section}{clauses_section}{inventory_section}\n\n{_format_brief_for_prompt(brief)}{diagnostics_block}{node_shape_block}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
         "quote, or echo the brief — it is your input, not your output.\n"
         f"{seed_block}"

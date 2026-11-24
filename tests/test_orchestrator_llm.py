@@ -5222,12 +5222,14 @@ class TestPlannerStandinOverwriteFix(unittest.TestCase):
         empty = '{"nodes": []}'
         with patch(
             "freetalon.orchestrator.planner.call_llm",
-            side_effect=[empty] * 6,
+            side_effect=[empty] * 8,
         ) as call_mock:
             with self.assertRaises(LLMResponseError):
                 plan_task_intent(self.intent, settings=self.settings)
-        # 1 initial + 2 free re-prompts + 2 repairs = 5 calls, then raise.
-        self.assertEqual(call_mock.call_count, 5)
+        # 1 initial + 2 free re-prompts + 4 repairs = 7 calls, then
+        # raise. (The repair count is campaign build #4's raised
+        # plan_task_intent budget; the free-reprompt cap is unchanged.)
+        self.assertEqual(call_mock.call_count, 7)
 
     # --- Legitimate writes still pass ---
 
@@ -9349,7 +9351,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         self.assertIn("The grounded move is:", repair_prompt)
         self.assertIn("do_GET method of the Handler class", repair_prompt)
         self.assertIn("will be rejected again", repair_prompt)
-        self.assertIn("This is repair 1 of 2", repair_prompt)
+        self.assertIn("This is repair 1 of 4", repair_prompt)
 
     # --- (b) Verbatim retry-#19 rejections ---
 
@@ -9424,7 +9426,7 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         self.assertIn("Do NOT write a Flask app", second_repair)
         self.assertIn("The grounded move is:", second_repair)
         self.assertIn("will be rejected again", second_repair)
-        self.assertIn("This is repair 2 of 2", second_repair)
+        self.assertIn("This is repair 2 of 4", second_repair)
 
     def test_flask_repeated_three_times_escalates(self) -> None:
         flask = TestPlannerDuplicateKeysFix.RETRY15_ATTEMPT2_RAW
@@ -9441,10 +9443,10 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
         # replacement and the consequence.
         first_repair = call_mock.call_args_list[1][0][1]
         self.assertIn("Do NOT write a Flask app", first_repair)
-        self.assertIn("This is repair 1 of 2", first_repair)
+        self.assertIn("This is repair 1 of 4", first_repair)
         second_repair = call_mock.call_args_list[2][0][1]
         self.assertIn("Do NOT write a Flask app", second_repair)
-        self.assertIn("This is repair 2 of 2", second_repair)
+        self.assertIn("This is repair 2 of 4", second_repair)
 
     # --- (d) Valid plans pass: grounded, Flask in a new file without
     #     a route goal ---
@@ -11853,22 +11855,25 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
         self.assertEqual(len(plan.nodes), 4)
         self._assert_planner_num_ctx(call_mock)
 
-    def test_empty_five_times_still_escalates_with_grounded_move(self) -> None:
+    def test_empty_seven_times_still_escalates_with_grounded_move(self) -> None:
         from freetalon.orchestrator.planner import EmptyPlanError
 
-        # The budget is NOT changed by this fix: five empties still burn
-        # all 5 calls (1 initial + 2 free + 2 repairs) and escalate with
-        # the grounded move. The fix is delivery (the window), not a
-        # shorter fuse — ending the failure sooner would not produce a
-        # plan.
+        # Campaign build #4 raised plan_task_intent's repair budget
+        # (PLAN_TASK_INTENT_MAX_REPAIRS 2 -> 4, paired with attempt
+        # anchoring), so the empty-plan escalation now comes after
+        # seven empties burn all 7 calls (1 initial + 2 free + 4
+        # repairs). The escalation itself is unchanged: it still
+        # names the grounded move instead of failing silently on an
+        # empty reply. (Before build #4 this test burned five
+        # empties against the 2-repair budget.)
         empty = '{"nodes": []}'
         with patch(
             "freetalon.orchestrator.planner.call_llm",
-            side_effect=[empty, empty, empty, empty, empty],
+            side_effect=[empty, empty, empty, empty, empty, empty, empty],
         ) as call_mock:
             with self.assertRaises(EmptyPlanError) as caught:
                 plan_task_intent(self.intent, settings=self.settings)
-        self.assertEqual(call_mock.call_count, 5)
+        self.assertEqual(call_mock.call_count, 7)
         message = str(caught.exception)
         self.assertIn("grounded move", message)
         self.assertIn("freetalon/api.py", message)

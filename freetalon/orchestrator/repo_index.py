@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import textwrap
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -574,6 +575,96 @@ def format_repo_context(index: RepoIndex, workspace: str | None = None) -> str:
             lines.append(
                 f"- … and {len(index.docs) - _MAX_CONTEXT_FILES} more documents."
             )
+    return "\n".join(lines)
+
+
+# ── Existing-file inventory (campaign build #4) ────────────────────
+#
+# format_repo_context above lists at most _MAX_CONTEXT_FILES modules
+# and only freetalon/'s — it never showed the planner the tests/ tree
+# at all. Exam arm #13 (2026-11-23) priced that gap: the planner
+# scaffolded the EXISTING tests/test_pairing.py — a 47-test leftover
+# module from earlier arms — because nothing in its prompt said the
+# file existed; the scaffold-preservation guard caught the loss
+# (61 of 65 definitions dropped) only at validation, on the last
+# repair attempt, and the planning call died. The inventory below is
+# the deterministic counterpart: every existing Python file in the
+# scopes a plan can plausibly write to, with the number of
+# definitions it holds, so "this file already exists" is a prompt
+# fact instead of a rejection discovered after the fact.
+
+
+def existing_file_inventory(
+    root: str | Path, focus_dirs: Collection[str] = ()
+) -> list[tuple[str, int]]:
+    """(repo-relative path, qualified definition count) for existing files.
+
+    Scopes, in one sorted listing: the package root's own modules
+    (``freetalon/*.py``, non-recursive — the classic scaffold targets
+    like api.py), every ``*.py`` under each ``focus_dirs`` entry
+    (repo-relative directories, walked recursively — the caller
+    passes the goal-named specs' directories, i.e. the package the
+    goal is about), and every ``*.py`` under ``tests/``
+    (recursive). ``__pycache__`` and ``*.bak`` files are skipped, as
+    in build_repo_index. A file that cannot be read still appears
+    (it exists — that is the fact the planner needs) with a count
+    of 0; an unparseable file likewise counts 0 definitions
+    (qualified_def_names' own stance). Sorted by path and
+    deduplicated, so the result is byte-stable for an unchanged
+    tree.
+    """
+    root_path = Path(root)
+    candidates: set[Path] = set()
+    package = root_path / "freetalon"
+    if package.is_dir():
+        candidates.update(package.glob("*.py"))
+    for focus in focus_dirs:
+        focus_path = root_path / focus
+        if focus_path.is_dir():
+            candidates.update(focus_path.rglob("*.py"))
+    tests_dir = root_path / "tests"
+    if tests_dir.is_dir():
+        candidates.update(tests_dir.rglob("*.py"))
+    entries: dict[str, int] = {}
+    for path in sorted(candidates):
+        if "__pycache__" in path.parts or path.name.endswith(".bak"):
+            continue
+        try:
+            rel = path.relative_to(root_path).as_posix()
+        except ValueError:
+            continue
+        if rel in entries:
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError:
+            source = ""
+        entries[rel] = len(qualified_def_names(source))
+    return sorted(entries.items())
+
+
+def format_existing_file_inventory(entries: list[tuple[str, int]]) -> str:
+    """The EXISTING FILES prompt block: the inventory + the standing rule.
+
+    Empty for an empty inventory (a tree with none of the inventoried
+    scopes prompts exactly as before). The rule is the one the
+    scaffold-preservation guard enforces after the fact, stated
+    before it: an existing file is modified with an anchored or
+    scoped edit, or left untouched — never scaffolded; brand-new
+    files are fine.
+    """
+    if not entries:
+        return ""
+    lines = [
+        "EXISTING FILES — the files below already exist in the tree, "
+        "with the number of definitions each one holds. NEVER scaffold "
+        "an existing file: a scaffold replaces the whole file, so every "
+        "definition the new content does not repeat is deleted. Modify "
+        "an existing file with an anchored or scoped edit, or leave it "
+        "untouched; brand-new files are fine."
+    ]
+    for rel, count in entries:
+        lines.append(f"- {rel} ({count} definitions)")
     return "\n".join(lines)
 
 
