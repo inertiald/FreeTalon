@@ -12205,6 +12205,200 @@ def _filled_candidate_errors(
     return errors
 
 
+# ── Campaign build #8: schema-explicit repair for fill shape failures ──
+#
+# Arm #17 died in content fill, and its fill payloads were never
+# persisted — the diagnosis here rests on a byte-identical
+# reproduction run during this build (same greedy settings, same
+# worktree state, every raw response captured): every edit fill
+# opened with {} — the model's "no change needed" answer — and for
+# __init__.py, whose current content already satisfied the node's
+# objective, all three attempts were that same claim in different
+# dialects ({}, then a whole-file no-op edit rejected by content
+# validation as no_op_edit, then {"edits": []}). The repair prompt
+# only ever repeated the bare validator sentence; it never spelled
+# the schema. So: a payload that fails on SHAPE (not a JSON object,
+# an empty object, an empty edits list, an anchor without content,
+# a missing/empty/wrong-typed content) earns a schema-explicit
+# repair — the previous payload's defect named in plain words, the
+# exact required schema for the node's intent, and a minimal worked
+# example of the envelope. Content-validation failures keep the
+# plain errors block, and first attempts are unchanged. Envelope
+# recovery was considered and NOT built: the observed payloads
+# carried no usable content under any alternate envelope ({} and
+# {"edits": []} are empty by construction), so there was nothing
+# to recover.
+
+
+def _json_type_name(value: Any) -> str:
+    """The JSON type name of a parsed value, for defect sentences."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, list):
+        return "an array"
+    if isinstance(value, dict):
+        return "an object"
+    return "a number"
+
+
+def _fill_payload_shape(
+    payload: dict[str, Any], intent: str
+) -> tuple[dict[str, Any], list[str]]:
+    """Split one fill payload into (candidate input fields, defects).
+
+    The shape half of fill validation: is the payload one of the
+    envelopes the node's intent accepts? Returns the inputs the
+    payload contributes when the shape is usable, else a single
+    defect sentence naming — in plain words — what the payload
+    actually was, for the schema-explicit repair block. Content
+    validation (materialization, scaffold preservation, grounding,
+    ...) judges the fields afterwards, exactly as before.
+    """
+    if intent in ("create", "whole_file"):
+        if "content" not in payload:
+            if not payload:
+                return {}, [
+                    "your previous payload was an empty JSON object "
+                    '({}) — it carried no "content" at all'
+                ]
+            keys = ", ".join(sorted(str(key) for key in payload))
+            return {}, [
+                'your previous payload carried no "content" string '
+                f"(keys present: {keys}) — the complete file "
+                'content must ride in "content"'
+            ]
+        content = payload["content"]
+        if not isinstance(content, str):
+            return {}, [
+                'your previous payload\'s "content" was '
+                f"{_json_type_name(content)}, not a string"
+            ]
+        if not content:
+            return {}, [
+                'your previous payload\'s "content" was an empty '
+                "string — it must carry the complete file content"
+            ]
+        return {"content": content}, []
+    edits = payload.get("edits")
+    if isinstance(edits, list) and edits:
+        return {"edits": edits}, []
+    anchor = payload.get("anchor")
+    if isinstance(anchor, str) and anchor:
+        snippet = payload.get("content")
+        if isinstance(snippet, str):
+            return {
+                "anchor": anchor,
+                "position": payload.get("position", "after"),
+                "content": snippet,
+            }, []
+        if "content" not in payload:
+            return {}, [
+                'your previous payload carried an "anchor" but no '
+                '"content" — an anchored edit must also carry the '
+                'new code in "content"'
+            ]
+        return {}, [
+            'your previous payload\'s "content" was '
+            f"{_json_type_name(snippet)}, not a string — an "
+            "anchored edit must carry the new code as a string "
+            'in "content"'
+        ]
+    if not payload:
+        return {}, [
+            "your previous payload was an empty JSON object "
+            '({}) — it carried neither an "edits" list nor '
+            'an "anchor"'
+        ]
+    if "edits" in payload:
+        if isinstance(edits, list):
+            return {}, [
+                'your previous payload carried an "edits" list, '
+                "but it was empty — an empty list makes no change "
+                "and is not a valid payload"
+            ]
+        return {}, [
+            'your previous payload\'s "edits" was '
+            f"{_json_type_name(edits)}, not a list of edits"
+        ]
+    if "anchor" in payload:
+        if isinstance(anchor, str):
+            return {}, [
+                'your previous payload\'s "anchor" was an empty '
+                "string — it must be a line copied exactly from "
+                "the current file"
+            ]
+        return {}, [
+            'your previous payload\'s "anchor" was '
+            f"{_json_type_name(anchor)}, not a string"
+        ]
+    keys = ", ".join(sorted(str(key) for key in payload))
+    return {}, [
+        "your previous payload carried none of the required keys "
+        f"(keys present: {keys}) — it had neither a non-empty "
+        '"edits" list nor an "anchor" with "content"'
+    ]
+
+
+def _fill_shape_repair_block(intent: str, defects: list[str]) -> str:
+    """The schema-explicit repair block after a shape failure.
+
+    Names the previous payload's defect, spells the exact required
+    schema for the node's intent, and shows a minimal worked
+    example of the envelope — the three things the pre-build-#8
+    repair prompt (the bare validator sentence, repeated) never
+    gave the model.
+    """
+    lines = [
+        "Your previous payload for this node was REJECTED — it "
+        "did not match the required payload shape:",
+        *(f"  - {defect}" for defect in defects),
+        "",
+    ]
+    if intent in ("create", "whole_file"):
+        lines += [
+            f"The required payload shape for this node "
+            f"(content_intent: {intent}) is EXACTLY this JSON "
+            "object — nothing else is a valid payload:",
+            '  {"content": "<the complete file content>"}',
+            '  Worked example: {"content": "VALUE = 1\\n"}',
+            "",
+            'An empty object ({}), a missing "content", and an '
+            'empty "content" string are NOT valid answers: '
+            '"content" must carry the whole file, every '
+            "definition, no elisions, no placeholders.",
+            "Return a corrected payload only.",
+        ]
+    else:
+        lines += [
+            "The required payload shape for this node "
+            "(content_intent: edit) is EXACTLY ONE of these two "
+            "JSON objects — nothing else is a valid payload:",
+            '  1. Scoped edits: {"edits": [{"search": "<text '
+            'copied exactly from the current file>", "replace": '
+            '"<the new text>"}]}',
+            '     Worked example: {"edits": [{"search": '
+            '"import os\\n", "replace": "import os\\nimport '
+            'sys\\n"}]}',
+            '  2. Anchored edit: {"anchor": "<a line copied '
+            'exactly from the current file>", "position": '
+            '"after" or "before", "content": "<the new code>"}',
+            '     Worked example: {"anchor": "import os", '
+            '"position": "after", "content": "import sys"}',
+            "",
+            'An empty object ({}) and an empty "edits" list are '
+            'NOT "no change" answers — this contract has no '
+            "no-change payload: the payload must carry at least "
+            "one real edit or one anchored insertion. Do NOT "
+            "return the whole file.",
+            "Return a corrected payload only.",
+        ]
+    return "\n".join(lines)
+
+
 def _fill_node_payload(
     node: PlanNode,
     intent: str,
@@ -12225,8 +12419,15 @@ def _fill_node_payload(
     used). Bounded repair: up to _CONTENT_FILL_MAX_ATTEMPTS calls,
     each retry carrying the validator errors of the last payload.
     A node that still fails raises LLMResponseError naming the
-    node, its target, and the last errors — the plan fails with
-    that precise error; nothing is silently accepted.
+    node, its target, its intent, and the last errors — for a
+    shape failure those errors are the final payload's defect
+    sentences (campaign build #8) — the plan fails with that
+    precise error; nothing is silently accepted.
+
+    Campaign build #8: a retry after a SHAPE failure carries the
+    schema-explicit repair block (_fill_shape_repair_block) in
+    place of the plain errors block; a retry after a
+    content-validation failure keeps the plain block unchanged.
     """
     target = _node_write_target(node) or ""
     if intent in ("create", "whole_file"):
@@ -12252,6 +12453,7 @@ def _fill_node_payload(
         )
     errors_block = ""
     last_errors: list[str] = []
+    last_defects: list[str] = []
     for attempt in range(1, _CONTENT_FILL_MAX_ATTEMPTS + 1):
         prompt = (
             f"CONTENT FILL — node '{node.id}' writes {target} "
@@ -12274,61 +12476,36 @@ def _fill_node_payload(
         candidate = node.model_dump(mode="json")
         candidate_inputs = dict(candidate.get("inputs") or {})
         candidate_inputs.pop("content_intent", None)
-        shape_errors: list[str] = []
         try:
             payload = parse_json_object(response_text)
         except Exception as exc:  # noqa: BLE001 — named to the repair
             payload = None
-            shape_errors = [f"payload is not a JSON object: {exc}"]
-        if isinstance(payload, dict):
-            if intent in ("create", "whole_file"):
-                content = payload.get("content")
-                if isinstance(content, str) and content:
-                    candidate_inputs["content"] = content
-                else:
-                    shape_errors = [
-                        'payload must carry a non-empty "content" '
-                        "string with the complete file content"
-                    ]
-            else:
-                edits = payload.get("edits")
-                anchor = payload.get("anchor")
-                if isinstance(edits, list) and edits:
-                    candidate_inputs["edits"] = edits
-                elif isinstance(anchor, str) and anchor:
-                    candidate_inputs["anchor"] = anchor
-                    candidate_inputs["position"] = payload.get(
-                        "position", "after"
-                    )
-                    snippet = payload.get("content")
-                    if isinstance(snippet, str):
-                        candidate_inputs["content"] = snippet
-                    else:
-                        shape_errors = [
-                            'an anchored-edit payload must carry the '
-                            'new code in "content"'
-                        ]
-                else:
-                    shape_errors = [
-                        'payload must carry a non-empty "edits" list '
-                        'or an "anchor" with "content"'
-                    ]
-        elif not shape_errors:
-            shape_errors = ["payload is not a JSON object"]
+            last_defects = [
+                f"your previous payload was not a JSON object: {exc}"
+            ]
+        fields: dict[str, Any] = {}
+        if payload is not None:
+            fields, last_defects = _fill_payload_shape(payload, intent)
+        candidate_inputs.update(fields)
         candidate["inputs"] = candidate_inputs
-        if shape_errors:
-            last_errors = shape_errors
+        if last_defects:
+            last_errors = last_defects
         else:
             last_errors = _filled_candidate_errors(
                 candidate, prior_dicts, repo_root, goal_text
             )
         if not last_errors:
             return candidate, attempt
-        errors_block = (
-            "\n\nYour previous payload for this node was REJECTED:\n"
-            + "\n".join(f"  - {error}" for error in last_errors)
-            + "\nReturn a corrected payload only."
-        )
+        if last_defects:
+            errors_block = "\n\n" + _fill_shape_repair_block(
+                intent, last_defects
+            )
+        else:
+            errors_block = (
+                "\n\nYour previous payload for this node was REJECTED:\n"
+                + "\n".join(f"  - {error}" for error in last_errors)
+                + "\nReturn a corrected payload only."
+            )
     raise LLMResponseError(
         f"Content fill for planner node '{node.id}' (target "
         f"{target!r}, intent {intent!r}) failed after "
