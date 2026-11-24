@@ -26,10 +26,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .critic import deterministic_hollow_evidence
 from .measure import VERDICT_UNMEASURABLE
 from .memory import (
+    approach_payload,
     approach_signature,
     describe_signature,
+    node_payload,
+    normalize_payload,
     write_targets_for_node,
     write_targets_for_nodes,
 )
@@ -232,6 +236,128 @@ def _failing_test_ids(node: PlanNode) -> set[str]:
     return ids
 
 
+@dataclass
+class RepeatAssessment:
+    """The substance check's verdict on one signature match.
+
+    ``veto`` True: the match is substantively the approach that was
+    measured FAIL and the repeat gate's refusal stands. False: the
+    match is historical only — the plan proceeds and ``reason`` is
+    the warning the caller records (plan metadata / audit log),
+    never a silent pass.
+    """
+
+    veto: bool
+    reason: str
+
+
+def assess_approach_repeat(
+    node: PlanNode, records: list[dict[str, Any]]
+) -> RepeatAssessment | None:
+    """Adjudicate one node against experiment memory's executed records.
+
+    Returns None when the node is not a repeat at all: no signature
+    (plumbing), no executed-FAIL record for its signature, or the
+    node carries the system's repair note (``differs_by`` — the
+    standing exemption both repeat gates honor). Otherwise the
+    signature match escalates to a substance check:
+
+    - A 'command'- or 'params'-form signature IS the approach's
+      payload (the full command text / every scalar parameter), so
+      a match is substantively identical by construction: veto.
+    - A 'write'-form signature names only mechanism + targets. The
+      veto then stands only on payload evidence: the candidate's
+      payload is convicted by the critic's deterministic confession
+      rule (hollow by the standing evidence standard), or it is
+      identical — whitespace-normalized, the bash signature's own
+      normalization — to a recorded failed payload. A payload that
+      differs from every recorded failed payload is a different
+      substance: it proceeds with the historical warning, and its
+      substance is judged by the machinery that judges substance
+      (critic review, execution measurement), not by this gate.
+    - When no payload comparison is possible (the candidate or
+      every recorded failure carries no payload), memory's verdict
+      history decides: a PASS for the signature newer than its
+      newest FAIL supersedes the failure (warning); anything else
+      keeps the veto — the gate does not guess a difference it
+      cannot establish.
+
+    ``records`` are ExperimentStore.executed_approach_records
+    entries (oldest first) for the node's goal and domain.
+    """
+    if node.differs_by:
+        return None
+    signature = approach_signature(node)
+    if signature is None:
+        return None
+    history = [r for r in records if r.get("signature") == signature]
+    failed = [r for r in history if r.get("verdict") == "FAIL"]
+    if not failed:
+        return None
+    described = f"{describe_signature(signature)} (node {node.id})"
+    form = str(signature[1]) if len(signature) > 1 else ""
+    if form != "write":
+        return RepeatAssessment(
+            True,
+            f"{described} — the signature is the approach's full "
+            "substance (command text / recorded parameters), so the "
+            "match is the measured-failed approach itself",
+        )
+    candidate = node_payload(node)
+    if candidate is not None:
+        confession = deterministic_hollow_evidence(candidate)
+        if confession is not None:
+            line, marker = confession
+            return RepeatAssessment(
+                True,
+                f"{described} — the plan's payload is hollow by the "
+                f"deterministic confession rule ({marker!r}): {line}",
+            )
+    recorded = [
+        (r, payload)
+        for r in failed
+        for payload in [approach_payload(r.get("approach") or {})]
+        if payload is not None
+    ]
+    if candidate is not None and recorded:
+        normalized = normalize_payload(candidate)
+        for record, payload in recorded:
+            if normalized == normalize_payload(payload):
+                return RepeatAssessment(
+                    True,
+                    f"{described} — the plan's payload is identical to "
+                    "the payload already measured FAIL for this goal "
+                    f"(run {record.get('run_id')})",
+                )
+        return RepeatAssessment(
+            False,
+            f"warning: {described} repeats the mechanism and targets "
+            "of an approach measured FAIL for this goal "
+            f"({'; '.join(str(r.get('lesson', '')) for r in failed)}), "
+            "but its payload differs from every recorded failed "
+            "payload and carries no deterministic hollow evidence; "
+            "proceeding — the historical failure rides as this "
+            "warning, and the new payload is measured on its own",
+        )
+    # No payload comparison possible: fall back to verdict history.
+    newest = history[-1] if history else None
+    if newest is not None and newest.get("verdict") == "PASS":
+        return RepeatAssessment(
+            False,
+            f"warning: {described} matches an approach measured FAIL "
+            f"for this goal (run {failed[-1].get('run_id')}), but the "
+            "same approach was later measured PASS "
+            f"(run {newest.get('run_id')}); the failure is superseded "
+            "in experiment memory — proceeding with this warning",
+        )
+    return RepeatAssessment(
+        True,
+        f"{described} — no payload evidence distinguishes the plan "
+        "from the approach measured FAIL for this goal "
+        f"(run {failed[-1].get('run_id')})",
+    )
+
+
 class Judge:
     """Stateful per-run judge: budget accounting, decisions, re-plan briefs."""
 
@@ -258,6 +384,12 @@ class Judge:
         self._failing_tests_since: int | None = None
         self._file_last_written: dict[str, int] = {}
         self._declared_targets: set[str] = set()
+        # Historical warnings from the cross-run substance check in
+        # validate_delta_plan: signature matches the check cleared
+        # to proceed. The loop drains this list into the accepted
+        # delta plan's metadata — a cleared repeat is recorded,
+        # never silent (see assess_approach_repeat).
+        self.repeat_warnings: list[str] = []
 
     # ── Bookkeeping ──────────────────────────────────────────────────────
 
@@ -516,6 +648,7 @@ class Judge:
         brief: dict[str, Any],
         new_nodes: list[PlanNode],
         known_failures: set[tuple[Any, ...]] | None = None,
+        known_failure_records: list[dict[str, Any]] | None = None,
     ) -> str | None:
         """Reject a re-plan that repeats a failed approach without a reason.
 
@@ -534,6 +667,20 @@ class Judge:
         executed-stage by construction. ``known_failures`` adds the
         signatures recorded in experiment memory (M2) — executed-stage
         measured failures only (see ExperimentStore.failed_approaches).
+
+        The two failure sources are adjudicated differently. The
+        brief's failures are this run's own, measured against this
+        run's code state minutes ago: a signature match there is a
+        repeat, full stop (the cycle-3 rule). Cross-run memory is
+        history, and when the caller supplies the records themselves
+        (``known_failure_records`` — ExperimentStore
+        .executed_approach_records) a match there escalates to the
+        substance check (assess_approach_repeat): the veto stands
+        only for a substantively identical or deterministically
+        hollow payload, and a cleared match is appended to
+        ``self.repeat_warnings`` for the loop to record in the new
+        plan's metadata. With only the signature set supplied, the
+        cross-run check stays signature-strict, as before.
         """
         failed_signatures: set[tuple[Any, ...]] = set()
         for f in brief.get("failed_nodes", []):
@@ -548,25 +695,36 @@ class Judge:
             )
             if signature is not None:
                 failed_signatures.add(signature)
-        if known_failures:
+        cross_run_records: list[dict[str, Any]] = []
+        if known_failure_records is not None:
+            cross_run_records = list(known_failure_records)
+        elif known_failures:
             failed_signatures |= set(known_failures)
         stagnation_error = self._stagnation_gate_error(brief, new_nodes)
         if stagnation_error is not None:
             return stagnation_error
-        if not failed_signatures:
+        if not failed_signatures and not cross_run_records:
             return None
         for node in new_nodes:
             signature = approach_signature(node)
-            if (
-                signature is not None
-                and signature in failed_signatures
-                and not node.differs_by
-            ):
+            if signature is None or node.differs_by:
+                continue
+            if signature in failed_signatures:
                 return (
                     f"re-plan repeats failed approach "
                     f"({describe_signature(signature)}) "
                     f"without a system repair note"
                 )
+            if cross_run_records:
+                assessment = assess_approach_repeat(node, cross_run_records)
+                if assessment is not None:
+                    if assessment.veto:
+                        return (
+                            "re-plan repeats failed approach "
+                            f"({assessment.reason}) "
+                            "without a system repair note"
+                        )
+                    self.repeat_warnings.append(assessment.reason)
         return None
 
     def _stagnation_gate_error(

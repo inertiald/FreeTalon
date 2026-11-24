@@ -340,6 +340,62 @@ def describe_signature(signature: tuple[Any, ...]) -> str:
     return f"{capability!r} approach (recorded parameters)"
 
 
+# ── Approach payloads ────────────────────────────────────────────────
+#
+# The signature deliberately excludes content — but the record keeps
+# it: a write claw's content rides in key_params (it is a scalar, so
+# approach_for keeps it), and a bash node's command likewise. The
+# payload is what the repeat gate's substance check compares (see
+# judge.assess_approach_repeat): a signature match says the same
+# mechanism touched the same targets; the payload says whether this
+# attempt is the same substance that was measured, or a different
+# one. Extraction mirrors the signature's own construction — one
+# conversion (approach_for) feeds both sides, stored record and live
+# node alike.
+
+
+def approach_payload(approach: dict[str, Any]) -> str | None:
+    """The substantive payload a recorded approach carried, if any.
+
+    Write claws: the content they wrote (``content``, else
+    ``file_content`` — the critic's own precedence). Bash: the
+    command text. Any other claw's identity already IS its recorded
+    parameters (the params-form signature), so it has no separate
+    payload and returns None, as does a write whose content was not
+    recorded (e.g. it arrived as a non-scalar input approach_for
+    drops).
+    """
+    capability = str(approach.get("capability", "") or "")
+    key_params = approach.get("key_params") or {}
+    if capability in _WRITE_CLAWS:
+        for key in ("content", "file_content"):
+            value = key_params.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return None
+    if capability == "bash":
+        value = key_params.get("command")
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def node_payload(node: Any) -> str | None:
+    """The substantive payload a live node carries, if any."""
+    return approach_payload(approach_for(node))
+
+
+def normalize_payload(text: str) -> str:
+    """Whitespace-normalized payload text for identity comparison.
+
+    The same normalization the bash signature applies to command
+    text (" ".join(split())): two payloads that differ only in
+    layout are the same substance; anything else is a different
+    payload, however similar it reads.
+    """
+    return " ".join(text.split())
+
+
 def _stage_for_measurement(measurement: dict[str, Any]) -> str:
     """The failure stage a measurement belongs to.
 
@@ -496,6 +552,46 @@ class ExperimentStore:
             )
             return [self._row_to_record(row) for row in cursor.fetchall()]
 
+    def executed_approach_records(
+        self, goal_key: str, domain: str
+    ) -> list[dict[str, Any]]:
+        """Executed-stage records with a substance signature, oldest first.
+
+        Each entry carries the record's signature, its approach dict
+        (payload included — see approach_payload), verdict, run id,
+        node id, timestamp and lesson. This is the evidence the
+        repeat gate's substance check adjudicates against (see
+        judge.assess_approach_repeat): failed_approaches below is
+        the FAIL-only view of the same set. A record contributes
+        only when its stage is "executed" (the approach was actually
+        tried) and its approach has a signature (plumbing has none).
+        Records written before stages were stored derive the stage
+        from their criteria the same way (see _stage_for_measurement).
+        """
+        records: list[dict[str, Any]] = []
+        for record in reversed(
+            self.experiments_for_goal(goal_key, domain, limit=500)
+        ):
+            measurement = record["measurement"]
+            stage = measurement.get("stage") or _stage_for_measurement(measurement)
+            if stage != "executed":
+                continue
+            signature = signature_from_approach(record["approach"])
+            if signature is None:
+                continue
+            records.append(
+                {
+                    "signature": signature,
+                    "approach": record["approach"],
+                    "verdict": measurement.get("verdict"),
+                    "run_id": record["run_id"],
+                    "node_id": record["node_id"],
+                    "ts": record["ts"],
+                    "lesson": record["lesson"],
+                }
+            )
+        return records
+
     def failed_approaches(
         self, goal_key: str, domain: str
     ) -> set[tuple[Any, ...]]:
@@ -510,18 +606,11 @@ class ExperimentStore:
         written before stages were stored derive the stage from their
         criteria the same way (see _stage_for_measurement).
         """
-        failed: set[tuple[Any, ...]] = set()
-        for record in self.experiments_for_goal(goal_key, domain, limit=500):
-            measurement = record["measurement"]
-            if measurement.get("verdict") != "FAIL":
-                continue
-            stage = measurement.get("stage") or _stage_for_measurement(measurement)
-            if stage != "executed":
-                continue
-            signature = signature_from_approach(record["approach"])
-            if signature is not None:
-                failed.add(signature)
-        return failed
+        return {
+            record["signature"]
+            for record in self.executed_approach_records(goal_key, domain)
+            if record["verdict"] == "FAIL"
+        }
 
     def count(self) -> int:
         """Total experiment records (append-only; nothing is deleted)."""

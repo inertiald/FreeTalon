@@ -20,14 +20,9 @@ from typing import Any, Callable
 from .critic import CriticSettings, critic_settings_from_env, review_write_nodes
 from .executor import Executor
 from .gates import GateStatus, GateStore, build_packet, compute_packet_hash
-from .judge import Decision, Judge
+from .judge import Decision, Judge, assess_approach_repeat
 from .measure import VERDICT_FAIL, VERDICT_PASS, VERDICT_UNMEASURABLE, _compare
-from .memory import (
-    ExperimentStore,
-    approach_signature,
-    describe_signature,
-    goal_key_for,
-)
+from .memory import ExperimentStore, goal_key_for
 from .models import (
     ExecutionPlan,
     GoalContract,
@@ -162,9 +157,15 @@ class LoopRunner:
         # the same goal must not repeat a measured-failed approach. A node
         # that repeats one without a system repair note escalates before
         # anything runs; the earlier failure is cited, not repeated.
+        # A signature match is adjudicated on substance first (see
+        # _assess_plan_repeats): a match the substance check clears
+        # proceeds, with the historical warning recorded in the plan
+        # metadata and the audit log — never silently.
         goal_key = goal_key_for(contract.objective)
         domain = plan.intent.project_type
-        repeat = self._find_repeated_approach(plan, goal_key, domain)
+        repeat, repeat_warnings = self._assess_plan_repeats(
+            plan, goal_key, domain
+        )
         skip_execution = False
         if repeat is not None:
             escalation = (
@@ -179,6 +180,21 @@ class LoopRunner:
                 repeat=repeat,
             )
             skip_execution = True
+        elif repeat_warnings:
+            metadata = dict(plan.metadata or {})
+            metadata["repeated_approach_warnings"] = list(repeat_warnings)
+            plan.metadata = metadata
+            # Persist now: the executor reloads the plan from the
+            # state store, so a metadata change that lives only on
+            # this in-memory copy would never reach the run record.
+            self._store.save(plan)
+            for warning in repeat_warnings:
+                self._log(
+                    "loop.memory.repeat_warning",
+                    run_id=run_id,
+                    plan_id=plan.plan_id,
+                    warning=warning,
+                )
 
         while not skip_execution:
             self._run_store.write_plan_version(run_id, version, plan)
@@ -410,8 +426,10 @@ class LoopRunner:
                 rejection = judge.validate_delta_plan(
                     brief,
                     new_nodes,
-                    known_failures=self._memory_store.failed_approaches(
-                        goal_key, domain
+                    known_failure_records=(
+                        self._memory_store.executed_approach_records(
+                            goal_key, domain
+                        )
                     ),
                 )
                 if rejection is not None:
@@ -423,6 +441,21 @@ class LoopRunner:
                     metadata["rejected_approaches"] = list(
                         brief["rejected_approaches"]
                     )
+                if judge.repeat_warnings:
+                    # Cross-run signature matches the substance check
+                    # cleared: the historical warnings ride into the
+                    # new version's metadata, never silently.
+                    metadata["repeated_approach_warnings"] = list(
+                        judge.repeat_warnings
+                    )
+                    for warning in judge.repeat_warnings:
+                        self._log(
+                            "loop.memory.repeat_warning",
+                            run_id=run_id,
+                            plan_id=plan.plan_id,
+                            warning=warning,
+                        )
+                    judge.repeat_warnings.clear()
                 plan = build_execution_plan(
                     plan.intent, new_nodes, plan_id=plan.plan_id, metadata=metadata
                 )
@@ -842,31 +875,59 @@ class LoopRunner:
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
-    def _find_repeated_approach(
+    def _assess_plan_repeats(
         self, plan: ExecutionPlan, goal_key: str, domain: str
-    ) -> str | None:
-        """A node that repeats a recorded failed approach for this goal.
+    ) -> tuple[str | None, list[str]]:
+        """Adjudicate a plan's nodes against experiment memory.
 
-        Returns a human description of the repeat, or None. Matching is
-        by approach signature (memory.approach_signature): the node's
-        mechanism and targets, never its objective/hypothesis wording —
-        and only against approaches that were actually tried (executed
-        and measured FAIL; see ExperimentStore.failed_approaches).
-        Plumbing nodes (test runs, live checks, server starts) have no
-        signature and can never be a repeat. A node carrying the
+        Returns (veto, warnings): the first vetoed repeat's human
+        description, and the warnings for signature matches the
+        substance check cleared to proceed. Matching is by approach
+        signature (memory.approach_signature): the node's mechanism
+        and targets, never its objective/hypothesis wording — and
+        only against approaches that were actually tried (executed
+        stage; see ExperimentStore.executed_approach_records). A
+        signature match alone no longer vetoes: the substance check
+        (judge.assess_approach_repeat) decides whether this plan is
+        the approach that was measured FAIL — identical payload, or
+        hollow by the deterministic confession rule — or a different
+        payload that merely shares the mechanism and targets, which
+        proceeds with the historical failure carried as a warning.
+        Plumbing nodes (test runs, live checks, server starts) have
+        no signature and can never be a repeat. A node carrying the
         system's repair note (``differs_by``, written only by the
         repair path when it splices a measured fix; parse strips any
         model-emitted value) is not a repeat — the change is
         acknowledged by the system itself.
         """
-        known = self._memory_store.failed_approaches(goal_key, domain)
-        if not known:
-            return None
+        records = self._memory_store.executed_approach_records(goal_key, domain)
+        if not records:
+            return None, []
+        veto: str | None = None
+        warnings: list[str] = []
         for node in plan.nodes:
-            signature = approach_signature(node)
-            if signature is not None and signature in known and not node.differs_by:
-                return f"{describe_signature(signature)} (node {node.id})"
-        return None
+            assessment = assess_approach_repeat(node, records)
+            if assessment is None:
+                continue
+            if assessment.veto:
+                if veto is None:
+                    veto = assessment.reason
+            else:
+                warnings.append(assessment.reason)
+        return veto, warnings
+
+    def _find_repeated_approach(
+        self, plan: ExecutionPlan, goal_key: str, domain: str
+    ) -> str | None:
+        """A node whose repeat of a recorded failed approach vetoes.
+
+        The veto-only view of _assess_plan_repeats: a human
+        description of the first substantively-repeating node, or
+        None when every signature match was cleared by the substance
+        check (or there was no match at all).
+        """
+        veto, _warnings = self._assess_plan_repeats(plan, goal_key, domain)
+        return veto
 
     def _record_experiments(
         self,

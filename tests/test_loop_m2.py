@@ -286,7 +286,7 @@ class TestLoopMemorySignature(unittest.TestCase):
             )
             self.assertIsNone(repeat)
 
-    def test_executed_write_repeat_still_escalates(self):
+    def test_executed_write_repeat_identical_payload_still_escalates(self):
         with tempfile.TemporaryDirectory() as tmp:
             runner, store, _, memory = _make_runner(tmp)
             _seed(memory, PlanNode(
@@ -296,12 +296,13 @@ class TestLoopMemorySignature(unittest.TestCase):
                 criteria=[{"type": "file_exists", "path": "/ws/api.py"}],
             ), verdict="FAIL")
             self.assertEqual(memory.count(), 1)
-            # Same mechanism on the same file — different content and
-            # completely different wording. Still a repeat.
+            # Same mechanism on the same file, completely different
+            # wording — and the IDENTICAL payload that was measured
+            # FAIL. A true repeat: still escalates before running.
             plan = _plan("plan-repeat", [PlanNode(
                 id="node-1", objective="Completely reworded objective",
                 assigned_claw="scaffold",
-                inputs={"file_path": "/ws/api.py", "content": "# v2, new code\n"},
+                inputs={"file_path": "/ws/api.py", "content": "# v1\n"},
                 criteria=[{"type": "file_exists", "path": "/ws/api.py"}],
             )])
             store.save(plan)
@@ -314,6 +315,46 @@ class TestLoopMemorySignature(unittest.TestCase):
             self.assertIn("/ws/api.py", result.escalation)
             self.assertEqual(result.measurements, [])  # nothing executed
             self.assertEqual(memory.count(), 1)  # nothing new recorded
+
+    def test_executed_write_repeat_new_payload_proceeds_with_warning(self):
+        # The 2026-11-23 live-proof defect (run
+        # run-20261124T003551Z-523bc2): the signature-only gate
+        # vetoed a substantive new plan because a scaffold write of
+        # the same file had once been measured FAIL. A different
+        # payload is a different substance: the run proceeds, and
+        # the historical failure rides in the plan metadata as a
+        # warning — recorded, never silent.
+        with tempfile.TemporaryDirectory() as tmp:
+            runner, store, _, memory = _make_runner(tmp)
+            target = f"{tmp}/api.py"
+            _seed(memory, PlanNode(
+                id="node-1", objective="Write the module the first way",
+                assigned_claw="scaffold",
+                inputs={"file_path": target, "content": "# v1\n"},
+                criteria=[{"type": "file_exists", "path": target}],
+            ), verdict="FAIL")
+            self.assertEqual(memory.count(), 1)
+            plan = _plan("plan-repeat", [PlanNode(
+                id="node-1", objective="Completely reworded objective",
+                assigned_claw="scaffold",
+                inputs={"file_path": target, "content": "# v2, new code\n"},
+                criteria=[{"type": "file_exists", "path": target}],
+            )])
+            store.save(plan)
+            contract = GoalContract(
+                objective="test goal", budget=RunBudget(max_replans=0)
+            )
+            result = runner.run_plan(plan, contract, replan_fn=_no_replanner)
+            self.assertIsNone(result.escalation)
+            self.assertEqual(result.goal_verdict, "PASS")  # it executed
+            self.assertEqual(memory.count(), 2)  # and was measured
+            warnings = (result.plan.metadata or {}).get(
+                "repeated_approach_warnings"
+            )
+            self.assertIsNotNone(warnings)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("measured FAIL", warnings[0])
+            self.assertIn(target, warnings[0])
 
     def test_same_wording_different_mechanism_is_not_a_repeat(self):
         with tempfile.TemporaryDirectory() as tmp:
