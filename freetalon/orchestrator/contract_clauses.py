@@ -23,7 +23,12 @@ enforcement. This module compiles the contract into obligations:
    version, outside the model's self-written tests: declared
    files exist; a contract requiring defined behavior for
    non-GET/POST methods (it pins ``405``) has a handler surface
-   that provides it.
+   that provides it. Build #6 adds LIVE probes: a contract
+   family's registered runner may exercise the produced code
+   for real (the pairing runner boots the shipped server in a
+   subprocess and runs its pinned HTTP flows) under a hard
+   deadline, recording outcomes in the same record shape — the
+   static probes cannot see a server that hangs or answers 400.
 4. STATES — per clause: verified / failed / unverified / waived,
    computed from the coverage declarations, node outcomes, and
    probe results. The judge's re-plan brief carries the
@@ -38,7 +43,16 @@ a model and never write.
 from __future__ import annotations
 
 import ast
+import http.client
+import json
+import os
 import re
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -356,6 +370,9 @@ def run_contract_probes(
     One record per (clause, probe): {clause_id, probe, ok, detail}.
     A clause with no mechanically checkable content produces no
     records — its verification rides its verification node alone.
+    Live-probe runners (below) append their records after the
+    static ones; a runner that does not recognize the clause set
+    returns nothing.
     """
     root = Path(repo_root)
     results: list[dict[str, Any]] = []
@@ -388,11 +405,433 @@ def run_contract_probes(
                     "detail": detail,
                 }
             )
+    for runner in _LIVE_PROBE_RUNNERS:
+        results.extend(runner(clauses, root))
     return results
 
 
 def probe_failures(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [record for record in results if not record.get("ok")]
+
+
+# ── Live probes (campaign build #6) ────────────────────────────────
+#
+# The static probes read the tree; they cannot see behavior that
+# exists only at runtime. Exam arm #15 shipped a pairing server
+# whose register flow answered valid POSTs with 400 and whose
+# confirm/poll flows hung — invisible to declared_files and
+# method_surface, fatal to the plan's own test node, which timed
+# out twice and ended the run. A live probe exercises the produced
+# code for real and records per-flow outcomes in the same record
+# shape, so a live failure forces re-plans through exactly the
+# channel a static failure uses.
+#
+# Live probes are registered runners: each takes (clauses, root)
+# and returns records, or [] when the clause set is not its
+# contract family. A runner is family-specific by nature — it must
+# know how to boot the family's server and which flows its
+# contract pins — so the pairing runner below is the first entry,
+# and a new contract family adds a runner here; the loop and the
+# verdict gate need no changes.
+
+# Hard bounds. The overall deadline is the probe's contract with
+# the loop: a probe run completes or is killed within it, and a
+# probe-internal timeout is a probe FAILURE record, never a loop
+# stall.
+_SMOKE_OVERALL_TIMEOUT_S = 20.0
+_SMOKE_BOOT_TIMEOUT_S = 5.0
+_SMOKE_REQUEST_TIMEOUT_S = 3.0
+
+# The probe's fixed identity: same tree, same requests, same
+# outcome. The code matches the contract's ^[A-Z]{2,}-\d{4}$ rule
+# and the nonce its 32-hex rule.
+_SMOKE_CODE = "SMOKE-0001"
+_SMOKE_NONCE = "0123456789abcdef" * 2
+_SMOKE_MACHINE_ID = "smoke-probe-machine"
+_SMOKE_TOKEN = "<redacted>"
+_SMOKE_CREDENTIALS = {"smoke_probe": "bundle"}
+
+_PAIRING_SERVER_PATH = "freetalon/pairing/server.py"
+_PAIRING_MAIN_PATH = "freetalon/pairing/__main__.py"
+
+# The boot program: the contract's own construction surface
+# (server.py's make_server over store.py's PairingStore), bound to
+# an ephemeral port whose number is the program's first stdout
+# line. Booting through make_server exercises the construction
+# clause for real and learns the bound port with no race and no
+# fixed port; the entry-point module itself (python -m
+# freetalon.pairing) stays covered by the declared_files probe.
+_SMOKE_BOOTSTRAP = """\
+import os
+
+from freetalon.pairing.server import make_server
+from freetalon.pairing.store import PairingStore
+
+store = PairingStore(os.environ["FREETALON_PAIRING_STORE_PATH"])
+server = make_server(
+    store,
+    os.environ.get("FREETALON_PAIRING_TOKEN"),
+    host="127.0.0.1",
+    port=0,
+)
+print(f"SMOKE_PORT {server.server_address[1]}", flush=True)
+server.serve_forever()
+"""
+
+
+def _smoke_http(
+    port: int,
+    method: str,
+    path: str,
+    *,
+    body: dict[str, Any] | None = None,
+    token: str | None = None,
+    timeout: float,
+) -> tuple[int, bytes]:
+    """One HTTP request against the probe server (loopback only).
+
+    Raises OSError / http.client.HTTPException on transport
+    failure, timeouts included — the caller records those as flow
+    failures, never as probe crashes.
+    """
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        headers: dict[str, str] = {}
+        data: bytes | None = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        connection.request(method, path, body=data, headers=headers)
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def _pairing_smoke_flows(
+    port: int, deadline: float
+) -> list[tuple[str, bool, str]]:
+    """The pairing contract's core flows, exercised in order.
+
+    Each entry: (flow, ok, detail). The expectations are the
+    contract's pinned ones (CONTRACT.md, HTTP API + poll table):
+    a valid fresh registration answers a success status (201);
+    a pending code polls 404; confirm with the operator token
+    answers 200; the claiming poll answers 200 with the bundle;
+    a wrong method on a known path answers the contract's 405 —
+    never the stdlib's 501 default. A flow that cannot be
+    attempted inside the overall deadline fails as unattempted.
+    """
+
+    def request(name, method, path, **kwargs):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, (
+                f"{name}: not attempted — the probe's overall "
+                f"{_SMOKE_OVERALL_TIMEOUT_S:.0f}s deadline was spent "
+                "by earlier flows"
+            )
+        timeout = min(_SMOKE_REQUEST_TIMEOUT_S, remaining)
+        try:
+            outcome = _smoke_http(port, method, path, timeout=timeout, **kwargs)
+        except TimeoutError:
+            return None, (
+                f"{name}: {method} {path} timed out after "
+                f"{timeout:.1f}s — the server did not answer "
+                "(a hang, not an error response)"
+            )
+        except (OSError, http.client.HTTPException) as exc:
+            return None, f"{name}: {method} {path} failed at transport: {exc}"
+        return outcome, None
+
+    flows: list[tuple[str, bool, str]] = []
+
+    outcome, error = request(
+        "register",
+        "POST",
+        "/pairing/register",
+        body={
+            "code": _SMOKE_CODE,
+            "nonce": _SMOKE_NONCE,
+            "machine_id": _SMOKE_MACHINE_ID,
+            "hostname": "smoke-probe",
+            "mac": "02:00:00:00:00:01",
+        },
+    )
+    if error is not None:
+        flows.append(("register", False, error))
+    else:
+        status, _raw = outcome
+        flows.append(
+            (
+                "register",
+                status in (200, 201),
+                f"register: POST /pairing/register -> {status} "
+                "(expected a success status — 201 for a fresh code; "
+                "a 400/5xx means the server rejects or breaks on a "
+                "valid registration)",
+            )
+        )
+
+    outcome, error = request("poll_pending", "GET", f"/pairing/{_SMOKE_CODE}")
+    if error is not None:
+        flows.append(("poll_pending", False, error))
+    else:
+        status, _raw = outcome
+        flows.append(
+            (
+                "poll_pending",
+                status == 404,
+                f"poll_pending: GET /pairing/{_SMOKE_CODE} -> {status} "
+                "(expected 404 — the contract's pending poll)",
+            )
+        )
+
+    outcome, error = request(
+        "confirm",
+        "POST",
+        f"/pairing/{_SMOKE_CODE}/confirm",
+        body={"credentials": _SMOKE_CREDENTIALS},
+        token=_SMOKE_TOKEN,
+    )
+    if error is not None:
+        flows.append(("confirm", False, error))
+    else:
+        status, _raw = outcome
+        flows.append(
+            (
+                "confirm",
+                status == 200,
+                f"confirm: POST /pairing/{_SMOKE_CODE}/confirm -> "
+                f"{status} (expected 200 with the operator token)",
+            )
+        )
+
+    outcome, error = request("poll_claim", "GET", f"/pairing/{_SMOKE_CODE}")
+    if error is not None:
+        flows.append(("poll_claim", False, error))
+    else:
+        status, raw = outcome
+        bundle_present = False
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            bundle_present = payload.get("credentials") == _SMOKE_CREDENTIALS
+        flows.append(
+            (
+                "poll_claim",
+                status == 200 and bundle_present,
+                f"poll_claim: GET /pairing/{_SMOKE_CODE} -> {status} "
+                "(expected 200 with the confirmed credential bundle "
+                "— the one-time claim)",
+            )
+        )
+
+    outcome, error = request("wrong_method", "PUT", "/pairing/register")
+    if error is not None:
+        flows.append(("wrong_method", False, error))
+    else:
+        status, _raw = outcome
+        flows.append(
+            (
+                "wrong_method",
+                status == 405,
+                f"wrong_method: PUT /pairing/register -> {status} "
+                "(expected the contract's 405 for a known path with "
+                "the wrong method"
+                + (
+                    " — 501 is the stdlib default the contract forbids"
+                    if status == 501
+                    else ""
+                )
+                + ")",
+            )
+        )
+    return flows
+
+
+def _boot_pairing_server(
+    root: Path, work_dir: Path
+) -> tuple[subprocess.Popen[bytes] | None, int | None, str]:
+    """Boot the shipped pairing server in a subprocess.
+
+    Returns (process, port, detail): on success the process is
+    serving on the port and the caller owns killing it; on
+    failure the process may still be returned (hung at boot) and
+    the caller kills it the same way. Configuration rides the
+    contract's own env surface, pointed at a throwaway store in
+    the probe's temp dir; the only network the child can see is
+    the loopback it binds.
+    """
+    stderr_path = work_dir / "smoke-server.stderr"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONUNBUFFERED"] = "1"
+    env["FREETALON_PAIRING_STORE_PATH"] = str(work_dir / "smoke-store.json")
+    env["FREETALON_PAIRING_TOKEN"] = _SMOKE_TOKEN
+    with stderr_path.open("wb") as stderr_file:
+        proc: subprocess.Popen[bytes] = subprocess.Popen(
+            [sys.executable, "-c", _SMOKE_BOOTSTRAP],
+            cwd=str(root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            start_new_session=True,
+        )
+    deadline = time.monotonic() + _SMOKE_BOOT_TIMEOUT_S
+    port: int | None = None
+    buffer = b""
+    while time.monotonic() < deadline and port is None:
+        if proc.poll() is not None:
+            break
+        ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+        if not ready:
+            continue
+        chunk = os.read(proc.stdout.fileno(), 4096)
+        if not chunk:
+            break
+        buffer += chunk
+        for line in buffer.split(b"\n"):
+            if line.startswith(b"SMOKE_PORT "):
+                try:
+                    port = int(line.split()[1])
+                except (IndexError, ValueError):
+                    port = None
+    if port is not None:
+        return proc, port, (
+            "server booted via make_server on an ephemeral port "
+            "and reported it ready"
+        )
+    tail = ""
+    try:
+        tail = stderr_path.read_text(encoding="utf-8", errors="replace")[
+            -400:
+        ].strip()
+    except OSError:
+        pass
+    if proc.poll() is None:
+        detail = (
+            f"server did not report a port within "
+            f"{_SMOKE_BOOT_TIMEOUT_S:.0f}s (boot hang)"
+        )
+    else:
+        detail = f"server exited during boot (status {proc.returncode})"
+    if tail:
+        detail += f"; stderr tail: {tail}"
+    return proc, None, detail
+
+
+def _kill_process_tree(proc: subprocess.Popen[bytes]) -> None:
+    """Kill the probe subprocess and its process group, always.
+
+    The probe's safety rests on this running in a finally block:
+    the child gets SIGKILL to its whole group (it was started in
+    its own session), so no server a probe booted can outlive the
+    probe — including one whose handler threads are hung.
+    """
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+
+
+def _pairing_http_smoke_records(
+    clauses: list[dict[str, Any]], root: Path
+) -> list[dict[str, Any]]:
+    """Live HTTP smoke probe for the pairing contract (build #6).
+
+    Scoping is the contract's own: the runner engages when a
+    clause declares the pairing server module. The boot record
+    rides the clause(s) declaring the package entry point
+    (__main__.py — the server-construction clause); the flow
+    records ride the method-surface clause(s) (the HTTP API
+    clause), falling back to the clauses declaring the server
+    module. When the server module itself is missing there are
+    no records — the declared_files probe already owns that
+    failure. The whole run is bounded by _SMOKE_OVERALL_TIMEOUT_S
+    and the child is killed unconditionally.
+    """
+    if not any(
+        _PAIRING_SERVER_PATH in (clause.get("declared_files") or [])
+        for clause in clauses
+    ):
+        return []
+    if not (root / _PAIRING_SERVER_PATH).is_file():
+        return []
+    flow_clauses = [c for c in clauses if c.get("method_surface")]
+    if not flow_clauses:
+        flow_clauses = [
+            c
+            for c in clauses
+            if _PAIRING_SERVER_PATH in (c.get("declared_files") or [])
+        ]
+    boot_clauses = [
+        c
+        for c in clauses
+        if _PAIRING_MAIN_PATH in (c.get("declared_files") or [])
+    ] or flow_clauses
+    if not flow_clauses and not boot_clauses:
+        return []
+    deadline = time.monotonic() + _SMOKE_OVERALL_TIMEOUT_S
+    records: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="freetalon-smoke-") as tmp:
+        proc, port, boot_detail = _boot_pairing_server(root, Path(tmp))
+        try:
+            for clause in boot_clauses:
+                records.append(
+                    {
+                        "clause_id": str(clause["id"]),
+                        "probe": "http_smoke_boot",
+                        "ok": port is not None,
+                        "detail": boot_detail,
+                    }
+                )
+            if port is None:
+                flows = [
+                    (
+                        "flows",
+                        False,
+                        f"no flow could run: {boot_detail}",
+                    )
+                ]
+            else:
+                flows = _pairing_smoke_flows(port, deadline)
+            for clause in flow_clauses:
+                for _name, ok, detail in flows:
+                    records.append(
+                        {
+                            "clause_id": str(clause["id"]),
+                            "probe": "http_smoke",
+                            "ok": ok,
+                            "detail": detail,
+                        }
+                    )
+        finally:
+            if proc is not None:
+                _kill_process_tree(proc)
+    return records
+
+
+# The registered live-probe runners, in run order. A new contract
+# family appends its runner here (see the section header).
+_LIVE_PROBE_RUNNERS = (_pairing_http_smoke_records,)
 
 
 # ── Clause states ───────────────────────────────────────────────────

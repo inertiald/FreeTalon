@@ -63,6 +63,11 @@ class JudgeDecision:
     reason: str
     retry_node_ids: list[str] = field(default_factory=list)
     replan_brief: dict[str, Any] | None = None
+    # Campaign build #6: the named failure class of an ESCALATE —
+    # the cause the loop's escalation-to-re-plan conversion keys
+    # on (see loop._CONVERTIBLE_FAILURE_CLASSES and the design
+    # note in the build log). Empty for non-escalation decisions.
+    failure_class: str = ""
 
 
 class ProgressTracker:
@@ -108,6 +113,42 @@ def _is_timeout(node: PlanNode) -> bool:
 
 def _is_unmeasurable(node: PlanNode) -> bool:
     return (node.measurement or {}).get("verdict") == VERDICT_UNMEASURABLE
+
+
+def timeout_diagnostics(
+    plan: ExecutionPlan, judge: "Judge"
+) -> list[dict[str, Any]]:
+    """Per-node timeout evidence for a re-plan brief (build #6).
+
+    One record per FAILED node whose failure is a timeout: the
+    node, what it was running (its command input, when it has
+    one), the criteria it is judged against, the timeout it ran
+    under, how long the timed-out attempt actually ran, and how
+    many attempts the node has had in this run (the initial
+    execution plus the judge-granted retries). Computed from the
+    plan and the judge's own bookkeeping — never from model
+    output — so a brief built from it states the wall the run hit
+    as fact. Arm #15's version of this record: node-11, a test-run
+    command, 120s, 2 attempts — against a server that hung.
+    """
+    records: list[dict[str, Any]] = []
+    for node in plan.nodes:
+        if node.status != PlanStatus.FAILED or not _is_timeout(node):
+            continue
+        measurement = node.measurement or {}
+        inputs = node.inputs or {}
+        records.append(
+            {
+                "node_id": node.id,
+                "objective": node.objective,
+                "command": inputs.get("command"),
+                "criteria": [dict(c) for c in node.criteria or []],
+                "timeout_s": node.timeout_s,
+                "observed_duration_s": measurement.get("duration_s"),
+                "attempts": judge.retries_by_node.get(node.id, 0) + 1,
+            }
+        )
+    return records
 
 
 # Bounds for the diagnostic excerpt a re-plan brief carries per failed
@@ -438,18 +479,22 @@ class Judge:
                 Decision.ESCALATE,
                 "missing capability: "
                 + ", ".join(n.assigned_claw or n.id for n in needs_tool),
+                failure_class="missing_tool",
             )
         if self.wall_clock_exceeded():
             return JudgeDecision(
                 Decision.ESCALATE,
                 f"wall-clock budget spent ({self.budget.max_wall_clock_s}s)",
+                failure_class="wall_clock",
             )
 
         failed = [n for n in plan.nodes if n.status == PlanStatus.FAILED]
         if not failed:
             # Plan is not COMPLETED but nothing failed (e.g. cancelled).
             return JudgeDecision(
-                Decision.ESCALATE, f"plan ended in state {plan.status.value}"
+                Decision.ESCALATE,
+                f"plan ended in state {plan.status.value}",
+                failure_class="plan_state",
             )
 
         # Repeated UNMEASURABLE is an escalation, not a re-plan: the plan
@@ -460,6 +505,7 @@ class Judge:
                     Decision.ESCALATE,
                     f"node {node.id!r} unmeasurable twice in a row; "
                     "the plan is underspecified",
+                    failure_class="unmeasurable",
                 )
 
         # Transient failures only: retry the timed-out nodes, unchanged.
@@ -486,6 +532,7 @@ class Judge:
             return JudgeDecision(
                 Decision.ESCALATE,
                 "timed-out nodes exhausted their retries",
+                failure_class="timeout_retries_exhausted",
             )
 
         # Informative failure: re-plan if budget and progress allow.
@@ -493,12 +540,14 @@ class Judge:
             return JudgeDecision(
                 Decision.ESCALATE,
                 f"re-plan budget spent ({self.budget.max_replans} re-plans)",
+                failure_class="replan_budget_spent",
             )
         if self.progress.stalled():
             return JudgeDecision(
                 Decision.ESCALATE,
                 "no criterion has newly passed across "
                 f"{ProgressTracker.STALL_LIMIT} re-plans; stalled",
+                failure_class="stalled",
             )
         return JudgeDecision(
             Decision.REPLAN,

@@ -28,7 +28,13 @@ from .contract_clauses import (
 from .critic import CriticSettings, critic_settings_from_env, review_write_nodes
 from .executor import Executor
 from .gates import GateStatus, GateStore, build_packet, compute_packet_hash
-from .judge import Decision, Judge, JudgeDecision, assess_approach_repeat
+from .judge import (
+    Decision,
+    Judge,
+    JudgeDecision,
+    assess_approach_repeat,
+    timeout_diagnostics,
+)
 from .measure import (
     VERDICT_FAIL,
     VERDICT_INCONCLUSIVE,
@@ -60,6 +66,36 @@ if True:  # TYPE_CHECKING-friendly import for audit logger
 
 # A re-plan function takes a brief dict and returns delta-plan nodes.
 ReplanFn = Callable[[dict[str, Any]], list[PlanNode]]
+
+# Campaign build #6: the failure classes whose ESCALATE the loop
+# converts into a re-plan while re-plan budget remains. The set is
+# deliberately a single class — conversion is for failures a
+# different plan can plausibly fix:
+#
+# - timeout_retries_exhausted (CONVERTIBLE): a node hit its hard
+#   timeout on every attempt. The timeout is evidence about the
+#   tree the plan produced — arm #15's shipped server hung on POST
+#   flows, so the plan's own test node timed out twice — which is
+#   exactly what a re-plan briefed with the clause-probe failures
+#   and the timeout diagnostics exists to repair. Escalating there
+#   ended the run with all three re-plans unspent and the probes'
+#   real findings unused.
+#
+# Every other class stays an escalation:
+# - missing_tool: no plan can invent a capability mid-run.
+# - wall_clock: the run's time budget is spent; a re-plan's
+#   execution would run past it.
+# - unmeasurable: the same node was unmeasurable twice — the plan
+#   is underspecified in a way re-planning this goal has already
+#   failed to fix (the judge's standing rule).
+# - stalled: the progress rule fired — no criterion newly passed
+#   across the stall limit of re-plans; more re-plans are the
+#   failure mode that rule guards against.
+# - replan_budget_spent: no budget remains, by definition (the
+#   conversion also checks the budget directly).
+# - plan_state: the plan ended in a non-failure terminal state
+#   (e.g. cancelled); there is no failure evidence to brief.
+_CONVERTIBLE_FAILURE_CLASSES = frozenset({"timeout_retries_exhausted"})
 
 
 @dataclass
@@ -361,6 +397,55 @@ class LoopRunner:
                         "contract probes failing and re-plan budget "
                         "exhausted: " + ", ".join(failed_clause_ids),
                     )
+            # Campaign build #6: escalation-to-re-plan conversion.
+            # A convertible escalation (see
+            # _CONVERTIBLE_FAILURE_CLASSES) with re-plan budget
+            # remaining is not the end of the run. The conversion
+            # routes through the ordinary REPLAN path below; the
+            # brief is augmented there with the current probe
+            # failures verbatim and the timeout diagnostics, and
+            # the conversion is audit-logged here and stamped into
+            # the new version's metadata — never silent.
+            conversion: dict[str, Any] | None = None
+            conversion_timeout_diagnostics: list[dict[str, Any]] = []
+            if (
+                decision.decision == Decision.ESCALATE
+                and decision.failure_class in _CONVERTIBLE_FAILURE_CLASSES
+                and judge.remaining_budget()["replans"] > 0
+            ):
+                conversion_timeout_diagnostics = timeout_diagnostics(
+                    plan, judge
+                )
+                conversion = {
+                    "failure_class": decision.failure_class,
+                    "original_reason": decision.reason,
+                    "from_version": version,
+                    "timeout_nodes": [
+                        entry["node_id"]
+                        for entry in conversion_timeout_diagnostics
+                    ],
+                }
+                self._log(
+                    "loop.replan.escalation_converted",
+                    run_id=run_id,
+                    plan_id=plan.plan_id,
+                    version=version,
+                    failure_class=decision.failure_class,
+                    reason=decision.reason,
+                    timeout_nodes=conversion["timeout_nodes"],
+                    failing_clauses=sorted(
+                        {str(r["clause_id"]) for r in probe_failures_now}
+                    ),
+                )
+                decision = JudgeDecision(
+                    Decision.REPLAN,
+                    "escalation converted to re-plan: "
+                    + decision.reason
+                    + " — re-plan budget remains and the failure is "
+                    "one a re-plan can address; the brief carries "
+                    "the clause-probe failures and the timeout "
+                    "diagnostics",
+                )
             decision_history.append(
                 {
                     "version": version,
@@ -418,6 +503,24 @@ class LoopRunner:
                 pinned_contract = plan.metadata.get("module_contract")
                 if pinned_contract:
                     brief["module_contract"] = pinned_contract
+                # Campaign build #6: the current version's clause-
+                # probe failures ride every re-plan brief verbatim
+                # (clause id, probe kind, detail) — the judge's
+                # uncovered-clause list embeds them as reasons, but
+                # the raw records are the evidence a repair targets.
+                if probe_failures_now:
+                    brief["contract_probe_failures"] = [
+                        dict(record) for record in probe_failures_now
+                    ]
+                # Campaign build #6: a converted escalation's brief
+                # also carries the conversion record and the timeout
+                # diagnostics — why this re-plan exists and the wall
+                # the previous version hit.
+                if conversion is not None:
+                    brief["escalation_conversion"] = dict(conversion)
+                    brief["timeout_diagnostics"] = (
+                        conversion_timeout_diagnostics
+                    )
                 replan = replan_fn or (lambda b: replan_from_brief(b))
                 new_nodes: list[PlanNode] | None = None
                 # Campaign build #2: the repair seams record WHY
@@ -539,6 +642,12 @@ class LoopRunner:
                     metadata["repair_declines"] = [
                         dict(record) for record in repair_declines
                     ]
+                if conversion is not None:
+                    # Campaign build #6: the conversion record rides
+                    # the new version's metadata, next to the seam
+                    # accounting — a version that exists because an
+                    # escalation was converted says so.
+                    metadata["escalation_conversion"] = dict(conversion)
                 if seams_bypassed is not None:
                     # Campaign build #3: the bypass record rides
                     # the same channel — a version produced under

@@ -178,7 +178,12 @@ class TestLoopRunnerM0(unittest.TestCase):
             )
             plan = _plan("plan-timeout", [node])
             store.save(plan)
-            result = runner.run_plan(plan, _contract())
+            # Campaign build #6: a retries-exhausted timeout now
+            # converts to a re-plan while budget remains, so the
+            # M0 scope (the node's own failure record) pins the
+            # re-planner off, exactly like the sibling failure
+            # tests above.
+            result = runner.run_plan(plan, _contract(), replan_fn=_no_replanner)
             finished = result.plan.nodes[0]
             self.assertEqual(finished.status, PlanStatus.FAILED)
             self.assertIn("timed out", finished.error or "")

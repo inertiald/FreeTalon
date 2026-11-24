@@ -8643,6 +8643,54 @@ def _format_brief_for_prompt(brief: dict[str, Any]) -> str:
                 f"- {entry.get('id', '')} ({entry.get('heading', '')}): "
                 f"{reasons}"
             )
+    # Escalation conversion (campaign build #6): when the judge's
+    # escalation was converted into this re-plan, the brief says so,
+    # with the timeout diagnostics (the wall the last version hit)
+    # and the clause-probe failures verbatim (the system's own
+    # checks, outside the plan's tests). Rendered only when the
+    # loop stamped the fields and they are non-empty; a brief
+    # without them renders byte-identically to before.
+    conversion = brief.get("escalation_conversion")
+    if isinstance(conversion, dict) and conversion:
+        lines.append(
+            "Escalation converted (system): the judge escalated "
+            f"({conversion.get('original_reason', '')}) but re-plan "
+            "budget remained, so the run was NOT ended \u2014 this "
+            "re-plan replaces the escalation. The failure is "
+            "informative: address its evidence below, or the delta "
+            "plan meets the same wall."
+        )
+    timeout_records = brief.get("timeout_diagnostics") or []
+    if timeout_records:
+        lines.append(
+            "Timeout diagnostics (system): these nodes hit their "
+            "hard timeout on every attempt \u2014 what they ran "
+            "against did not finish (a hang, not a slow pass):"
+        )
+        for entry in timeout_records:
+            if not isinstance(entry, dict):
+                continue
+            lines.append(
+                f"- {entry.get('node_id', '')}: command "
+                f"{entry.get('command')!r} timed out after "
+                f"{entry.get('timeout_s', '')}s "
+                f"(attempts: {entry.get('attempts', '')})"
+            )
+    probe_failure_records = brief.get("contract_probe_failures") or []
+    if probe_failure_records:
+        lines.append(
+            "Contract probe failures (system, verbatim): the "
+            "system's deterministic probes against the produced "
+            "tree failed \u2014 defects in the produced code, "
+            "independent of the plan's own tests:"
+        )
+        for record in probe_failure_records:
+            if not isinstance(record, dict):
+                continue
+            lines.append(
+                f"- {record.get('clause_id', '')} "
+                f"[{record.get('probe', '')}]: {record.get('detail', '')}"
+            )
     measurements = brief.get("measurements") or []
     if measurements:
         lines.append("Measurements so far:")
