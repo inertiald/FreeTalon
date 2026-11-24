@@ -27,6 +27,7 @@ from .contract_clauses import (
     format_clauses_block,
     format_replan_clauses_block,
     node_clause_declaration,
+    probe_suspect_map,
 )
 from .executor import _command_runs_full_suite
 from .grounding import edit_grounding_violations
@@ -9124,6 +9125,26 @@ def _format_brief_for_prompt(brief: dict[str, Any]) -> str:
                 f"- {record.get('clause_id', '')} "
                 f"[{record.get('probe', '')}]: {record.get('detail', '')}"
             )
+    # Campaign build #12: the derived suspect — when the failed
+    # flows all exercised one produced file, that file and its
+    # failed flows are the delta's target list, named as such so
+    # the planner aims at the flows even when the repair seams
+    # declined. Rendered only when the loop stamped the map;
+    # a brief without it renders byte-identically to before.
+    probe_suspect = brief.get("probe_suspect")
+    if isinstance(probe_suspect, dict) and probe_suspect:
+        lines.append(
+            "Probe suspect (system): every failed flow above "
+            f"exercised one produced file — "
+            f"{probe_suspect.get('file', '')}. Treat that file "
+            "and its failed flows as this delta's target list:"
+        )
+        for entry in probe_suspect.get("flows") or []:
+            if not isinstance(entry, dict):
+                continue
+            lines.append(
+                f"- {entry.get('flow', '')}: {entry.get('detail', '')}"
+            )
     measurements = brief.get("measurements") or []
     if measurements:
         lines.append("Measurements so far:")
@@ -13882,6 +13903,81 @@ def _replan_diagnostics(
     return "\n".join(lines), suspect_map
 
 
+def _probe_repair_diagnostics(
+    brief: dict[str, Any],
+    *,
+    has_spec: bool,
+    spec_paths: Collection[str] = (),
+) -> tuple[str, dict[str, dict[str, Any]], list[str]]:
+    """Probe-derived diagnostics + suspect map for the seams (#12).
+
+    The counterpart of _replan_diagnostics for a brief whose
+    failure named no failing tests — the timeout class: the plan's
+    own test node hung, so there are no test IDs to locate, and
+    both repair seams declined in every arm-#21 cycle for exactly
+    that absence. The loop's contract probes, though, recorded
+    precise per-flow failures against the produced file they
+    exercised. When those failures name exactly one file
+    (contract_clauses.probe_suspect_map, over the loop-stamped
+    brief["probe_suspect"] when present, else derived here from
+    the brief's verbatim probe failures), the failed flows stand
+    in for failing tests: each flow becomes one synthetic failing
+    entry ("probe:<flow>") whose exercised module is the suspect
+    file, and the block below is the diagnostics the seam's model
+    reads. Returns ("", {}, []) when no single suspect exists —
+    the seams then decline exactly as before this build.
+    """
+    suspect = brief.get("probe_suspect")
+    if not isinstance(suspect, dict) or not suspect:
+        suspect = probe_suspect_map(brief.get("contract_probe_failures") or [])
+    if not suspect:
+        return "", {}, []
+    target = suspect.get("file")
+    flows = suspect.get("flows") or []
+    if not isinstance(target, str) or not target or not flows:
+        return "", {}, []
+    lines = [
+        "Probe diagnostics (system — the loop's own contract "
+        "probes exercised the produced file below against the "
+        "contract and recorded these flow failures; computed from "
+        "the run's probe records, not from a model's account of "
+        "them):"
+    ]
+    failing: list[str] = []
+    suspect_map: dict[str, dict[str, Any]] = {}
+    for entry in flows:
+        if not isinstance(entry, dict):
+            continue
+        flow = str(entry.get("flow") or "flow")
+        probe_id = f"probe:{flow}"
+        if probe_id in suspect_map:
+            continue
+        failing.append(probe_id)
+        suspect_map[probe_id] = {"file": None, "modules": [target]}
+        lines.append(f"Failing probe flow {probe_id}:")
+        lines.append(f"  exercised produced file: {target}")
+        lines.append(f"  {entry.get('detail') or ''}")
+    if not failing:
+        return "", {}, []
+    if has_spec:
+        names = ", ".join(spec_paths) or "the goal-named spec"
+        lines.append(
+            f"Precedence (system): {names} is the authoritative "
+            "specification for this goal, and these records are "
+            "the system's own probes against it — the suspect is "
+            "the produced file, not the probe. Fix the file so "
+            "the recorded flows behave as the contract pins."
+        )
+    else:
+        lines.append(
+            "Precedence (system): no external spec governs this "
+            "run; the goal text governs, and these records are "
+            "the system's own probes — the suspect is the "
+            "produced file, not the probe."
+        )
+    return "\n".join(lines), suspect_map, failing
+
+
 def _replan_required_clause_ids(
     brief: dict[str, Any], clauses: list[dict[str, Any]]
 ) -> list[str]:
@@ -14988,6 +15084,22 @@ def _try_local_repair(
 # files is now a target (per-file all-or-nothing, candidate-level
 # atomicity): arm #10's span was exactly two files (store.poll +
 # server.do_GET), the shape the single-file seam could not take.
+#
+# Campaign build #12 (2026-11-24): a second targeting source.
+# Arm #21's failure named no failing tests at all — the plan's
+# test node TIMED OUT against a hanging server — so this seam
+# declined no_diagnostics in all three cycles while the loop's
+# own smoke probe held precise per-flow diagnostics against
+# exactly one produced file. _probe_repair_diagnostics now
+# derives the same (diagnostics block, suspect map) pair from
+# the brief's probe evidence when the failing-tests source is
+# empty: the failed flows stand in for failing tests, judged
+# against the same cap, the same writer/disk/size preconditions,
+# and the same grounding checks. Cycle 8's seam is unchanged:
+# its targeting needs a definition window (a traceback frame or
+# a route anchor in an executed failure's diagnostics), which a
+# flow record does not carry — its preconditions do not fit
+# this evidence class, so it keeps declining on it as before.
 
 from .prompts import SCOPED_EDIT_REPAIR_SYSTEM_PROMPT as _SCOPED_EDIT_PROMPT
 
@@ -15433,14 +15545,33 @@ def _try_scoped_edit_repair(
         has_spec=bool(specs),
         spec_paths=[spec.path for spec in specs],
     )
+    targets_brief = brief
     if not diagnostics_block:
-        return decline(
-            "no_diagnostics",
-            "the brief names no failing tests, so no diagnostics "
-            "block (and no suspect map) was computed",
+        # Campaign build #12: a brief with no failing tests can
+        # still carry the loop's probe evidence — the timeout
+        # class, where the plan's own test node hung and named
+        # nothing. When the failed probe flows name exactly one
+        # produced file, they stand in for the failing tests:
+        # the seam targets that file with the flows as its
+        # diagnostics (the failed-flow count is judged against
+        # the same suspect cap in _scoped_edit_targets). Only
+        # when neither source names a suspect does the seam
+        # decline no_diagnostics, exactly as before.
+        probe_block, probe_map, probe_failing = _probe_repair_diagnostics(
+            brief,
+            has_spec=bool(specs),
+            spec_paths=[spec.path for spec in specs],
         )
+        if not probe_block:
+            return decline(
+                "no_diagnostics",
+                "the brief names no failing tests, so no diagnostics "
+                "block (and no suspect map) was computed",
+            )
+        diagnostics_block, suspect_map = probe_block, probe_map
+        targets_brief = {**brief, "failing_tests": probe_failing}
     targets = _scoped_edit_targets(
-        plan, brief, root, suspect_map, declines
+        plan, targets_brief, root, suspect_map, declines
     )
     if targets is None:
         # _scoped_edit_targets recorded the reason itself.

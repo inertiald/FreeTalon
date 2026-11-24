@@ -607,6 +607,66 @@ def probe_failures(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [record for record in results if not record.get("ok")]
 
 
+def probe_suspect_map(
+    failures: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """The repair suspect a set of probe failures names (build #12).
+
+    Live-probe records carry the produced file they exercised
+    (the "file" key); grouping the FAILED records by that file
+    yields a suspect only when the failures name exactly one
+    file — the seams' all-or-nothing confidence standard,
+    computed from the probe's own records, never from model
+    output. Returns {"file": <repo-relative path>, "flows":
+    [{flow, clause_id, probe, detail}, ...]} with one entry per
+    distinct failed flow, in record order; None when no failed
+    record names a file (a static-probe failure set, or a
+    pre-#12 record set) or the failures span more than one file.
+
+    Exam arm #21 is why this exists: its three re-plan cycles
+    each carried precise per-flow smoke diagnostics against
+    exactly one produced file, yet both repair seams declined —
+    local_repair for want of a unique suspect, scoped_edit for
+    want of diagnostics — because a node timeout names neither,
+    and the only repair that ever fired was the wholesale
+    re-plan rewrite. The failed flows below stand in for the
+    failing tests a seam's targeting consumes: their count is
+    judged against the same suspect cap.
+    """
+    by_file: dict[str, list[dict[str, Any]]] = {}
+    for record in failures:
+        if not isinstance(record, dict) or record.get("ok"):
+            continue
+        path = record.get("file")
+        if not isinstance(path, str) or not path:
+            continue
+        by_file.setdefault(path, []).append(record)
+    if len(by_file) != 1:
+        return None
+    path, records = next(iter(by_file.items()))
+    flows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for record in records:
+        flow = record.get("flow")
+        flow_name = flow if isinstance(flow, str) else ""
+        detail = str(record.get("detail") or "")
+        key = (flow_name, detail)
+        if key in seen:
+            continue
+        seen.add(key)
+        flows.append(
+            {
+                "flow": flow_name,
+                "clause_id": str(record.get("clause_id") or ""),
+                "probe": str(record.get("probe") or ""),
+                "detail": detail,
+            }
+        )
+    if not flows:
+        return None
+    return {"file": path, "flows": flows}
+
+
 # ── Live probes (campaign build #6) ────────────────────────────────
 #
 # The static probes read the tree; they cannot see behavior that
@@ -714,8 +774,13 @@ def _pairing_smoke_flows(
     a pending code polls 404; confirm with the operator token
     answers 200; the claiming poll answers 200 with the bundle;
     a wrong method on a known path answers the contract's 405 —
-    never the stdlib's 501 default. A flow that cannot be
-    attempted inside the overall deadline fails as unattempted.
+    never the stdlib's 501 default; a path the server never
+    registered answers 404 (campaign build #12: the acceptance
+    set checks exactly that case, and a server whose method
+    handling answers 405 for everything passed the first five
+    flows while failing it — the probe now sees what acceptance
+    sees). A flow that cannot be attempted inside the overall
+    deadline fails as unattempted.
     """
 
     def request(name, method, path, **kwargs):
@@ -839,6 +904,31 @@ def _pairing_smoke_flows(
                 + (
                     " — 501 is the stdlib default the contract forbids"
                     if status == 501
+                    else ""
+                )
+                + ")",
+            )
+        )
+
+    outcome, error = request(
+        "unknown_route", "GET", "/smoke-probe/no-such-route"
+    )
+    if error is not None:
+        flows.append(("unknown_route", False, error))
+    else:
+        status, _raw = outcome
+        flows.append(
+            (
+                "unknown_route",
+                status == 404,
+                f"unknown_route: GET /smoke-probe/no-such-route -> "
+                f"{status} (expected 404 — the path is not a route "
+                "the server registers"
+                + (
+                    "; 405 is the wrong-method answer leaking onto "
+                    "unknown routes, where the contract's routing "
+                    "owes a 404"
+                    if status == 405
                     else ""
                 )
                 + ")",
@@ -1007,13 +1097,22 @@ def _pairing_http_smoke_records(
             else:
                 flows = _pairing_smoke_flows(port, deadline)
             for clause in flow_clauses:
-                for _name, ok, detail in flows:
+                for name, ok, detail in flows:
                     records.append(
                         {
                             "clause_id": str(clause["id"]),
                             "probe": "http_smoke",
                             "ok": ok,
                             "detail": detail,
+                            # Campaign build #12: the flow's name
+                            # and the one produced file the flows
+                            # exercised ride the record, so the
+                            # repair seams can derive a suspect map
+                            # from the failures (probe_suspect_map)
+                            # instead of declining for want of
+                            # diagnostics.
+                            "flow": name,
+                            "file": _PAIRING_SERVER_PATH,
                         }
                     )
         finally:

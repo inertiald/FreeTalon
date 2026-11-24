@@ -264,7 +264,9 @@ class TestPairingSmokeProbe(unittest.TestCase):
             results = run_contract_probes(SMOKE_CLAUSES, root)
             self.assertEqual(probe_failures(results), [])
             flows = _smoke_records(results)
-            self.assertEqual(len(flows), 5)
+            # Six flows since campaign build #12 added the
+            # unknown-route check to the five build #6 flows.
+            self.assertEqual(len(flows), 6)
             boot = [
                 r
                 for r in results

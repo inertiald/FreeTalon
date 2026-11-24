@@ -23,6 +23,7 @@ from .contract_clauses import (
     clause_states,
     clauses_from_metadata,
     probe_failures,
+    probe_suspect_map,
     run_contract_probes,
 )
 from .critic import CriticSettings, critic_settings_from_env, review_write_nodes
@@ -557,6 +558,30 @@ class LoopRunner:
                     brief["contract_probe_failures"] = [
                         dict(record) for record in probe_failures_now
                     ]
+                    # Campaign build #12: when the failures name
+                    # exactly one produced file, the derived
+                    # suspect map rides the brief too. The repair
+                    # seams read it as their targeting evidence —
+                    # a node timeout names no suspect and no
+                    # failing tests, but the probe's failed flows
+                    # name both — and the brief prompt renders it
+                    # as the delta's target list when the seams
+                    # decline. Derived from the probe records by
+                    # the clause layer, never from model output.
+                    probe_suspect = probe_suspect_map(probe_failures_now)
+                    if probe_suspect is not None:
+                        brief["probe_suspect"] = probe_suspect
+                        self._log(
+                            "loop.replan.probe_suspect",
+                            run_id=run_id,
+                            plan_id=plan.plan_id,
+                            version=version,
+                            file=probe_suspect["file"],
+                            flows=[
+                                entry["flow"]
+                                for entry in probe_suspect["flows"]
+                            ],
+                        )
                 # Campaign build #6: a converted escalation's brief
                 # also carries the conversion record and the timeout
                 # diagnostics — why this re-plan exists and the wall
