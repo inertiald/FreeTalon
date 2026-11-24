@@ -146,23 +146,36 @@ class TestSkeletonValidation(_TreeCase):
         ]
         self.assertIn("clause_coverage", codes)
 
-    def test_create_intent_against_existing_file_rejected(self) -> None:
-        with self.assertRaises(LLMResponseError) as caught:
-            self._parse(_payload(_write_node("w1", "pkg/server.py", "create")))
-        codes = [
-            record.code
-            for record in getattr(caught.exception, "plan_errors", [])
-        ]
-        self.assertIn("skeleton_intent", codes)
+    def test_create_intent_against_existing_file_corrected(self) -> None:
+        # Campaign build #11: "create" against an existing file is
+        # a deterministic contradiction — parse corrects it to
+        # "edit" before validation and accepts, recording the
+        # correction in the plan metadata. (Through build #10 this
+        # rejected with skeleton_intent; exam arm #20 spent four
+        # of its five skeleton attempts on exactly this defect.)
+        nodes, metadata = self._parse(
+            _payload(_write_node("w1", "pkg/server.py", "create"))
+        )
+        self.assertEqual(nodes[0].inputs["content_intent"], "edit")
+        corrections = metadata["intent_corrections"]
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]["target"], "pkg/server.py")
+        self.assertEqual(corrections[0]["from"], "create")
+        self.assertEqual(corrections[0]["to"], "edit")
 
-    def test_edit_intent_against_missing_file_rejected(self) -> None:
-        with self.assertRaises(LLMResponseError) as caught:
-            self._parse(_payload(_write_node("w1", "pkg/store.py", "edit")))
-        codes = [
-            record.code
-            for record in getattr(caught.exception, "plan_errors", [])
-        ]
-        self.assertIn("skeleton_intent", codes)
+    def test_edit_intent_against_missing_file_corrected(self) -> None:
+        # Campaign build #11: the symmetric correction — "edit"
+        # against a file that does not exist becomes "create"
+        # (through build #10 this rejected with skeleton_intent).
+        nodes, metadata = self._parse(
+            _payload(_write_node("w1", "pkg/store.py", "edit"))
+        )
+        self.assertEqual(nodes[0].inputs["content_intent"], "create")
+        corrections = metadata["intent_corrections"]
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]["target"], "pkg/store.py")
+        self.assertEqual(corrections[0]["from"], "edit")
+        self.assertEqual(corrections[0]["to"], "create")
 
     def test_whole_file_intent_needs_justification_pair(self) -> None:
         with self.assertRaises(LLMResponseError) as caught:

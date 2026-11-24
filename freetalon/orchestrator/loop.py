@@ -723,6 +723,27 @@ class LoopRunner:
                     coverage_record["plan_version"] = version
                     coverage_history.append(coverage_record)
                     metadata["replan_clause_coverage"] = coverage_history
+                if brief.get("intent_corrections"):
+                    # Campaign build #11: the accepted re-plan's
+                    # deterministic skeleton-intent corrections
+                    # (the brief write-back from replan_from_brief:
+                    # the declared intents parse corrected against
+                    # the tree), appended per version next to the
+                    # coverage record above — each entry gains the
+                    # version whose delta declared it, so the run
+                    # record shows which versions needed the
+                    # system's correction and why.
+                    correction_history = metadata.get("intent_corrections")
+                    correction_history = (
+                        list(correction_history)
+                        if isinstance(correction_history, list)
+                        else []
+                    )
+                    for correction in brief["intent_corrections"]:
+                        correction_record = dict(correction)
+                        correction_record["plan_version"] = version
+                        correction_history.append(correction_record)
+                    metadata["intent_corrections"] = correction_history
                 if judge.repeat_warnings:
                     # Cross-run signature matches the substance check
                     # cleared: the historical warnings ride into the

@@ -278,6 +278,24 @@ def _attach_plan_errors(
     return exc
 
 
+def _attach_intent_corrections(
+    exc: LLMResponseError, corrections: Collection[dict[str, Any]]
+) -> LLMResponseError:
+    """Attach this attempt's skeleton-intent corrections to a rejection.
+
+    Campaign build #11: parse corrects a skeleton write node's
+    declared content intent deterministically when it contradicts
+    the tree (see _correct_skeleton_intents); when the attempt is
+    still rejected for other defects, the corrections ride the
+    exception — the _attach_plan_errors channel — so the repair
+    loop can persist them in the attempt record (build #9) and
+    name them in the repair brief's target-facts block instead of
+    the correction vanishing with the discarded candidate.
+    """
+    exc.intent_corrections = list(corrections)  # type: ignore[attr-defined]
+    return exc
+
+
 def _single_error_rejection(code: str, message: str, stage: str) -> LLMResponseError:
     """An LLMResponseError carrying exactly one structured record."""
     return _attach_plan_errors(
@@ -1466,6 +1484,26 @@ def parse_planner_response(
         effective_contract = _derive_contract_entries(
             nodes, effective_contract, repo_root
         )
+    module_cache = _ModuleSourceCache()
+    intent_corrections: list[dict[str, Any]] = []
+    if skeleton:
+        # Campaign build #11: deterministic skeleton-intent
+        # correction — a declared content intent that contradicts
+        # the tree on disk is corrected mechanically HERE, before
+        # the remaining validation judges the attempt, so the
+        # model never spends a repair round re-deriving a fact
+        # the system already knows (arm #20: four of five
+        # skeleton attempts died on "create" declared for files
+        # the standing tree already held). The corrections are
+        # recorded, never silent: they ride the returned metadata
+        # on acceptance and the rejection itself (the
+        # _attach_intent_corrections channel) otherwise. The one
+        # module cache serves both the correction and the
+        # validators, so each module file is still read at most
+        # once per parse.
+        intent_corrections = _correct_skeleton_intents(
+            nodes, repo_root, index=index, modules=module_cache
+        )
     relabeled_nodes = _relabel_nodes_for_errors(nodes, id_labels)
     records, cheap = _collect_plan_error_records(
         relabeled_nodes,
@@ -1473,7 +1511,7 @@ def parse_planner_response(
         goal_text,
         workspace,
         index=index,
-        modules=_ModuleSourceCache(),
+        modules=module_cache,
         contract=effective_contract,
         clauses=clauses if clauses is not None else _CLAUSES_UNSUPPLIED,
         skeleton=skeleton,
@@ -1488,7 +1526,10 @@ def parse_planner_response(
         # edit form is pre-filled and needs no intent.
         records = records + _skeleton_intent_basic_records(relabeled_nodes)
     if records:
-        raise _numbered_rejection(records, cheap=cheap)
+        rejection = _numbered_rejection(records, cheap=cheap)
+        if intent_corrections:
+            _attach_intent_corrections(rejection, intent_corrections)
+        raise rejection
 
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
@@ -1501,6 +1542,13 @@ def parse_planner_response(
         metadata[CONTRACT_METADATA_KEY] = effective_contract
     else:
         metadata.pop(CONTRACT_METADATA_KEY, None)
+    # The intent-corrections key is system-owned like the module
+    # contract key (campaign build #11): stamped from this parse's
+    # own corrections — a model-supplied value under it never
+    # survives, and a parse that corrected nothing carries none.
+    metadata.pop(INTENT_CORRECTIONS_METADATA_KEY, None)
+    if intent_corrections:
+        metadata[INTENT_CORRECTIONS_METADATA_KEY] = intent_corrections
 
     return nodes, metadata
 
@@ -6979,6 +7027,14 @@ SKELETON_CONTENT_INTENTS = ("create", "edit", "whole_file")
 #: Plan metadata key for the two-phase emission record.
 PLAN_EMISSION_METADATA_KEY = "plan_emission"
 
+#: Plan metadata key for the deterministic skeleton-intent
+#: corrections (campaign build #11): one entry per write node
+#: whose declared content intent parse corrected against the
+#: tree — {node, target, from, to, reason}. System-owned: parse
+#: stamps it from its own corrections and clears any value a
+#: model payload carried under it.
+INTENT_CORRECTIONS_METADATA_KEY = "intent_corrections"
+
 #: Validator codes that judge a write node's payload. At the
 #: skeleton phase their records against a content-less write node
 #: are dropped (see _collect_plan_error_records); at the fill
@@ -7061,6 +7117,315 @@ def _skeleton_intent_basic_records(
     return records
 
 
+# ── Campaign build #11: skeleton-intent correction + anchoring ──
+#
+# Exam arm #20 (2026-11-24): the initial skeleton exhausted all
+# five attempts, four of them on skeleton_intent — the model kept
+# declaring content_intent "create" for freetalon/pairing/store.py
+# and server.py, which the standing exam tree already held. The
+# rejection named the defect exactly and the model still never
+# settled on a legal intent: whether a file exists is not a
+# judgment the model should spend repair rounds re-deriving,
+# because the system already knows it (build #4's inventory
+# states it in the first prompt). Arm #19's skeleton declared
+# "whole_file" for the same files and passed on attempt 2 — pure
+# model variance on a deterministic fact.
+#
+# Two mechanisms, both deterministic:
+#
+# - INTENT CORRECTION (_correct_skeleton_intents): at skeleton
+#   parse, before the remaining validation judges the attempt, a
+#   declared intent that contradicts the tree is corrected
+#   mechanically — "create" for a target that exists on disk
+#   becomes "edit"; "edit" / "whole_file" for a target that
+#   exists neither on disk nor earlier in the same plan becomes
+#   "create". If the intent was the node's only defect the
+#   attempt proceeds; if other errors coexist, validation judges
+#   the corrected plan, so the repair round works from a
+#   rejection that no longer contains the corrected defect.
+#   Every correction is recorded — plan metadata on acceptance,
+#   the rejection and the attempt record (build #9) otherwise —
+#   visible, never silent. NOT correctable, by design:
+#   "whole_file" against an existing target without the
+#   justification + impact-check pair (a justification is the
+#   model's claim to make, not a fact the system can fabricate);
+#   "create" against a target an earlier node of the same plan
+#   creates (a plan-internal contradiction, not a tree fact);
+#   and a missing or invalid intent (the basic shape rule's
+#   rejection, unchanged).
+#
+# - EXISTENCE ANCHORING (_skeleton_target_facts_block): every
+#   skeleton repair brief gains the deterministic facts for the
+#   rejected skeleton's write targets — exists on disk (with the
+#   existing-file inventory's definition count when the
+#   inventory has it), created earlier in this same plan, or
+#   absent — plus the legal intents for each, the intent the
+#   attempt declared, and the correction the system already
+#   applied. Build #4's anchoring pattern (measured facts + a
+#   standing instruction) for the defect class its facts never
+#   covered: clause coverage and write scope, not existence.
+#
+# Both mechanisms read existence from ONE computation
+# (_skeleton_write_target_facts — the validator's own: on disk
+# through the parse's module-source cache, or written by an
+# earlier node of the same plan; only in-tree targets judged),
+# so the correction, the validator, and the brief can never
+# disagree about what exists. The re-plan path shares the seam:
+# replan_from_brief's skeleton phase parses through the same
+# parse_planner_response(skeleton=True), so delta skeletons are
+# corrected and anchored identically; their corrections write
+# back through the brief (the build #7 channel) and the loop
+# stamps them into the new version's metadata.
+
+
+@dataclass(frozen=True)
+class _SkeletonTargetFact:
+    """One skeleton write target's existence facts (build #11)."""
+
+    node: Any  # a PlanNode, or a lenient view of one (repair briefs)
+    target: str  # the target exactly as the node declares it
+    resolved: str  # the resolved on-disk path, as a string
+    on_disk: bool  # the target exists in the tree now
+    plan_prior: bool  # an earlier node of this same plan writes it
+
+    @property
+    def prior(self) -> bool:
+        """The validator's existence verdict: on disk, or in-plan."""
+        return self.on_disk or self.plan_prior
+
+
+def _skeleton_write_target_facts(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    index: Any | None = None,
+    modules: Any | None = None,
+) -> list[_SkeletonTargetFact]:
+    """Existence facts for every judged skeleton write target.
+
+    The one existence computation for skeleton intents (campaign
+    build #11): a target is judged only when it resolves inside
+    the repo root (the validator's own scope); it exists when it
+    is on disk (read through the parse's module-source cache when
+    one is given, so each module file is still read at most once
+    per parse) or when an earlier node of this same plan writes
+    it. Every judged target registers for the nodes after it —
+    pre-filled nodes included — exactly as the validator's
+    `existing` set always accumulated them.
+    """
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    root_resolved = Path(root).resolve()
+    existing: set[str] = set()
+    facts: list[_SkeletonTargetFact] = []
+    for node in nodes:
+        target = _node_write_target(node)
+        if target is None:
+            continue
+        resolved_path = _resolve_plan_target(target, root).resolve()
+        if not resolved_path.is_relative_to(root_resolved):
+            continue
+        resolved = str(resolved_path)
+        if modules is not None:
+            on_disk = modules.source(resolved_path) is not None
+        else:
+            on_disk = resolved_path.is_file()
+        plan_prior = resolved in existing
+        existing.add(resolved)
+        facts.append(
+            _SkeletonTargetFact(
+                node=node,
+                target=target,
+                resolved=resolved,
+                on_disk=on_disk,
+                plan_prior=plan_prior,
+            )
+        )
+    return facts
+
+
+def _correct_skeleton_intents(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    index: Any | None = None,
+    modules: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Correct skeleton content intents that contradict the tree.
+
+    The build #11 correction (see the section above for the rule
+    and its deliberate exclusions). Mutates the corrected nodes'
+    inputs in place — the fill phase reads the intent from the
+    node, so the corrected intent is the one the payload is
+    requested under — and returns one record per correction:
+    {node, target, from, to, reason}. Pre-filled nodes are exempt,
+    exactly as in the validator: their form is the model's own
+    payload, judged by the ordinary rules.
+    """
+    corrections: list[dict[str, Any]] = []
+    for fact in _skeleton_write_target_facts(
+        nodes, repo_root, index, modules
+    ):
+        node = fact.node
+        inputs = node.inputs or {}
+        if not isinstance(inputs, dict):
+            continue
+        if isinstance(inputs.get("content"), str):
+            continue
+        intent = inputs.get("content_intent")
+        corrected: str | None = None
+        reason = ""
+        if intent == "create" and fact.on_disk:
+            corrected = "edit"
+            reason = "the target already exists on disk"
+        elif intent in ("edit", "whole_file") and not fact.prior:
+            corrected = "create"
+            reason = (
+                "the target does not exist on disk and no earlier "
+                "node of this plan creates it"
+            )
+        if corrected is None:
+            continue
+        inputs["content_intent"] = corrected
+        corrections.append(
+            {
+                "node": node.id,
+                "target": fact.target,
+                "from": intent,
+                "to": corrected,
+                "reason": reason,
+            }
+        )
+    return corrections
+
+
+def _skeleton_target_facts_block(
+    response_text: str,
+    repo_root: str | Path | None,
+    corrections: Collection[dict[str, Any]] = (),
+) -> str:
+    """The SKELETON TARGET FACTS block for a skeleton repair brief.
+
+    Deterministic existence facts for the rejected skeleton's
+    write targets (campaign build #11): for each target — whether
+    it exists on disk (with the existing-file inventory's
+    definition count when the inventory has it), whether an
+    earlier node of this same skeleton creates it, or that it
+    exists nowhere yet; the content intents that are legal for
+    it; the intent the attempt declared; and the correction the
+    system already applied to that declaration, when it applied
+    one. Read leniently from the raw output (the
+    _plan_attempt_facts pattern — the output may be too malformed
+    for PlanNode validation) and fail-soft: any extraction
+    failure returns "", because a facts failure must never mask
+    the rejection it describes. "" when the output names no
+    in-tree write target.
+    """
+    try:
+        payload = parse_json_object(sanitize_llm_output(response_text))
+    except Exception:
+        return ""
+    nodes_raw = payload.get("nodes") if isinstance(payload, dict) else None
+    if not isinstance(nodes_raw, list):
+        return ""
+    try:
+        root = resolve_repo_root(repo_root)
+        root_resolved = Path(root).resolve()
+        views = [
+            view
+            for view in (
+                _lenient_node_view(raw, position)
+                for position, raw in enumerate(nodes_raw, start=1)
+            )
+            if view is not None
+        ]
+        facts = _skeleton_write_target_facts(views, root)
+        if not facts:
+            return ""
+        focus_dirs: set[str] = set()
+        for fact in facts:
+            try:
+                parent = (
+                    Path(fact.resolved)
+                    .relative_to(root_resolved)
+                    .parent.as_posix()
+                )
+            except ValueError:
+                continue
+            if parent not in ("", "."):
+                focus_dirs.add(parent)
+        inventory = dict(existing_file_inventory(root, sorted(focus_dirs)))
+        corrected_by_target = {
+            entry.get("target"): entry
+            for entry in corrections
+            if isinstance(entry, dict)
+        }
+        whole_file_pair = (
+            '"whole_file" with a non-empty overwrite_justification '
+            "AND an impact-check node"
+        )
+        lines = [
+            "SKELETON TARGET FACTS (system — measured from the "
+            "tree on disk and this skeleton's own node order, "
+            "not from memory):"
+        ]
+        for fact in facts:
+            inputs = fact.node.inputs or {}
+            declared = inputs.get("content_intent")
+            try:
+                rel = Path(fact.resolved).relative_to(root_resolved).as_posix()
+            except ValueError:
+                rel = fact.target
+            count = inventory.get(rel)
+            count_text = (
+                f" ({count} definitions)" if count is not None else ""
+            )
+            if fact.on_disk:
+                state = f"EXISTS on disk{count_text}"
+                legal = f'"edit", or {whole_file_pair}'
+            elif fact.plan_prior:
+                state = (
+                    "does not exist on disk, but an earlier node "
+                    "of this skeleton writes it, so it exists by "
+                    "the time it is filled"
+                )
+                legal = f'"edit", or {whole_file_pair}'
+            else:
+                state = "does not exist yet"
+                legal = '"create"'
+            line = (
+                f"- {fact.target}: {state}. Legal content "
+                f"intents: {legal}."
+            )
+            if isinstance(inputs.get("content"), str):
+                line += (
+                    " This node carries its content already, so "
+                    "no content intent applies to it."
+                )
+            elif declared is not None:
+                line += f' Declared: "{declared}".'
+                correction = corrected_by_target.get(fact.target)
+                if (
+                    correction is not None
+                    and correction.get("from") == declared
+                ):
+                    line += (
+                        " The system corrected that declaration "
+                        f'to "{correction.get("to")}" for this '
+                        "attempt's validation."
+                    )
+            lines.append(line)
+        lines.append(
+            "Declare every write node's content intent from "
+            "these facts: whether a file exists is a measured "
+            "fact, not a choice — an intent that contradicts it "
+            "is corrected mechanically where the correction is "
+            "unambiguous, and rejected where it is not (a "
+            "whole-file rewrite of an existing file still needs "
+            "YOUR overwrite_justification and impact-check node)."
+        )
+        return "\n" + "\n".join(lines) + "\n"
+    except Exception:
+        return ""
+
+
 def _skeleton_intent_errors(
     nodes: list[PlanNode],
     repo_root: str | Path | None,
@@ -7080,26 +7445,25 @@ def _skeleton_intent_errors(
     "whole_file" against a missing file is a create mislabeled.
     Pre-filled nodes are exempt — their form was judged by the
     ordinary rules.
+
+    Campaign build #11: existence comes from
+    _skeleton_write_target_facts, the one computation the intent
+    correction and the repair brief's target facts also read —
+    and parse has already corrected the mechanically correctable
+    contradictions before this runs, so what remains here is
+    exactly the non-correctable residue (the unjustified
+    whole-file rewrite, the plan-internal contradiction).
     """
     root = index.root if index is not None else resolve_repo_root(repo_root)
-    root_resolved = Path(root).resolve()
     errors: list[str] = []
-    existing: set[str] = set()
-    for node in nodes:
-        target = _node_write_target(node)
-        if target is None:
-            continue
-        resolved_path = _resolve_plan_target(target, root).resolve()
-        if not resolved_path.is_relative_to(root_resolved):
-            continue
-        resolved = str(resolved_path)
+    for fact in _skeleton_write_target_facts(
+        nodes, repo_root, index, modules
+    ):
+        node = fact.node
+        target = fact.target
+        resolved = fact.resolved
         inputs = node.inputs or {}
-        if modules is not None:
-            on_disk = modules.source(resolved_path) is not None
-        else:
-            on_disk = resolved_path.is_file()
-        prior = resolved in existing or on_disk
-        existing.add(resolved)
+        prior = fact.prior
         if isinstance(inputs.get("content"), str):
             continue
         intent = inputs.get("content_intent")
@@ -11746,6 +12110,7 @@ def _record_planner_attempt(
     node_id: str | None = None,
     target: str | None = None,
     intent: str | None = None,
+    intent_corrections: Collection[dict[str, Any]] = (),
 ) -> None:
     """Persist one planner attempt (see the section above).
 
@@ -11753,6 +12118,13 @@ def _record_planner_attempt(
     text is the rejection's own rendering, capped at
     _ATTEMPT_ERROR_CAP characters — the raw response is NOT
     capped: it is the artifact the record exists to preserve.
+
+    Campaign build #11: ``intent_corrections`` carries the
+    skeleton-intent corrections parse applied to this attempt
+    (accepted or rejected alike); the key is present only when
+    a correction actually happened, so a record from an
+    uncorrected attempt is byte-identical to the pre-build-#11
+    shape.
     """
     error_text = "\n".join(str(error) for error in errors)
     if len(error_text) > _ATTEMPT_ERROR_CAP:
@@ -11771,6 +12143,10 @@ def _record_planner_attempt(
         "intent": intent,
         "response_text": response_text,
     }
+    if intent_corrections:
+        record["intent_corrections"] = [
+            dict(entry) for entry in intent_corrections
+        ]
     header = (
         f"phase={phase} attempt={attempt} outcome={outcome}"
         + (f" node={node_id}" if node_id else "")
@@ -11977,6 +12353,15 @@ def _call_llm_with_repair(
     planner, "replan_skeleton" for a re-plan), with its outcome
     and, on a rejection, the structured error codes. Recording
     changes no decision this function makes.
+
+    Campaign build #11: at the skeleton phases, parse corrects
+    content intents that contradict the tree before judging the
+    attempt (arm #20's five-attempt death on a deterministic
+    fact); the corrections ride the attempt records kept here —
+    from the accepted plan's metadata, or from the rejection
+    itself — and every skeleton repair prompt carries the
+    SKELETON TARGET FACTS block: the rejected skeleton's write
+    targets with their measured existence and legal intents.
     """
     # Retry #22: derive the effective settings once, before the loop,
     # so every call in this planning call (initial + repairs) gets
@@ -12013,6 +12398,11 @@ def _call_llm_with_repair(
             effective_settings, format_schema=plan_envelope_schema()
         )
         planner_schema_owned = True
+    # Campaign build #11: the skeleton-phase flag, captured before
+    # the loop — the empty-plan branch inside it rebinds the local
+    # name ``skeleton`` to the grounded-skeleton TEXT (the
+    # long-standing shadowing), so the phase is read here.
+    is_skeleton_phase = skeleton
     prompt = user_prompt
     last_error: LLMResponseError | None = None
     prev_response_text: str | None = None
@@ -12165,6 +12555,10 @@ def _call_llm_with_repair(
                 attempt=attempt_no,
                 outcome="accepted",
                 response_text=response_text,
+                intent_corrections=metadata.get(
+                    INTENT_CORRECTIONS_METADATA_KEY
+                )
+                or (),
             )
             return nodes, metadata
         except LLMResponseError as exc:
@@ -12186,6 +12580,10 @@ def _call_llm_with_repair(
                 response_text=response_text,
                 error_codes=error_codes,
                 errors=[str(exc)],
+                intent_corrections=getattr(
+                    exc, "intent_corrections", None
+                )
+                or (),
             )
             # Campaign build #4: record this attempt's plan-shape
             # facts BEFORE the budget decision, so the anchoring
@@ -12315,6 +12713,22 @@ def _call_llm_with_repair(
             materialization_block = _materialization_steering_block(
                 response_text, error_codes, repo_root
             )
+            # Campaign build #11: the skeleton target-facts block
+            # — deterministic existence facts for the rejected
+            # skeleton's write targets (exists on disk / created
+            # earlier in this plan / absent), the legal intents
+            # for each, and the corrections this attempt already
+            # received. Skeleton phases only; a non-skeleton
+            # repair brief is byte-unchanged.
+            existence_block = (
+                _skeleton_target_facts_block(
+                    response_text,
+                    repo_root,
+                    getattr(exc, "intent_corrections", None) or (),
+                )
+                if is_skeleton_phase
+                else ""
+            )
             # Campaign build #4: the anchoring block — prior
             # attempts' measured facts + DO-NOT-REGRESS constraints.
             # Empty until a second attempt exists.
@@ -12345,6 +12759,7 @@ def _call_llm_with_repair(
                 f"{steering_block}"
                 f"{extension_block}"
                 f"{materialization_block}"
+                f"{existence_block}"
                 f"{anchoring_block}"
                 f"\nNODE SHAPE — {_NODE_SHAPE_EXAMPLE}\n"
                 f"{skeleton_block}\n"
@@ -13782,6 +14197,18 @@ def _replan_from_brief(
     if metadata.get(CONTRACT_REASK_METADATA_KEY) is not None:
         brief[CONTRACT_REASK_METADATA_KEY] = metadata[
             CONTRACT_REASK_METADATA_KEY
+        ]
+    if metadata.get(INTENT_CORRECTIONS_METADATA_KEY):
+        # Campaign build #11: the delta skeleton's deterministic
+        # intent corrections (the skeleton phase parses through
+        # the same parse_planner_response as the initial planner,
+        # so the correction applies here identically) write back
+        # on the same channel — the loop stamps them into the new
+        # plan version's metadata, so a delta whose declared
+        # intents the system had to correct says so in the run
+        # record.
+        brief["intent_corrections"] = metadata[
+            INTENT_CORRECTIONS_METADATA_KEY
         ]
     if specs:
         brief[SPEC_CONTEXT_METADATA_KEY] = [
