@@ -374,6 +374,14 @@ class LoopRunner:
                     brief["module_contract"] = pinned_contract
                 replan = replan_fn or (lambda b: replan_from_brief(b))
                 new_nodes: list[PlanNode] | None = None
+                # Campaign build #2: the repair seams record WHY
+                # they declined into this list (one structured
+                # record per declined attempt); the records are
+                # audit-logged below and stamped into the new
+                # version's metadata. An injected replan_fn skips
+                # the seams entirely, so the list stays empty then.
+                repair_declines: list[dict[str, Any]] = []
+                declines_logged = 0
                 if replan_fn is None:
                     # Cycle 8: before re-planning the whole task, try
                     # repairing only the node that produced the code a
@@ -390,7 +398,9 @@ class LoopRunner:
                     # override of the whole re-plan step, so the
                     # local seam — part of the default path — is not
                     # attempted under it.
-                    new_nodes = try_local_repair(plan, brief)
+                    new_nodes = try_local_repair(
+                        plan, brief, declines=repair_declines
+                    )
                     if new_nodes is not None:
                         self._log(
                             "loop.replan.local_repair",
@@ -399,6 +409,13 @@ class LoopRunner:
                             version=version,
                         )
                     if new_nodes is None:
+                        declines_logged = self._log_decline_records(
+                            repair_declines,
+                            run_id,
+                            plan.plan_id,
+                            version,
+                            declines_logged,
+                        )
                         # Scoped-edit repair (campaign step 1): when
                         # the single-definition seam cannot identify
                         # its window, try editing the one suspect
@@ -409,13 +426,23 @@ class LoopRunner:
                         # re-plan decision); any doubt returns None
                         # and the whole-task re-plan below runs
                         # exactly as before.
-                        new_nodes = try_scoped_edit_repair(plan, brief)
+                        new_nodes = try_scoped_edit_repair(
+                            plan, brief, declines=repair_declines
+                        )
                         if new_nodes is not None:
                             self._log(
                                 "loop.replan.scoped_edit_repair",
                                 run_id=run_id,
                                 plan_id=plan.plan_id,
                                 version=version,
+                            )
+                        else:
+                            declines_logged = self._log_decline_records(
+                                repair_declines,
+                                run_id,
+                                plan.plan_id,
+                                version,
+                                declines_logged,
                             )
                 if new_nodes is None:
                     try:
@@ -437,6 +464,16 @@ class LoopRunner:
                     break
                 version += 1
                 metadata = dict(plan.metadata or {})
+                if repair_declines:
+                    # Campaign build #2: why each repair seam
+                    # declined rides into the new version's
+                    # metadata, next to the repeat warnings below —
+                    # never silently. (When the judge rejects the
+                    # delta there is no new version to stamp; the
+                    # audit events above still carry the records.)
+                    metadata["repair_declines"] = [
+                        dict(record) for record in repair_declines
+                    ]
                 if brief.get("rejected_approaches"):
                     metadata["rejected_approaches"] = list(
                         brief["rejected_approaches"]
@@ -1105,3 +1142,36 @@ class LoopRunner:
     def _log(self, event: str, **fields: Any) -> None:
         if self._audit_logger is not None:
             self._audit_logger.log(event, **fields)
+
+    def _log_decline_records(
+        self,
+        records: list[dict[str, Any]],
+        run_id: str,
+        plan_id: str,
+        version: int,
+        seen: int,
+    ) -> int:
+        """Audit-log the decline records appended since ``seen``.
+
+        Campaign build #2: one event per record, named for its
+        seam (loop.replan.local_repair_declined /
+        loop.replan.scoped_edit_repair_declined) and carrying the
+        reason code + detail the seam recorded. Returns the new
+        high-water mark, so each record is logged exactly once
+        across the two seam attempts of one re-plan decision.
+        """
+        for record in records[seen:]:
+            event = (
+                "loop.replan.local_repair_declined"
+                if record.get("seam") == "local_repair"
+                else "loop.replan.scoped_edit_repair_declined"
+            )
+            self._log(
+                event,
+                run_id=run_id,
+                plan_id=plan_id,
+                version=version,
+                reason=record.get("reason", ""),
+                detail=record.get("detail", ""),
+            )
+        return len(records)

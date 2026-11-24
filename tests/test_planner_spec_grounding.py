@@ -299,12 +299,38 @@ class TestStubOnlyModuleRule(SpecTreeCase):
     def test_existing_file_rewrite_is_not_new(self) -> None:
         target = self.root / "freetalon" / "pairing" / "store.py"
         _write(target, '"""Old store."""\n')
+        # Campaign build #2: a whole-file rewrite of an existing
+        # file needs the modify-path override (justification + an
+        # impact-check node) before any other rule sees the plan;
+        # with it, the stub-only rule still exempts the rewrite
+        # because the target is not new — the point of this test.
+        plan = json.loads(self._scaffold_plan(str(target), STUB_STORE))
+        plan["nodes"][0]["inputs"]["overwrite_justification"] = (
+            "the module is being replaced wholesale per the contract"
+        )
+        plan["nodes"].append(
+            {
+                "id": "step_2",
+                "objective": "Check the rewrite's impact",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {
+                    "command": (
+                        "./.venv/bin/python -m unittest "
+                        "tests.test_pairing"
+                    ),
+                    "impact_check_for": "freetalon/pairing/store.py",
+                },
+                "outputs": [],
+                "criteria": [{"type": "exit_code", "expected": 0}],
+            }
+        )
         nodes, _metadata = planner_module.parse_planner_response(
-            self._scaffold_plan(str(target), STUB_STORE),
+            json.dumps(plan),
             repo_root=self.root,
             goal_text="Implement the pairing store.",
         )
-        self.assertEqual(len(nodes), 1)
+        self.assertEqual(len(nodes), 2)
 
 
 class TestRepoContextDocsListing(SpecTreeCase):

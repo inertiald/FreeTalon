@@ -18,6 +18,13 @@ from typing import Any, Collection
 from pydantic import ValidationError
 
 from .executor import _command_runs_full_suite
+from .scoped_edits import (
+    ScopedEdit,
+    ScopedEditError,
+    apply_scoped_edits,
+    parse_scoped_edits,
+    python_syntax_error,
+)
 from .intake import (
     LLMBackendError,
     LLMResponseError,
@@ -569,7 +576,12 @@ def _schema_path_merged_records(
         return []
     try:
         records, _cheap = _collect_plan_error_records(
-            nodes, repo_root, goal_text, None, index=repo_index
+            nodes,
+            repo_root,
+            goal_text,
+            None,
+            index=repo_index,
+            plan_context="enrichment",
         )
     except Exception:
         return []
@@ -674,7 +686,12 @@ def _structural_rejection(
     """
     try:
         records, _cheap = _collect_plan_error_records(
-            nodes, repo_root, goal_text, workspace, index=repo_index
+            nodes,
+            repo_root,
+            goal_text,
+            workspace,
+            index=repo_index,
+            plan_context="enrichment",
         )
     except Exception:
         records = []
@@ -778,7 +795,12 @@ def normalize_plan_nodes(
         # same rejection. Duplicate ids, cycles, and self-dependency still
         # raise first, as before.
         extra_records, _cheap = _collect_plan_error_records(
-            nodes, repo_root, goal_text, workspace, index=repo_index
+            nodes,
+            repo_root,
+            goal_text,
+            workspace,
+            index=repo_index,
+            plan_context="enrichment",
         )
         all_records = _error_records(
             "unknown_dependency", unknown_dep_errors, stage=STAGE_SCHEMA
@@ -1218,7 +1240,12 @@ def parse_planner_response(
             if view is not None
         ]
         extra_records, _cheap = _collect_plan_error_records(
-            views, repo_root, goal_text, workspace, index=repo_index
+            views,
+            repo_root,
+            goal_text,
+            workspace,
+            index=repo_index,
+            plan_context="enrichment",
         )
         all_records = _error_records(
             "duplicate_keys", dup_errors, stage=STAGE_SCHEMA
@@ -1326,6 +1353,18 @@ def parse_planner_response(
         if isinstance(node, dict):
             node.pop("responds_to", None)
             node.pop("differs_by", None)
+            # "_materialized_from" is the same class of system-owned
+            # bookkeeping, one level down: materialization stamps it
+            # on a write node's inputs when the node's content was
+            # DERIVED from an edit form (anchored / scoped edits), and
+            # the modify-path rule (campaign build #2) exempts
+            # edit-derived content. A model that emits the key itself
+            # could exempt its own whole-file rewrite, so the raw
+            # value is stripped here — only materialization may set
+            # it, later in this same function.
+            raw_inputs = node.get("inputs")
+            if isinstance(raw_inputs, dict):
+                raw_inputs.pop("_materialized_from", None)
 
     # Deterministic interpreter normalization (retry #27): rewrite
     # the model-spelled interpreter tokens in the plan's bash
@@ -2077,6 +2116,29 @@ _EDIT_SHAPE_EXAMPLE = (
     'the whole module.'
 )
 
+# Campaign build #2 (step 1.5): the second edit form. Where the
+# anchored form names ONE Python definition, the scoped form names
+# exact text spans — the repair seam's primitive (f4f9e35) promoted
+# to a plan form, for any file type: a write node for an EXISTING
+# file carries "edits" (a list of search/replace pairs) instead of
+# "content", and materialization applies them to the file's current
+# text with the same deterministic machinery (exact match, exactly
+# once, all-or-nothing), so the executor again sees an ordinary
+# full-content node and everything outside the spans is preserved
+# by construction.
+_SCOPED_EDIT_SHAPE_EXAMPLE = (
+    'SCOPED EDITS — to change an existing file without retyping '
+    'it, a scaffold node\'s inputs may be {"file_path": "<path>", '
+    '"edits": [{"search": "<text copied exactly from the current '
+    'file>", "replace": "<the new text>"}, ...]} with NO "content": '
+    'each search text must occur exactly once in the file as it '
+    'stands, the system applies every edit mechanically, and '
+    'everything outside the searched spans is preserved exactly. '
+    'Use this (or an anchored edit for one Python definition) '
+    'whenever the target file already exists; reserve whole-file '
+    '"content" for creating a NEW file.'
+)
+
 
 def _definition_spans(source: str) -> list[tuple[str, int, int, int]]:
     """(qualified name, first line, last line, indent) per definition.
@@ -2600,6 +2662,124 @@ def _materialize_scaffold_edit(
     inputs["content"] = materialized
     inputs.pop("anchor", None)
     inputs.pop("position", None)
+    # Provenance for the modify-path rule (campaign build #2): this
+    # content was derived from an edit form, not authored whole —
+    # the validator exempts it. Set only here (parse strips the key
+    # from raw model nodes), never by the model.
+    inputs["_materialized_from"] = "anchored_edit"
+    sources[resolved] = materialized
+    return None
+
+
+def _materialize_scoped_edit(
+    label: str,
+    inputs: dict[str, Any],
+    repo_root: str | Path | None,
+    sources: dict[Path, str],
+) -> tuple[str, bool] | None:
+    """Materialize one node's scoped-edit form in place.
+
+    Mirrors _materialize_scaffold_edit's contract: on success the
+    node's inputs hold the full materialized file as "content"
+    (the "edits" key removed, "_materialized_from" stamped) and
+    None is returned; on failure an (error, False) pair — a
+    scoped-edit failure is never the placeholder class. The base
+    text is the target's current text from the shared ``sources``
+    chain (an earlier node's write in this same plan wins over the
+    file on disk), application is the repair seam's deterministic
+    machinery (exact match, exactly once, all-or-nothing), and the
+    result feeds the chain for later nodes targeting the same file.
+    """
+    if "anchor" in inputs or "position" in inputs:
+        return (
+            f"Planner node '{label}' carries both an anchored edit "
+            "('anchor'/'position') and scoped edits ('edits') — the "
+            "two edit forms are alternatives: an anchored edit "
+            "rewrites ONE Python definition by name, scoped edits "
+            "rewrite exact text spans in any file. Keep one form.",
+            False,
+        )
+    if "content" in inputs:
+        return (
+            f"Planner node '{label}' carries both 'content' and "
+            "'edits' — an edit-form node carries only 'file_path' "
+            "and 'edits' (the system produces the content by "
+            "applying the edits to the current file); a create node "
+            "carries only 'file_path' and 'content'. Drop one.",
+            False,
+        )
+    target = inputs.get("file_path") or inputs.get("path")
+    if not isinstance(target, str) or not target:
+        return (
+            f"Planner node '{label}' carries 'edits' but names no "
+            "'file_path' — scoped edits change the existing file "
+            "named in 'file_path'.",
+            False,
+        )
+    edits_raw = inputs.get("edits")
+    if not isinstance(edits_raw, list) or not edits_raw:
+        return (
+            f"Planner node '{label}' carries 'edits' that is not a "
+            "non-empty list — 'edits' is a list of "
+            '{"search": "<text copied exactly from the current '
+            'file>", "replace": "<the new text>"} objects, one per '
+            "change. To create a new file instead, scaffold its "
+            "full 'content' and drop 'edits'.",
+            False,
+        )
+    edits: list[ScopedEdit] = []
+    for position, entry in enumerate(edits_raw, start=1):
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("search"), str)
+            or not entry.get("search")
+            or not isinstance(entry.get("replace"), str)
+        ):
+            return (
+                f"Planner node '{label}' has an 'edits' entry "
+                f"(#{position}) that is not a usable edit: every "
+                'edit is {"search": "<non-empty text copied exactly '
+                'from the current file>", "replace": "<the new '
+                'text>"} — the search text must be non-empty (an '
+                "empty search is not a create form; scaffold new "
+                "files with 'content').",
+                False,
+            )
+        edits.append(
+            ScopedEdit(search=entry["search"], replace=entry["replace"])
+        )
+    resolved = _resolve_plan_target(target, resolve_repo_root(repo_root))
+    if resolved in sources:
+        source = sources[resolved]
+    else:
+        try:
+            source = resolved.read_text(encoding="utf-8")
+        except OSError:
+            return (
+                f"Planner node '{label}' has scoped edits for "
+                f"{target!r}, which does not exist — scoped edits "
+                "change an existing file; to create a new file, "
+                "scaffold its full 'content' instead, without "
+                "'edits'.",
+                False,
+            )
+    try:
+        materialized = apply_scoped_edits(source, edits)
+    except ScopedEditError as exc:
+        return (
+            f"Planner node '{label}' has scoped edits for {target!r} "
+            f"that do not apply ({exc.kind}): {exc} — every search "
+            "text must be copied character-for-character from the "
+            "file as it stands and occur exactly once in it; widen "
+            "a search text with more surrounding lines until it is "
+            "unique, and never overlap two edits.",
+            False,
+        )
+    inputs["content"] = materialized
+    inputs.pop("edits", None)
+    # Provenance for the modify-path rule, as in the anchored form:
+    # this content was derived from edits, not authored whole.
+    inputs["_materialized_from"] = "scoped_edits"
     sources[resolved] = materialized
     return None
 
@@ -2607,23 +2787,24 @@ def _materialize_scaffold_edit(
 def _materialize_plan_edits(
     nodes_raw: list[Any], repo_root: str | Path | None
 ) -> None:
-    """Rewrite anchored-edit scaffold nodes to full-content nodes.
+    """Rewrite edit-form scaffold nodes to full-content nodes.
 
     Runs on the raw node dicts in parse_planner_response, after
     interpreter normalization and before normalize_plan_nodes — the
     same in-place raw-dict seam. A node is an edit-form node when it
     is a scaffold/file_writer node whose inputs carry an "anchor"
-    (or a stray "position" — a malformed edit, named as such).
-    Legacy full-content nodes are untouched. Errors from every edit
-    node are collected into ONE numbered rejection in the house
-    format, naming the model's own raw node ids; when every error
-    is a placeholder delta, the rejection is cheap (the retry-#17
-    placeholder rule: a comment stub costs the model nothing to
-    replace with real code, so the re-prompt is free) — and its
-    records carry the 'placeholder_delta' code, so the
-    repair loop answers it with the grounded skeleton.
+    (or a stray "position" — a malformed edit, named as such) or
+    "edits" (the scoped form, campaign build #2). Legacy full-content
+    nodes are untouched. Errors from every edit node are collected
+    into ONE numbered rejection in the house format, naming the
+    model's own raw node ids; when every error is a placeholder
+    delta, the rejection is cheap (the retry-#17 placeholder rule:
+    a comment stub costs the model nothing to replace with real
+    code, so the re-prompt is free) — and its records carry the
+    'placeholder_delta' code, so the repair loop answers it with
+    the grounded skeleton. Scoped-edit errors carry 'scoped_edit'.
     """
-    errors: list[tuple[str, bool]] = []
+    errors: list[tuple[str, str]] = []
     sources: dict[Path, str] = {}
     for node_position, raw in enumerate(nodes_raw, start=1):
         if not isinstance(raw, dict):
@@ -2633,13 +2814,27 @@ def _materialize_plan_edits(
         inputs = raw.get("inputs")
         if not isinstance(inputs, dict):
             continue
-        if "anchor" not in inputs and "position" not in inputs:
+        if (
+            "anchor" not in inputs
+            and "position" not in inputs
+            and "edits" not in inputs
+        ):
             continue
         raw_id = raw.get("id")
         label = raw_id if isinstance(raw_id, str) else f"position {node_position}"
+        if "edits" in inputs:
+            outcome = _materialize_scoped_edit(
+                label, inputs, repo_root, sources
+            )
+            if outcome is not None:
+                errors.append((outcome[0], "scoped_edit"))
+            continue
         outcome = _materialize_scaffold_edit(label, inputs, repo_root, sources)
         if outcome is not None:
-            errors.append(outcome)
+            error, placeholder = outcome
+            errors.append(
+                (error, "placeholder_delta" if placeholder else "anchored_edit")
+            )
     if not errors:
         return
     # Structured records (A/B refactor): a placeholder delta carries
@@ -2647,17 +2842,22 @@ def _materialize_plan_edits(
     # the grounded skeleton, not the materialization steering block.
     records = [
         PlanError(
-            code="placeholder_delta" if placeholder else "anchored_edit",
+            code=code,
             message=error,
             node_id=_node_id_from_message(error),
             stage=STAGE_MATERIALIZE,
         )
-        for error, placeholder in errors
+        for error, code in errors
     ]
+    suffix_parts: list[str] = []
+    if any(code != "scoped_edit" for _error, code in errors):
+        suffix_parts.append(_EDIT_SHAPE_EXAMPLE)
+    if any(code == "scoped_edit" for _error, code in errors):
+        suffix_parts.append(_SCOPED_EDIT_SHAPE_EXAMPLE)
     raise _numbered_rejection(
         records,
-        cheap=all(placeholder for _error, placeholder in errors),
-        suffix=f"\n{_EDIT_SHAPE_EXAMPLE}",
+        cheap=all(code == "placeholder_delta" for _error, code in errors),
+        suffix="\n" + "\n".join(suffix_parts),
     )
 
 
@@ -6671,6 +6871,7 @@ def _collect_plan_error_records(
     index: Any | None = None,
     modules: _ModuleSourceCache | None = None,
     contract: Any = _CONTRACT_UNSUPPLIED,
+    plan_context: str = "authored",
 ) -> tuple[list[PlanError], bool]:
     """Collect EVERY plan validation error as structured records.
 
@@ -6704,6 +6905,19 @@ def _collect_plan_error_records(
     ``modules`` is the per-parse cache of existing-module sources, so
     the validators that read module files share one read + parse per
     file per parse call; a fresh cache is created when none is given.
+
+    ``plan_context`` (campaign build #2) names whose plan this is:
+    "authored" (a model's fresh plan, the default), "derivative"
+    (a repair seam's candidate — a mechanical derivative of an
+    already-accepted plan), or "enrichment" (records being gathered
+    to enrich a rejection that already exists). The two gated rules
+    (whole_file_modify, suite_placement) judge how a plan's author
+    CHOSE to express work, and each fires only on an authored plan
+    that no other rule has rejected: a derivative candidate's nodes
+    were judged at acceptance (its culprit's content is an edit
+    product by construction), and an enrichment call serves a plan
+    already under rejection — in both cases the plan is not the
+    otherwise-acceptable plan these rules exist to steer.
 
     Returns (records, cheap): ``cheap`` is True when every error is a
     stand-in / code-overwrite fake (retry #12) or a placeholder scaffold
@@ -6893,6 +7107,34 @@ def _collect_plan_error_records(
     # caller keeps the pre-contract behavior exactly.
     if contract is not _CONTRACT_UNSUPPLIED:
         records.extend(_contract_error_records(nodes, contract, repo_root))
+    # Campaign build #2: the gated authorship rules — the modify-
+    # path rule (an existing file is changed with scoped edits, not
+    # a whole-file rewrite) and the tiered criteria rule (a full-
+    # suite run belongs only on the plan's final gate node). Each
+    # fires ONLY when the plan is authored (plan_context) and every
+    # other rule has passed: a plan rejected for substantive
+    # defects gets those fixed first (the one-defect-class rhythm
+    # of retry #20's placeholder suppression), and the rules bite
+    # with full force on exactly the plans that would otherwise be
+    # accepted — the only plans whose expression choices can do
+    # harm, since a rejected plan never executes. Neither is cheap:
+    # re-expressing a write as edits, or re-tiering a suite run, is
+    # a real regeneration, not a mechanical relocation. The modify
+    # rule runs first; when it fires, the suite rule waits for the
+    # next round, for the same one-class-at-a-time reason.
+    if plan_context == "authored" and not records:
+        modify_records = _error_records(
+            "whole_file_modify",
+            _modify_path_errors(nodes, repo_root, index, modules),
+        )
+        records.extend(modify_records)
+        if not modify_records:
+            records.extend(
+                _error_records(
+                    "suite_placement",
+                    _suite_placement_errors(nodes, repo_root, index),
+                )
+            )
     # Cheap rejection (retry #12): the only errors are stand-in /
     # code-overwrite fakes, so re-prompting costs the model nothing to
     # fix and must not spend the repair budget. A rejection whose only
@@ -6923,6 +7165,278 @@ def _collect_plan_error_records(
         == len(records)
     )
     return records, cheap
+
+
+# --- Campaign build #2: the gated authorship rules -------------------
+#
+# Registered in _collect_plan_error_records under the gate described
+# there (authored plans only, and only when every other rule has
+# passed). Both rules judge how a plan's author expressed the work,
+# never what the work is.
+
+
+def _modify_path_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    index: Any | None = None,
+    modules: Any | None = None,
+) -> list[str]:
+    """Reject authored whole-file writes to files that already exist.
+
+    Campaign build #2 (step 1.5), from live proof-2: the accepted
+    plan's first node rewrote the EXISTING freetalon/api.py
+    whole-file and broke 19 sibling endpoint tests — a whole-file
+    write replaces every line it does not mention, so retyping a
+    file from memory silently reverts whatever the retype omits or
+    misremembers. Prior art is unanimous (Aider / SWE-agent /
+    OpenHands, and Gemini's consultation answer): create and
+    modify are different operations, and no modify path is a
+    wholesale rewrite. The def-retention guard
+    (_scaffold_overwrite_errors) catches a rewrite that DROPS
+    definitions; this rule is the structural one — it judges the
+    form, whatever the content happens to keep.
+
+    A write node violates when its target exists — on disk, or
+    written by an earlier node of this same plan (by execution
+    time the file is there either way) — and its content is an
+    authored whole-file payload. Edit-derived content is exempt:
+    materialization stamps inputs["_materialized_from"] on nodes
+    whose content the system produced from an anchored or scoped
+    edit, and parse strips the key from raw model nodes, so only
+    materialization can set it. The gated override: the node
+    carries a non-empty "overwrite_justification" AND a companion
+    impact-check node exists — another node that depends on the
+    write node and carries inputs["impact_check_for"] naming the
+    same target (path-keyed because normalization remaps node ids,
+    never paths). The justification is for the cases edits cannot
+    carry (an edit set that repeatedly failed to apply, or a
+    rewrite of more than about two-thirds of the file); the impact
+    check is the symbol/test evidence the rewrite is safe.
+
+    Two scoping decisions, both from the rule's own wording ("a
+    target path that EXISTS in the tree"): only targets resolving
+    INSIDE the repo root are judged — a plan's scratch outputs
+    outside the tree (workspace scripts, /tmp artifacts) are not
+    the tree the planner is modifying — and existence is read
+    through the validation pass's module-source cache when the
+    collector threaded one in, so this rule judges the same tree
+    presentation as every other validator (the recorded-fixture
+    pins that present a file as absent apply to it uniformly).
+    """
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    root_resolved = Path(root).resolve()
+    errors: list[str] = []
+    existing: set[str] = set()
+    for node in nodes:
+        target = _node_write_target(node)
+        if target is None:
+            continue
+        resolved_path = _resolve_plan_target(target, root).resolve()
+        if not resolved_path.is_relative_to(root_resolved):
+            continue
+        resolved = str(resolved_path)
+        content = (node.inputs or {}).get("content")
+        if modules is not None:
+            on_disk = modules.source(resolved_path) is not None
+        else:
+            on_disk = resolved_path.is_file()
+        prior = resolved in existing or on_disk
+        if isinstance(content, str) and prior:
+            inputs = node.inputs or {}
+            if inputs.get("_materialized_from") not in (
+                "anchored_edit",
+                "scoped_edits",
+            ):
+                justification = inputs.get("overwrite_justification")
+                has_justification = isinstance(
+                    justification, str
+                ) and bool(justification.strip())
+                has_impact_check = False
+                for other in nodes:
+                    if other is node:
+                        continue
+                    if node.id not in (other.depends_on or []):
+                        continue
+                    named = (other.inputs or {}).get("impact_check_for")
+                    if not isinstance(named, str) or not named:
+                        continue
+                    if (
+                        str(_resolve_plan_target(named, root).resolve())
+                        == resolved
+                    ):
+                        has_impact_check = True
+                        break
+                if not (has_justification and has_impact_check):
+                    missing: list[str] = []
+                    if not has_justification:
+                        missing.append(
+                            'a non-empty "overwrite_justification" '
+                            "explaining why the change cannot be "
+                            "expressed as edits"
+                        )
+                    if not has_impact_check:
+                        missing.append(
+                            "an impact-check node that depends on "
+                            "this node and carries inputs "
+                            '{"impact_check_for": "'
+                            + target
+                            + '"} — a node running the touched '
+                            "module's tests or a symbol-level diff "
+                            "of the rewrite"
+                        )
+                    errors.append(
+                        "Planner node '"
+                        + node.id
+                        + "' writes the whole file "
+                        + repr(target)
+                        + ", which already exists — a whole-file "
+                        "write replaces every line it does not "
+                        "mention, so retyping an existing file from "
+                        "memory silently reverts whatever the "
+                        "retype omits or misremembers. Change the "
+                        "file with scoped edits instead: inputs "
+                        '{"file_path": "'
+                        + target
+                        + '", "edits": [{"search": "<text copied '
+                        "exactly from the current file>\", "
+                        '"replace": "<the new text>"}]} with NO '
+                        '"content" — or, for one Python definition, '
+                        "an anchored edit. Reserve whole-file "
+                        '"content" for creating a NEW file. To keep '
+                        "a whole-file rewrite of an existing file, "
+                        "the node must also carry "
+                        + " AND ".join(missing)
+                        + "."
+                    )
+        existing.add(resolved)
+    return errors
+
+
+def _transitive_ancestors(
+    node: PlanNode, by_id: dict[str, PlanNode]
+) -> set[str]:
+    ancestors: set[str] = set()
+    stack = list(node.depends_on or [])
+    while stack:
+        current = stack.pop()
+        if current in ancestors:
+            continue
+        ancestors.add(current)
+        parent = by_id.get(current)
+        if parent is not None:
+            stack.extend(parent.depends_on or [])
+    return ancestors
+
+
+def _is_gate_node(node: PlanNode, nodes: list[PlanNode]) -> bool:
+    """True when ``node`` is a plan's final verification gate.
+
+    A gate node transitively depends on every node that writes a
+    file, and no write node transitively depends on it — so a
+    suite run placed on it measures the plan's complete product,
+    and nothing written later escapes its verdict. Trailing
+    non-write steps (a live probe, a summary) do not disqualify
+    it: the barrier's purpose is that the suite is the last word
+    over the plan's WRITES, not that it is the plan's last node.
+    When the plan writes nothing, the ancestry condition is
+    vacuous: a pure verification plan's suite node is its gate.
+    """
+    by_id = {item.id: item for item in nodes}
+    ancestors = _transitive_ancestors(node, by_id)
+    writes = [
+        other
+        for other in nodes
+        if other.id != node.id and _node_written_paths(other)
+    ]
+    if any(other.id not in ancestors for other in writes):
+        return False
+    return all(
+        node.id not in _transitive_ancestors(other, by_id)
+        for other in writes
+    )
+
+
+def _suite_placement_errors(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    index: Any | None = None,
+) -> list[str]:
+    """Reject full-suite runs placed anywhere but the final gate.
+
+    Campaign build #2 (tiered criteria): proof-2's plan carried
+    ~13-minute full-suite runs as mid-plan node criteria — two of
+    them burned ~26 minutes, and a suite run attached to a timed
+    criterion is what manufactured the false FAIL record behind
+    the judge-gate defect. Prior art agrees (Aider lints only
+    touched files; SWE-agent's in-loop check is a seconds-long
+    reproduction script; FAIL_TO_PASS lives in the grading layer):
+    the full suite is a boundary artifact, never a per-step
+    assertion. Detection is the executor's own definition,
+    _command_runs_full_suite, applied to a node's own command and
+    to criterion commands — the command forms are where the
+    measured harm lives (proof-2's ~13-minute node criteria; the
+    60-second criterion-command timeout that manufactured the
+    judge-gate defect's false FAIL). A tests_pass criterion over
+    the whole tests directory is deliberately NOT this rule's
+    concern: it is the canonical cycle-9 verification shape,
+    measured through measure's own budget rather than the
+    criterion-command cap, and its failure is an ordinary
+    measured FAIL the judge can re-plan on. The prompts still
+    steer criteria toward targeted tests; this rule hard-stops
+    only the command forms. The exit_code-criterion-command
+    placement is cycle 12's cheap error already — when it fires,
+    this rule is gated off with the rest, so the two never
+    double-name. A node carrying a non-empty
+    "suite_justification" is exempt.
+    """
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    errors: list[str] = []
+    for node in nodes:
+        inputs = node.inputs or {}
+        placement: str | None = None
+        if (node.assigned_claw or "") in ("bash", "shell_exec"):
+            command = inputs.get("command") or inputs.get("cmd")
+            if isinstance(command, str) and _command_runs_full_suite(command):
+                placement = "its own command"
+        if placement is None:
+            for criterion in node.criteria or []:
+                if not isinstance(criterion, dict):
+                    continue
+                command = criterion.get("command")
+                if isinstance(command, str) and _command_runs_full_suite(
+                    command
+                ):
+                    placement = "a criterion command"
+                    break
+
+        if placement is None:
+            continue
+        justification = inputs.get("suite_justification")
+        if isinstance(justification, str) and justification.strip():
+            continue
+        if _is_gate_node(node, nodes):
+            continue
+        errors.append(
+            "Planner node '"
+            + node.id
+            + "' runs the full test suite as "
+            + placement
+            + " — the full suite takes ~13 minutes on this repo "
+            "and is a synchronization barrier, not a per-step "
+            "assertion: placed mid-plan it makes every earlier step "
+            "wait behind a run that can only report the accumulated "
+            "state, and a suite run under a criterion's timeout "
+            "manufactures failures that belong to no step. Default "
+            "to TARGETED tests for the module the node touches "
+            '(for example "python -m unittest tests.test_<module>" '
+            "— seconds). Reserve the full suite for ONE final gate "
+            "node: a node that depends (directly or transitively) "
+            "on every write node in the plan and that no write "
+            "node follows. Or "
+            'carry a non-empty "suite_justification" on this node '
+            "explaining why the suite must run here."
+        )
+    return errors
 
 
 # --- Anti-fake validation (retry #2, run-20261117T054715Z-698173) ---
@@ -11251,7 +11765,7 @@ def _route_literals(source: str) -> list[str]:
 
 def _local_repair_target(
     plan: ExecutionPlan, brief: dict[str, Any], root: Path
-) -> _LocalRepairTarget | None:
+) -> tuple[_LocalRepairTarget | None, tuple[str, str] | None]:
     """Map a brief's first mappable failure to its culprit edit node.
 
     Confidence is all-or-nothing; every requirement is mandatory and
@@ -11273,6 +11787,12 @@ def _local_repair_target(
     - the window text in the culprit node's content is identical to
       the text on disk, so the culprit is the file's current author
       for that definition (no later writer drifted it).
+
+    Campaign build #2: on failure the second element is the decline
+    (reason, detail) of the entry that got FURTHEST through the
+    checks — the binding constraint on the seam, not the first
+    entry's incidental one (an early write-node entry must not mask
+    a later entry's suspect ambiguity).
     """
     nodes_by_id = {node.id: node for node in plan.nodes}
     writers: dict[str, list[PlanNode]] = {}
@@ -11283,16 +11803,28 @@ def _local_repair_target(
         resolved = str(_resolve_plan_target(target, root).resolve())
         writers.setdefault(resolved, []).append(node)
     if not writers:
-        return None
-    for entry in brief.get("failed_nodes") or []:
-        if not isinstance(entry, dict):
-            continue
-        target = _local_repair_target_for_entry(
+        return None, (
+            "no_writers",
+            "no completed write node in this plan version",
+        )
+    entries = [
+        entry
+        for entry in brief.get("failed_nodes") or []
+        if isinstance(entry, dict)
+    ]
+    if not entries:
+        return None, ("no_failed_nodes", "the brief names no failed nodes")
+    best: tuple[str, str] | None = None
+    best_depth = -1
+    for entry in entries:
+        target, decline, depth = _local_repair_target_for_entry(
             plan, entry, nodes_by_id, writers, root
         )
         if target is not None:
-            return target
-    return None
+            return target, None
+        if decline is not None and depth > best_depth:
+            best, best_depth = decline, depth
+    return None, best
 
 
 def _local_repair_target_for_entry(
@@ -11301,25 +11833,46 @@ def _local_repair_target_for_entry(
     nodes_by_id: dict[str, PlanNode],
     writers: dict[str, list[PlanNode]],
     root: Path,
-) -> _LocalRepairTarget | None:
+) -> tuple[_LocalRepairTarget | None, tuple[str, str] | None, int]:
+    """One entry's target search: (target, decline, depth).
+
+    Depth is the ordinal of the check that failed — the caller
+    keeps the deepest entry's decline as the seam's reason
+    (campaign build #2 decline observability).
+    """
     failed_id = entry.get("id")
     failed_node = nodes_by_id.get(failed_id) if isinstance(failed_id, str) else None
     if failed_node is None:
-        return None
+        return None, (
+            "failed_node_unknown",
+            f"failed node {failed_id!r} is not in this plan version",
+        ), 0
     if _node_write_target(failed_node) is not None:
-        return None
+        return None, (
+            "failed_node_is_write",
+            f"failed node {failed_id} is itself a write node",
+        ), 1
     measurement = entry.get("measurement") or failed_node.measurement or {}
     if not isinstance(measurement, dict) or measurement.get("verdict") != VERDICT_FAIL:
-        return None
+        return None, (
+            "no_fail_measurement",
+            f"failed node {failed_id} has no FAIL measurement",
+        ), 2
     results = measurement.get("results") or []
     if not any(
         isinstance(result, dict) and result.get("measured") and not result.get("passed")
         for result in results
     ):
-        return None
+        return None, (
+            "no_measured_failure",
+            f"failed node {failed_id} has no measured failing result",
+        ), 3
     diagnostics = entry.get("diagnostics")
     if not isinstance(diagnostics, str) or not diagnostics.strip():
-        return None
+        return None, (
+            "no_diagnostics",
+            f"failed node {failed_id} carries no diagnostics excerpt",
+        ), 4
     inputs = entry.get("inputs") or failed_node.inputs or {}
     command = inputs.get("command")
     if not isinstance(command, str):
@@ -11343,22 +11896,43 @@ def _local_repair_target_for_entry(
             if resolved in writers and resolved not in candidate_files:
                 candidate_files.append(resolved)
     if len(candidate_files) != 1:
-        return None
+        return None, (
+            "suspect_not_unique",
+            "the failure links to "
+            f"{len(candidate_files)} produced files, not exactly one",
+        ), 5
     resolved = candidate_files[0]
     culprits = writers[resolved]
     if len(culprits) != 1:
-        return None
+        if len(culprits) > 1:
+            return None, (
+                "multiple_writers",
+                f"{len(culprits)} completed write nodes wrote {resolved}",
+            ), 6
+        return None, (
+            "no_completed_writer",
+            f"no completed write node wrote {resolved}",
+        ), 6
     culprit = culprits[0]
     content = (culprit.inputs or {}).get("content")
     if not isinstance(content, str) or not content:
-        return None
+        return None, (
+            "content_missing",
+            f"culprit node {culprit.id} carries no content",
+        ), 7
     try:
         disk_source = Path(resolved).read_text(encoding="utf-8")
     except OSError:
-        return None
+        return None, (
+            "disk_unreadable",
+            f"the suspect file {resolved} cannot be read from disk",
+        ), 8
     spans = _definition_spans(content)
     if not spans:
-        return None
+        return None, (
+            "no_definitions",
+            f"no definition spans in {resolved}",
+        ), 9
     qualified: str | None = None
     span: tuple[int, int] | None = None
     indent = 0
@@ -11376,14 +11950,21 @@ def _local_repair_target_for_entry(
                 if name is not None:
                     anchors.add(name)
         if len(anchors) != 1:
-            return None
+            return None, (
+                "window_not_identified",
+                f"{len(anchors)} route-branch anchors in {resolved}, "
+                "not exactly one, and no frame line names a window",
+            ), 10
         qualified = anchors.pop()
         for item in spans:
             if item[0] == qualified:
                 span, indent = (item[1], item[2]), item[3]
                 break
         if span is None:
-            return None
+            return None, (
+                "window_not_identified",
+                f"anchor {qualified} has no span in {resolved}",
+            ), 10
     lines = content.splitlines()
     window = "\n".join(lines[span[0] - 1 : span[1]])
     disk_lines = disk_source.splitlines()
@@ -11391,10 +11972,17 @@ def _local_repair_target_for_entry(
         qualified
     )
     if disk_span is None:
-        return None
+        return None, (
+            "disk_window_missing",
+            f"definition {qualified} is not present in {resolved} on disk",
+        ), 11
     disk_window = "\n".join(disk_lines[disk_span[1] - 1 : disk_span[2]])
     if disk_window != window:
-        return None
+        return None, (
+            "disk_drift",
+            f"the on-disk text of {qualified} in {resolved} differs "
+            "from the culprit node's content",
+        ), 12
     return _LocalRepairTarget(
         failed_id=failed_id,
         culprit_id=culprit.id,
@@ -11405,7 +11993,7 @@ def _local_repair_target_for_entry(
         window=window,
         diagnostics=diagnostics,
         criterion_detail=measurement_failed_detail(measurement),
-    )
+    ), None, 13
 
 
 
@@ -11551,6 +12139,7 @@ def try_local_repair(
     plan: ExecutionPlan,
     brief: dict[str, Any],
     settings: LLMSettings | None = None,
+    declines: list[dict[str, Any]] | None = None,
 ) -> list[PlanNode] | None:
     """Attempt a node-local repair of a failed plan version (cycle 8).
 
@@ -11562,10 +12151,26 @@ def try_local_repair(
     candidate fails the full validator stack. None always means the
     caller proceeds with the whole-task re-plan exactly as before;
     this function never raises.
+
+    Campaign build #2: when ``declines`` is supplied, a None return
+    appends exactly one structured record to it —
+    {"seam": "local_repair", "reason": <code>, "detail": <short
+    string>} — including the blanket-exception path below
+    (reason "internal_error"), so a decline is never again
+    observable only as the absence of a success.
     """
+    before = len(declines) if declines is not None else 0
     try:
-        return _try_local_repair(plan, brief, settings)
-    except Exception:  # noqa: BLE001 - any doubt falls back to whole-task re-plan
+        return _try_local_repair(plan, brief, settings, declines)
+    except Exception as exc:  # noqa: BLE001 - any doubt falls back to whole-task re-plan
+        if declines is not None and len(declines) == before:
+            declines.append(
+                {
+                    "seam": "local_repair",
+                    "reason": "internal_error",
+                    "detail": str(exc)[:200],
+                }
+            )
         return None
 
 
@@ -11573,7 +12178,15 @@ def _try_local_repair(
     plan: ExecutionPlan,
     brief: dict[str, Any],
     settings: LLMSettings | None,
+    declines: list[dict[str, Any]] | None = None,
 ) -> list[PlanNode] | None:
+    def decline(reason: str, detail: str = "") -> None:
+        if declines is not None:
+            declines.append(
+                {"seam": "local_repair", "reason": reason, "detail": detail}
+            )
+        return None
+
     metadata = plan.metadata or {}
     pinned_contract = _contract_from_metadata(metadata)
     stamped = metadata.get("repo_root")
@@ -11582,9 +12195,10 @@ def _try_local_repair(
         if isinstance(stamped, str) and stamped
         else resolve_repo_root(None)
     )
-    target = _local_repair_target(plan, brief, root)
+    target, target_decline = _local_repair_target(plan, brief, root)
     if target is None:
-        return None
+        reason, detail = target_decline or ("no_target", "")
+        return decline(reason, detail)
     culprit = next(node for node in plan.nodes if node.id == target.culprit_id)
     content = (culprit.inputs or {})["content"]
     goal = brief.get("goal")
@@ -11611,11 +12225,19 @@ def _try_local_repair(
     response = call_llm(system_prompt, user_prompt, settings=effective)
     extracted = _extract_repaired_definition(response, target.qualified_name)
     if extracted is None:
-        return None
+        return decline(
+            "no_definition_extracted",
+            "the model's answer holds no definition matching "
+            f"{target.qualified_name}",
+        )
     repaired_lines, response_indent = extracted
     shifted = _shift_lines(repaired_lines, target.indent - response_indent)
     if shifted is None:
-        return None
+        return decline(
+            "splice_indent_failed",
+            "the repaired definition cannot be re-indented to the "
+            "window's indentation",
+        )
     lines = content.splitlines()
     new_content = "\n".join(
         lines[: target.span[0] - 1] + shifted + lines[target.span[1] :]
@@ -11623,16 +12245,23 @@ def _try_local_repair(
     if content.endswith("\n"):
         new_content += "\n"
     if new_content == content:
-        return None
+        return decline("no_change", "the splice reproduces the file exactly")
     new_spans = {item[0]: item for item in _definition_spans(new_content)}
     new_span = new_spans.get(target.qualified_name)
     if new_span is None:
-        return None
+        return decline(
+            "definition_vanished",
+            f"the spliced file no longer defines {target.qualified_name}",
+        )
     new_window = "\n".join(
         new_content.splitlines()[new_span[1] - 1 : new_span[2]]
     )
     if new_window == target.window:
-        return None
+        return decline(
+            "window_unchanged",
+            f"the repaired {target.qualified_name} is identical to "
+            "the window as it stood",
+        )
     nodes = _local_repair_candidate_nodes(plan, target, new_content)
     workspace = (plan.intent.constraints or {}).get("workspace")
     records, _cheap = _collect_plan_error_records(
@@ -11647,9 +12276,14 @@ def _try_local_repair(
             if pinned_contract is not None
             else _CONTRACT_UNSUPPLIED
         ),
+        plan_context="derivative",
     )
     if records:
-        return None
+        return decline(
+            "validator_records",
+            "candidate rejected: "
+            + ", ".join(sorted({record.code for record in records})),
+        )
     return nodes
 
 
@@ -11688,19 +12322,34 @@ def _try_local_repair(
 # itself. The attempt rides the caller's re-plan decision, so it
 # consumes exactly one unit of the existing re-plan budget, the
 # same as cycle 8's repair and the whole-task re-plan.
+#
+# Campaign build #2 (2026-11-23): two changes. (1) Decline
+# observability — every None path in this seam (and, for symmetry,
+# cycle 8's) records a structured reason through the optional
+# ``declines`` out-param; arm #10's silent decline at its only
+# repair opportunity is the defect this ends. (2) Pair support —
+# the target is the suspect map's module UNION, and a union of two
+# files is now a target (per-file all-or-nothing, candidate-level
+# atomicity): arm #10's span was exactly two files (store.poll +
+# server.do_GET), the shape the single-file seam could not take.
 
 from .prompts import SCOPED_EDIT_REPAIR_SYSTEM_PROMPT as _SCOPED_EDIT_PROMPT
-from .scoped_edits import (
-    ScopedEditError,
-    apply_scoped_edits,
-    parse_scoped_edits,
-    python_syntax_error,
-)
+
+# (The scoped_edits names — ScopedEdit, ScopedEditError,
+# apply_scoped_edits, parse_scoped_edits, python_syntax_error —
+# are imported at the top of this module since campaign build #2,
+# which also uses them in plan materialization.)
 
 # The model must hold the suspect file verbatim to write exact
 # SEARCH text; beyond this size the seam declines rather than
 # truncating the file it would ask the model to match against.
 _SCOPED_EDIT_MAX_FILE_CHARS = 24_000
+
+# Campaign build #2: pair support (below) lets the seam target a
+# minimal PAIR of suspect files in one candidate. The model must
+# hold BOTH files verbatim, so the pair's combined size is capped
+# tighter than twice the single-file cap.
+_SCOPED_EDIT_MAX_PAIR_CHARS = 36_000
 
 
 @dataclass(frozen=True)
@@ -11716,15 +12365,55 @@ class _ScopedEditTarget:
     criterion_detail: str  # one-line summary for the differs_by note
 
 
-def _scoped_edit_target(
+def _scoped_edit_targets(
     plan: ExecutionPlan,
     brief: dict[str, Any],
     root: Path,
     suspect_map: dict[str, dict[str, Any]],
-) -> _ScopedEditTarget | None:
-    failing = [str(test) for test in brief.get("failing_tests") or []]
-    if not failing or len(failing) > _SUSPECT_TEST_CAP:
+    declines: list[dict[str, Any]] | None = None,
+) -> list[_ScopedEditTarget] | None:
+    """The seam's targets: ONE suspect file, or a minimal PAIR.
+
+    The suspect map (from _replan_diagnostics) names, per failing
+    test, the produced modules it exercises; the seam's field is
+    the UNION of those modules. Campaign step 1 fired only on a
+    union of exactly one; arm #10's only repair opportunity had a
+    union of two (the failing poll behavior spanned store.poll and
+    server.do_GET) and declined silently. Campaign build #2: a
+    union of one or two files is a target — per-file requirements
+    unchanged (exactly one completed writer, node content
+    byte-identical to disk, the file is never a failing test's own
+    file, <= the per-file size cap) plus a combined cap for the
+    pair. A union of zero or of three-plus still declines: beyond
+    a pair the suspect span is a re-plan's work, not a seam's.
+
+    Every decline appends its record to ``declines`` when supplied
+    (campaign build #2 observability), naming the binding reason.
+    """
+
+    def decline(reason: str, detail: str = "") -> None:
+        if declines is not None:
+            declines.append(
+                {
+                    "seam": "scoped_edit_repair",
+                    "reason": reason,
+                    "detail": detail,
+                }
+            )
         return None
+
+    failing = [str(test) for test in brief.get("failing_tests") or []]
+    if not failing:
+        return decline(
+            "no_failing_tests", "the brief names no failing tests"
+        )
+    if len(failing) > _SUSPECT_TEST_CAP:
+        return decline(
+            "suspect_cap_exceeded",
+            f"{len(failing)} failing tests exceed the suspect cap "
+            f"of {_SUSPECT_TEST_CAP}; the suspect map would be "
+            "partial evidence",
+        )
     modules: set[str] = set()
     test_files: set[str] = set()
     for entry in suspect_map.values():
@@ -11735,13 +12424,19 @@ def _scoped_edit_target(
         for module in entry.get("modules") or []:
             if isinstance(module, str):
                 modules.add(module)
-    if len(modules) != 1:
-        return None
-    relative = next(iter(modules))
-    if relative in test_files:
-        # The one exercised "module" is a failing test's own file:
-        # editing the measurement is outside this seam.
-        return None
+    if not modules:
+        return decline(
+            "no_suspect_module",
+            "the failing tests exercise no produced module",
+        )
+    if len(modules) > 2:
+        return decline(
+            "suspect_not_unique",
+            "the failing tests exercise "
+            f"{len(modules)} produced modules ("
+            + ", ".join(sorted(modules))
+            + "); the seam targets one file or a minimal pair",
+        )
     writers: dict[str, list[PlanNode]] = {}
     for node in plan.nodes:
         target = _node_write_target(node)
@@ -11749,22 +12444,6 @@ def _scoped_edit_target(
             continue
         resolved = str(_resolve_plan_target(target, root).resolve())
         writers.setdefault(resolved, []).append(node)
-    resolved_target = str(_resolve_plan_target(relative, root).resolve())
-    culprits = writers.get(resolved_target) or []
-    if len(culprits) != 1:
-        return None
-    culprit = culprits[0]
-    content = (culprit.inputs or {}).get("content")
-    if not isinstance(content, str) or not content:
-        return None
-    if len(content) > _SCOPED_EDIT_MAX_FILE_CHARS:
-        return None
-    try:
-        disk_source = Path(resolved_target).read_text(encoding="utf-8")
-    except OSError:
-        return None
-    if disk_source != content:
-        return None
     failed_id: str | None = None
     for entry in brief.get("failed_nodes") or []:
         if isinstance(entry, dict) and isinstance(entry.get("id"), str):
@@ -11773,58 +12452,216 @@ def _scoped_edit_target(
     detail = f"{len(failing)} failing test(s): {failing[0]}"
     if len(failing) > 1:
         detail += f" (+{len(failing) - 1} more)"
-    return _ScopedEditTarget(
-        failed_id=failed_id,
-        culprit_id=culprit.id,
-        target_path=resolved_target,
-        relative_path=relative,
-        content=content,
-        failing_tests=failing,
-        criterion_detail=detail,
-    )
+    targets: list[_ScopedEditTarget] = []
+    for relative in sorted(modules):
+        if relative in test_files:
+            # An exercised "module" that is a failing test's own
+            # file: editing the measurement is outside this seam.
+            return decline(
+                "test_file_target",
+                f"suspect {relative} is a failing test's own file",
+            )
+        resolved_target = str(_resolve_plan_target(relative, root).resolve())
+        culprits = writers.get(resolved_target) or []
+        if len(culprits) != 1:
+            if len(culprits) > 1:
+                return decline(
+                    "multiple_writers",
+                    f"{len(culprits)} completed write nodes wrote "
+                    f"{relative}",
+                )
+            return decline(
+                "no_completed_writer",
+                f"no completed write node wrote {relative}",
+            )
+        culprit = culprits[0]
+        content = (culprit.inputs or {}).get("content")
+        if not isinstance(content, str) or not content:
+            return decline(
+                "content_missing",
+                f"culprit node {culprit.id} carries no content",
+            )
+        if len(content) > _SCOPED_EDIT_MAX_FILE_CHARS:
+            return decline(
+                "file_too_large",
+                f"{relative} is {len(content)} chars, over the "
+                f"{_SCOPED_EDIT_MAX_FILE_CHARS}-char seam cap",
+            )
+        try:
+            disk_source = Path(resolved_target).read_text(encoding="utf-8")
+        except OSError:
+            return decline(
+                "disk_unreadable",
+                f"the suspect file {relative} cannot be read from disk",
+            )
+        if disk_source != content:
+            return decline(
+                "disk_drift",
+                f"the on-disk text of {relative} differs from the "
+                "culprit node's content",
+            )
+        targets.append(
+            _ScopedEditTarget(
+                failed_id=failed_id,
+                culprit_id=culprit.id,
+                target_path=resolved_target,
+                relative_path=relative,
+                content=content,
+                failing_tests=failing,
+                criterion_detail=detail,
+            )
+        )
+    if len(targets) == 2:
+        combined = sum(len(target.content) for target in targets)
+        if combined > _SCOPED_EDIT_MAX_PAIR_CHARS:
+            return decline(
+                "pair_too_large",
+                f"the pair is {combined} chars combined, over the "
+                f"{_SCOPED_EDIT_MAX_PAIR_CHARS}-char pair cap",
+            )
+    return targets
 
 
 def _scoped_edit_prompts(
     goal_text: str,
-    target: _ScopedEditTarget,
+    targets: list[_ScopedEditTarget],
     diagnostics_block: str,
     spec_block: str = "",
 ) -> tuple[str, str]:
-    """The scoped-edit ask: the diagnostics, the file as it stands,
-    and the demand — edit blocks only, copied exactly, for this one
-    file. When the goal names a spec, ``spec_block`` carries its
-    verbatim text (spec grounding, as in the other repair paths).
+    """The scoped-edit ask: the diagnostics, the file(s) as they
+    stand, and the demand — edit blocks only, copied exactly. For
+    a pair (campaign build #2), both files are shown under FILE:
+    headers and the answer must group its blocks under the same
+    headers, one section per file. When the goal names a spec,
+    ``spec_block`` carries its verbatim text (spec grounding, as
+    in the other repair paths).
     """
     spec_section = f"{spec_block}\n\n" if spec_block else ""
+    if len(targets) == 1:
+        target = targets[0]
+        user_prompt = (
+            f"THE TASK IS UNCHANGED: {goal_text}\n\n"
+            f"{spec_section}"
+            f"One step of the current plan (node {target.culprit_id}) wrote "
+            f"{target.relative_path}, and later steps measured the result: "
+            f"{target.criterion_detail}.\n\n"
+            f"{diagnostics_block}\n\n"
+            f"The file below is {target.relative_path}, exactly as it "
+            f"stands in the file now:\n\n"
+            f"{target.content}\n\n"
+            "Return ONLY search/replace edit blocks for this one file, "
+            "in the format the system prompt shows — one block per "
+            "change, every SEARCH text copied character-for-character "
+            "from the file above and appearing exactly once in it. Do "
+            "not write the whole file and do not touch any other file."
+        )
+        return _SCOPED_EDIT_PROMPT, user_prompt
+    files_section = "\n\n".join(
+        f"FILE: {target.relative_path}\n\n{target.content}"
+        for target in targets
+    )
+    names = " and ".join(target.relative_path for target in targets)
     user_prompt = (
         f"THE TASK IS UNCHANGED: {goal_text}\n\n"
         f"{spec_section}"
-        f"One step of the current plan (node {target.culprit_id}) wrote "
-        f"{target.relative_path}, and later steps measured the result: "
-        f"{target.criterion_detail}.\n\n"
+        f"Steps of the current plan wrote {names}, and later steps "
+        f"measured the result: {targets[0].criterion_detail}. The "
+        "failure spans both files; each is shown below exactly as "
+        f"it stands now, under its FILE: header.\n\n"
         f"{diagnostics_block}\n\n"
-        f"The file below is {target.relative_path}, exactly as it "
-        f"stands in the file now:\n\n"
-        f"{target.content}\n\n"
-        "Return ONLY search/replace edit blocks for this one file, "
-        "in the format the system prompt shows — one block per "
-        "change, every SEARCH text copied character-for-character "
-        "from the file above and appearing exactly once in it. Do "
-        "not write the whole file and do not touch any other file."
+        f"{files_section}\n\n"
+        "Return search/replace edit blocks for these two files "
+        "ONLY, grouped under a line 'FILE: <path>' naming each "
+        "file exactly as shown — one section per file, every "
+        "SEARCH text copied character-for-character from its own "
+        "file's section and appearing exactly once in that file. "
+        "Do not write either whole file and do not touch any "
+        "other file."
     )
-    return _SCOPED_EDIT_PROMPT, user_prompt
+    pair_addendum = (
+        "\n\nPAIR FORM: this repair spans TWO files. Group the "
+        "blocks under a line 'FILE: <path>' per file, exactly as "
+        "the task names them; every SEARCH text belongs to the "
+        "file of its own section."
+    )
+    return _SCOPED_EDIT_PROMPT + pair_addendum, user_prompt
+
+
+def _scoped_edit_sections(
+    response: str, targets: list[_ScopedEditTarget]
+) -> tuple[dict[str, list[ScopedEdit]] | None, str | None]:
+    """Split a scoped-edit response into per-file edit lists.
+
+    Returns (sections, None) on success — sections maps each
+    target's relative path to its edits — or (None, problem) with
+    problem "malformed" (a block or FILE section that does not
+    parse), "empty" (a file's section carries no blocks), or
+    "missing_section" (a pair target has no section). The single-
+    file form is the step-1 format unchanged: bare blocks, no
+    header. The pair form requires one 'FILE: <path>' section per
+    target; a block marker before the first header, an unknown or
+    repeated header, is malformed — a block in the wrong section
+    then fails application against that section's file, which is
+    the atomicity the candidate relies on.
+    """
+    if len(targets) == 1:
+        edits = parse_scoped_edits(response)
+        if edits is None:
+            return None, "malformed"
+        if not edits:
+            return None, "empty"
+        return {targets[0].relative_path: edits}, None
+    wanted = {target.relative_path for target in targets}
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in response.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("FILE:"):
+            name = stripped[len("FILE:") :].strip()
+            if name not in wanted or name in sections:
+                return None, "malformed"
+            sections[name] = []
+            current = name
+            continue
+        if current is None:
+            if stripped.startswith(("<<<<<<<", "=======", ">>>>>>>")):
+                return None, "malformed"
+            continue
+        sections[current].append(line)
+    if len(sections) != len(targets):
+        return None, "missing_section"
+    parsed: dict[str, list[ScopedEdit]] = {}
+    for target in targets:
+        edits = parse_scoped_edits("\n".join(sections[target.relative_path]))
+        if edits is None:
+            return None, "malformed"
+        if not edits:
+            return None, "empty"
+        parsed[target.relative_path] = edits
+    return parsed, None
 
 
 def _scoped_edit_candidate_nodes(
-    plan: ExecutionPlan, target: _ScopedEditTarget, new_content: str
+    plan: ExecutionPlan,
+    edited: list[tuple[_ScopedEditTarget, str]],
 ) -> list[PlanNode]:
-    """Same plan, one node's content replaced by the edited file.
+    """Same plan, the edited nodes' contents replaced.
 
     Mirrors _local_repair_candidate_nodes (cycle 8): every node is
-    deep-copied with its execution state reset, only the culprit's
-    content changes, and the culprit records what it answers so the
-    judge's delta validation sees a genuine, stated difference.
+    deep-copied with its execution state reset, only the culprits'
+    contents change, and each culprit records what it answers so
+    the judge's delta validation sees a genuine, stated
+    difference. ``edited`` carries one (target, new content) pair
+    per edited file — one for a single-file repair, two for a pair
+    (campaign build #2); each file's edit set was applied
+    all-or-nothing before this builder runs, so the candidate is
+    never half-applied.
     """
+    replacements = {
+        target.culprit_id: (target, new_content)
+        for target, new_content in edited
+    }
+    pair = len(edited) > 1
     nodes: list[PlanNode] = []
     for node in plan.nodes:
         copied = node.model_copy(deep=True)
@@ -11837,10 +12674,13 @@ def _scoped_edit_candidate_nodes(
         for key in _EXECUTOR_RESIDUE_INPUT_KEYS:
             inputs.pop(key, None)
         copied.inputs = inputs
-        if copied.id == target.culprit_id:
+        if copied.id in replacements:
+            target, new_content = replacements[copied.id]
             copied.inputs = {**inputs, "content": new_content}
             note = (
-                f"scoped-edit repair: {target.relative_path} edited in "
+                f"scoped-edit repair"
+                + (" (pair)" if pair else "")
+                + f": {target.relative_path} edited in "
                 f"response to the measured failure "
                 f"({target.criterion_detail}); search/replace blocks "
                 f"applied mechanically to the file as it stood, the "
@@ -11859,22 +12699,40 @@ def try_scoped_edit_repair(
     plan: ExecutionPlan,
     brief: dict[str, Any],
     settings: LLMSettings | None = None,
+    declines: list[dict[str, Any]] | None = None,
 ) -> list[PlanNode] | None:
     """Attempt a scoped-edit repair of a failed plan version.
 
     Returns the replacement node list for a new version of the same
-    plan — the one suspect file's content with the model's
+    plan — the suspect file's (or pair's) content with the model's
     search/replace blocks applied, every other node preserved — or
     None when the suspect cannot be identified with confidence, the
-    model's answer carries no applicable edit set, the edited file
+    model's answer carries no applicable edit set, an edited file
     fails syntax or the full validator stack, or the edit changes
     nothing. None always means the caller proceeds with the
     whole-task re-plan exactly as before; this function never
     raises.
+
+    Campaign build #2: when ``declines`` is supplied, a None return
+    appends exactly one structured record to it —
+    {"seam": "scoped_edit_repair", "reason": <code>, "detail":
+    <short string>} — including the blanket-exception path below
+    (reason "internal_error"). Arm #10 declined its only repair
+    opportunity with no trace anywhere; that is the defect this
+    record exists to end.
     """
+    before = len(declines) if declines is not None else 0
     try:
-        return _try_scoped_edit_repair(plan, brief, settings)
-    except Exception:  # noqa: BLE001 - any doubt falls back to whole-task re-plan
+        return _try_scoped_edit_repair(plan, brief, settings, declines)
+    except Exception as exc:  # noqa: BLE001 - any doubt falls back to whole-task re-plan
+        if declines is not None and len(declines) == before:
+            declines.append(
+                {
+                    "seam": "scoped_edit_repair",
+                    "reason": "internal_error",
+                    "detail": str(exc)[:200],
+                }
+            )
         return None
 
 
@@ -11882,7 +12740,19 @@ def _try_scoped_edit_repair(
     plan: ExecutionPlan,
     brief: dict[str, Any],
     settings: LLMSettings | None,
+    declines: list[dict[str, Any]] | None = None,
 ) -> list[PlanNode] | None:
+    def decline(reason: str, detail: str = "") -> None:
+        if declines is not None:
+            declines.append(
+                {
+                    "seam": "scoped_edit_repair",
+                    "reason": reason,
+                    "detail": detail,
+                }
+            )
+        return None
+
     metadata = plan.metadata or {}
     pinned_contract = _contract_from_metadata(metadata)
     stamped = metadata.get("repo_root")
@@ -11908,12 +12778,19 @@ def _try_scoped_edit_repair(
         spec_paths=[spec.path for spec in specs],
     )
     if not diagnostics_block:
-        return None
-    target = _scoped_edit_target(plan, brief, root, suspect_map)
-    if target is None:
+        return decline(
+            "no_diagnostics",
+            "the brief names no failing tests, so no diagnostics "
+            "block (and no suspect map) was computed",
+        )
+    targets = _scoped_edit_targets(
+        plan, brief, root, suspect_map, declines
+    )
+    if targets is None:
+        # _scoped_edit_targets recorded the reason itself.
         return None
     system_prompt, user_prompt = _scoped_edit_prompts(
-        goal_text, target, diagnostics_block, format_spec_context(specs)
+        goal_text, targets, diagnostics_block, format_spec_context(specs)
     )
     effective = settings or LLMSettings.from_env()
     if effective.num_ctx is None:
@@ -11924,19 +12801,52 @@ def _try_scoped_edit_repair(
         # two-channel finding).
         effective = dataclass_replace(effective, format_schema=None)
     response = call_llm(system_prompt, user_prompt, settings=effective)
-    edits = parse_scoped_edits(response)
-    if not edits:
-        return None
-    try:
-        new_content = apply_scoped_edits(target.content, edits)
-    except ScopedEditError:
-        return None
-    if new_content == target.content:
-        return None
-    if target.relative_path.endswith(".py"):
-        if python_syntax_error(new_content) is not None:
-            return None
-    nodes = _scoped_edit_candidate_nodes(plan, target, new_content)
+    sections, problem = _scoped_edit_sections(response, targets)
+    if sections is None:
+        if problem == "malformed":
+            return decline(
+                "malformed_edit_blocks",
+                "the model's response carries a malformed edit "
+                "block or FILE section",
+            )
+        if problem == "missing_section":
+            return decline(
+                "no_edit_blocks",
+                "the model's response has no FILE section for one "
+                "of the pair's files",
+            )
+        return decline(
+            "no_edit_blocks",
+            "the model's response carries no edit blocks",
+        )
+    edited: list[tuple[_ScopedEditTarget, str]] = []
+    for target in targets:
+        try:
+            new_content = apply_scoped_edits(
+                target.content, sections[target.relative_path]
+            )
+        except ScopedEditError as exc:
+            # Candidate-level atomicity: one file's failing edit
+            # set declines the whole candidate — a half-applied
+            # pair is never produced.
+            return decline(
+                "blocks_failed_to_apply",
+                f"{target.relative_path}: {exc.kind}: {exc}",
+            )
+        if new_content == target.content:
+            return decline(
+                "no_change",
+                f"the edit set for {target.relative_path} changes "
+                "nothing",
+            )
+        if target.relative_path.endswith(".py"):
+            syntax = python_syntax_error(new_content)
+            if syntax is not None:
+                return decline(
+                    "syntax_error", f"{target.relative_path}: {syntax}"
+                )
+        edited.append((target, new_content))
+    nodes = _scoped_edit_candidate_nodes(plan, edited)
     workspace = (plan.intent.constraints or {}).get("workspace")
     records, _cheap = _collect_plan_error_records(
         nodes,
@@ -11950,7 +12860,12 @@ def _try_scoped_edit_repair(
             if pinned_contract is not None
             else _CONTRACT_UNSUPPLIED
         ),
+        plan_context="derivative",
     )
     if records:
-        return None
+        return decline(
+            "validator_records",
+            "candidate rejected: "
+            + ", ".join(sorted({record.code for record in records})),
+        )
     return nodes

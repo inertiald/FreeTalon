@@ -478,7 +478,13 @@ class TestScopedEditSeam(ScopedEditSeamCase):
         )
         self.assertIsNone(result)
 
-    def test_two_suspect_modules_decline_before_any_call(self):
+    def test_two_suspect_modules_attempt_a_pair_repair(self):
+        # Campaign build #2 superseded this test's original shape
+        # ("two suspect modules decline before any call"): a span
+        # of exactly two files is now ONE pair candidate. The seam
+        # calls the model once with the pair prompt; a bare
+        # single-file response (no FILE: sections) cannot apply to
+        # a pair, so the seam still declines — after the call.
         nodes = self._nodes(with_server=True)
         brief = self._brief(
             failing_tests=[
@@ -498,7 +504,8 @@ class TestScopedEditSeam(ScopedEditSeamCase):
             brief=brief,
         )
         self.assertIsNone(result)
-        self.assertEqual(calls, [])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("PAIR FORM", calls[0][0])
 
     def test_no_failing_tests_declines_before_any_call(self):
         result, calls = self._run(

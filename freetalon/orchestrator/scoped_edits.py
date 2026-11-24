@@ -39,7 +39,18 @@ _REPLACE_MARKER = ">>>>>>> REPLACE"
 
 
 class ScopedEditError(ValueError):
-    """A scoped edit set cannot be applied exactly as written."""
+    """A scoped edit set cannot be applied exactly as written.
+
+    ``kind`` names the failure class (empty_set, empty_search,
+    no_op_edit, not_found, ambiguous, overlap, no_change) so a
+    caller recording WHY an edit set failed — the repair seams'
+    decline records, the plan materializer's steering message —
+    can carry the class, not just the prose.
+    """
+
+    def __init__(self, message: str, *, kind: str = "invalid") -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 @dataclass(frozen=True)
@@ -109,36 +120,43 @@ def apply_scoped_edits(content: str, edits: list[ScopedEdit]) -> str:
     only returned whole).
     """
     if not edits:
-        raise ScopedEditError("the edit set is empty")
+        raise ScopedEditError("the edit set is empty", kind="empty_set")
     spans: list[tuple[int, int, str]] = []
     for edit in edits:
         if not edit.search:
-            raise ScopedEditError("an edit's search text is empty")
+            raise ScopedEditError(
+                "an edit's search text is empty", kind="empty_search"
+            )
         if edit.search == edit.replace:
             raise ScopedEditError(
-                "an edit's replacement is identical to its search text"
+                "an edit's replacement is identical to its search text",
+                kind="no_op_edit",
             )
         first = content.find(edit.search)
         if first == -1:
             raise ScopedEditError(
                 "a search text does not occur in the content: "
-                + repr(edit.search[:80])
+                + repr(edit.search[:80]),
+                kind="not_found",
             )
         if content.find(edit.search, first + 1) != -1:
             raise ScopedEditError(
                 "a search text occurs more than once in the content: "
-                + repr(edit.search[:80])
+                + repr(edit.search[:80]),
+                kind="ambiguous",
             )
         spans.append((first, first + len(edit.search), edit.replace))
     spans.sort(key=lambda span: span[0])
     for previous, current in zip(spans, spans[1:]):
         if current[0] < previous[1]:
-            raise ScopedEditError("two edits' search spans overlap")
+            raise ScopedEditError(
+                "two edits' search spans overlap", kind="overlap"
+            )
     result = content
     for start, end, replace in reversed(spans):
         result = result[:start] + replace + result[end:]
     if result == content:
-        raise ScopedEditError("the edit set changes nothing")
+        raise ScopedEditError("the edit set changes nothing", kind="no_change")
     return result
 
 

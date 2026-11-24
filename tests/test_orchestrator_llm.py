@@ -3445,6 +3445,9 @@ class TestPlannerNodeShapeFix(unittest.TestCase):
         # rejects it. The framework judgment this test pins -- an
         # http.server write to the http.server module is not flagged
         # -- is unchanged.
+        # Campaign build #2: the whole-file write of the existing
+        # module also carries the modify-path override; the
+        # framework judgment is what parse success pins here.
         node = {
             "id": "step_1",
             "objective": "Extend the health endpoint in freetalon/api.py",
@@ -3453,14 +3456,32 @@ class TestPlannerNodeShapeFix(unittest.TestCase):
             "inputs": {
                 "file_path": self.api_path,
                 "content": Path(self.api_path).read_text(encoding="utf-8"),
+                "overwrite_justification": (
+                    "the payload is the module's own current "
+                    "source, carried verbatim"
+                ),
             },
             "outputs": [self.api_path],
             "criteria": [{"type": "file_exists", "path": self.api_path}],
         }
+        impact = {
+            "id": "step_2",
+            "objective": "Check the rewrite's impact",
+            "depends_on": ["step_1"],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": (
+                    "./.venv/bin/python -m unittest tests.test_health"
+                ),
+                "impact_check_for": "freetalon/api.py",
+            },
+            "outputs": [],
+            "criteria": [{"type": "exit_code", "expected": 0}],
+        }
         nodes, _ = parse_planner_response(
-            self._dag([node]), goal_text=self.HEALTH_GOAL
+            self._dag([node, impact]), goal_text=self.HEALTH_GOAL
         )
-        self.assertEqual(len(nodes), 1)
+        self.assertEqual(len(nodes), 2)
 
     def test_repo_context_names_serving_module_framework(self) -> None:
         from freetalon.orchestrator.repo_index import (
@@ -5722,6 +5743,9 @@ class TestPlannerFrameworkSteerFix(unittest.TestCase):
         # http.server fragment as the FULL content of api.py) is a
         # defect-1 overwrite and the retention guard now rejects it;
         # the framework judgment this test pins is unchanged.
+        # Campaign build #2: the whole-file write of the existing
+        # module also carries the modify-path override; the
+        # framework judgment is what parse success pins here.
         node = {
             "id": "step_1",
             "objective": "Extend the health endpoint in freetalon/api.py",
@@ -5730,14 +5754,32 @@ class TestPlannerFrameworkSteerFix(unittest.TestCase):
             "inputs": {
                 "file_path": self.api_path,
                 "content": Path(self.api_path).read_text(encoding="utf-8"),
+                "overwrite_justification": (
+                    "the payload is the module's own current "
+                    "source, carried verbatim"
+                ),
             },
             "outputs": [self.api_path],
             "criteria": [{"type": "file_exists", "path": self.api_path}],
         }
+        impact = {
+            "id": "step_2",
+            "objective": "Check the rewrite's impact",
+            "depends_on": ["step_1"],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": (
+                    "./.venv/bin/python -m unittest tests.test_health"
+                ),
+                "impact_check_for": "freetalon/api.py",
+            },
+            "outputs": [],
+            "criteria": [{"type": "exit_code", "expected": 0}],
+        }
         nodes, _ = parse_planner_response(
-            self._dag([node]), goal_text=self.HEALTH_GOAL
+            self._dag([node, impact]), goal_text=self.HEALTH_GOAL
         )
-        self.assertEqual(len(nodes), 1)
+        self.assertEqual(len(nodes), 2)
 
     # --- Regression guards ---
 
@@ -14377,23 +14419,49 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
             encoding="utf-8"
         )
         content = source + "\n\ndef _health_probe() -> bool:\n    return True\n"
+        # Campaign build #2: a whole-file write of an existing
+        # file also needs the modify-path override (justification
+        # + impact-check node) before the plan validates; the
+        # retention guard's own judgment — nothing dropped, so not
+        # flagged — is what this test pins, and it is unchanged.
         node = {
             "id": "step_1",
             "objective": "Extend the health endpoint in freetalon/api.py",
             "depends_on": [],
             "assigned_claw": "scaffold",
-            "inputs": {"file_path": self.api_path, "content": content},
+            "inputs": {
+                "file_path": self.api_path,
+                "content": content,
+                "overwrite_justification": (
+                    "the payload is the full current module plus "
+                    "the new definition, carried verbatim"
+                ),
+            },
             "outputs": [self.api_path],
             "criteria": [{"type": "file_exists", "path": self.api_path}],
         }
+        impact = {
+            "id": "step_2",
+            "objective": "Check the rewrite's impact",
+            "depends_on": ["step_1"],
+            "assigned_claw": "bash",
+            "inputs": {
+                "command": (
+                    "./.venv/bin/python -m unittest tests.test_health"
+                ),
+                "impact_check_for": "freetalon/api.py",
+            },
+            "outputs": [],
+            "criteria": [{"type": "exit_code", "expected": 0}],
+        }
         for root in (None, str(self.repo_root)):
             nodes, _ = parse_planner_response(
-                self._dag([node]),
+                self._dag([node, impact]),
                 goal_text=self.HEALTH_GOAL,
                 workspace=self.WS,
                 repo_root=root,
             )
-            self.assertEqual(len(nodes), 1)
+            self.assertEqual(len(nodes), 2)
 
     def test_new_file_scaffold_passes(self) -> None:
         # A new file has nothing to delete: exempt however complete
@@ -14447,23 +14515,47 @@ class TestPlannerRepoRootOverwriteFix(unittest.TestCase):
                 "def delta():\n    return 4\n\n\n"
                 "def epsilon():\n    return 5\n"
             )
+            # Campaign build #2: the rewrite also carries the
+            # modify-path override; the guard's >= 4-definition
+            # floor — the judgment this test pins — is unchanged.
             node = {
                 "id": "step_1",
                 "objective": "Rewrite the tiny helper module",
                 "depends_on": [],
                 "assigned_claw": "scaffold",
-                "inputs": {"file_path": "freetalon/tiny.py", "content": content},
+                "inputs": {
+                    "file_path": "freetalon/tiny.py",
+                    "content": content,
+                    "overwrite_justification": (
+                        "the tiny module is replaced wholesale"
+                    ),
+                },
                 "outputs": ["freetalon/tiny.py"],
                 "criteria": [
                     {"type": "file_exists", "path": "freetalon/tiny.py"}
                 ],
             }
+            impact = {
+                "id": "step_2",
+                "objective": "Check the rewrite's impact",
+                "depends_on": ["step_1"],
+                "assigned_claw": "bash",
+                "inputs": {
+                    "command": (
+                        "./.venv/bin/python -m unittest "
+                        "tests.test_health"
+                    ),
+                    "impact_check_for": "freetalon/tiny.py",
+                },
+                "outputs": [],
+                "criteria": [{"type": "exit_code", "expected": 0}],
+            }
             nodes, _ = parse_planner_response(
-                self._dag([node]),
+                self._dag([node, impact]),
                 goal_text=self.GENERIC_GOAL,
                 repo_root=tmp,
             )
-            self.assertEqual(len(nodes), 1)
+            self.assertEqual(len(nodes), 2)
 
     def test_fragment_scaffold_not_flagged(self) -> None:
         # Fragment-scale content (zero definitions -- the grounded

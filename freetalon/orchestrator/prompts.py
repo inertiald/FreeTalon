@@ -89,7 +89,7 @@ Return EXACTLY one valid JSON object and nothing else.
 Do NOT wrap output in Markdown code blocks (no ```json or ```).
 
 ALLOWED CLAWS — "assigned_claw" MUST be one of these exact names. Never invent a claw name. There is no "script" claw, no "write_file" claw, no "run" claw:
-- "scaffold" (also "file_writer"): Writes a file to disk. Inputs MUST have "file_path" and "content".
+- "scaffold" (also "file_writer"): Writes a file to disk. Inputs MUST have "file_path" and "content" — or, to CHANGE an existing file, "file_path" and "edits" (scoped edits; see CREATE vs MODIFY below).
 - "bash" (also "shell_exec"): Runs a shell command. Inputs MUST have "command".
 - "llm_synthesis" (also "summarize"): Summarizes or analyzes text from previous steps. Inputs MUST use context piping: {"instruction": "...", "context": "{{step_1.stdout}}"}.
 - "research" (also "web_search"): Researches a topic on the web or forums. Inputs MUST have "topic".
@@ -130,6 +130,36 @@ and never a comment alone ("# Define a test command ..."). A scaffold
 "content" that overwrites an existing code file must be real code, never
 a comment-only placeholder ("# Placeholder ...").
 
+CREATE vs MODIFY — creating a file and changing one are different
+operations, and a plan expresses them differently:
+- CREATE (the file does not exist yet): scaffold it with whole-file
+  "content", as above.
+- MODIFY (the file already exists — in the repo, or written by an
+  earlier node of this same plan): express the change as EDITS, never
+  as a whole-file rewrite. A whole-file "content" for an existing
+  file replaces every line it does not mention, so retyping a file
+  from memory silently reverts whatever the retype omits or
+  misremembers — and a plan whose only defect is a whole-file rewrite
+  of an existing file is rejected for exactly that. Two edit forms:
+  * Scoped edits (any file): inputs {"file_path": "<path>", "edits":
+    [{"search": "<text copied exactly from the current file>",
+    "replace": "<the new text>"}, ...]} with NO "content". Each
+    search text must occur exactly once in the file as it stands;
+    the system applies the edits mechanically and preserves
+    everything outside the searched spans exactly.
+  * Anchored edit (one Python definition): inputs {"file_path":
+    "<path>", "anchor": "<qualified definition name>", "position":
+    "replace" | "after" | "before", "content": "<only the new
+    code>"} — the form the grounded module skeletons show.
+- The whole-file rewrite of an existing file is a gated exception,
+  not a default: it is accepted only when the node ALSO carries a
+  non-empty "overwrite_justification" (why the change cannot be
+  expressed as edits — an edit set that repeatedly failed to apply,
+  or a rewrite of more than about two-thirds of the file) AND the
+  plan adds an impact-check node that depends on the write node and
+  carries inputs {"impact_check_for": "<the same path>"}, running
+  the touched module's tests or a symbol-level diff of the rewrite.
+
 CRITICAL SCHEMA RULES:
 1. "acceptance", "outputs", and "depends_on" MUST ALWAYS be JSON arrays of strings (e.g. ["Command exits with code 0"]), NEVER a bare string.
 2. Root nodes MUST have "depends_on": []. Downstream nodes MUST list parent step IDs in "depends_on".
@@ -148,6 +178,7 @@ MEASURABLE CRITERIA — every node MUST have a "criteria" array with at least on
 - {"type": "metric", "name": "<metric>", "op": ">=", "value": <number>} — a numeric metric the node's claw reports. The metrics each claw reports are exactly: __REPORTABLE_METRICS__. "bash" and "scaffold" report NO metrics — never put a metric criterion on them, and never invent a metric name (for example "json_response") for a check no claw reports: to verify a response a bash command produces, use an "exit_code" criterion on that node instead.
 - {"type": "tests_pass", "suite": "<path>"} — the suite must pass. The suite must be named by THIS node itself: a test file this node writes, or a path that appears in this node's command (for example the exact directory its unittest command runs against, spelled exactly as in the command). A path only another node touches — or a directory path that never appears in this node's command or inputs — is rejected.
 - "custom_check" is NOT available: no custom checkers are registered, so every "custom_check" criterion is rejected, whatever "name" it carries. Do not use it — use one of the types above.
+TIERED VERIFICATION — match the check to the change. A node's criteria default to TARGETED tests for the module that node touches (for example "python -m unittest tests.test_<module>" — seconds). The FULL test suite (unittest discover over the whole tests directory, a bare unittest/pytest run, or a tests_pass criterion naming the tests directory) takes ~13 minutes on this repo and is a synchronization barrier, not a per-step assertion: placed mid-plan it makes every earlier step wait behind a run that can only report the accumulated state, and a suite run that times out manufactures a failure that belongs to no step. Reserve the full suite for ONE final gate node — a node which depends (directly or transitively) on every write node in the plan and which no write node follows (trailing read-only checks after it are fine) — or, exceptionally, carry a non-empty "suite_justification" in the node's inputs explaining why the suite must run at that node. A plan whose only defect is a full-suite command run on a non-gate node is rejected for exactly that.
 A file criterion's "path" MUST be a file the plan actually produces or that already exists: a file some node demonstrably writes — a scaffold/file_writer "file_path" target, a heredoc target, a bash redirect (">" or ">>"), a download target (curl -o/--output or wget -O), a tee target, a "dd of=" target, a cp/mv destination, or a touch target — a file a node runs or reads in its "bash" command, or a file that already exists on disk. Listing a path in "outputs" alone does NOT count — echoing an answer to stdout does not create the file, and a bare "curl" writes nothing: its response goes to stdout. To verify a live endpoint, do NOT name a file for the response — use an "exit_code" criterion on the node whose command curls the endpoint (for example "curl -sf http://localhost:8765/health"): the exit code is the verification and stdout is the response, so nothing needs to be written to a file. A later node may check a file an earlier node wrote.
 
 COVER EVERY STEP — if the goal says write a file, run it, and verify the output, the plan needs a node for each of those steps, in dependency order. Never collapse a multi-step goal into a single node. If the goal asks for tests to be written or added, the plan MUST include a node that WRITES the test file(s) (the "scaffold" claw, or a bash heredoc) — a node that only runs an existing test suite does not satisfy a write-tests requirement. Put new tests in a NEW test file (for example "tests/test_health.py") — never scaffold a replacement for an existing test module: a scaffold overwrites the whole file, so scaffolding an existing module like "tests/test_api.py" deletes every test already in it and is rejected. To add cases to an existing test module, use an anchored insert into that module (an "anchor" naming an existing definition, "position": "after", and content holding only the new test code) instead. Run each new test module by itself as well, scoped to that one module (for example "python -m unittest tests.test_health"), as the writing node's exit_code criterion "command" or as a bash node after it — a few seconds, inside the __CRITERION_COMMAND_BUDGET__ criterion budget — so broken test code fails at its own node, not inside the full suite. Write files at the exact path the goal requests (or the "workspace" path in the TaskIntent constraints when the goal says "in the workspace"); never substitute /tmp or another directory.
@@ -427,6 +458,24 @@ Rules:
 - A bash "command" must be executable shell, never prose or a comment
   alone; a scaffold "content" overwriting an existing code file must be
   real code, never a comment-only placeholder.
+- Create vs modify holds in a delta plan too: a write to a file that
+  already exists (on disk, or written by an earlier node) is expressed
+  as scoped edits — inputs {"file_path": "<path>", "edits":
+  [{"search": "<text copied exactly from the current file>",
+  "replace": "<the new text>"}]} with NO "content" — or as an anchored
+  edit for one Python definition; never as a whole-file rewrite. The
+  rewrite is accepted only with a non-empty "overwrite_justification"
+  on the node AND an impact-check node depending on it with inputs
+  {"impact_check_for": "<the same path>"}.
+- Tier the verification: a delta node's criteria default to the
+  TARGETED tests of the module it touches (seconds). The full test
+  suite costs ~13 minutes on this repo — a synchronization barrier,
+  not a per-step assertion — so place it only on the delta's final
+  gate node (depending on every write node, with no write node
+  after it),
+  or carry a "suite_justification" in that node's inputs. Do not
+  spend the run's remaining budget re-running the whole suite at
+  every step.
 - Shrink scope before growing it: narrow the hypothesis, add a cheaper
   test, or gather the missing data first.
 - Every node needs testable acceptance: a "criteria" array with at least

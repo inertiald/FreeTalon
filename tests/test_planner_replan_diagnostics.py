@@ -186,20 +186,25 @@ class TestBriefRendering(unittest.TestCase):
 
 class TestReplanEndToEnd(PairingTreeCase):
     def test_replan_prompt_carries_diagnostics_and_stamps_map(self):
+        # Campaign build #2: the mock delta writes a NEW module —
+        # a whole-file rewrite of the existing store.py is now a
+        # plan error (the modify-path rule) unless it carries the
+        # gated override; this test's subject is the diagnostics
+        # and the suspect map, not the write's shape.
         node = {
             "id": "step_1",
-            "objective": "Rewrite the store module",
+            "objective": "Write the store implementation module",
             "depends_on": [],
             "assigned_claw": "scaffold",
             "inputs": {
-                "file_path": str(self.root / "pkg" / "store.py"),
+                "file_path": str(self.root / "pkg" / "store_impl.py"),
                 "content": "x = 1\n",
             },
-            "outputs": [str(self.root / "pkg" / "store.py")],
+            "outputs": [str(self.root / "pkg" / "store_impl.py")],
             "criteria": [
                 {
                     "type": "file_exists",
-                    "path": str(self.root / "pkg" / "store.py"),
+                    "path": str(self.root / "pkg" / "store_impl.py"),
                 }
             ],
             "responds_to": "node-1",
