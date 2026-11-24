@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import ast
+from contextlib import contextmanager
 from dataclasses import dataclass, replace as dataclass_replace
 from collections import Counter
 import json
@@ -13,7 +14,7 @@ import heapq
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Collection
+from typing import Any, Callable, Collection
 
 from pydantic import ValidationError
 
@@ -6963,10 +6964,13 @@ def _contract_omitted_modules(
 # validator, then a CONTENT FILL (one call per write node, only
 # that node's payload) judged per node, then ASSEMBLY through the
 # ordinary full parse so the accepted plan is indistinguishable
-# from a single-shot plan. replan_from_brief keeps the single-shot
-# emission: it does not share _call_llm_with_repair's skeleton
-# flag, and delta plans are small (one repair target), so the
-# truncation pressure the split answers does not arise there.
+# from a single-shot plan. replan_from_brief originally kept the
+# single-shot emission (delta plans were assumed small); campaign
+# build #9 mirrors the split there — see the build #9 section at
+# replan_from_brief. Arm #18 measured why: a repair delta for the
+# standing server failure rewrites server.py wholesale, which is
+# not a small response, and the re-plan died at raw JSON validity
+# with no v2 produced.
 
 #: Content intents a skeleton write node may declare.
 SKELETON_CONTENT_INTENTS = ("create", "edit", "whole_file")
@@ -11532,6 +11536,130 @@ def _existing_files_section(
     return f"\n\n{block}" if block else ""
 
 
+# ── Campaign build #9: planner attempt persistence ──────────────────
+#
+# Arm #17's fill payloads were never persisted (build #8's
+# diagnosis had to reproduce the run byte-identically to see
+# them), and arm #18's terminal re-plan failure — "LLM response
+# was not valid JSON" — could not be attributed to an attempt:
+# the re-plan path persisted no per-attempt outputs at all. Parse
+# prints every plan response to stdout (the driver-log pattern
+# the corpora were built from), but unlabeled: no phase, no
+# attempt number, no outcome, and fill payloads never printed.
+#
+# Every planner attempt now records one labeled record — phase,
+# attempt number within the phase, validation outcome, the error
+# codes / validator errors on a rejection, and the raw response
+# text (post-formatter for plan phases, post-sanitize for fill:
+# the text validation actually judged) — to two destinations:
+#
+# - stdout, as a labeled block in the same spirit as parse's
+#   RAW PLANNER OUTPUT print, so the driver-visible log carries
+#   attributed attempts for every planning call, in or out of a
+#   run; and
+# - the attempt sink, when one is installed: a callable taking
+#   the record dict. LoopRunner.run_plan installs a sink bound
+#   to its run store for the run's duration, so a run's attempts
+#   land in <run_dir>/planner_attempts.jsonl next to the
+#   measurements and memory records; plan_task_intent and
+#   replan_from_brief also accept an attempt_sink argument for
+#   direct capture outside a run.
+#
+# Persistence is observability, never a gate: a sink failure is
+# swallowed (noted on stdout), never raised into planning. The
+# volume is bounded by the attempt budgets themselves (plan-sized
+# texts, a handful per planning call); the recorded error text is
+# capped for the same reason.
+
+_ATTEMPT_ERROR_CAP = 4000
+
+#: The installed attempt sink, if any (see planner_attempt_sink).
+_ATTEMPT_SINK: Callable[[dict[str, Any]], None] | None = None
+
+
+@contextmanager
+def planner_attempt_sink(
+    sink: Callable[[dict[str, Any]], None] | None,
+):
+    """Install ``sink`` as the planner attempt sink for a block.
+
+    Records go to the innermost installed sink; nesting restores
+    the outer sink on exit. Passing None installs a blackout (the
+    stdout record still prints). LoopRunner.run_plan is the
+    production installer; tests and drivers may install their own.
+    """
+    global _ATTEMPT_SINK
+    previous = _ATTEMPT_SINK
+    _ATTEMPT_SINK = sink
+    try:
+        yield
+    finally:
+        _ATTEMPT_SINK = previous
+
+
+def _record_planner_attempt(
+    *,
+    phase: str,
+    attempt: int,
+    outcome: str,
+    response_text: str,
+    error_codes: Collection[str] = (),
+    errors: Collection[str] = (),
+    node_id: str | None = None,
+    target: str | None = None,
+    intent: str | None = None,
+) -> None:
+    """Persist one planner attempt (see the section above).
+
+    ``outcome`` is "accepted" or "rejected". The record's error
+    text is the rejection's own rendering, capped at
+    _ATTEMPT_ERROR_CAP characters — the raw response is NOT
+    capped: it is the artifact the record exists to preserve.
+    """
+    error_text = "\n".join(str(error) for error in errors)
+    if len(error_text) > _ATTEMPT_ERROR_CAP:
+        error_text = (
+            error_text[:_ATTEMPT_ERROR_CAP]
+            + "\n... [error text capped]"
+        )
+    record: dict[str, Any] = {
+        "phase": phase,
+        "attempt": attempt,
+        "outcome": outcome,
+        "error_codes": sorted(str(code) for code in error_codes),
+        "errors": error_text,
+        "node_id": node_id,
+        "target": target,
+        "intent": intent,
+        "response_text": response_text,
+    }
+    header = (
+        f"phase={phase} attempt={attempt} outcome={outcome}"
+        + (f" node={node_id}" if node_id else "")
+        + (f" target={target}" if target else "")
+        + (f" intent={intent}" if intent else "")
+        + (
+            f" error_codes={','.join(record['error_codes'])}"
+            if record["error_codes"]
+            else ""
+        )
+    )
+    print(
+        f"\n--- PLANNER ATTEMPT [{header}] ---\n"
+        f"{response_text}\n"
+        "--- END PLANNER ATTEMPT ---\n"
+    )
+    if _ATTEMPT_SINK is not None:
+        try:
+            _ATTEMPT_SINK(record)
+        except Exception as exc:  # noqa: BLE001 — observability, not a gate
+            print(
+                "planner attempt sink failed "
+                f"({type(exc).__name__}: {exc}); the attempt record "
+                "above stands in the log only."
+            )
+
+
 def _call_llm_with_repair(
     system_prompt: str,
     user_prompt: str,
@@ -11549,6 +11677,7 @@ def _call_llm_with_repair(
     skeleton: bool = False,
     clause_mode: str = "full",
     clause_required: Collection[str] | None = None,
+    attempt_phase: str = "plan",
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
 
@@ -11695,6 +11824,13 @@ def _call_llm_with_repair(
     counts — alongside the full-list counts. The repair budget
     semantics are unchanged: clause rejections are not cheap and
     spend repairs like any other real rejection.
+
+    Campaign build #9: every attempt in this cycle is persisted
+    via _record_planner_attempt under ``attempt_phase`` (the
+    caller's phase name — "plan_skeleton" for the initial
+    planner, "replan_skeleton" for a re-plan), with its outcome
+    and, on a rejection, the structured error codes. Recording
+    changes no decision this function makes.
     """
     # Retry #22: derive the effective settings once, before the loop,
     # so every call in this planning call (initial + repairs) gets
@@ -11765,11 +11901,13 @@ def _call_llm_with_repair(
     # from the whole history each round, so a property established
     # by ANY earlier attempt anchors every later repair.
     attempt_history: list[dict[str, Any]] = []
+    attempt_no = 0
     while True:
         endorsed_paths |= _prompt_named_paths(prompt)
         response_text = call_llm(
             system_prompt, prompt, settings=effective_settings
         )
+        attempt_no += 1
         if formatter is not None:
             # Steal #7 plumbing: the configured formatter pass
             # re-emits the response under the envelope schema before
@@ -11872,6 +12010,16 @@ def _call_llm_with_repair(
                         attempt_history
                     ),
                 }
+            # Campaign build #9: the accepted attempt is part of
+            # the same record as the rejected ones — the phase's
+            # full attempt sequence is recoverable, not only its
+            # failures.
+            _record_planner_attempt(
+                phase=attempt_phase,
+                attempt=attempt_no,
+                outcome="accepted",
+                response_text=response_text,
+            )
             return nodes, metadata
         except LLMResponseError as exc:
             last_error = exc
@@ -11881,6 +12029,18 @@ def _call_llm_with_repair(
                 record.code
                 for record in getattr(exc, "plan_errors", None) or []
             }
+            # Campaign build #9: record the rejected attempt
+            # before any budget decision, so an attempt that ends
+            # the call (budget exhausted, stuck detection) is
+            # persisted exactly like one that earns a repair.
+            _record_planner_attempt(
+                phase=attempt_phase,
+                attempt=attempt_no,
+                outcome="rejected",
+                response_text=response_text,
+                error_codes=error_codes,
+                errors=[str(exc)],
+            )
             # Campaign build #4: record this attempt's plan-shape
             # facts BEFORE the budget decision, so the anchoring
             # block built below describes every attempt the model
@@ -12412,6 +12572,7 @@ def _fill_node_payload(
     prior_dicts: list[dict[str, Any]],
     repo_root: str | Path | None,
     goal_text: str | None,
+    attempt_phase: str = "content_fill",
 ) -> tuple[dict[str, Any], int]:
     """Fill one skeleton write node via its own LLM call(s).
 
@@ -12428,6 +12589,14 @@ def _fill_node_payload(
     schema-explicit repair block (_fill_shape_repair_block) in
     place of the plain errors block; a retry after a
     content-validation failure keeps the plain block unchanged.
+
+    Campaign build #9: every attempt is persisted via
+    _record_planner_attempt under ``attempt_phase`` (the caller's
+    fill-phase name — "content_fill" for the initial planner,
+    "replan_content_fill" for a re-plan), with the node, target,
+    and intent attached. The recorded text is the sanitized
+    response — the payload validation actually judged. Arm #17's
+    unpersisted fill payloads are the failure this removes.
     """
     target = _node_write_target(node) or ""
     if intent in ("create", "whole_file"):
@@ -12495,7 +12664,26 @@ def _fill_node_payload(
                 candidate, prior_dicts, repo_root, goal_text
             )
         if not last_errors:
+            _record_planner_attempt(
+                phase=attempt_phase,
+                attempt=attempt,
+                outcome="accepted",
+                response_text=response_text,
+                node_id=node.id,
+                target=target,
+                intent=intent,
+            )
             return candidate, attempt
+        _record_planner_attempt(
+            phase=attempt_phase,
+            attempt=attempt,
+            outcome="rejected",
+            response_text=response_text,
+            errors=last_errors,
+            node_id=node.id,
+            target=target,
+            intent=intent,
+        )
         if last_defects:
             errors_block = "\n\n" + _fill_shape_repair_block(
                 intent, last_defects
@@ -12523,6 +12711,7 @@ def _fill_plan_contents(
     clauses: list[dict[str, Any]] | None,
     spec_section: str,
     inventory_section: str,
+    attempt_phase: str = "content_fill",
 ) -> tuple[list[dict[str, Any]], dict[str, int], list[str]] | None:
     """Phase 2: fill every content-less write node of a skeleton.
 
@@ -12533,6 +12722,13 @@ def _fill_plan_contents(
     attempt counts, pre-filled node ids). Nodes fill in skeleton
     (topological) order, so an edit node sees the filled content of
     every earlier write to its target.
+
+    Campaign build #9: this helper is the ONE fill implementation
+    for both planning calls — plan_task_intent (initial plans) and
+    replan_from_brief (repair deltas) — parameterized only by
+    ``attempt_phase``, the persistence label its per-node attempts
+    are recorded under. There is no second fill path for the
+    re-plan to drift from.
     """
     pending = [
         node
@@ -12608,6 +12804,7 @@ def _fill_plan_contents(
             prior_dicts=filled_dicts,
             repo_root=repo_root,
             goal_text=goal_text,
+            attempt_phase=attempt_phase,
         )
         attempts[node.id] = used
         filled_dicts.append(candidate)
@@ -12651,6 +12848,7 @@ def plan_task_intent(
     plan_id: str | None = None,
     max_repairs: int = PLAN_TASK_INTENT_MAX_REPAIRS,
     repo_root: str | Path | None = None,
+    attempt_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> ExecutionPlan:
     """Generate a validated execution plan DAG for a TaskIntent.
 
@@ -12661,7 +12859,41 @@ def plan_task_intent(
     the prompt also carries the grounded ROUTE GOAL shape, so the first
     attempt already has the valid move in front of it instead of having
     to discover it by trial and error.
+
+    Campaign build #9: ``attempt_sink``, when given, is installed
+    as the planner attempt sink for this call (see
+    planner_attempt_sink) — every skeleton and content-fill
+    attempt is recorded to it as well as to stdout. A sink already
+    installed by an outer scope (a run's) is restored on exit.
     """
+    if attempt_sink is None:
+        return _plan_task_intent(
+            intent,
+            settings,
+            plan_id=plan_id,
+            max_repairs=max_repairs,
+            repo_root=repo_root,
+        )
+    with planner_attempt_sink(attempt_sink):
+        return _plan_task_intent(
+            intent,
+            settings,
+            plan_id=plan_id,
+            max_repairs=max_repairs,
+            repo_root=repo_root,
+        )
+
+
+def _plan_task_intent(
+    intent: TaskIntent,
+    settings: LLMSettings | None = None,
+    *,
+    plan_id: str | None = None,
+    max_repairs: int = PLAN_TASK_INTENT_MAX_REPAIRS,
+    repo_root: str | Path | None = None,
+) -> ExecutionPlan:
+    """plan_task_intent's body (build #9 split it out so the
+    public entry can scope the attempt sink)."""
     workspace = (intent.constraints or {}).get("workspace")
     index = build_repo_index(repo_root)
     context = format_repo_context(index, workspace=workspace)
@@ -12737,6 +12969,7 @@ def plan_task_intent(
         clauses=clauses,
         formatter=formatter_settings_from_env(),
         skeleton=True,
+        attempt_phase="plan_skeleton",
     )
     # Campaign build #5, phase 2 + assembly: fill each content-less
     # write node with its own call, then run the filled plan
@@ -12753,6 +12986,7 @@ def plan_task_intent(
         clauses=clauses,
         spec_section=spec_section,
         inventory_section=inventory_section,
+        attempt_phase="content_fill",
     )
     if filled is not None:
         filled_dicts, fill_attempts, prefilled_ids = filled
@@ -13116,6 +13350,42 @@ def replan_from_brief(
     max_repairs: int = 2,
     repo_root: str | Path | None = None,
     seed_forbidden: list[str] | None = None,
+    attempt_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> list[PlanNode]:
+    """Produce delta-plan nodes from a judge's re-plan brief (M1).
+
+    Campaign build #9: ``attempt_sink``, when given, is installed
+    as the planner attempt sink for this call (see
+    planner_attempt_sink) — every re-plan skeleton and
+    content-fill attempt is recorded to it as well as to stdout.
+    A sink already installed by an outer scope (a run's) is
+    restored on exit. The rest of this docstring is the body's.
+    """
+    if attempt_sink is None:
+        return _replan_from_brief(
+            brief,
+            settings,
+            max_repairs=max_repairs,
+            repo_root=repo_root,
+            seed_forbidden=seed_forbidden,
+        )
+    with planner_attempt_sink(attempt_sink):
+        return _replan_from_brief(
+            brief,
+            settings,
+            max_repairs=max_repairs,
+            repo_root=repo_root,
+            seed_forbidden=seed_forbidden,
+        )
+
+
+def _replan_from_brief(
+    brief: dict[str, Any],
+    settings: LLMSettings | None = None,
+    *,
+    max_repairs: int = 2,
+    repo_root: str | Path | None = None,
+    seed_forbidden: list[str] | None = None,
 ) -> list[PlanNode]:
     """Produce delta-plan nodes from a judge's re-plan brief (M1).
 
@@ -13146,6 +13416,27 @@ def replan_from_brief(
     accumulated rejected-approaches list is written back into the brief
     under "rejected_approaches" so the loop can carry it into the next
     replan's seed.
+
+    Campaign build #9: emission is two-phase, mirroring build
+    #5's split in plan_task_intent. Phase 1 emits the delta
+    SKELETON (structure, targets, deps, criteria, content
+    intents, clause declarations — no file contents) through the
+    same repair cycle, judged by build #7's delta rule at this
+    phase (the rule, the anchoring facts, and the re-ask
+    machinery all live in that cycle; the repair budget is
+    unchanged at 2). Phase 2 fills each content-less write node
+    through the shared _fill_plan_contents — the same per-node
+    validators and build #8 shape-repair blocks as the initial
+    planner — and the filled delta is assembled through the
+    ordinary full parse under the delta rule and the contract
+    pin, so the result is indistinguishable in shape from a
+    single-shot re-plan output. Arm #18 is why: its re-plan had
+    to rewrite server.py wholesale — not a small response — and
+    the single-shot emission died at raw JSON validity before
+    the delta rule could judge anything (the second arm running
+    build #7 went unmeasured). The accepted emission is written
+    back into the brief under "plan_emission", on the same
+    write-back channel as "replan_clause_coverage".
     """
 
     index = build_repo_index(repo_root)
@@ -13247,6 +13538,20 @@ def replan_from_brief(
         f"{context}{spec_section}{clauses_section}{inventory_section}\n\n{_format_brief_for_prompt(brief)}{diagnostics_block}{node_shape_block}\n\n"
         "Produce a NEW delta plan DAG for the brief above. Do NOT repeat, "
         "quote, or echo the brief — it is your input, not your output.\n"
+        "\nSPLIT EMISSION (campaign build #9): emit the delta SKELETON "
+        "only. Do NOT include any file \"content\", \"edits\", or "
+        "\"anchor\" in any node — file payloads are requested "
+        "separately, one node at a time, after the skeleton is "
+        "accepted. For each scaffold/file_writer node, declare "
+        "inputs \"content_intent\": \"create\" for a NEW file (filled "
+        "with its full content), \"edit\" for an EXISTING file "
+        "(filled with scoped/anchored edits), or \"whole_file\" for "
+        "an existing file that must be rewritten whole (which "
+        "requires the overwrite_justification + impact-check pair "
+        "the modify rules demand). Keep each node's file_path, "
+        "depends_on, criteria, and inputs.clauses declarations "
+        "exactly as a full delta plan would carry them. Bash/command "
+        "nodes keep their command in the skeleton as usual.\n"
         f"{seed_block}"
         f"{shape_block}\n\n"
         "JSON Output:"
@@ -13263,9 +13568,52 @@ def replan_from_brief(
         pinned_contract=pinned_contract,
         clauses=clauses,
         formatter=formatter_settings_from_env(),
+        skeleton=True,
         clause_mode="delta",
         clause_required=required_clause_ids if clauses else None,
+        attempt_phase="replan_skeleton",
     )
+    # Campaign build #9, phase 2 + assembly: fill each content-less
+    # write node of the accepted delta skeleton with its own call
+    # (the shared fill machinery — identical per-node validation
+    # and shape repair to the initial planner's), then run the
+    # filled delta through the ordinary full parse under the same
+    # delta clause rule and the same contract pin, so the
+    # assembled delta carries exactly the shape and judgments a
+    # single-shot re-plan output carried. The contract pin's
+    # content-level coherence checks bind here, at assembly, as
+    # they do for the initial planner (build #5): a skeleton has
+    # no contents for them to judge. A delta the model emitted
+    # pre-filled needs neither step — its nodes were judged whole
+    # at the skeleton phase.
+    filled = _fill_plan_contents(
+        nodes,
+        settings=settings,
+        goal_text=_goal_text_from_brief(brief),
+        repo_root=repo_root,
+        clauses=clauses,
+        spec_section=spec_section,
+        inventory_section=inventory_section,
+        attempt_phase="replan_content_fill",
+    )
+    if filled is not None:
+        filled_dicts, fill_attempts, prefilled_ids = filled
+        assembled_nodes, _assembled_metadata = parse_planner_response(
+            json.dumps({"nodes": filled_dicts, "metadata": {}}),
+            goal_text=_goal_text_from_brief(brief),
+            workspace=brief.get("workspace"),
+            repo_root=repo_root,
+            pinned_contract=pinned_contract,
+            clauses=clauses,
+            clause_mode="delta",
+            clause_required=required_clause_ids if clauses else None,
+        )
+        nodes = assembled_nodes
+        brief["plan_emission"] = {
+            "phases": ["replan_skeleton", "replan_content_fill"],
+            "content_attempts": fill_attempts,
+            "prefilled": prefilled_ids,
+        }
     brief["rejected_approaches"] = metadata.get("rejected_approaches", seed or [])
     if clauses:
         # Campaign build #7: the accepted delta's declared

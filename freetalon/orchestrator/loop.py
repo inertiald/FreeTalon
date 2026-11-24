@@ -53,6 +53,7 @@ from .models import (
 )
 from .planner import (
     build_execution_plan,
+    planner_attempt_sink,
     replan_from_brief,
     try_local_repair,
     try_scoped_edit_repair,
@@ -174,7 +175,39 @@ class LoopRunner:
         run_id: str | None = None,
         replan_fn: ReplanFn | None = None,
     ) -> RunResult:
-        """Execute a plan under a goal contract, with judge + re-plan (M1)."""
+        """Execute a plan under a goal contract, with judge + re-plan (M1).
+
+        Campaign build #9: for this run's duration the planner's
+        attempt sink points at this run's store, so every planner
+        attempt the run makes (the re-plan skeleton and content
+        fill phases of the default re-plan path) persists to
+        planner_attempts.jsonl in the run directory — phase,
+        attempt number, validation outcome, and raw response
+        text — next to the measurements and memory records. The
+        sink is observability only: the planner guards sink
+        failures, so persistence can never fail a run. An injected
+        replan_fn makes no planner calls and records nothing.
+        """
+        run_id = run_id or new_run_id()
+
+        def _attempt_sink(record: dict[str, Any]) -> None:
+            self._run_store.append_planner_attempt(run_id, record)
+
+        with planner_attempt_sink(_attempt_sink):
+            return self._run_plan(
+                plan, contract, run_id=run_id, replan_fn=replan_fn
+            )
+
+    def _run_plan(
+        self,
+        plan: ExecutionPlan,
+        contract: GoalContract,
+        *,
+        run_id: str | None = None,
+        replan_fn: ReplanFn | None = None,
+    ) -> RunResult:
+        """run_plan's body (campaign build #9 split it out so the
+        public entry can scope the planner attempt sink)."""
         run_id = run_id or new_run_id()
         started = time.monotonic()
         started_at = datetime.now(UTC).isoformat()

@@ -9,6 +9,7 @@ Every run gets a directory Pat can inspect directly::
         nodes/<node-id>/     # stdout, stderr, artifacts per node
         measurements.jsonl   # one verdict record per node
         memory.jsonl         # experiment records (M2)
+        planner_attempts.jsonl  # planner attempts (campaign build #9)
         gates/               # approval requests and decisions (M4)
         summary.md           # human-readable run report
         logs/                # service-level logs, as today
@@ -128,6 +129,24 @@ class RunStore:
         """Append one experiment record to memory.jsonl."""
         self._append_jsonl(run_id, "memory.jsonl", record)
 
+    def append_planner_attempt(self, run_id: str, record: dict[str, Any]) -> None:
+        """Append one planner attempt record to planner_attempts.jsonl.
+
+        Campaign build #9: the planner's attempt sink (installed by
+        LoopRunner.run_plan for the run's duration) lands here —
+        one record per planner attempt with its phase, attempt
+        number, validation outcome, and raw response text, so a
+        failed planning call inside a run is reconstructable from
+        the run directory like everything else the loop did. The
+        run directory is created if missing (unlike the
+        measurement appends, which the loop only makes after
+        create_run): the attempt sink is installed for a run's
+        whole duration, and an attempt record must never be lost
+        to an ordering assumption.
+        """
+        self.run_dir(run_id).mkdir(parents=True, exist_ok=True)
+        self._append_jsonl(run_id, "planner_attempts.jsonl", record)
+
     def read_measurements(self, run_id: str) -> list[dict[str, Any]]:
         """Read back all measurement records for a run (empty list if none)."""
         return self._read_jsonl(run_id, "measurements.jsonl")
@@ -135,6 +154,10 @@ class RunStore:
     def read_memory(self, run_id: str) -> list[dict[str, Any]]:
         """Read back all experiment records for a run (empty list if none)."""
         return self._read_jsonl(run_id, "memory.jsonl")
+
+    def read_planner_attempts(self, run_id: str) -> list[dict[str, Any]]:
+        """Read back all planner attempt records for a run (empty if none)."""
+        return self._read_jsonl(run_id, "planner_attempts.jsonl")
 
     def _read_jsonl(self, run_id: str, filename: str) -> list[dict[str, Any]]:
         path = self.run_dir(run_id) / filename
