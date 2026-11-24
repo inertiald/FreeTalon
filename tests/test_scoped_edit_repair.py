@@ -458,10 +458,14 @@ class TestScopedEditSeam(ScopedEditSeamCase):
     def test_whole_file_answer_declines(self):
         # The failure mode this seam exists to refuse: the model
         # re-emits the entire corrected file instead of edit blocks.
+        # Campaign build #13: a no-blocks answer earns one format
+        # re-ask inside the same invocation (the stub answers the
+        # whole file again), so the decline now follows TWO calls;
+        # this assertion pinned the pre-#13 single call.
         whole = STORE_TEXT.replace(DEFECTIVE_REGISTER, FIXED_REGISTER)
         result, calls = self._run(whole)
         self.assertIsNone(result)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
 
     def test_non_matching_search_text_declines(self):
         result, _calls = self._run(

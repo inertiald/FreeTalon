@@ -12203,6 +12203,101 @@ def _record_planner_attempt(
         del _PENDING_ATTEMPTS[:-_PENDING_ATTEMPT_LIMIT]
 
 
+# ── Seam attempt persistence (campaign build #13) ─────────────────
+#
+# The repair seams (cycle 8's local repair, the scoped-edit seam)
+# make model calls too, and until this build those calls were the
+# last unrecorded response class in the loop. Exam arm #22 is the
+# cost: build #12's suspect-map wiring worked — the scoped-edit
+# seam reached its model call in all three cycles with the
+# suspect file and the probe's flow diagnostics — and declined
+# 3/3 with the new reason no_edit_blocks, "the model's response
+# carries no edit blocks". What the model actually returned (a
+# prose explanation? a whole-file rewrite? a JSON envelope?) was
+# recorded NOWHERE — not the driver log, not the run store — so
+# the decline was a verdict without evidence, the same failure
+# that cost arm #17 (fill payloads, answered by build #8's
+# capture) and arm #18 (re-plan JSON, answered by build #9's
+# planner persistence). The seams now get the build #9 treatment:
+#
+# - every seam model call records one labeled record — seam name,
+#   attempt number within the invocation, the response's
+#   disposition (accepted = in the seam's required format and
+#   judged as a candidate; rejected = the response itself was
+#   unusable, with the decline reason it produced), cycle context
+#   (plan id, the brief's plan version, the target), and the FULL
+#   raw response text — to the same two channels: stdout, as a
+#   labeled block, and the attempt sink when one is installed.
+#   LoopRunner.run_plan's sink routes seam records (they carry
+#   kind="seam_attempt") to the run's seam_attempts.jsonl, so
+#   planner_attempts.jsonl keeps its build #9 shape exactly.
+# - seam records never enter the pending buffer: a seam only runs
+#   inside a run (a sink is installed) or under a direct caller,
+#   whose capture is the stdout block. Buffering them would
+#   misattribute one caller's seam calls to whatever run started
+#   next — the build #10 reasoning, applied unchanged.
+# - persistence is observability, never a gate: a sink failure is
+#   swallowed (noted on stdout), never raised into the seam.
+
+
+def _record_seam_attempt(
+    *,
+    seam: str,
+    attempt: int,
+    outcome: str,
+    response_text: str,
+    decline_reason: str = "",
+    shape_repair: bool = False,
+    plan_id: str | None = None,
+    plan_version: Any = None,
+    target: str | None = None,
+) -> None:
+    """Persist one repair-seam model call (see the section above).
+
+    ``outcome`` is the RESPONSE's disposition: "accepted" when it
+    arrived in the seam's required format (edit blocks parsed /
+    the definition extracted) and went on to candidate judgment,
+    "rejected" when the response itself was unusable — with
+    ``decline_reason`` naming the decline it produced. Candidate-
+    level declines after an accepted response (an edit set that
+    fails to apply, a splice that changes nothing) ride the
+    build #2 decline records, as before; this record exists so
+    the raw response behind ANY seam outcome is reconstructable.
+    """
+    record: dict[str, Any] = {
+        "kind": "seam_attempt",
+        "seam": seam,
+        "attempt": attempt,
+        "outcome": outcome,
+        "decline_reason": decline_reason,
+        "shape_repair": shape_repair,
+        "plan_id": plan_id,
+        "plan_version": plan_version,
+        "target": target,
+        "response_text": response_text,
+    }
+    header = (
+        f"seam={seam} attempt={attempt} outcome={outcome}"
+        + (f" reason={decline_reason}" if decline_reason else "")
+        + (" shape_repair=true" if shape_repair else "")
+        + (f" target={target}" if target else "")
+    )
+    print(
+        f"\n--- SEAM ATTEMPT [{header}] ---\n"
+        f"{response_text}\n"
+        "--- END SEAM ATTEMPT ---\n"
+    )
+    if _ATTEMPT_SINK is not None:
+        try:
+            _ATTEMPT_SINK(record)
+        except Exception as exc:  # noqa: BLE001 — observability, not a gate
+            print(
+                "seam attempt sink failed "
+                f"({type(exc).__name__}: {exc}); the attempt record "
+                "above stands in the log only."
+            )
+
+
 def _call_llm_with_repair(
     system_prompt: str,
     user_prompt: str,
@@ -14879,6 +14974,42 @@ def _local_repair_candidate_nodes(
     return nodes
 
 
+def _local_repair_shape_repair_block(target: _LocalRepairTarget) -> str:
+    """The format re-ask after an unextractable answer (build #13).
+
+    Build #8's shape-repair pattern for cycle 8's seam: the
+    defect named in plain words, the exact required form
+    restated (the one definition, its def line included, at the
+    window's indentation — nothing else), and one minimal worked
+    example of the form against a generic definition.
+    """
+    lines = [
+        "Your previous response was REJECTED — it did not answer "
+        "in the required format:",
+        f"  - your previous response carried no definition "
+        f"matching {target.qualified_name} that the system "
+        "could extract from it",
+        "",
+        "The ONLY acceptable answer is the complete new version "
+        f"of the one definition {target.qualified_name} — its "
+        f"def line included, at the indentation the task shows "
+        f"({target.indent} spaces) — and nothing else: no JSON, "
+        "no prose before or after, no other definitions, and "
+        "not the whole module. (A single code fence holding only "
+        "the definition is accepted; prose around it is not.)",
+        "",
+        "Worked example of the form — a response repairing a "
+        "definition named compute_total is exactly:",
+        "",
+        "def compute_total(items):",
+        "    return sum(items)",
+        "",
+        "— the definition alone, at its own indentation.",
+        "Return the repaired definition only.",
+    ]
+    return "\n".join(lines)
+
+
 def try_local_repair(
     plan: ExecutionPlan,
     brief: dict[str, Any],
@@ -14902,6 +15033,12 @@ def try_local_repair(
     string>} — including the blanket-exception path below
     (reason "internal_error"), so a decline is never again
     observable only as the absence of a success.
+
+    Campaign build #13: every model call this seam makes is
+    recorded with its full raw response (_record_seam_attempt),
+    and an answer no definition can be extracted from earns one
+    format re-ask inside the same invocation — arm #22's
+    unrecorded seam responses are the defect this ends.
     """
     before = len(declines) if declines is not None else 0
     try:
@@ -14966,8 +15103,56 @@ def _try_local_repair(
         # the envelope grammar would corrupt the code payload (the
         # cycle-2 two-channel finding).
         effective = dataclass_replace(effective, format_schema=None)
+    # Campaign build #13: the call is recorded (raw response
+    # included), and an answer from which no matching definition
+    # can be extracted earns ONE format re-ask — the scoped-edit
+    # seam's treatment, and symmetric by construction: extraction
+    # failure is this seam's no-blocks class, a response whose
+    # SHAPE is wrong (prose, JSON, a different definition, the
+    # whole module without the one definition) rather than a
+    # repair that failed on substance. The re-ask restates this
+    # seam's own format (build #8's shape-repair pattern); it is
+    # INSIDE this invocation, so the seam still rides the
+    # caller's one re-plan budget unit, and a second extraction
+    # failure declines no_definition_extracted exactly as
+    # before — now with both responses on record.
+    seam_target = f"{target.target_path}::{target.qualified_name}"
     response = call_llm(system_prompt, user_prompt, settings=effective)
     extracted = _extract_repaired_definition(response, target.qualified_name)
+    _record_seam_attempt(
+        seam="local_repair",
+        attempt=1,
+        outcome="accepted" if extracted is not None else "rejected",
+        response_text=response,
+        decline_reason="" if extracted is not None else "no_definition_extracted",
+        plan_id=plan.plan_id,
+        plan_version=brief.get("plan_version"),
+        target=seam_target,
+    )
+    if extracted is None:
+        response = call_llm(
+            system_prompt,
+            user_prompt
+            + "\n\n"
+            + _local_repair_shape_repair_block(target),
+            settings=effective,
+        )
+        extracted = _extract_repaired_definition(
+            response, target.qualified_name
+        )
+        _record_seam_attempt(
+            seam="local_repair",
+            attempt=2,
+            outcome="accepted" if extracted is not None else "rejected",
+            response_text=response,
+            decline_reason=(
+                "" if extracted is not None else "no_definition_extracted"
+            ),
+            shape_repair=True,
+            plan_id=plan.plan_id,
+            plan_version=brief.get("plan_version"),
+            target=seam_target,
+        )
     if extracted is None:
         return decline(
             "no_definition_extracted",
@@ -15463,6 +15648,81 @@ def _scoped_edit_candidate_nodes(
     return nodes
 
 
+def _scoped_edit_shape_repair_block(
+    problem: str | None, targets: list[_ScopedEditTarget]
+) -> str:
+    """The format re-ask after a no-blocks response (build #13).
+
+    Build #8's shape-repair pattern for the seam: the previous
+    response's defect named in plain words, the exact required
+    block format restated, one minimal worked example against a
+    generic snippet, and the contract's boundaries restated —
+    prose and whole-file returns are not answers; the only
+    non-block answer is the explicitly empty return the seam's
+    contract already allows when the file is already correct.
+    """
+    if problem == "missing_section":
+        defect = (
+            "your previous response did not group its blocks "
+            "under one 'FILE: <path>' section per file — a "
+            "repair spanning two files must carry both sections, "
+            "one per file, or it cannot be applied"
+        )
+    else:
+        defect = (
+            "your previous response carried no SEARCH/REPLACE "
+            "edit blocks at all — no block in the required format "
+            "was found in it"
+        )
+    lines = [
+        "Your previous response was REJECTED — it did not answer "
+        "in the required format:",
+        f"  - {defect}",
+        "",
+        "The ONLY acceptable answer is search/replace edit "
+        "blocks in EXACTLY this format, one block per change:",
+        "",
+        "<<<<<<< SEARCH",
+        "<existing text, copied character-for-character from "
+        "the file>",
+        "=======",
+        "<the new text>",
+        ">>>>>>> REPLACE",
+        "",
+        "Worked example — changing one line of a file:",
+        "",
+        "<<<<<<< SEARCH",
+        "LIMIT = 10",
+        "=======",
+        "LIMIT = 20",
+        ">>>>>>> REPLACE",
+        "",
+        "Prose explanations, JSON, and whole-file returns are "
+        "NOT acceptable answers, and neither is a summary of the "
+        "change you intend: return the blocks themselves.",
+    ]
+    if len(targets) > 1:
+        headers = " and ".join(
+            f"'FILE: {target.relative_path}'" for target in targets
+        )
+        lines += [
+            f"This repair spans TWO files: group the blocks "
+            f"under the lines {headers} — one section per file, "
+            "every SEARCH text copied from its own file's "
+            "section above.",
+            "",
+        ]
+    lines += [
+        "One exception, from the repair contract itself: if — "
+        "and only if — the file is already correct against the "
+        "goal and the diagnostics, return an empty response (no "
+        "text at all) rather than inventing an edit. Any other "
+        "answer must be edit blocks.",
+        "Return the edit blocks only.",
+    ]
+    return "\n".join(lines)
+
+
 def try_scoped_edit_repair(
     plan: ExecutionPlan,
     brief: dict[str, Any],
@@ -15488,6 +15748,13 @@ def try_scoped_edit_repair(
     (reason "internal_error"). Arm #10 declined its only repair
     opportunity with no trace anywhere; that is the defect this
     record exists to end.
+
+    Campaign build #13: every model call this seam makes is
+    recorded with its full raw response (_record_seam_attempt),
+    and a response carrying no parseable edit blocks earns one
+    format re-ask inside the same invocation — arm #22 declined
+    3/3 no_edit_blocks with the responses recorded nowhere; both
+    halves of that are the defect this ends.
     """
     before = len(declines) if declines is not None else 0
     try:
@@ -15587,8 +15854,73 @@ def _try_scoped_edit_repair(
         # envelope grammar would corrupt the payload (the cycle-2
         # two-channel finding).
         effective = dataclass_replace(effective, format_schema=None)
+    # Campaign build #13: every seam call is recorded (raw
+    # response included), and a response carrying no parseable
+    # edit blocks earns ONE format re-ask — build #8's
+    # shape-repair pattern, which content fill proved on exactly
+    # this failure class: the first prompt's bare format demand
+    # repeated is not steering, so the re-ask names the defect in
+    # plain words, restates the exact block format with a worked
+    # example, and restates the contract's one non-block answer
+    # (an explicitly empty return when the file is already
+    # correct). The re-ask is INSIDE this invocation: the seam
+    # still rides the caller's one re-plan budget unit, and a
+    # second no-blocks response declines no_edit_blocks exactly
+    # as before — now with both responses on record. A MALFORMED
+    # response (block markers present but broken) is not
+    # re-asked: it declines malformed_edit_blocks on the first
+    # response, as before — the model attempted the format and
+    # broke its mechanics, a different defect from never
+    # attempting it.
+    seam_target = ", ".join(target.relative_path for target in targets)
     response = call_llm(system_prompt, user_prompt, settings=effective)
     sections, problem = _scoped_edit_sections(response, targets)
+    _record_seam_attempt(
+        seam="scoped_edit",
+        attempt=1,
+        outcome="accepted" if sections is not None else "rejected",
+        response_text=response,
+        decline_reason=(
+            ""
+            if sections is not None
+            else (
+                "malformed_edit_blocks"
+                if problem == "malformed"
+                else "no_edit_blocks"
+            )
+        ),
+        plan_id=plan.plan_id,
+        plan_version=brief.get("plan_version"),
+        target=seam_target,
+    )
+    if sections is None and problem in ("empty", "missing_section"):
+        response = call_llm(
+            system_prompt,
+            user_prompt
+            + "\n\n"
+            + _scoped_edit_shape_repair_block(problem, targets),
+            settings=effective,
+        )
+        sections, problem = _scoped_edit_sections(response, targets)
+        _record_seam_attempt(
+            seam="scoped_edit",
+            attempt=2,
+            outcome="accepted" if sections is not None else "rejected",
+            response_text=response,
+            decline_reason=(
+                ""
+                if sections is not None
+                else (
+                    "malformed_edit_blocks"
+                    if problem == "malformed"
+                    else "no_edit_blocks"
+                )
+            ),
+            shape_repair=True,
+            plan_id=plan.plan_id,
+            plan_version=brief.get("plan_version"),
+            target=seam_target,
+        )
     if sections is None:
         if problem == "malformed":
             return decline(

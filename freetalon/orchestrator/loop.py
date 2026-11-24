@@ -199,11 +199,24 @@ class LoopRunner:
         records wait in the planner's pending buffer; drain them
         into this run's sink first, so the run's trail opens
         with the planning that produced its plan.
+
+        Campaign build #13: the sink also carries the repair
+        seams' attempt records (kind="seam_attempt"), routed to
+        seam_attempts.jsonl — every model call a seam makes in
+        this run, raw response included (arm #22's declines were
+        unresolvable without them).
         """
         run_id = run_id or new_run_id()
 
         def _attempt_sink(record: dict[str, Any]) -> None:
-            self._run_store.append_planner_attempt(run_id, record)
+            # Campaign build #13: the repair seams record through
+            # the same sink; their records carry kind="seam_attempt"
+            # and land in seam_attempts.jsonl, so
+            # planner_attempts.jsonl keeps its build #9 shape.
+            if record.get("kind") == "seam_attempt":
+                self._run_store.append_seam_attempt(run_id, record)
+            else:
+                self._run_store.append_planner_attempt(run_id, record)
 
         with planner_attempt_sink(_attempt_sink):
             drain_pending_planner_attempts(_attempt_sink)

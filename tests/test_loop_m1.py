@@ -503,7 +503,15 @@ class TestLoopLocalRepair(unittest.TestCase):
             # re-plans would have bought.
             self.assertEqual(result.goal_verdict, "FAIL")
             self.assertEqual(result.plan_versions, 3)
-            self.assertEqual(llm_calls["n"], 2)
+            # Campaign build #13: the second decision's local
+            # attempt now earns ONE format re-ask when no
+            # definition can be extracted (the stub answers "no
+            # definition here" to the re-ask too, so it still
+            # declines and falls back within the same unit) —
+            # three LLM calls, still exactly two re-plan units,
+            # as plan_versions and replan_calls below pin. This
+            # assertion counted two before build #13.
+            self.assertEqual(llm_calls["n"], 3)
             self.assertEqual(replan_calls["n"], 1)
             self.assertIsNotNone(result.escalation)
             self.assertIn("re-plan budget spent", result.escalation)

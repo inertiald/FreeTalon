@@ -10,6 +10,7 @@ Every run gets a directory Pat can inspect directly::
         measurements.jsonl   # one verdict record per node
         memory.jsonl         # experiment records (M2)
         planner_attempts.jsonl  # planner attempts (campaign build #9)
+        seam_attempts.jsonl  # repair-seam attempts (campaign build #13)
         gates/               # approval requests and decisions (M4)
         summary.md           # human-readable run report
         logs/                # service-level logs, as today
@@ -147,6 +148,23 @@ class RunStore:
         self.run_dir(run_id).mkdir(parents=True, exist_ok=True)
         self._append_jsonl(run_id, "planner_attempts.jsonl", record)
 
+    def append_seam_attempt(self, run_id: str, record: dict[str, Any]) -> None:
+        """Append one repair-seam attempt record to seam_attempts.jsonl.
+
+        Campaign build #13: the planner's attempt sink carries
+        seam records too (kind="seam_attempt"); LoopRunner.run_plan
+        routes them here, apart from planner_attempts.jsonl, whose
+        build #9 shape is unchanged — one record per seam model
+        call with the seam name, attempt number, the response's
+        disposition, and the full raw response text, so a declined
+        repair (arm #22: 3/3 no_edit_blocks, responses recorded
+        nowhere) is reconstructable from the run directory. The
+        run directory is created if missing, as in
+        append_planner_attempt.
+        """
+        self.run_dir(run_id).mkdir(parents=True, exist_ok=True)
+        self._append_jsonl(run_id, "seam_attempts.jsonl", record)
+
     def read_measurements(self, run_id: str) -> list[dict[str, Any]]:
         """Read back all measurement records for a run (empty list if none)."""
         return self._read_jsonl(run_id, "measurements.jsonl")
@@ -158,6 +176,10 @@ class RunStore:
     def read_planner_attempts(self, run_id: str) -> list[dict[str, Any]]:
         """Read back all planner attempt records for a run (empty if none)."""
         return self._read_jsonl(run_id, "planner_attempts.jsonl")
+
+    def read_seam_attempts(self, run_id: str) -> list[dict[str, Any]]:
+        """Read back all repair-seam attempt records (empty if none)."""
+        return self._read_jsonl(run_id, "seam_attempts.jsonl")
 
     def _read_jsonl(self, run_id: str, filename: str) -> list[dict[str, Any]]:
         path = self.run_dir(run_id) / filename
