@@ -769,17 +769,45 @@ def _pairing_smoke_flows(
     """The pairing contract's core flows, exercised in order.
 
     Each entry: (flow, ok, detail). The expectations are the
-    contract's pinned ones (CONTRACT.md, HTTP API + poll table):
-    a valid fresh registration answers a success status (201);
-    a pending code polls 404; confirm with the operator token
-    answers 200; the claiming poll answers 200 with the bundle;
-    a wrong method on a known path answers the contract's 405 —
-    never the stdlib's 501 default; a path the server never
-    registered answers 404 (campaign build #12: the acceptance
-    set checks exactly that case, and a server whose method
-    handling answers 405 for everything passed the first five
-    flows while failing it — the probe now sees what acceptance
-    sees). A flow that cannot be attempted inside the overall
+    contract's pinned status table (CONTRACT.md, HTTP API + poll
+    table + the routing sentences), checked exactly. Campaign
+    build #16: a flow passes only on the contract's own status,
+    and a status detail carries the machine-readable fact
+    ("<flow>_status: expected X, got Y") that the re-plan brief
+    renders verbatim:
+
+    - register: a valid FRESH registration answers 201
+      ("`201` new, `200` idempotent"). The probe boots a fresh
+      store, so its code is new — a 200 here is the idempotent
+      answer leaking onto a creation (arm #25's plan removed
+      the is_new->201 branch, and the old (200, 201) check read
+      that regression as a pass).
+    - register_idempotent: the same registration repeated
+      (same code + nonce + machine_id) answers 200 — the row's
+      other half; a server that always answers 201 fails here.
+    - poll_pending: a pending code polls 404 (poll table).
+    - confirm_bad_credentials: confirm with the operator token
+      but an EMPTY bundle answers 400 ("`400` invalid bundle" —
+      a bundle must be a non-empty object). Runs while the
+      record is still pending; a server that confirms anyway
+      (arm #25 answered 200) fails here.
+    - confirm: confirm with the operator token and a valid
+      bundle answers 200.
+    - poll_claim: the claiming poll answers 200 with the
+      bundle (poll table — exactly once).
+    - poll_claimed: the same poll again answers 410 with the
+      claimed body (poll table: the code is burned).
+    - wrong_method: a wrong method on a known path answers
+      the contract's 405 — never the stdlib's 501 default.
+    - unknown_route: a path the server never registered
+      answers 404 (build #12).
+    - wrong_method_unknown_route: a wrong method on an
+      UNKNOWN path still answers 404 — "Unknown routes ->
+      404"; the 405 belongs only to known paths (arm #25's
+      third miss: its server answered 405 there, and no flow
+      exercised the combination).
+
+    A flow that cannot be attempted inside the overall
     deadline fails as unattempted.
     """
 
@@ -806,17 +834,19 @@ def _pairing_smoke_flows(
 
     flows: list[tuple[str, bool, str]] = []
 
+    register_body = {
+        "code": _SMOKE_CODE,
+        "nonce": _SMOKE_NONCE,
+        "machine_id": _SMOKE_MACHINE_ID,
+        "hostname": "smoke-probe",
+        "mac": "02:00:00:00:00:01",
+    }
+
     outcome, error = request(
         "register",
         "POST",
         "/pairing/register",
-        body={
-            "code": _SMOKE_CODE,
-            "nonce": _SMOKE_NONCE,
-            "machine_id": _SMOKE_MACHINE_ID,
-            "hostname": "smoke-probe",
-            "mac": "02:00:00:00:00:01",
-        },
+        body=register_body,
     )
     if error is not None:
         flows.append(("register", False, error))
@@ -825,11 +855,37 @@ def _pairing_smoke_flows(
         flows.append(
             (
                 "register",
-                status in (200, 201),
+                status == 201,
                 f"register: POST /pairing/register -> {status} "
-                "(expected a success status — 201 for a fresh code; "
-                "a 400/5xx means the server rejects or breaks on a "
-                "valid registration)",
+                f"(register_status: expected 201, got {status} — "
+                "the contract's register row answers 201 for a "
+                "NEW code and 200 only for an idempotent "
+                "re-registration; this probe registers a fresh "
+                "code, so a 200 means the creation answer is "
+                "missing)",
+            )
+        )
+
+    outcome, error = request(
+        "register_idempotent",
+        "POST",
+        "/pairing/register",
+        body=register_body,
+    )
+    if error is not None:
+        flows.append(("register_idempotent", False, error))
+    else:
+        status, _raw = outcome
+        flows.append(
+            (
+                "register_idempotent",
+                status == 200,
+                f"register_idempotent: POST /pairing/register "
+                f"-> {status} (register_idempotent_status: "
+                f"expected 200, got {status} — the same code + "
+                "nonce + machine_id re-registered is the "
+                "contract's idempotent case; a 201 here means "
+                "the server treated a repeat as a creation)",
             )
         )
 
@@ -844,6 +900,31 @@ def _pairing_smoke_flows(
                 status == 404,
                 f"poll_pending: GET /pairing/{_SMOKE_CODE} -> {status} "
                 "(expected 404 — the contract's pending poll)",
+            )
+        )
+
+    outcome, error = request(
+        "confirm_bad_credentials",
+        "POST",
+        f"/pairing/{_SMOKE_CODE}/confirm",
+        body={"credentials": {}},
+        token=_SMOKE_TOKEN,
+    )
+    if error is not None:
+        flows.append(("confirm_bad_credentials", False, error))
+    else:
+        status, _raw = outcome
+        flows.append(
+            (
+                "confirm_bad_credentials",
+                status == 400,
+                f"confirm_bad_credentials: POST "
+                f"/pairing/{_SMOKE_CODE}/confirm -> {status} "
+                f"(confirm_bad_credentials_status: expected 400, "
+                f"got {status} — an empty bundle is the "
+                "contract's invalid-bundle case (`400` invalid "
+                "bundle); a 200 means the server confirmed a "
+                "record carrying no usable credential bundle)",
             )
         )
 
@@ -886,6 +967,36 @@ def _pairing_smoke_flows(
                 f"poll_claim: GET /pairing/{_SMOKE_CODE} -> {status} "
                 "(expected 200 with the confirmed credential bundle "
                 "— the one-time claim)",
+            )
+        )
+
+    outcome, error = request("poll_claimed", "GET", f"/pairing/{_SMOKE_CODE}")
+    if error is not None:
+        flows.append(("poll_claimed", False, error))
+    else:
+        status, raw = outcome
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        claimed_body = (
+            isinstance(payload, dict) and payload.get("status") == "claimed"
+        )
+        flows.append(
+            (
+                "poll_claimed",
+                status == 410 and claimed_body,
+                f"poll_claimed: GET /pairing/{_SMOKE_CODE} -> "
+                f"{status} (poll_claimed_status: expected 410, "
+                f"got {status} — the claim burned the code, so "
+                "the poll table's claimed row answers 410 with "
+                "status \"claimed\")"
+                + (
+                    " — the status code is right but the body "
+                    "does not carry status \"claimed\""
+                    if status == 410 and not claimed_body
+                    else ""
+                ),
             )
         )
 
@@ -934,8 +1045,34 @@ def _pairing_smoke_flows(
                 + ")",
             )
         )
-    return flows
 
+    outcome, error = request(
+        "wrong_method_unknown_route", "PUT", "/smoke-probe/no-such-route"
+    )
+    if error is not None:
+        flows.append(("wrong_method_unknown_route", False, error))
+    else:
+        status, _raw = outcome
+        flows.append(
+            (
+                "wrong_method_unknown_route",
+                status == 404,
+                f"wrong_method_unknown_route: PUT "
+                f"/smoke-probe/no-such-route -> {status} "
+                f"(wrong_method_unknown_route_status: expected "
+                f"404, got {status} — unknown routes answer 404 "
+                "whatever the method; 405 belongs only to a "
+                "known path with the wrong method"
+                + (
+                    "; the wrong-method answer is leaking onto "
+                    "unknown routes"
+                    if status == 405
+                    else ""
+                )
+                + ")",
+            )
+        )
+    return flows
 
 def _boot_pairing_server(
     root: Path, work_dir: Path

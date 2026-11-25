@@ -110,7 +110,7 @@ class TestUnknownRouteFlow(unittest.TestCase):
             root = _fixture_tree(Path(tmp), FIXTURE_SERVER_GOOD)
             results = run_contract_probes(SMOKE_CLAUSES, root)
             flows = _smoke_records(results)
-            self.assertEqual(len(flows), 6)
+            self.assertEqual(len(flows), 10)
             for record in flows:
                 self.assertEqual(record["file"], SERVER_REL)
                 self.assertTrue(record["flow"])
@@ -147,7 +147,7 @@ class TestUnknownRouteFlow(unittest.TestCase):
             elapsed = time.monotonic() - started
             self.assertLess(elapsed, 20.0)
             flows = _smoke_records(results)
-            self.assertEqual(len(flows), 6)
+            self.assertEqual(len(flows), 10)
             register = _flow(results, "register")
             self.assertFalse(register[0]["ok"])
             self.assertIn("timed out", register[0]["detail"])

@@ -112,7 +112,17 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/pairing/register":
             body = self._body()
             code = body.get("code", "")
-            self.records[code] = {"status": "pending", "credentials": None}
+            existing = self.records.get(code)
+            if existing is not None and existing.get("nonce") == body.get(
+                "nonce"
+            ):
+                self._json(200, {"code": code, "status": existing["status"]})
+                return
+            self.records[code] = {
+                "status": "pending",
+                "credentials": None,
+                "nonce": body.get("nonce"),
+            }
             self._json(201, {"code": code, "status": "pending"})
             return
         if self.path.startswith("/pairing/") and self.path.endswith("/confirm"):
@@ -121,7 +131,11 @@ class _Handler(BaseHTTPRequestHandler):
             if record is None:
                 self._json(404, {"error": "not found"})
                 return
-            record["credentials"] = self._body().get("credentials")
+            bundle = self._body().get("credentials")
+            if not bundle:
+                self._json(400, {"error": "invalid bundle"})
+                return
+            record["credentials"] = bundle
             record["status"] = "confirmed"
             self._json(200, {"code": code, "status": "confirmed"})
             return
@@ -152,10 +166,16 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_PUT(self):
-        self._json(405, {"error": "method not allowed"})
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
 
     def do_DELETE(self):
-        self._json(405, {"error": "method not allowed"})
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
 
 
 def make_server(store, token, host="127.0.0.1", port=0):
@@ -173,10 +193,16 @@ FIXTURE_SERVER_400 = FIXTURE_SERVER_GOOD.replace(
 # 501 default the contract forbids.
 FIXTURE_SERVER_501 = FIXTURE_SERVER_GOOD.replace(
     '''    def do_PUT(self):
-        self._json(405, {"error": "method not allowed"})
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
 
     def do_DELETE(self):
-        self._json(405, {"error": "method not allowed"})
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
 
 ''',
     "",
@@ -264,9 +290,11 @@ class TestPairingSmokeProbe(unittest.TestCase):
             results = run_contract_probes(SMOKE_CLAUSES, root)
             self.assertEqual(probe_failures(results), [])
             flows = _smoke_records(results)
-            # Six flows since campaign build #12 added the
-            # unknown-route check to the five build #6 flows.
-            self.assertEqual(len(flows), 6)
+            # Ten flows since campaign build #16 extended the
+            # probe to the contract's exact status table (build
+            # #12 had brought the five build #6 flows to six
+            # with the unknown-route check).
+            self.assertEqual(len(flows), 10)
             boot = [
                 r
                 for r in results
