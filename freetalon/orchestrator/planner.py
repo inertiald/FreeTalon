@@ -12,6 +12,8 @@ import shlex
 import hashlib
 import heapq
 import textwrap
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Collection
@@ -60,6 +62,7 @@ from .repo_index import (
     goal_named_specs,
     qualified_def_names,
 )
+from .run_store import RunStore, new_run_id
 from .measure import (
     CRITERION_COMMAND_TIMEOUT_S,
     CRITERION_CUSTOM_CHECK,
@@ -8002,7 +8005,15 @@ def _modify_path_errors(
     materialization stamps inputs["_materialized_from"] on nodes
     whose content the system produced from an anchored or scoped
     edit, and parse strips the key from raw model nodes, so only
-    materialization can set it. The gated override: the node
+    materialization can set it. A write whose content is
+    byte-identical to the target's current text is also not a
+    violation (campaign build #17): it changes nothing, so it
+    cannot commit this rule's harm — the fill path's no-change
+    completion (an all-identity edit set, converted by
+    _fill_node_payload) reaches assembly in exactly that shape,
+    and identity is verified here from the same sources the rule
+    already reads, never merely claimed by a stamp. The gated
+    override: the node
     carries a non-empty "overwrite_justification" AND a companion
     impact-check node exists — another node that depends on the
     write node and carries inputs["impact_check_for"] naming the
@@ -8026,6 +8037,7 @@ def _modify_path_errors(
     root_resolved = Path(root).resolve()
     errors: list[str] = []
     existing: set[str] = set()
+    written: dict[str, str] = {}
     for node in nodes:
         target = _node_write_target(node)
         if target is None:
@@ -8041,6 +8053,26 @@ def _modify_path_errors(
             on_disk = resolved_path.is_file()
         prior = resolved in existing or on_disk
         if isinstance(content, str) and prior:
+            # Campaign build #17: byte-identity with the target's
+            # current text (an earlier node's write in this plan,
+            # else the file as it stands) is verified no-change,
+            # not a rewrite — skip before the stamp/override
+            # checks (see the docstring).
+            if resolved in written:
+                current_text: str | None = written[resolved]
+            elif modules is not None:
+                current_text = modules.source(resolved_path)
+            else:
+                try:
+                    current_text = resolved_path.read_text(
+                        encoding="utf-8"
+                    )
+                except OSError:
+                    current_text = None
+            if current_text is not None and content == current_text:
+                existing.add(resolved)
+                written[resolved] = content
+                continue
             inputs = node.inputs or {}
             if inputs.get("_materialized_from") not in (
                 "anchored_edit",
@@ -8108,6 +8140,8 @@ def _modify_path_errors(
                         + "."
                     )
         existing.add(resolved)
+        if isinstance(content, str):
+            written[resolved] = content
     return errors
 
 
@@ -12137,6 +12171,7 @@ def _record_planner_attempt(
     target: str | None = None,
     intent: str | None = None,
     intent_corrections: Collection[dict[str, Any]] = (),
+    fill_notes: Collection[str] = (),
 ) -> None:
     """Persist one planner attempt (see the section above).
 
@@ -12151,6 +12186,13 @@ def _record_planner_attempt(
     a correction actually happened, so a record from an
     uncorrected attempt is byte-identical to the pre-build-#11
     shape.
+
+    Campaign build #17: ``fill_notes`` carries the fill path's
+    no-change accounting for this attempt — one note per identity
+    edit the fill converted to a no-change declaration (see
+    _split_identity_edits); the key is present only when a
+    conversion actually happened, so a record from an attempt
+    without one is byte-identical to the pre-build-#17 shape.
     """
     error_text = "\n".join(str(error) for error in errors)
     if len(error_text) > _ATTEMPT_ERROR_CAP:
@@ -12173,6 +12215,8 @@ def _record_planner_attempt(
         record["intent_corrections"] = [
             dict(entry) for entry in intent_corrections
         ]
+    if fill_notes:
+        record["fill_notes"] = [str(note) for note in fill_notes]
     header = (
         f"phase={phase} attempt={attempt} outcome={outcome}"
         + (f" node={node_id}" if node_id else "")
@@ -13251,13 +13295,77 @@ def _fill_shape_repair_block(intent: str, defects: list[str]) -> str:
             '"position": "after", "content": "import sys"}',
             "",
             'An empty object ({}) and an empty "edits" list are '
-            'NOT "no change" answers — this contract has no '
-            "no-change payload: the payload must carry at least "
-            "one real edit or one anchored insertion. Do NOT "
-            "return the whole file.",
+            'NOT "no change" answers. The no-change spelling is '
+            'a scoped edit whose "replace" is identical to its '
+            '"search" over text that already satisfies this '
+            "node — an edit set of only such declarations "
+            "completes the node as no-change. Otherwise the "
+            "payload must carry at least one real edit or one "
+            "anchored insertion. Do NOT return the whole file.",
             "Return a corrected payload only.",
         ]
     return "\n".join(lines)
+
+
+# ── Campaign build #17: identity edits are the fill's no-change ──
+# spelling ──
+#
+# Arm #26 died in content fill: asked to fill an edit node against
+# a standing implementation it judged already correct, the model
+# spelled "no change" as a single scoped edit whose replacement
+# was character-identical to its search text (the whole register()
+# method) — on all three attempts. The validator rejected each as
+# no_op_edit: build #8 had given the PLAN-form fill a legal
+# spelling for shape failures, but the scoped-edit dialect of the
+# "no change needed" judgment — the very dialect arm #17's
+# diagnosis already showed ({}, a no-op edit, {"edits": []}) — had
+# none in the fill path, so a legitimate judgment burned the
+# node's whole attempt budget and then the plan. The conversion
+# belongs in the fill, not the validator: apply_scoped_edits'
+# no_op_edit rejection still guards authored plans exactly as
+# before (a plan that ASKS for an identity edit is rejected);
+# the fill instead READS an identity edit as the declaration it
+# is, drops it, and records the declaration. An edit set of only
+# declarations completes the node as no-change: content = the
+# file as it stands, stamped _materialized_from="no_change" by
+# the system (parse strips that key from model nodes, so the
+# stamp cannot be forged), with the plan-emission metadata
+# naming the node. Downstream probes and the node's own tests
+# remain the judges of whether "no change" was right.
+
+
+def _split_identity_edits(
+    edits: list[Any], existing_source: str | None
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Split raw fill edits into (real edits, no-change declarations).
+
+    An entry declares no-change when it is a usable edit dict
+    whose ``replace`` is character-identical to its ``search`` —
+    the exact test apply_scoped_edits raises no_op_edit on — AND
+    the search text occurs exactly once in the file as it stands:
+    the declaration is about THIS text, standing unchanged, so an
+    identity claim over absent or ambiguous text is not one (it
+    stays in the real list and meets the ordinary validators,
+    which reject it as the no-op it also is). Malformed entries
+    likewise stay real. When the file's current text is unknown
+    (``existing_source`` is None) nothing is a declaration.
+    """
+    if existing_source is None:
+        return list(edits), []
+    real: list[Any] = []
+    declared: list[dict[str, Any]] = []
+    for entry in edits:
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("search"), str)
+            and bool(entry["search"])
+            and entry.get("replace") == entry["search"]
+            and existing_source.count(entry["search"]) == 1
+        ):
+            declared.append(entry)
+        else:
+            real.append(entry)
+    return real, declared
 
 
 def _fill_node_payload(
@@ -13298,6 +13406,13 @@ def _fill_node_payload(
     and intent attached. The recorded text is the sanitized
     response — the payload validation actually judged. Arm #17's
     unpersisted fill payloads are the failure this removes.
+
+    Campaign build #17: identity edits in an edit payload are
+    the model's no-change declaration (see _split_identity_edits):
+    they are dropped and recorded as fill_notes on the attempt,
+    never counted as failures; a payload of only declarations
+    completes the node as no-change on that same attempt, its
+    content the file's standing text.
     """
     target = _node_write_target(node) or ""
     if intent in ("create", "whole_file"):
@@ -13313,7 +13428,11 @@ def _fill_node_payload(
             'text>"}]} (scoped edits) OR {"anchor": "<a line copied '
             'exactly from the current file>", "position": "after" '
             'or "before", "content": "<the new code>"} (an anchored '
-            "edit). Do NOT return the whole file."
+            "edit). An edit whose \"replace\" is identical to its "
+            '"search" declares that text needs no change; if every '
+            "edit is such a declaration, the node completes as "
+            "no-change with the file as it stands. Do NOT return "
+            "the whole file."
         )
     existing_block = ""
     if existing_source is not None:
@@ -13354,8 +13473,35 @@ def _fill_node_payload(
                 f"your previous payload was not a JSON object: {exc}"
             ]
         fields: dict[str, Any] = {}
+        fill_notes: list[str] = []
         if payload is not None:
             fields, last_defects = _fill_payload_shape(payload, intent)
+        if not last_defects and isinstance(fields.get("edits"), list):
+            # Campaign build #17: partition the payload's identity
+            # edits out as no-change declarations before validation
+            # judges the rest (see _split_identity_edits). A mixed
+            # payload proceeds on its real edits alone; a payload
+            # of only declarations completes the node as no-change
+            # on this attempt — the declaration is an answer, not
+            # a failure, so it spends no attempt budget.
+            real_edits, declared = _split_identity_edits(
+                fields["edits"], existing_source
+            )
+            if declared:
+                fill_notes = [
+                    "identity edit declared no-change and was "
+                    "dropped (search begins "
+                    + repr(str(entry["search"])[:60])
+                    + ")"
+                    for entry in declared
+                ]
+                if real_edits:
+                    fields = {**fields, "edits": real_edits}
+                else:
+                    fields = {}
+                    candidate_inputs.pop("edits", None)
+                    candidate_inputs["content"] = existing_source
+                    candidate_inputs["_materialized_from"] = "no_change"
         candidate_inputs.update(fields)
         candidate["inputs"] = candidate_inputs
         if last_defects:
@@ -13373,6 +13519,7 @@ def _fill_node_payload(
                 node_id=node.id,
                 target=target,
                 intent=intent,
+                fill_notes=fill_notes,
             )
             return candidate, attempt
         _record_planner_attempt(
@@ -13384,6 +13531,7 @@ def _fill_node_payload(
             node_id=node.id,
             target=target,
             intent=intent,
+            fill_notes=fill_notes,
         )
         if last_defects:
             errors_block = "\n\n" + _fill_shape_repair_block(
@@ -13512,6 +13660,66 @@ def _fill_plan_contents(
     return filled_dicts, attempts, prefilled
 
 
+def _no_change_node_ids(filled_dicts: list[dict[str, Any]]) -> list[str]:
+    """Ids of filled nodes the fill completed as no-change.
+
+    Campaign build #17: read off the filled dicts (the fill's
+    system stamp, _materialized_from="no_change") for the
+    plan-emission metadata — the record that a node's content is
+    the file as it stands because the model declared no-change
+    and the fill verified the declaration, not because the node
+    was authored whole.
+    """
+    return [
+        str(raw.get("id"))
+        for raw in filled_dicts
+        if isinstance(raw, dict)
+        and (raw.get("inputs") or {}).get("_materialized_from")
+        == "no_change"
+    ]
+
+
+def _restamp_no_change_nodes(
+    assembled: list[PlanNode], filled_dicts: list[dict[str, Any]]
+) -> None:
+    """Restamp the no-change provenance on assembled nodes.
+
+    Campaign build #17: assembly parse strips _materialized_from
+    from raw node dicts (only materialization may set it, so a
+    model cannot forge an exemption), and a no-change node's
+    content was not produced by materialization, so its stamp
+    would be lost there. The filled dicts are the system-side
+    record: an assembled node whose target and content match a
+    no-change filled dict exactly gets the stamp back, so the
+    plan record (the run store's plan versions) shows which
+    writes are verified no-ops. Content identity is re-verified
+    here — a node whose content differs from the filled dict's
+    is never stamped.
+    """
+    declared = [
+        raw
+        for raw in filled_dicts
+        if isinstance(raw, dict)
+        and (raw.get("inputs") or {}).get("_materialized_from")
+        == "no_change"
+    ]
+    if not declared:
+        return
+    for node in assembled:
+        inputs = node.inputs or {}
+        content = inputs.get("content")
+        if not isinstance(content, str):
+            continue
+        target = _node_write_target(node)
+        for raw in declared:
+            raw_inputs = raw.get("inputs") or {}
+            if raw_inputs.get("content") == content and (
+                raw_inputs.get("file_path") or raw_inputs.get("path")
+            ) == target:
+                inputs["_materialized_from"] = "no_change"
+                break
+
+
 def build_execution_plan(
     intent: TaskIntent,
     nodes: list[PlanNode] | list[dict[str, Any]],
@@ -13542,6 +13750,106 @@ def build_execution_plan(
 PLAN_TASK_INTENT_MAX_REPAIRS = 4
 
 
+def _record_planning_failure(
+    intent: TaskIntent,
+    exc: LLMResponseError,
+    *,
+    plan_id: str | None,
+    started: float,
+    started_at: str,
+    attempt_sink: Callable[[dict[str, Any]], None] | None,
+) -> str | None:
+    """Write the run record for a terminal planning failure.
+
+    Campaign build #17: the driver flow plans BEFORE any
+    LoopRunner exists, so a planning failure there created no
+    run record at all — no contract, no planner attempts file,
+    no summary, no verdict; the failure existed only as a
+    traceback in the driver's log (exam arms #17 and #26). A
+    planning failure INSIDE a run is recorded by the loop
+    (escalation → _finish_run → the run's summary and attempts
+    files); this routes the pre-run failure into the same
+    machinery — the same RunStore record shape (contract.json
+    via create_run, the buffered attempts drained into
+    planner_attempts.jsonl exactly as run_plan drains them, and
+    a summary.md in _write_summary's line format) with the
+    verdict the loop's vocabulary already has for a plan that
+    failed before execution: FAIL, its detail naming the
+    planning failure.
+
+    Recording applies only when the attempts have no other
+    owner and the record has a home: a caller-supplied
+    ``attempt_sink`` (or an outer scope's installed sink) means
+    the attempts already flow to a record the caller owns, and
+    the intent's ``workspace`` constraint — the fact the drivers
+    stamp with the workspace whose runs/ directory their
+    LoopRunner reads — names the store. Returns the new run id,
+    or None when recording does not apply. Recording is
+    observability, never a gate: a failure inside it is noted
+    on stdout and the original exception stands.
+    """
+    if attempt_sink is not None or _ATTEMPT_SINK is not None:
+        return None
+    workspace = (intent.constraints or {}).get("workspace")
+    if not isinstance(workspace, str) or not workspace:
+        return None
+    base = Path(workspace)
+    if not base.is_dir():
+        return None
+    try:
+        store = RunStore(base / "runs")
+        run_id = new_run_id()
+        effective_plan_id = plan_id or _plan_id_for_intent(intent)
+        store.create_run(
+            run_id,
+            {
+                "objective": intent.goal,
+                "planning_failure": {
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "plan_id": effective_plan_id,
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                },
+            },
+        )
+
+        def _sink(record: dict[str, Any]) -> None:
+            # The loop's own sink split (build #13): seam records
+            # to seam_attempts.jsonl, planner records to
+            # planner_attempts.jsonl.
+            if record.get("kind") == "seam_attempt":
+                store.append_seam_attempt(run_id, record)
+            else:
+                store.append_planner_attempt(run_id, record)
+
+        drain_pending_planner_attempts(_sink)
+        elapsed_s = time.monotonic() - started
+        lines = [
+            f"# Run {run_id}",
+            "",
+            f"- Started: {started_at}",
+            f"- Elapsed: {elapsed_s:.1f}s",
+            f"- Goal: {intent.goal}",
+            f"- Plan: {effective_plan_id} (status failed, "
+            "0 version(s))",
+            f"- Goal verdict: **{VERDICT_FAIL}** — planning "
+            f"failure: {exc}",
+            "",
+            "Escalation: planning failed before execution: "
+            f"{exc}",
+            "",
+        ]
+        store.write_summary(run_id, "\n".join(lines))
+        return run_id
+    except Exception as record_exc:  # noqa: BLE001 — observability, not a gate
+        print(
+            "planning failure recording failed "
+            f"({type(record_exc).__name__}: {record_exc}); the "
+            "planning failure itself stands in the log only."
+        )
+        return None
+
+
 def plan_task_intent(
     intent: TaskIntent,
     settings: LLMSettings | None = None,
@@ -13566,23 +13874,53 @@ def plan_task_intent(
     planner_attempt_sink) — every skeleton and content-fill
     attempt is recorded to it as well as to stdout. A sink already
     installed by an outer scope (a run's) is restored on exit.
+
+    Campaign build #17: a terminal LLMResponseError (skeleton
+    repair exhaustion, content-fill exhaustion, spec grounding)
+    is recorded as a run record before it propagates, when the
+    recording applies (see _record_planning_failure). The
+    exception itself is then annotated — a ``run_id`` attribute
+    and the record's name appended to its message — and re-raised
+    unchanged in type, so every caller's failure handling (and
+    the taxonomy the planner's own subclasses carry) is exactly
+    as before; the record is pure addition. When recording does
+    not apply, the exception propagates untouched.
     """
-    if attempt_sink is None:
-        return _plan_task_intent(
+    started = time.monotonic()
+    started_at = datetime.now(UTC).isoformat()
+    try:
+        if attempt_sink is None:
+            return _plan_task_intent(
+                intent,
+                settings,
+                plan_id=plan_id,
+                max_repairs=max_repairs,
+                repo_root=repo_root,
+            )
+        with planner_attempt_sink(attempt_sink):
+            return _plan_task_intent(
+                intent,
+                settings,
+                plan_id=plan_id,
+                max_repairs=max_repairs,
+                repo_root=repo_root,
+            )
+    except LLMResponseError as exc:
+        run_id = _record_planning_failure(
             intent,
-            settings,
+            exc,
             plan_id=plan_id,
-            max_repairs=max_repairs,
-            repo_root=repo_root,
+            started=started,
+            started_at=started_at,
+            attempt_sink=attempt_sink,
         )
-    with planner_attempt_sink(attempt_sink):
-        return _plan_task_intent(
-            intent,
-            settings,
-            plan_id=plan_id,
-            max_repairs=max_repairs,
-            repo_root=repo_root,
-        )
+        if run_id is not None:
+            exc.run_id = run_id  # type: ignore[attr-defined]
+            exc.args = (
+                f"{exc} [planning failure recorded as run {run_id}]",
+                *exc.args[1:],
+            )
+        raise
 
 
 def _plan_task_intent(
@@ -13698,17 +14036,22 @@ def _plan_task_intent(
             repo_root=repo_root,
             clauses=clauses,
         )
+        _restamp_no_change_nodes(assembled_nodes, filled_dicts)
         nodes = assembled_nodes
         metadata = dict(metadata or {})
         if assembled_metadata.get(CONTRACT_METADATA_KEY) is not None:
             metadata[CONTRACT_METADATA_KEY] = assembled_metadata[
                 CONTRACT_METADATA_KEY
             ]
-        metadata[PLAN_EMISSION_METADATA_KEY] = {
+        emission: dict[str, Any] = {
             "phases": ["skeleton", "content_fill"],
             "content_attempts": fill_attempts,
             "prefilled": prefilled_ids,
         }
+        no_change_ids = _no_change_node_ids(filled_dicts)
+        if no_change_ids:
+            emission["no_change_nodes"] = no_change_ids
+        metadata[PLAN_EMISSION_METADATA_KEY] = emission
     # Cycle 4: record the repo this plan was grounded against in its
     # metadata, so the executor resolves the plan's relative
     # references (./.venv/bin/python, scaffold targets, criterion
@@ -14384,12 +14727,17 @@ def _replan_from_brief(
             clause_mode="delta",
             clause_required=required_clause_ids if clauses else None,
         )
+        _restamp_no_change_nodes(assembled_nodes, filled_dicts)
         nodes = assembled_nodes
-        brief["plan_emission"] = {
+        replan_emission: dict[str, Any] = {
             "phases": ["replan_skeleton", "replan_content_fill"],
             "content_attempts": fill_attempts,
             "prefilled": prefilled_ids,
         }
+        replan_no_change_ids = _no_change_node_ids(filled_dicts)
+        if replan_no_change_ids:
+            replan_emission["no_change_nodes"] = replan_no_change_ids
+        brief["plan_emission"] = replan_emission
     brief["rejected_approaches"] = metadata.get("rejected_approaches", seed or [])
     if clauses:
         # Campaign build #7: the accepted delta's declared
