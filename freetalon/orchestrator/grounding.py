@@ -88,7 +88,7 @@ from __future__ import annotations
 
 import ast
 import builtins
-from typing import Any
+from typing import Any, Callable
 
 # Instance attributes (and methods — a ``self.method()`` call is an
 # attribute load too) the stdlib sets or defines on its request
@@ -187,6 +187,174 @@ def attribute_grounding_violations(old_source: str, new_source: str) -> list[str
     except (SyntaxError, ValueError):
         return []
     return _chain_violations(old_tree, new_tree)
+
+
+# ── cross-file import references (campaign build #22) ──────────────
+#
+# The checks above judge a file's references against ITSELF: an
+# edit's new text may only use names and attributes the file's own
+# text resolves. Nothing judged a file's references against the
+# OTHER files — a from-import naming a project module was taken on
+# faith. The held-out screening (build #21) measured the cost: both
+# task-B candidate runs opened with a freshly created test module
+# importing ``NotesStore`` from a store that defines ``NoteStore``;
+# the import passed every validator and detonated at execution,
+# where the verdict machinery counted it against the
+# implementation. Create fills are the exposed shape — a modify
+# fill is anchored by the file it edits, a create has no prior
+# text, so the same-file checks never even run on it.
+#
+# ``import_grounding_findings`` judges one filled file's
+# from-imports against the target modules' actual texts, supplied
+# by the caller through ``resolve_module`` (dotted name -> source
+# text, or None when the text is not knowable: an external package,
+# a file a later node of the same plan will write, a missing
+# file). Unknowable modules are NEVER judged — the conservative
+# exit every check in this module shares. A name also resolves
+# when it is a submodule of the imported package (``from pkg
+# import sub``), including a submodule the plan itself will write
+# (``module_planned``). A target module that star-imports or
+# defines a module-level ``__getattr__`` is exempt — its namespace
+# is dynamic. Unparseable input, on either side, yields no
+# findings: the syntax machinery owns that failure class.
+
+
+def _module_level_getattr_defined(tree: ast.Module) -> bool:
+    """True when the module defines a module-level ``__getattr__``
+    (PEP 562): any imported name may then resolve dynamically, so
+    no from-import of this module can be judged statically."""
+    return any(
+        isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and stmt.name == "__getattr__"
+        for stmt in tree.body
+    )
+
+
+def _defined_names_sample(defined: set[str]) -> str:
+    names = sorted(defined)
+    if not names:
+        return "no top-level names"
+    if len(names) <= 12:
+        return ", ".join(names)
+    return ", ".join(names[:12]) + f", … ({len(names)} total)"
+
+
+def _import_from_dotted(
+    node: ast.ImportFrom, importer_package: tuple[str, ...] | None
+) -> str | None:
+    """The absolute dotted module an ImportFrom names, or None when
+    it cannot be resolved statically (a relative import with no
+    known importer package, or one reaching above the top level)."""
+    if node.level == 0:
+        return node.module
+    if importer_package is None:
+        return None
+    up = node.level - 1
+    if up > len(importer_package):
+        return None
+    base = importer_package[: len(importer_package) - up] if up else importer_package
+    parts = list(base)
+    if node.module:
+        parts.extend(node.module.split("."))
+    if not parts:
+        return None
+    return ".".join(parts)
+
+
+def import_grounding_findings(
+    source: str,
+    *,
+    importer_package: tuple[str, ...] | None,
+    importer_module: str | None,
+    resolve_module: Callable[[str], str | None],
+    module_planned: Callable[[str], bool],
+) -> list[tuple[str, str, str]]:
+    """Cross-file import findings for one file's text.
+
+    Returns (dotted module, imported name, message) triples — one
+    per from-import that names a name the target module does not
+    define. See the section comment above for the conservative
+    exits. Plain ``import a.b.c`` statements bind no imported
+    names to judge and are not flagged.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    findings: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    defined_cache: dict[str, set[str] | None] = {}
+
+    def defined_names(dotted: str) -> set[str] | None:
+        """Top-level names the module defines; None = do not judge."""
+        if dotted in defined_cache:
+            return defined_cache[dotted]
+        result: set[str] | None = None
+        module_source = resolve_module(dotted)
+        if module_source is not None:
+            try:
+                module_tree = ast.parse(module_source)
+            except (SyntaxError, ValueError):
+                module_tree = None
+            if module_tree is not None and not (
+                _has_star_import(module_tree)
+                or _module_level_getattr_defined(module_tree)
+            ):
+                result = _module_level_names(module_tree)
+        defined_cache[dotted] = result
+        return result
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        dotted = _import_from_dotted(node, importer_package)
+        if dotted is None or dotted == importer_module:
+            continue
+        defined = defined_names(dotted)
+        if defined is None:
+            continue
+        for alias in node.names:
+            name = alias.name
+            if name == "*" or name in defined or (dotted, name) in seen:
+                continue
+            submodule = f"{dotted}.{name}"
+            if (
+                resolve_module(submodule) is not None
+                or module_planned(submodule)
+            ):
+                continue
+            seen.add((dotted, name))
+            findings.append(
+                (
+                    dotted,
+                    name,
+                    f"{name} is imported from {dotted}, but that "
+                    f"module does not define it (it defines: "
+                    f"{_defined_names_sample(defined)})",
+                )
+            )
+    return findings
+
+
+def import_grounding_violations(
+    source: str,
+    *,
+    importer_package: tuple[str, ...] | None,
+    importer_module: str | None,
+    resolve_module: Callable[[str], str | None],
+    module_planned: Callable[[str], bool],
+) -> list[str]:
+    """The messages of ``import_grounding_findings`` (see there)."""
+    return [
+        message
+        for _dotted, _name, message in import_grounding_findings(
+            source,
+            importer_package=importer_package,
+            importer_module=importer_module,
+            resolve_module=resolve_module,
+            module_planned=module_planned,
+        )
+    ]
 
 
 # ── self.<attr> references ──────────────────────────────────────────

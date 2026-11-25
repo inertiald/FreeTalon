@@ -35,6 +35,7 @@ from .executor import _command_runs_full_suite
 from .grounding import (
     attribute_grounding_violations,
     edit_grounding_violations,
+    import_grounding_findings,
 )
 from .scoped_edits import (
     ScopedEdit,
@@ -13166,8 +13167,12 @@ def _filled_candidate_errors(
     A whole-file/create payload for an existing Python file also
     faces the edit grounding check against the file's prior text:
     a rewrite may not introduce references the file cannot resolve
-    any more than an edit may. Returns error strings; empty = the
-    payload is valid.
+    any more than an edit may. Campaign build #22: the candidate's
+    materialized text additionally faces cross-file import
+    grounding (see _fill_import_grounding_errors) — a create has
+    no prior text, so the same-file check never ran on it, and its
+    imports were never judged against the tree at all. Returns
+    error strings; empty = the payload is valid.
     """
     import copy as _copy
 
@@ -13229,7 +13234,163 @@ def _filled_candidate_errors(
                     + " — reference only attributes the class assigns "
                     "and names the module defines or imports."
                 )
+    if target is not None and target.endswith(".py"):
+        materialized_inputs = dicts[-1].get("inputs") or {}
+        materialized_content = materialized_inputs.get("content")
+        if isinstance(materialized_content, str):
+            errors.extend(
+                _fill_import_grounding_errors(
+                    materialized_content,
+                    target,
+                    dicts,
+                    prior_dicts,
+                    repo_root,
+                    plan_written,
+                )
+            )
     return errors
+
+
+def _fill_import_grounding_errors(
+    content: str,
+    target: str,
+    dicts: list[dict[str, Any]],
+    prior_dicts: list[dict[str, Any]],
+    repo_root: str | Path | None,
+    plan_written: Collection[str] | None,
+) -> list[str]:
+    """Cross-file import grounding for one filled candidate (build #22).
+
+    The candidate's materialized text is judged against the tree
+    as the plan leaves it: a from-import naming a project module
+    whose text is known — on disk, overlaid with this plan's own
+    fills (``dicts`` is the materialized prior+candidate list) —
+    must name only names that module defines. The held-out
+    screening measured why: both task-B candidate runs at build
+    #21 opened with a created test module importing ``NotesStore``
+    from a store defining ``NoteStore``; no validator resolved the
+    import, so it detonated at execution and the verdict counted
+    it against the implementation. A create has no prior text, so
+    the build #3/#15 same-file grounding never ran on it.
+
+    Conservative exits, mirroring grounding.py's: a module whose
+    text is not knowable (external package, missing file, a file
+    a later node of this plan will write) is never judged; a name
+    that is a submodule of the imported package resolves,
+    including a planned one; and for a file WITH a prior text only
+    imports the candidate INTRODUCES are judged — a standing bad
+    import is not this fill's sin.
+    """
+    root = resolve_repo_root(repo_root)
+    resolved_target = _resolve_plan_target(target, root)
+    known_sources: dict[str, str] = {}
+    for item in dicts:
+        item_inputs = item.get("inputs") or {}
+        item_target = item_inputs.get("file_path") or item_inputs.get("path")
+        if not item_target:
+            outputs = item_inputs.get("outputs")
+            if isinstance(outputs, (list, tuple)) and outputs:
+                item_target = outputs[0]
+        item_content = item_inputs.get("content")
+        if isinstance(item_target, str) and isinstance(item_content, str):
+            known_sources[str(_resolve_plan_target(item_target, root))] = (
+                item_content
+            )
+    planned_paths: set[str] = set()
+    if plan_written:
+        for written in plan_written:
+            if isinstance(written, str):
+                planned_paths.add(str(_resolve_plan_target(written, root)))
+    disk_cache: dict[str, str | None] = {}
+
+    def module_paths(dotted: str) -> tuple[Path, Path]:
+        parts = dotted.split(".")
+        return (
+            root.joinpath(*parts).with_suffix(".py"),
+            root.joinpath(*parts, "__init__.py"),
+        )
+
+    def resolve_module(dotted: str) -> str | None:
+        for candidate_path in module_paths(dotted):
+            key = str(candidate_path)
+            if key in known_sources:
+                return known_sources[key]
+            if key not in disk_cache:
+                try:
+                    disk_cache[key] = candidate_path.read_text(
+                        encoding="utf-8"
+                    )
+                except OSError:
+                    disk_cache[key] = None
+            if disk_cache[key] is not None:
+                return disk_cache[key]
+        return None
+
+    def module_planned(dotted: str) -> bool:
+        return any(
+            str(candidate_path) in planned_paths
+            for candidate_path in module_paths(dotted)
+        )
+
+    importer_package: tuple[str, ...] | None = None
+    importer_module: str | None = None
+    try:
+        rel = resolved_target.relative_to(root)
+    except ValueError:
+        rel = None
+    if rel is not None:
+        importer_package = tuple(rel.parent.parts)
+        if rel.name == "__init__.py":
+            importer_module = ".".join(rel.parent.parts) or None
+        else:
+            importer_module = ".".join(
+                (*rel.parent.parts, rel.stem)
+            )
+    findings = import_grounding_findings(
+        content,
+        importer_package=importer_package,
+        importer_module=importer_module,
+        resolve_module=resolve_module,
+        module_planned=module_planned,
+    )
+    if not findings:
+        return []
+    prior_source: str | None = None
+    for prior in prior_dicts:
+        prior_inputs = prior.get("inputs") or {}
+        if _node_write_target(
+            PlanNode.model_validate(prior)
+        ) == target and isinstance(prior_inputs.get("content"), str):
+            prior_source = prior_inputs["content"]
+    if prior_source is None:
+        try:
+            prior_source = resolved_target.read_text(encoding="utf-8")
+        except OSError:
+            prior_source = None
+    if prior_source is not None:
+        prior_pairs = {
+            (dotted, name)
+            for dotted, name, _message in import_grounding_findings(
+                prior_source,
+                importer_package=importer_package,
+                importer_module=importer_module,
+                resolve_module=resolve_module,
+                module_planned=module_planned,
+            )
+        }
+        findings = [
+            finding
+            for finding in findings
+            if (finding[0], finding[1]) not in prior_pairs
+        ]
+    if not findings:
+        return []
+    return [
+        "the filled content introduces ungrounded imports: "
+        + "; ".join(message for _d, _n, message in findings)
+        + " — import only names the module defines (or submodules "
+        "that exist)."
+    ]
 
 
 # ── Campaign build #8: schema-explicit repair for fill shape failures ──
@@ -13490,6 +13651,124 @@ def _split_identity_edits(
     return real, declared
 
 
+def _is_test_file_target(target: str) -> bool:
+    """True when a write target is a test file: a test_*.py /
+    *_test.py basename, or a tests/test directory component."""
+    path = Path(target)
+    base = path.name
+    if not base.endswith(".py"):
+        return False
+    return (
+        base.startswith("test_")
+        or base.endswith("_test.py")
+        or "tests" in path.parts
+        or "test" in path.parts
+    )
+
+
+_CODE_UNDER_TEST_FILE_CAP = 7000
+_CODE_UNDER_TEST_TOTAL_CAP = 18000
+
+
+def _code_under_test_block(
+    target: str,
+    prior_dicts: list[dict[str, Any]],
+    repo_root: str | Path | None,
+    plan_written: Collection[str] | None,
+) -> str:
+    """The code-under-test context for a test file's fill (build #22).
+
+    A modify fill is anchored by its target's standing content
+    (``existing_source``); a test file is a CREATE — it has no
+    standing content, and before this build its fill saw nothing
+    of the code it tests: not the baseline on disk, not the
+    implementation fills produced earlier in the same pass. The
+    held-out screening measured the result — tests written
+    against an imagined API (a pluralized class name, a
+    dict-shaped return the contract pins as a dataclass, a store
+    file in a shape the store's own _save never writes). This
+    block puts the actual code in the prompt: the materialized
+    contents of the Python files earlier nodes of this plan
+    wrote, and — for plan write targets no earlier fill covers,
+    the re-plan case, where the implementation stands on disk
+    from the previous version — their standing disk content.
+    Test files themselves and the fill's own target are excluded.
+    Best-effort by construction: any failure to assemble the
+    context yields a shorter block or none, never a fill error.
+    Per-file and total caps keep the block a context, not a dump.
+    """
+    root = resolve_repo_root(repo_root)
+    collected: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def offer(raw_target: Any, content: Any) -> None:
+        if not isinstance(raw_target, str) or not isinstance(content, str):
+            return
+        if not raw_target.endswith(".py") or _is_test_file_target(raw_target):
+            return
+        if raw_target == target:
+            return
+        key = str(_resolve_plan_target(raw_target, root))
+        if key in seen:
+            return
+        seen.add(key)
+        collected.append((raw_target, content))
+
+    if prior_dicts:
+        import copy as _copy
+
+        copies = [_copy.deepcopy(item) for item in prior_dicts]
+        try:
+            _materialize_plan_edits(copies, repo_root)
+        except Exception:  # noqa: BLE001 — context is best-effort
+            copies = prior_dicts
+        for item in copies:
+            item_inputs = item.get("inputs") or {}
+            offer(
+                item_inputs.get("file_path") or item_inputs.get("path"),
+                item_inputs.get("content"),
+            )
+    if plan_written:
+        for written in sorted(plan_written):
+            if not isinstance(written, str) or not written.endswith(".py"):
+                continue
+            if _is_test_file_target(written) or written == target:
+                continue
+            resolved = _resolve_plan_target(written, root)
+            if str(resolved) in seen:
+                continue
+            try:
+                text = resolved.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            offer(written, text)
+    if not collected:
+        return ""
+    sections: list[str] = []
+    total = 0
+    for raw_target, content in collected:
+        snippet = content
+        if len(snippet) > _CODE_UNDER_TEST_FILE_CAP:
+            snippet = (
+                snippet[:_CODE_UNDER_TEST_FILE_CAP]
+                + "\n... [truncated for length]"
+            )
+        if sections and total + len(snippet) > _CODE_UNDER_TEST_TOTAL_CAP:
+            break
+        total += len(snippet)
+        sections.append(f"--- {raw_target} ---\n{snippet}")
+    if not sections:
+        return ""
+    return (
+        "\n\nCode under test — the actual current content of the "
+        "Python files this plan produces or modifies. Write the "
+        "tests against THESE definitions: class and function "
+        "names, signatures, return shapes, and on-disk formats "
+        "exactly as they stand here, not as you might assume "
+        "them to be:\n" + "\n\n".join(sections)
+    )
+
+
 def _fill_node_payload(
     node: PlanNode,
     intent: str,
@@ -13536,6 +13815,17 @@ def _fill_node_payload(
     never counted as failures; a payload of only declarations
     completes the node as no-change on that same attempt, its
     content the file's standing text.
+
+    Campaign build #22: when the node writes a test file, the
+    prompt also carries the code under test (the materialized
+    contents of the plan's earlier Python writes, plus standing
+    disk content for plan targets no earlier fill covered — see
+    _code_under_test_block), and every filled payload faces
+    cross-file import grounding in _filled_candidate_errors.
+    The held-out screening measured test fills written against
+    an imagined API detonating at execution; the fill now sees
+    the real definitions and is declined when it imports names
+    they do not define.
     """
     target = _node_write_target(node) or ""
     if intent in ("create", "whole_file"):
@@ -13563,6 +13853,15 @@ def _fill_node_payload(
             f"\n\nCurrent content of {target} (the file as it "
             f"stands before this node):\n{existing_source}"
         )
+    # Campaign build #22: a test file's fill also sees the code
+    # under test (see _code_under_test_block) — a create has no
+    # standing content of its own to anchor it, and the screening
+    # measured tests written against imagined APIs without it.
+    code_under_test_block = ""
+    if _is_test_file_target(target):
+        code_under_test_block = _code_under_test_block(
+            target, prior_dicts, repo_root, plan_written
+        )
     errors_block = ""
     last_errors: list[str] = []
     last_defects: list[str] = []
@@ -13577,6 +13876,7 @@ def _fill_node_payload(
             + f"{spec_section}"
             + f"{inventory_section}"
             + f"{existing_block}"
+            + f"{code_under_test_block}"
             + f"{errors_block}\n\n"
             f"{form}\n"
             "JSON Output:"
