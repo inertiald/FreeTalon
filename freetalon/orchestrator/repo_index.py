@@ -727,6 +727,22 @@ def duplicate_scaffold_error(target_path: str, index: RepoIndex) -> str | None:
     return None
 
 
+def package_lineage_overlap(
+    existing_dir: tuple[str, ...], candidate_dir: tuple[str, ...]
+) -> bool:
+    """True when two repo-relative directories share a package lineage.
+
+    One is a prefix of (or equal to) the other: the two files live
+    in the same package tree — the same directory, a package and
+    its subpackage, or a package and its parent package. Disjoint
+    subtrees (sibling packages) do not overlap. An empty directory
+    (a module at the repo root) is a prefix of every directory, so
+    a root module overlaps everything under the root.
+    """
+    n = min(len(existing_dir), len(candidate_dir))
+    return existing_dir[:n] == candidate_dir[:n]
+
+
 # ── Goal-named spec grounding ─────────────────────────────────────
 #
 # The index above answers "what code exists"; it never showed the

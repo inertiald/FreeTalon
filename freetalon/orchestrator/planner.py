@@ -60,6 +60,7 @@ from .repo_index import (
     format_spec_context,
     framework_in_text,
     goal_named_specs,
+    package_lineage_overlap,
     qualified_def_names,
 )
 from .run_store import RunStore, new_run_id
@@ -3793,7 +3794,9 @@ def _command_errors(
     ]
 
 
-def _grounding_error(node: PlanNode, index: Any) -> str | None:
+def _grounding_error(
+    node: PlanNode, index: Any, plan_written: Collection[str] | None = None
+) -> str | None:
     """Return an error if a scaffold node duplicates existing code (fix 1)."""
     if node.assigned_claw not in ("scaffold", "file_writer"):
         return None
@@ -3806,8 +3809,86 @@ def _grounding_error(node: PlanNode, index: Any) -> str | None:
         return None
     error = duplicate_scaffold_error(target, index)
     if error is not None:
+        # Campaign build #20: a module-stem rejection is waived for
+        # a create inside a package the plan itself creates (see
+        # _duplicate_code_new_package_exempt). The standing-tree
+        # check is unchanged; the waiver reads the plan, which is
+        # the only place the new package's existence is a fact at
+        # plan time.
+        if plan_written and _duplicate_code_new_package_exempt(
+            target, index, plan_written
+        ):
+            return None
         return f"Planner node '{node.id}' duplicates existing code: {error}."
     return None
+
+
+def _duplicate_code_new_package_exempt(
+    target: str, index: Any, plan_written: Collection[str]
+) -> bool:
+    """True when a duplicate_code module-stem rejection names a new package's own module.
+
+    Campaign build #20. The held-out screening set measured the
+    validator rejecting freetalon/jobqueue/store.py and server.py
+    as duplicates of freetalon/pairing/store.py / server.py — the
+    contract-correct plan for a SECOND service package failed
+    planning terminally in both baseline runs (held-out task A
+    0/24, no code written). The rejection is waived only when
+    every one of these holds:
+
+    - the stem is an existing module stem but NOT a route name —
+      route collisions are never waived (api/health.py duplicating
+      GET /health is the original fix-1 case);
+    - the target's directory is not already a package in the
+      standing tree (no __init__.py there on disk);
+    - the plan itself writes that directory's __init__.py — the
+      plan creates the package, the same fact the dunder exemption
+      in duplicate_scaffold_error rests on (every package directory
+      carries its OWN __init__.py);
+    - no existing module of the same stem lives in the target's
+      package lineage (the same package tree, either nesting
+      direction): a create nested inside the existing module's own
+      package tree, or in its parent package, keeps the rejection.
+      Every stem of the top-level freetalon package is an ancestor
+      of everything under freetalon/, so the /health dodge (a new
+      file re-implementing a core module instead of extending it)
+      stays closed.
+    """
+    candidate = Path(target)
+    stem = candidate.stem
+    if not stem or stem not in index.modules:
+        return False
+    if stem in index.route_names():
+        return False
+    try:
+        inside_repo = candidate.is_absolute() and candidate.is_relative_to(index.root)
+    except AttributeError:  # pragma: no cover - Python < 3.9
+        inside_repo = False
+    if not inside_repo:
+        return False
+    rel = candidate.relative_to(index.root)
+    candidate_dir = rel.parent
+    if not candidate_dir.parts:
+        return False
+    if (index.root / candidate_dir / "__init__.py").exists():
+        return False
+    init_rel = (candidate_dir / "__init__.py").as_posix()
+    written_rel: set[str] = set()
+    for written in plan_written:
+        path = Path(written)
+        if path.is_absolute():
+            try:
+                written_rel.add(path.relative_to(index.root).as_posix())
+            except ValueError:
+                continue
+        else:
+            written_rel.add(path.as_posix())
+    if init_rel not in written_rel:
+        return False
+    return not any(
+        package_lineage_overlap(Path(existing).parent.parts, candidate_dir.parts)
+        for existing in index.modules[stem]
+    )
 
 
 def _tmp_write_errors(
@@ -7573,6 +7654,7 @@ def _collect_plan_error_records(
     skeleton: bool = False,
     clause_mode: str = "full",
     clause_required: Collection[str] | None = None,
+    extra_written: Collection[str] | None = None,
 ) -> tuple[list[PlanError], bool]:
     """Collect EVERY plan validation error as structured records.
 
@@ -7642,6 +7724,13 @@ def _collect_plan_error_records(
     plan_written: set[str] = set()
     for node in nodes:
         plan_written.update(_node_written_paths(node))
+    if extra_written:
+        # Campaign build #20: a caller validating one node of a
+        # larger plan (the fill phase) supplies the whole plan's
+        # written paths, so plan-level rules that read them (the
+        # duplicate_code new-package exemption) judge the plan the
+        # node belongs to, not the node in isolation.
+        plan_written.update(extra_written)
     for node in nodes:
         error = _claw_error(node)
         if error is not None:
@@ -7656,7 +7745,7 @@ def _collect_plan_error_records(
         )
         records.extend(_command_error_records(node, repo_root))
         if index is not None:
-            error = _grounding_error(node, index)
+            error = _grounding_error(node, index, plan_written)
             if error is not None:
                 records.append(
                     PlanError(
@@ -13063,6 +13152,7 @@ def _filled_candidate_errors(
     prior_dicts: list[dict[str, Any]],
     repo_root: str | Path | None,
     goal_text: str | None,
+    plan_written: Collection[str] | None = None,
 ) -> list[str]:
     """Per-node validators over one filled candidate node.
 
@@ -13098,6 +13188,7 @@ def _filled_candidate_errors(
         goal_text,
         None,
         plan_context="enrichment",
+        extra_written=plan_written,
     )
     errors = [
         record.message
@@ -13413,6 +13504,7 @@ def _fill_node_payload(
     repo_root: str | Path | None,
     goal_text: str | None,
     attempt_phase: str = "content_fill",
+    plan_written: set[str] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Fill one skeleton write node via its own LLM call(s).
 
@@ -13539,7 +13631,11 @@ def _fill_node_payload(
             last_errors = last_defects
         else:
             last_errors = _filled_candidate_errors(
-                candidate, prior_dicts, repo_root, goal_text
+                candidate,
+                prior_dicts,
+                repo_root,
+                goal_text,
+                plan_written=plan_written,
             )
         if not last_errors:
             _record_planner_attempt(
@@ -13639,6 +13735,14 @@ def _fill_plan_contents(
     attempts: dict[str, int] = {}
     prefilled: list[str] = []
     root = resolve_repo_root(repo_root)
+    # Campaign build #20: the whole skeleton's written paths travel
+    # with each fill, so the per-node validation judges the plan
+    # the node belongs to (the duplicate_code new-package
+    # exemption reads them — a package's __init__ node may fill
+    # after the module it licenses).
+    plan_written: set[str] = set()
+    for skeleton_node in nodes:
+        plan_written.update(_node_written_paths(skeleton_node))
     for node in nodes:
         raw = node.model_dump(mode="json")
         if (node.assigned_claw or "") not in ("scaffold", "file_writer"):
@@ -13685,6 +13789,7 @@ def _fill_plan_contents(
             repo_root=repo_root,
             goal_text=goal_text,
             attempt_phase=attempt_phase,
+            plan_written=plan_written,
         )
         attempts[node.id] = used
         filled_dicts.append(candidate)

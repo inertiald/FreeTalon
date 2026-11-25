@@ -31,7 +31,10 @@ Executor ground truth these tests pin the alignment to:
   the plan itself creates the directory in a step the write
   transitively depends on (or earlier in the write's own command);
 - duplicate_code keeps its full force for substantive stems and
-  route names; only the two dunder filenames are exempt.
+  route names; only the two dunder filenames are exempt (campaign
+  build #20 adds one plan-level exemption: a same-stem module
+  inside a package the plan itself creates — see
+  tests/test_campaign_build20.py).
 """
 
 from __future__ import annotations
@@ -224,9 +227,12 @@ class TestMissingDirectoryAlignment(unittest.TestCase):
         # The pairing proof arm's plan shape: a mkdir step, then the
         # new package's scaffold writes depending on it — including
         # the two dunder files duplicate_code used to reject. The
-        # module stem is probe_store, not store: freetalon/pairing/
-        # store.py exists now, and a second store.py anywhere is a
-        # genuine stem collision duplicate_code is right to reject.
+        # module stem is probe_store, not store, so the proof
+        # shape stays independent of the pairing package's contents:
+        # since campaign build #20 a plan-created sibling package's
+        # own store.py is exempt from duplicate_code, while a
+        # same-stem create inside the pairing package's own tree
+        # still rejects (tests/test_campaign_build20.py).
         mkdir = _bash("step_1", f"mkdir -p {PKG}")
         init = _scaffold(
             "step_2", PKG / "__init__.py",
