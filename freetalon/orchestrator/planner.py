@@ -30,7 +30,10 @@ from .contract_clauses import (
     probe_suspect_map,
 )
 from .executor import _command_runs_full_suite
-from .grounding import edit_grounding_violations
+from .grounding import (
+    attribute_grounding_violations,
+    edit_grounding_violations,
+)
 from .scoped_edits import (
     ScopedEdit,
     ScopedEditError,
@@ -15271,6 +15274,15 @@ def _try_local_repair(
     # introduces that the file cannot resolve (self.<attr> the
     # class never assigns, a call to an undefined name) declines
     # the candidate like any other doubt in this seam.
+    # Campaign build #15: attribute chains decline under their
+    # own reason — a chain the file cannot resolve (arm #24's
+    # self.server.pairing_store in a file whose handler reaches
+    # the store as self.store) teaches the re-plan a different
+    # lesson than a bare ungrounded name, and the decline text
+    # carries the file's own convention for the role.
+    chain_violations = attribute_grounding_violations(content, new_content)
+    if chain_violations:
+        return decline("ungrounded_attribute", "; ".join(chain_violations))
     grounding = edit_grounding_violations(content, new_content)
     if grounding:
         return decline("ungrounded_reference", "; ".join(grounding))
@@ -16051,6 +16063,17 @@ def _try_scoped_edit_repair(
             # seam — the edited content must answer to the file it
             # lands in (arm #11: edits that applied cleanly and
             # referenced self.store for self.server.store).
+            # Campaign build #15: attribute chains decline under
+            # their own reason, as in cycle 8's seam above.
+            chain_violations = attribute_grounding_violations(
+                target.content, new_content
+            )
+            if chain_violations:
+                return decline(
+                    "ungrounded_attribute",
+                    f"{target.relative_path}: "
+                    + "; ".join(chain_violations),
+                )
             grounding = edit_grounding_violations(target.content, new_content)
             if grounding:
                 return decline(
