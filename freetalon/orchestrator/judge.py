@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -109,6 +110,47 @@ def _is_timeout(node: PlanNode) -> bool:
     if measurement.get("envelope_status") == "timeout":
         return True
     return "timed out" in (node.error or "")
+
+
+def _is_environment_failure(node: PlanNode) -> bool:
+    """True when the node's failure is its command never starting.
+
+    Campaign build #21: a bash node whose interpreter/binary does
+    not exist dies with exit 127 and a shell not-found line naming
+    the missing token (dash: "/bin/sh: 1: ./.venv/bin/python: not
+    found"; bash: "<token>: No such file or directory") — an
+    environment failure, not evidence about the work, and the
+    held-out task-B runs spent their whole re-plan budget on exactly
+    this shape while the shipped work passed every hidden test. The
+    signature is deliberately narrow: the exit code must be exactly
+    127, and the not-found subject must be a token of the node's own
+    command (the thing that could not start), so a test failure that
+    merely mentions a missing file cannot qualify. The raw
+    measurement is never altered — this only classifies it.
+    """
+    measurement = node.measurement or {}
+    exit_code = measurement.get("exit_code", node.exit_code)
+    if exit_code != 127:
+        return False
+    diagnostics = _failure_diagnostics(node)
+    if not diagnostics:
+        return False
+    inputs = node.inputs or {}
+    command = inputs.get("command") or inputs.get("cmd")
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        command_tokens = set(shlex.split(command))
+    except ValueError:
+        return False
+    for token in command_tokens:
+        if (
+            f"{token}: not found" in diagnostics
+            or f"{token}: No such file or directory" in diagnostics
+            or f"{token}: command not found" in diagnostics
+        ):
+            return True
+    return False
 
 
 def _is_unmeasurable(node: PlanNode) -> bool:
@@ -631,7 +673,31 @@ class Judge:
 
         # Transient failures only: retry the timed-out nodes, unchanged.
         timeout_nodes = [n for n in failed if _is_timeout(n)]
-        informative = [n for n in failed if n not in timeout_nodes]
+        # Environment failures (build #21): the node's command never
+        # started — its interpreter/binary does not exist here. That
+        # is not evidence about the work and re-planning cannot fix
+        # it (the planner's commands are grounded deterministically),
+        # so such nodes are not informative either; a pass whose only
+        # failures are environmental escalates as an environment
+        # failure instead of spending the re-plan budget.
+        environment_nodes = [n for n in failed if _is_environment_failure(n)]
+        informative = [
+            n
+            for n in failed
+            if n not in timeout_nodes and n not in environment_nodes
+        ]
+        if environment_nodes and not informative and not timeout_nodes:
+            return JudgeDecision(
+                Decision.ESCALATE,
+                "environment failure: "
+                + "; ".join(
+                    f"{n.id}: {n.error or 'command could not start'}"
+                    for n in environment_nodes
+                )
+                + " — the command's interpreter/binary does not exist "
+                "in this environment (exit 127); re-planning cannot fix it",
+                failure_class="environment",
+            )
         if timeout_nodes and not informative:
             retryable = [
                 n

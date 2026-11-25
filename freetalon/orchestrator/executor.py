@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import shlex
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING, TypedDict
@@ -178,6 +179,207 @@ def _plan_repo_root(plan: ExecutionPlan) -> Path | None:
         )
         return None
     return root.resolve()
+
+
+# --- Execution-side interpreter resolution (campaign build #21) ---
+#
+# The planner grounds every python invocation in a plan to
+# ./.venv/bin/python (planner._normalize_plan_interpreters rewrites
+# even bare `python`/`python3` to it), and the validator exempts
+# that spelling from its existence check on the reasoning that the
+# venv is a machine fact — the executing machine has it. That held
+# for the main repo and the long-lived pairing exam worktree (both
+# carry a .venv), and broke on the held-out screening set: the
+# driver clones a FRESH worktree per run and never installs a venv,
+# so every verification node died with exit 127
+# ("/bin/sh: 1: ./.venv/bin/python: not found") and the judge spent
+# the re-plan budget on a phantom code failure while the shipped
+# work passed every hidden test (10 such measurements across the
+# four task-B runs, all with the identical stderr). Resolution
+# therefore also happens here, at execution, against the same repo
+# root validation judged the plan against: when the grounded
+# interpreter does not exist under that root, the token is
+# rewritten to the interpreter this process is running under
+# (sys.executable) — present by construction, and able to run the
+# project's code because it is running the project. When the venv
+# exists, commands pass through byte-identical, so the main repo
+# and the pairing arms are untouched.
+
+_VENV_INTERPRETER_SPELLINGS = ("./.venv/bin/python", ".venv/bin/python")
+
+# Segment separators, kept on split so a command reassembles
+# byte-identically apart from rewritten tokens. Mirrors
+# planner._INTERPRETER_SEGMENT_SPLIT_RE (the planner cannot be
+# imported here — it imports this module).
+_RESOLUTION_SEGMENT_SPLIT_RE = re.compile(r"(\n|&&|\|\||;|\|)")
+
+# Heredoc detection for span protection: same `cat > target <<MARKER`
+# shape the planner's normalization protects
+# (planner._STRIP_HEREDOC_RE) — a heredoc body is file content, not
+# shell, and is never rewritten.
+_RESOLUTION_HEREDOC_RE = re.compile(
+    r"cat\s*>>?\s*(?P<target>\S+)\s*<<-?\s*['\"]?(?P<marker>[A-Za-z_][A-Za-z0-9_]*)['\"]?"
+)
+
+# Shell builtins and keywords: never an interpreter token. Mirrors
+# planner._SHELL_SKIP_TOKENS.
+_RESOLUTION_SKIP_TOKENS = frozenset({
+    "cd", "echo", "export", "source", ".", "test", "[", "[[", "true",
+    "false", "set", "unset", "eval", "exec", "exit", "return", "shift",
+    "trap", "umask", "alias", "unalias", "if", "then", "else", "elif",
+    "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "function", "select", "time", "coproc", "{", "}",
+})
+
+
+def _resolution_heredoc_spans(command: str) -> list[tuple[int, int]]:
+    """Character spans of heredoc bodies in a bash command.
+
+    Mirrors planner._heredoc_body_spans: the head line and the
+    closing marker line are shell and stay unprotected; the lines
+    between them are file content. An unterminated heredoc protects
+    nothing past its head line.
+    """
+    spans: list[tuple[int, int]] = []
+    rest_start = 0
+    while True:
+        match = _RESOLUTION_HEREDOC_RE.search(command, rest_start)
+        if not match:
+            return spans
+        head_end = command.find("\n", match.end())
+        if head_end == -1:
+            return spans
+        body_start = head_end + 1
+        marker = match.group("marker")
+        cursor = body_start
+        marker_start: int | None = None
+        while cursor < len(command):
+            line_end = command.find("\n", cursor)
+            if line_end == -1:
+                line_end = len(command)
+            if command[cursor:line_end].strip() == marker:
+                marker_start = cursor
+                rest_start = line_end
+                break
+            cursor = line_end + 1
+        if marker_start is None:
+            return spans
+        spans.append((body_start, marker_start))
+
+
+def _resolution_token_span(text: str, start: int) -> tuple[int, int] | None:
+    """Raw span of the next shell token at/after ``start``.
+
+    Quote- and escape-aware, mirroring planner._scan_token_span.
+    Returns None when only whitespace remains.
+    """
+    index = start
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    if index >= len(text):
+        return None
+    token_start = index
+    while index < len(text):
+        char = text[index]
+        if char in " \t":
+            break
+        if char == "\\":
+            index += 2
+            continue
+        if char == "'":
+            close = text.find("'", index + 1)
+            if close == -1:
+                return token_start, len(text)
+            index = close + 1
+            continue
+        if char == '"':
+            cursor = index + 1
+            while cursor < len(text):
+                if text[cursor] == "\\":
+                    cursor += 2
+                    continue
+                if text[cursor] == '"':
+                    break
+                cursor += 1
+            index = cursor + 1 if cursor < len(text) else len(text)
+            continue
+        index += 1
+    return token_start, index
+
+
+def _resolve_segment_interpreter(
+    segment: str, fallback: str
+) -> tuple[str, tuple[str, str] | None]:
+    """Rewrite one shell segment's grounded interpreter token.
+
+    The interpreter token is identified exactly as the validator
+    identifies it: shlex tokens, leading env assignments stripped,
+    first remaining token. Only an exact venv spelling is rewritten,
+    at its raw span; anything else — skip tokens, other binaries,
+    segments shlex cannot tokenize — is returned byte-identical.
+    """
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return segment, None
+    index = 0
+    while index < len(tokens) and re.match(
+        r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[index]
+    ):
+        index += 1
+    if index >= len(tokens):
+        return segment, None
+    token = tokens[index]
+    if token in _RESOLUTION_SKIP_TOKENS or token not in _VENV_INTERPRETER_SPELLINGS:
+        return segment, None
+    span: tuple[int, int] | None = None
+    position = 0
+    for _ in range(index + 1):
+        span = _resolution_token_span(segment, position)
+        if span is None:
+            return segment, None
+        position = span[1]
+    return segment[: span[0]] + fallback + segment[span[1] :], (token, fallback)
+
+
+def _resolve_grounded_interpreter(
+    command: str, repo_root: Path | None
+) -> tuple[str, list[tuple[str, str]]]:
+    """Resolve a bash command's grounded venv interpreter for execution.
+
+    Returns (command, substitutions): the possibly rewritten command
+    and the (original, replacement) pairs applied. A no-op —
+    byte-identical command, no substitutions — when there is no
+    repo root, when <root>/.venv/bin/python exists (the main repo,
+    the pairing exam worktree), or when no covered token sits in
+    command position. Heredoc bodies are never rewritten.
+    """
+    if repo_root is None or not command:
+        return command, []
+    if (repo_root / ".venv" / "bin" / "python").exists():
+        return command, []
+    fallback = sys.executable
+    if not fallback:
+        return command, []
+    protected = _resolution_heredoc_spans(command)
+    parts = _RESOLUTION_SEGMENT_SPLIT_RE.split(command)
+    out: list[str] = []
+    substitutions: list[tuple[str, str]] = []
+    offset = 0
+    for position, part in enumerate(parts):
+        start = offset
+        offset += len(part)
+        if position % 2 == 1 or not part:
+            out.append(part)
+            continue
+        if any(start < end and begin < offset for begin, end in protected):
+            out.append(part)
+            continue
+        resolved, substitution = _resolve_segment_interpreter(part, fallback)
+        out.append(resolved)
+        if substitution is not None:
+            substitutions.append(substitution)
+    return "".join(out), substitutions
 
 
 class ExecutorError(RuntimeError):
@@ -364,6 +566,32 @@ class Executor:
                         target.timeout_s,
                     )
                 resolved_inputs.setdefault("timeout_s", effective_timeout)
+
+                # Build #21: resolve the command's grounded
+                # interpreter against the plan's repo root (see
+                # _resolve_grounded_interpreter). Only the resolved
+                # copy the handler receives is rewritten — the plan's
+                # own inputs keep the grounded command.
+                if capability in ("bash", "shell_exec"):
+                    for key in ("command", "cmd"):
+                        value = resolved_inputs.get(key)
+                        if isinstance(value, str):
+                            resolved_command, substitutions = (
+                                _resolve_grounded_interpreter(
+                                    value, self._plan_repo_root
+                                )
+                            )
+                            if substitutions:
+                                logger.warning(
+                                    "Node %s: grounded interpreter %s "
+                                    "does not exist under %s; running "
+                                    "with %s instead.",
+                                    node.id,
+                                    substitutions[0][0],
+                                    self._plan_repo_root,
+                                    substitutions[0][1],
+                                )
+                                resolved_inputs[key] = resolved_command
 
                 try:
                     result = await asyncio.wait_for(
@@ -574,12 +802,47 @@ class Executor:
             return node_dir
         return Path.cwd()
 
+    def _node_with_resolved_criteria(self, node: PlanNode) -> PlanNode:
+        """A copy of ``node`` with criterion commands interpreter-resolved.
+
+        Build #21: an exit_code criterion may carry its own command,
+        which measure_node runs in the node workdir — the plan-time
+        normalization grounds those commands to ./.venv/bin/python
+        too, so they hit the same fresh-checkout 127 as bash node
+        commands. The copy exists only for this measurement; the
+        plan's own node (and its persisted criteria) keep the
+        grounded command byte-identical.
+        """
+        if self._plan_repo_root is None or not node.criteria:
+            return node
+        criteria: list[Any] = []
+        changed = False
+        for criterion in node.criteria:
+            if isinstance(criterion, dict) and isinstance(
+                criterion.get("command"), str
+            ):
+                resolved, substitutions = _resolve_grounded_interpreter(
+                    criterion["command"], self._plan_repo_root
+                )
+                if substitutions:
+                    criterion = {**criterion, "command": resolved}
+                    changed = True
+            criteria.append(criterion)
+        if not changed:
+            return node
+        return node.model_copy(update={"criteria": criteria})
+
     def _measure_and_record(
         self, node: PlanNode, envelope: dict[str, Any]
     ) -> dict[str, Any]:
         """Measure a finished node and persist the verdict (M0)."""
         workdir = self._node_workdir(node.id)
-        measurement = measure_node(node, envelope, workdir, self._custom_checkers)
+        measurement = measure_node(
+            self._node_with_resolved_criteria(node),
+            envelope,
+            workdir,
+            self._custom_checkers,
+        )
         node.measurement = measurement
         node.exit_code = envelope.get("exit_code")
         node.duration_s = envelope.get("duration_s")
