@@ -27,6 +27,15 @@ YouTube title, then the PLATE stills as a Ken Burns slideshow.
 The video callable is optional and advisory in the same way: a
 render or upload failure is logged and the entry still lands at
 drafts-ready with its text drafts and treated photos.
+
+Video frames: a video media item gets visual grounding too.
+When a frame extractor is configured (freetalon.content.frames),
+representative frames are pulled from the video and each goes
+through the same vision callable a still gets; the descriptions
+join onto the video item's 'vision' key, so the draft prompts
+cannot tell a described video from a described photo. Advisory
+in the same way as everything else here: an extraction or
+vision failure leaves the video item metadata-only.
 """
 
 from __future__ import annotations
@@ -61,6 +70,11 @@ PhotoFn = Callable[[bytes], "TreatedPhoto"]
 # The video module is likewise imported lazily in main() (it shells
 # out to ffmpeg) and injected here.
 VideoFn = Callable[[list[bytes], str], "RenderedVideo"]
+
+# extract(video_bytes) -> [frame JPEG bytes in stream order]. The
+# frames module is likewise imported lazily in main() (it shells
+# out to ffmpeg) and injected here.
+FramesFn = Callable[[bytes], list[bytes]]
 
 _DEFAULT_SITE_BASE_URL = "http://100.87.140.12:3000"
 _DEFAULT_MODEL = "qwen3.8:27b"
@@ -149,12 +163,14 @@ class ContentGenerator:
         vision: VisionFn | None = None,
         photos: PhotoFn | None = None,
         videos: VideoFn | None = None,
+        frames: FramesFn | None = None,
     ) -> None:
         self._client = client
         self._chat = chat
         self._vision = vision
         self._photos = photos
         self._videos = videos
+        self._frames = frames
 
     def _enrich_media(
         self, entry: dict[str, Any]
@@ -171,7 +187,13 @@ class ContentGenerator:
         still is finished to the house standard from the same bytes
         vision saw - the ORIGINAL image; vision behavior is
         unchanged. A treatment failure degrades that photo to
-        untreated, exactly like a vision failure."""
+        untreated, exactly like a vision failure.
+
+        A video item is grounded through its frames instead: when
+        a frame extractor and a vision callable are both
+        configured, _describe_video fills the item's 'vision' key
+        from the extracted frames. Unconfigured, a video item
+        passes through untouched - metadata-only, as before."""
         enriched = dict(entry)
         media = []
         treated: dict[str, TreatedPhoto] = {}
@@ -195,6 +217,13 @@ class ContentGenerator:
                     )
                     if result is not None:
                         treated[item["filename"]] = result
+            if item.get("kind") == "video" and item.get("filename"):
+                if self._frames is not None and self._vision is not None:
+                    description = self._describe_video(
+                        entry["id"], item["filename"]
+                    )
+                    if description is not None:
+                        item["vision"] = description
             media.append(item)
         enriched["media"] = media
         return enriched, treated
@@ -244,6 +273,43 @@ class ContentGenerator:
             )
             return None
         return description.strip()
+
+    def _describe_video(self, entry_id: str, filename: str) -> str | None:
+        """Vision grounding for one video item: fetch the bytes,
+        extract representative frames, describe each through the
+        same per-image path a photo gets (_describe), and join the
+        descriptions in frame order onto the item's 'vision' key.
+        Every failure - fetch, extraction, or vision on every
+        frame - degrades the item to metadata-only, exactly like a
+        photo whose vision call failed; a partial set of described
+        frames still grounds the item."""
+        try:
+            raw = self._client.fetch_media(entry_id, filename)
+        except ContentQueueError as exc:
+            log.warning("media fetch failed for %s: %s", entry_id, exc)
+            return None
+        try:
+            frames = self._frames(raw)
+        except Exception as exc:  # extraction is advisory, never fatal
+            log.warning(
+                "frame extraction failed for %s/%s (%s: %s); "
+                "drafting from metadata only",
+                entry_id,
+                filename,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        descriptions = []
+        for index, frame in enumerate(frames):
+            description = self._describe(
+                self._vision, entry_id, f"{filename} frame {index + 1}", frame
+            )
+            if description is not None:
+                descriptions.append(description)
+        if not descriptions:
+            return None
+        return " ".join(descriptions)
 
     def generate_drafts(
         self, entry: dict[str, Any]
@@ -422,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Deferred import: photos is the pipeline's only Pillow
     # consumer; the rest of the package imports without it.
+    from .frames import extract_frames
     from .photos import process_photo
     from .video import render_video
 
@@ -432,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
         vision=make_ollama_vision(vision_settings_from_env()),
         photos=process_photo,
         videos=render_video,
+        frames=extract_frames,
     )
     try:
         results = generator.run_once()
