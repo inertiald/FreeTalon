@@ -9074,6 +9074,37 @@ def _format_brief_for_prompt(brief: dict[str, Any]) -> str:
             "themselves, and the files listed below — instead of "
             "rewriting the same files again."
         )
+    # Regression facts (campaign build #18): the judge's computed
+    # record of checks that were green in an earlier plan version
+    # and are red in the version this brief answers — ground the
+    # run already had and lost (arm #27: a v2 repair made the
+    # wrong-method probe flows green, a v4 rewrite dropped the
+    # handler, and nothing ever told the planner). Rendered only
+    # when the judge stamped the field and it is non-empty; a
+    # brief without it renders byte-identically to before.
+    regression_facts = brief.get("regression_facts") or []
+    if regression_facts:
+        lines.append(
+            "Regressed checks (system): the checks below were "
+            "GREEN in an earlier plan version and are FAILING in "
+            "the version this brief answers — the current tree "
+            "lost ground an earlier version had. Restore them "
+            "while fixing the failures above; a delta that trades "
+            "one for the other has not progressed:"
+        )
+        for entry in regression_facts:
+            if not isinstance(entry, dict):
+                continue
+            line = (
+                f"- {entry.get('label', '')}: green in plan "
+                f"version {entry.get('green_in_version', '')}, "
+                f"failing in plan version "
+                f"{entry.get('current_version', '')}"
+            )
+            detail = entry.get("detail")
+            if isinstance(detail, str) and detail:
+                line += f" — {detail}"
+            lines.append(line)
     never_revised = brief.get("never_revised_files") or []
     if never_revised:
         lines.append(

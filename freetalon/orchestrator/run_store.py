@@ -192,6 +192,94 @@ class RunStore:
                 records.append(json.loads(line))
         return records
 
+    # ── Version trees + outcomes (campaign build #18) ────────────────
+
+    def write_version_tree(
+        self, run_id: str, version: int, entries: dict[str, bytes | None]
+    ) -> Path:
+        """Persist one plan version's produced-file snapshot.
+
+        ``entries`` maps each declared write target (as the plan
+        named it) to its content bytes after the version executed,
+        or None when the target did not exist at that point. Files
+        land under trees/v{NNN}/ by index; the manifest
+        trees/v{NNN}.json names every target with its presence and
+        SHA-256, so the snapshot is auditable without opening the
+        blobs. Targets are recorded sorted, so the manifest is
+        deterministic for a given snapshot.
+        """
+        tree_dir = self.run_dir(run_id) / "trees" / f"v{version:03d}"
+        tree_dir.mkdir(parents=True, exist_ok=True)
+        files: list[dict[str, Any]] = []
+        for index, target in enumerate(sorted(entries)):
+            content = entries[target]
+            record: dict[str, Any] = {
+                "target": target,
+                "present": content is not None,
+                "sha256": (
+                    hashlib.sha256(content).hexdigest()
+                    if content is not None
+                    else None
+                ),
+                "stored": None,
+            }
+            if content is not None:
+                stored = f"{index:04d}.bin"
+                (tree_dir / stored).write_bytes(content)
+                record["stored"] = stored
+            files.append(record)
+        manifest = {"version": version, "files": files}
+        manifest_path = self.run_dir(run_id) / "trees" / f"v{version:03d}.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, default=json_default),
+            encoding="utf-8",
+        )
+        return manifest_path
+
+    def read_version_tree(
+        self, run_id: str, version: int
+    ) -> dict[str, bytes | None] | None:
+        """Read back a version tree snapshot (None when none was kept)."""
+        manifest_path = self.run_dir(run_id) / "trees" / f"v{version:03d}.json"
+        if not manifest_path.exists():
+            return None
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        tree_dir = self.run_dir(run_id) / "trees" / f"v{version:03d}"
+        entries: dict[str, bytes | None] = {}
+        for record in manifest.get("files", []):
+            stored = record.get("stored")
+            if record.get("present") and stored:
+                entries[str(record["target"])] = (tree_dir / stored).read_bytes()
+            else:
+                entries[str(record["target"])] = None
+        return entries
+
+    def write_version_outcomes(
+        self,
+        run_id: str,
+        outcomes: list[dict[str, Any]],
+        shipping: dict[str, Any] | None,
+    ) -> Path:
+        """Persist the per-version outcome facts and the shipping call.
+
+        Campaign build #18: the rank facts the loop ranked the
+        run's versions by (probe greens, failed nodes, failed
+        measured criteria per version) and the shipping decision
+        they produced — the run's own account of why the tree it
+        shipped is the version it is.
+        """
+        path = self.run_dir(run_id) / "version_outcomes.json"
+        path.write_text(
+            json.dumps(
+                {"versions": outcomes, "shipping": shipping},
+                indent=2,
+                sort_keys=True,
+                default=json_default,
+            ),
+            encoding="utf-8",
+        )
+        return path
+
     # ── Gates (M4) ───────────────────────────────────────────────────────
 
     def write_gate(self, run_id: str, packet: dict[str, Any]) -> Path:

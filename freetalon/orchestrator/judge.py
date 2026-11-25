@@ -283,6 +283,115 @@ def _failing_test_ids(node: PlanNode) -> set[str]:
     return ids
 
 
+# ── Check states (campaign build #18) ───────────────────────────────
+#
+# A "check" is one mechanically recorded outcome with a stable
+# identity across plan versions: a contract probe record (clause /
+# probe / flow) or one measured criterion result of one node (node
+# id + the criterion's own JSON). States derive only from records
+# the system wrote — measurements and probe results — never from
+# model output. Two consumers share this machinery: the judge's
+# re-plan brief (regression facts: a check green in an earlier
+# version and red in the latest is named, with the version that had
+# it green) and the loop's best-version shipping (the same
+# comparison between the shipped and the final version). A check
+# absent from a version's records is unobserved there, not red:
+# plans rename nodes and re-shape probes across versions, and
+# absence is not evidence.
+
+# A regression list is evidence, not a transcript: cap it like the
+# failing-test set (sorted first, so the cap is deterministic).
+_REGRESSION_FACTS_CAP = 12
+
+_CHECK_LABEL_CAP = 200
+
+
+def check_states(
+    measurements: list[dict[str, Any]],
+    probe_results: list[dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Check states from one version's records.
+
+    Returns {key: {"ok": bool, "label": str, "detail": str}}.
+    Measurement criteria count only when they were measured (an
+    unmeasured criterion is no evidence either way); later records
+    for the same key overwrite earlier ones, so a re-executed
+    version's newest outcome stands. Probe records carry their own
+    ok flag verbatim.
+    """
+    states: dict[str, dict[str, Any]] = {}
+    for measurement in measurements or []:
+        node_id = str(measurement.get("node_id", ""))
+        for result in measurement.get("results") or []:
+            if not isinstance(result, dict) or not result.get("measured"):
+                continue
+            try:
+                rendered = json.dumps(
+                    result.get("criterion"), sort_keys=True, default=str
+                )
+            except (TypeError, ValueError):
+                rendered = str(result.get("criterion"))
+            key = f"node:{node_id}:{rendered}"
+            states[key] = {
+                "ok": bool(result.get("passed")),
+                "label": f"node {node_id} criterion {rendered}"[:_CHECK_LABEL_CAP],
+                "detail": str(result.get("detail", "")),
+            }
+    for record in probe_results or []:
+        if not isinstance(record, dict):
+            continue
+        clause_id = str(record.get("clause_id", ""))
+        probe = str(record.get("probe", ""))
+        flow = record.get("flow")
+        key = f"probe:{clause_id}:{probe}"
+        label = f"contract probe {clause_id} [{probe}]"
+        if flow:
+            key += f":{flow}"
+            label += f" flow {flow}"
+        states[key] = {
+            "ok": bool(record.get("ok")),
+            "label": label[:_CHECK_LABEL_CAP],
+            "detail": str(record.get("detail", "")),
+        }
+    return states
+
+
+def regressed_checks(
+    history: dict[str, dict[int, bool]],
+    labels: dict[str, str],
+    details: dict[str, str],
+    current_version: int,
+) -> list[dict[str, Any]]:
+    """Checks green in an earlier version and red in the current one.
+
+    ``history`` maps check key -> {plan_version: ok}. A check
+    regresses when its state at ``current_version`` is red and some
+    earlier version recorded it green; the fact names the MOST
+    RECENT green version (the closest evidence of what was lost).
+    Facts are sorted by check key and capped, deterministically.
+    """
+    facts: list[dict[str, Any]] = []
+    for key in sorted(history):
+        states = history[key]
+        if states.get(current_version) is not False:
+            continue
+        green_versions = [
+            version for version, ok in states.items() if ok and version < current_version
+        ]
+        if not green_versions:
+            continue
+        facts.append(
+            {
+                "check": key,
+                "label": labels.get(key, key),
+                "green_in_version": max(green_versions),
+                "current_version": current_version,
+                "detail": details.get(key, ""),
+            }
+        )
+    return facts[:_REGRESSION_FACTS_CAP]
+
+
 @dataclass
 class RepeatAssessment:
     """The substance check's verdict on one signature match.
@@ -437,6 +546,18 @@ class Judge:
         # delta plan's metadata — a cleared repeat is recorded,
         # never silent (see assess_approach_repeat).
         self.repeat_warnings: list[str] = []
+        # Check-state history (campaign build #18): every check
+        # this judge has recorded, keyed by check identity with a
+        # per-version ok map, plus the label and newest detail of
+        # its most recent record — the raw material of the brief's
+        # regression facts (see _regression_fields). Fed by
+        # build_replan_brief from the measurements and probe
+        # results of the version being briefed; a version recorded
+        # twice (a retry re-executes it before the re-plan) keeps
+        # its newest states.
+        self._check_history: dict[str, dict[int, bool]] = {}
+        self._check_labels: dict[str, str] = {}
+        self._check_details: dict[str, str] = {}
 
     # ── Bookkeeping ──────────────────────────────────────────────────────
 
@@ -620,7 +741,55 @@ class Judge:
         }
         brief.update(self._anchoring_fields(plan, plan_version, failed))
         brief.update(self._clause_fields(plan))
+        self._record_check_states(plan, plan_version, measurements)
+        brief.update(self._regression_fields(plan_version))
         return brief
+
+    def _record_check_states(
+        self,
+        plan: ExecutionPlan,
+        plan_version: int,
+        measurements: list[dict[str, Any]],
+    ) -> None:
+        """Fold one version's check states into the history.
+
+        Sources: the version's measurements (the brief's own
+        argument) and the contract probe results the loop stamped
+        into the plan metadata after the version executed — the
+        same records _clause_fields reads. Nothing here is model
+        output; see check_states.
+        """
+        probe_results = (plan.metadata or {}).get(PROBE_RESULTS_METADATA_KEY)
+        states = check_states(
+            measurements,
+            probe_results if isinstance(probe_results, list) else [],
+        )
+        for key, state in states.items():
+            self._check_history.setdefault(key, {})[plan_version] = state["ok"]
+            self._check_labels[key] = state["label"]
+            if state["detail"]:
+                self._check_details[key] = state["detail"]
+
+    def _regression_fields(self, plan_version: int) -> dict[str, Any]:
+        """The brief's regression facts (campaign build #18).
+
+        Checks that were green in an earlier version of this run
+        and are red in the version being briefed — ground an
+        earlier version had and the current tree lost (arm #27:
+        a v2 seam edit made the wrong-method probe flows green;
+        v4's rewrite dropped the handler, the shipped tree
+        answered 501, and no brief ever said so). Computed from
+        the recorded check history, never from model output.
+        Present only when non-empty, so a brief with no
+        regressions is exactly the brief of before.
+        """
+        facts = regressed_checks(
+            self._check_history,
+            self._check_labels,
+            self._check_details,
+            plan_version,
+        )
+        return {"regression_facts": facts} if facts else {}
 
     def _clause_fields(self, plan: ExecutionPlan) -> dict[str, Any]:
         """The brief's contract-clause record (campaign build #3).

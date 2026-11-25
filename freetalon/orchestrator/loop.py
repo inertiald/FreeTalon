@@ -34,6 +34,8 @@ from .judge import (
     Judge,
     JudgeDecision,
     assess_approach_repeat,
+    check_states,
+    regressed_checks,
     timeout_diagnostics,
 )
 from .measure import (
@@ -44,7 +46,7 @@ from .measure import (
     VERDICT_UNMEASURABLE,
     _compare,
 )
-from .memory import ExperimentStore, goal_key_for
+from .memory import ExperimentStore, goal_key_for, write_targets_for_nodes
 from .models import (
     ExecutionPlan,
     GoalContract,
@@ -100,6 +102,39 @@ ReplanFn = Callable[[dict[str, Any]], list[PlanNode]]
 #   (e.g. cancelled); there is no failure evidence to brief.
 _CONVERTIBLE_FAILURE_CLASSES = frozenset({"timeout_retries_exhausted"})
 
+# Campaign build #18: a produced file larger than this is not
+# snapshotted into the run record (its version simply cannot be
+# shipped back to). Source files the loop writes sit far below it;
+# the cap keeps a pathological target from bloating every run.
+_TREE_SNAPSHOT_FILE_CAP = 8 * 1024 * 1024
+
+
+def _version_rank_key(outcome: dict[str, Any]) -> tuple[int, int, int, int]:
+    """The deterministic best-version order (campaign build #18).
+
+    Most contract probe flows green first — the probes are the
+    system's own checks, outside the model's tests — then fewest
+    failed nodes, then fewest failed measured criteria, then the
+    LATER version: recency wins exact ties, so the shipped tree
+    changes only when a later version is measurably worse than an
+    earlier one.
+    """
+    return (
+        -int(outcome.get("probe_green", 0)),
+        int(outcome.get("failed_nodes", 0)),
+        int(outcome.get("failed_criteria", 0)),
+        -int(outcome.get("version", 0)),
+    )
+
+
+def _best_version_outcome(
+    outcomes: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """The outcome record of the version a run should ship."""
+    if not outcomes:
+        return None
+    return min(outcomes, key=_version_rank_key)
+
 
 @dataclass
 class RunResult:
@@ -118,6 +153,13 @@ class RunResult:
     escalation: str | None = None
     decision_history: list[dict[str, Any]] = field(default_factory=list)
     gate_packet_id: str | None = None
+    # Campaign build #18: the version whose tree the run shipped
+    # and the shipping record (rank facts + what the final version
+    # lost, when it lost). None for runs the shipping step never
+    # judged — single-version runs and gate pauses — whose
+    # behavior is exactly as before.
+    shipped_version: int | None = None
+    shipping: dict[str, Any] | None = None
 
 
 class LoopRunner:
@@ -262,6 +304,18 @@ class LoopRunner:
         attempts: list[dict[str, Any]] = []
         decision_history: list[dict[str, Any]] = []
         escalation: str | None = None
+        # Campaign build #18: per-version outcome facts, probe
+        # results, measurements, and produced-file snapshots — the
+        # raw material of best-version shipping at run end (see
+        # _settle_shipping). Keyed by version; a re-executed
+        # version (retry) overwrites its own entry with the newest
+        # records, exactly as its measurements accumulate.
+        version_outcomes: dict[int, dict[str, Any]] = {}
+        version_measurements_map: dict[int, list[dict[str, Any]]] = {}
+        version_probe_results: dict[int, list[dict[str, Any]]] = {}
+        version_snapshots: dict[int, dict[str, bytes | None]] = {}
+        declared_targets_all: set[str] = set()
+        paused_at_gate = False
 
         # M2: before executing, the planner's retrieval — a second run of
         # the same goal must not repeat a measured-failed approach. A node
@@ -375,6 +429,44 @@ class LoopRunner:
             # whatever its own nodes report.
             probe_failures_now = self._run_contract_probes(run_id, plan, version)
 
+            # Campaign build #18: record this version's outcome
+            # facts and snapshot its produced files, so the run can
+            # ship its best measured version instead of blindly
+            # shipping its last (see _settle_shipping). The facts
+            # come from the records above — measurements and probe
+            # results — never from the plan's own account of itself.
+            probe_results_now = (plan.metadata or {}).get(
+                PROBE_RESULTS_METADATA_KEY
+            )
+            probe_results_list = (
+                probe_results_now if isinstance(probe_results_now, list) else []
+            )
+            version_probe_results[version] = [
+                dict(record) for record in probe_results_list
+            ]
+            version_measurements_map[version] = list(version_measurements)
+            version_outcomes[version] = {
+                "version": version,
+                "probe_green": sum(
+                    1 for record in probe_results_list if record.get("ok")
+                ),
+                "probe_total": len(probe_results_list),
+                "failed_nodes": (
+                    len(attempts[-1]["failed"]) if attempts else 0
+                ),
+                "failed_criteria": sum(
+                    1
+                    for measurement in version_measurements
+                    for result in measurement.get("results") or []
+                    if isinstance(result, dict)
+                    and result.get("measured")
+                    and not result.get("passed")
+                ),
+            }
+            snapshot = self._snapshot_version_tree(plan, declared_targets_all)
+            if snapshot is not None:
+                version_snapshots[version] = snapshot
+
             # M4: a node paused at a gate ends this pass — the run waits
             # for a human decision, it does not push through.
             awaiting = [
@@ -422,6 +514,11 @@ class LoopRunner:
                     packet_id=packet.packet_id,
                     node_id=node.id,
                 )
+                # Campaign build #18: a gate pause is not a
+                # terminal finish — the run may resume and keep
+                # building on this tree, so shipping never settles
+                # here.
+                paused_at_gate = True
                 break
 
             if plan.status == PlanStatus.COMPLETED and not probe_failures_now:
@@ -807,6 +904,25 @@ class LoopRunner:
             escalation = decision.reason
             break
 
+        # Campaign build #18: with two or more executed versions
+        # and a terminal (not gate-paused) finish, settle shipping
+        # before the summary is written — the best measured
+        # version's tree is restored when the final version is
+        # measurably worse, and the decision rides into the
+        # summary and the result. The restore cannot perturb the
+        # verdict: goal evaluation reads recorded measurements and
+        # metadata, never the live tree.
+        shipping: dict[str, Any] | None = None
+        if not paused_at_gate and len(version_outcomes) >= 2:
+            shipping = self._settle_shipping(
+                run_id,
+                plan,
+                version_outcomes=version_outcomes,
+                version_measurements_map=version_measurements_map,
+                version_probe_results=version_probe_results,
+                version_snapshots=version_snapshots,
+                final_version=version,
+            )
         return self._finish_run(
             run_id,
             plan,
@@ -817,6 +933,7 @@ class LoopRunner:
             escalation=escalation,
             started=started,
             started_at=started_at,
+            shipping=shipping,
         )
 
     def _critic_review(
@@ -945,6 +1062,7 @@ class LoopRunner:
         escalation: str | None,
         started: float,
         started_at: str,
+        shipping: dict[str, Any] | None = None,
     ) -> RunResult:
         """Evaluate the goal, write the summary, and build the result."""
         measurements = self._run_store.read_measurements(run_id)
@@ -969,6 +1087,7 @@ class LoopRunner:
                 attempts=attempts,
                 decision_history=decision_history,
                 escalation=escalation,
+                shipping=shipping,
             )
         )
         self._log(
@@ -992,6 +1111,10 @@ class LoopRunner:
             escalation=escalation,
             decision_history=decision_history,
             gate_packet_id=self._gate_packets.get(run_id),
+            shipped_version=(
+                shipping.get("shipped_version") if shipping is not None else None
+            ),
+            shipping=shipping,
         )
 
     # ── Approval gates (M4) ──────────────────────────────────────────────
@@ -1320,6 +1443,144 @@ class LoopRunner:
 
     # ── Goal evaluation ──────────────────────────────────────────────────
 
+    def _snapshot_version_tree(
+        self, plan: ExecutionPlan, declared_targets_all: set[str]
+    ) -> dict[str, bytes | None] | None:
+        """Snapshot the produced files as this version left them.
+
+        The target set is the union of declared write targets over
+        every version so far (accumulated into
+        ``declared_targets_all``), resolved against the plan's repo
+        root exactly as the judge's missing-target check resolves
+        them. A target maps to its content bytes, or None when it
+        does not exist after this version. Returns None when the
+        plan names no repo root — without a root there is no tree
+        the loop is responsible for — or when no target is
+        snapshot-able. Files over the cap and non-file paths are
+        skipped: a version that cannot be snapshotted simply
+        cannot be shipped back to.
+        """
+        root_value = (plan.metadata or {}).get("repo_root")
+        if not root_value:
+            return None
+        root = Path(str(root_value))
+        declared_targets_all.update(write_targets_for_nodes(plan.nodes))
+        entries: dict[str, bytes | None] = {}
+        for target in sorted(declared_targets_all):
+            resolved = root / target
+            try:
+                if resolved.is_file():
+                    if resolved.stat().st_size > _TREE_SNAPSHOT_FILE_CAP:
+                        continue
+                    entries[target] = resolved.read_bytes()
+                elif resolved.exists():
+                    continue
+                else:
+                    entries[target] = None
+            except OSError:
+                continue
+        return entries or None
+
+    def _settle_shipping(
+        self,
+        run_id: str,
+        plan: ExecutionPlan,
+        *,
+        version_outcomes: dict[int, dict[str, Any]],
+        version_measurements_map: dict[int, list[dict[str, Any]]],
+        version_probe_results: dict[int, list[dict[str, Any]]],
+        version_snapshots: dict[int, dict[str, bytes | None]],
+        final_version: int,
+    ) -> dict[str, Any]:
+        """Rank the versions, ship the best one's tree, record it.
+
+        Campaign build #18. Called only at a terminal finish with
+        two or more executed versions. The rank order is
+        _version_rank_key (probe flows green, failed nodes, failed
+        measured criteria, recency). When the best version is not
+        the final one and its snapshot exists, exactly the
+        snapshot's manifest entries are restored into the
+        workspace: present targets are rewritten with the
+        snapshot's bytes, absent targets are unlinked. Targets
+        first declared by later versions are left alone — the best
+        version never claimed them, and deleting a file it never
+        claimed could remove standing work. The snapshots and the
+        outcome record are persisted now (trees/ +
+        version_outcomes.json): they are written only for runs
+        shipping judged, so a single-version run's directory is
+        exactly as before.
+        """
+        outcomes = [version_outcomes[v] for v in sorted(version_outcomes)]
+        best = _best_version_outcome(outcomes)
+        assert best is not None  # the caller guarantees >= 2 outcomes
+        shipped_version = int(best["version"])
+        # The checks the final version lost to the shipped one,
+        # from the same check-state machinery the judge's brief
+        # facts use — aimed between the two versions: green in the
+        # shipped version's records, red in the final's.
+        history: dict[str, dict[int, bool]] = {}
+        labels: dict[str, str] = {}
+        details: dict[str, str] = {}
+        for outcome in outcomes:
+            v = int(outcome["version"])
+            states = check_states(
+                version_measurements_map.get(v, []),
+                version_probe_results.get(v, []),
+            )
+            for key, state in states.items():
+                history.setdefault(key, {})[v] = state["ok"]
+                labels[key] = state["label"]
+                if state["detail"]:
+                    details[key] = state["detail"]
+        lost: list[dict[str, Any]] = []
+        if shipped_version != final_version:
+            pair_history = {
+                key: {
+                    v: ok
+                    for v, ok in states.items()
+                    if v in (shipped_version, final_version)
+                }
+                for key, states in history.items()
+            }
+            lost = regressed_checks(pair_history, labels, details, final_version)
+        restored = False
+        snapshot = version_snapshots.get(shipped_version)
+        root_value = (plan.metadata or {}).get("repo_root")
+        if shipped_version != final_version and snapshot is not None and root_value:
+            root = Path(str(root_value))
+            for target in sorted(snapshot):
+                content = snapshot[target]
+                resolved = root / target
+                try:
+                    if content is None:
+                        resolved.unlink(missing_ok=True)
+                    else:
+                        resolved.parent.mkdir(parents=True, exist_ok=True)
+                        resolved.write_bytes(content)
+                except OSError:
+                    continue
+            restored = True
+        for v, entries in sorted(version_snapshots.items()):
+            self._run_store.write_version_tree(run_id, v, entries)
+        shipping: dict[str, Any] = {
+            "shipped_version": shipped_version,
+            "final_version": final_version,
+            "restored": restored,
+            "versions": outcomes,
+            "lost_checks": lost,
+        }
+        self._run_store.write_version_outcomes(run_id, outcomes, shipping)
+        self._log(
+            "loop.shipping.decision",
+            run_id=run_id,
+            plan_id=plan.plan_id,
+            shipped_version=shipped_version,
+            final_version=final_version,
+            restored=restored,
+            lost_checks=[fact["check"] for fact in lost],
+        )
+        return shipping
+
     def _run_contract_probes(
         self, run_id: str, plan: ExecutionPlan, version: int
     ) -> list[dict[str, Any]]:
@@ -1500,6 +1761,7 @@ class LoopRunner:
         attempts: list[dict[str, Any]],
         decision_history: list[dict[str, Any]],
         escalation: str | None,
+        shipping: dict[str, Any] | None = None,
     ) -> Path:
         lines = [
             f"# Run {run_id}",
@@ -1521,6 +1783,36 @@ class LoopRunner:
                 f"(failed: {attempt['failed'] or 'none'}, "
                 f"verdicts: {attempt['verdicts']})"
             )
+        if shipping is not None:
+            # Campaign build #18: the shipping record — which
+            # version's tree the run shipped, every version's rank
+            # facts, and (when the shipped version is not the
+            # final one) the checks the final version lost.
+            lines += ["", "## Shipped version", ""]
+            lines.append(
+                f"- Shipped: v{shipping['shipped_version']} "
+                f"(final version: v{shipping['final_version']})"
+            )
+            for outcome in shipping.get("versions", []):
+                lines.append(
+                    f"- v{outcome['version']}: probes green "
+                    f"{outcome['probe_green']}/{outcome['probe_total']}, "
+                    f"failed nodes {outcome['failed_nodes']}, "
+                    f"failed criteria {outcome['failed_criteria']}"
+                )
+            if shipping["shipped_version"] != shipping["final_version"]:
+                if shipping.get("restored"):
+                    lines.append(
+                        "- The final version's tree was NOT shipped: "
+                        f"v{shipping['shipped_version']}'s tree was "
+                        "restored from its snapshot."
+                    )
+                for fact in shipping.get("lost_checks", []):
+                    lines.append(
+                        f"- Lost in the final version: {fact['label']} "
+                        f"(green in v{fact['green_in_version']}, failing "
+                        f"in v{fact['current_version']})"
+                    )
         lines += ["", "## Judge decisions", ""]
         for entry in decision_history:
             lines.append(
