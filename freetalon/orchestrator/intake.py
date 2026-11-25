@@ -62,6 +62,21 @@ class LLMSettings:
     # as num_ctx: unset/unparsable/non-positive leaves it None.
     num_predict: int | None = None
     format_schema: dict[str, Any] | None = None
+    # Campaign build #14: the transport format directive, stated
+    # explicitly instead of being overloaded onto format_schema's
+    # None. "schema" sends format_schema as the format constraint;
+    # "json" sends the bare JSON directive; "unconstrained" sends
+    # NO format field at all, for calls whose expected answer is
+    # free-form (edit blocks, a code definition, prose). None —
+    # the default — resolves from format_schema: "schema" when a
+    # schema is set, "json" otherwise (the pre-build-#14 behavior
+    # for every call that does not state a mode). Before this
+    # field existed, a call that dropped its schema to escape the
+    # plan envelope (the repair seams) silently fell back to
+    # "json": the transport ordered JSON while the prompt ordered
+    # edit blocks, and arm #23's seam answered with fabricated
+    # API-error JSON bodies instead of blocks.
+    format_mode: Literal["schema", "json", "unconstrained"] | None = None
     # Ollama thinking control (the top-level "think" chat field).
     # None — the default, and what an unset or unrecognized
     # FREETALON_LLM_THINK yields — sends no field at all: the payload
@@ -300,11 +315,25 @@ def parse_task_intent_response(raw_text: str, user_request: str | None = None) -
         raise LLMResponseError(f"LLM response did not match TaskIntent schema: {exc}") from exc
 
 
+def resolved_format_mode(
+    settings: LLMSettings,
+) -> Literal["schema", "json", "unconstrained"]:
+    """The format directive a call actually carries (build #14).
+
+    An explicit format_mode wins; otherwise the mode resolves
+    from format_schema — a set schema means "schema", no schema
+    means "json" (the historical default every unstated call
+    shipped with).
+    """
+    if settings.format_mode is not None:
+        return settings.format_mode
+    return "schema" if settings.format_schema else "json"
+
+
 def _call_ollama(settings: LLMSettings, system_prompt: str, user_prompt: str) -> str:
     payload = {
         "model": settings.model,
         "stream": False,
-        "format": settings.format_schema if settings.format_schema else "json",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -312,6 +341,18 @@ def _call_ollama(settings: LLMSettings, system_prompt: str, user_prompt: str) ->
         "options": {"temperature": settings.temperature,
         	"num_ctx": settings.num_ctx if settings.num_ctx else 4096},
     }
+    # Campaign build #14: the format field is set from the
+    # resolved mode — "schema" carries the schema dict, "json"
+    # the bare directive, and "unconstrained" omits the field
+    # entirely so a free-form answer (edit blocks, code, prose)
+    # is not contradicted by a JSON order at the transport.
+    _format_mode = resolved_format_mode(settings)
+    if _format_mode == "schema":
+        payload["format"] = (
+            settings.format_schema if settings.format_schema else "json"
+        )
+    elif _format_mode == "json":
+        payload["format"] = "json"
     if settings.think is not None:
         # Ollama's think switch is a top-level chat field, not an
         # "options" entry. Sent only when configured: at the default
@@ -387,7 +428,11 @@ def intake_request(raw_request: str, settings: LLMSettings | None = None) -> Tas
     
     # Inject Pydantic schema for Ollama JSON schema enforcement
     strict_settings = llm_settings.__class__(
-        **{**llm_settings.__dict__, "format_schema": TaskIntent.model_json_schema()}
+        **{
+            **llm_settings.__dict__,
+            "format_schema": TaskIntent.model_json_schema(),
+            "format_mode": "schema",
+        }
     )
     
     # Send strict_settings (NOT settings) to enforce schema output in Ollama.

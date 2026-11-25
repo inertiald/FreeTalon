@@ -603,6 +603,7 @@ def review_write_nodes(
         base_url=critic.base_url or effective.base_url,
         model=critic.model or effective.model,
         format_schema=critic_verdict_schema(),
+        format_mode="schema",
         temperature=0.0,
         num_ctx=_CRITIC_NUM_CTX,
     )

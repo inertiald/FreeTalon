@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from freetalon.orchestrator.tool_registry import ToolRegistry, register_default_claws
 from freetalon.orchestrator.research import register_research_claws
@@ -12,7 +13,7 @@ from freetalon.orchestrator.sandbox import register_sandbox_claws
 from freetalon.orchestrator.finance import register_finance_claws
 from freetalon.orchestrator.ecu import register_ecu_claws
 from freetalon.orchestrator.tool_scaffolder import ToolScaffolder
-from freetalon.orchestrator.intake import call_llm
+from freetalon.orchestrator.intake import LLMSettings, call_llm
 
 _BOOTSTRAP_ENV_VAR = "FREETALON_BOOTSTRAPPED"
 
@@ -38,7 +39,15 @@ def initialize_orchestrator():
         prompt = f"""Write a Python handler function `handle(inputs: dict) -> dict` for the capability '{capability}'.
 Inputs schema context: {node_inputs}
 Return ONLY valid Python code containing the function definition."""
-        return call_llm("You are a Python code generator.", prompt)
+        # Build #14: the backend returns free-form Python code —
+        # state unconstrained explicitly instead of inheriting the
+        # transport's default JSON directive.
+        codegen_settings = dataclass_replace(
+            LLMSettings.from_env(), format_mode="unconstrained"
+        )
+        return call_llm(
+            "You are a Python code generator.", prompt, settings=codegen_settings
+        )
 
     # Absolute quarantine dir under the workspace: the relative default
     # ("generated/proposed_tools") always resolves under the cwd, and the

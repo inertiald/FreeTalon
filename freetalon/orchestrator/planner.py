@@ -11123,6 +11123,7 @@ def reformat_plan_output(
         base_url=formatter.base_url or settings.base_url,
         model=formatter.model or settings.model,
         format_schema=plan_envelope_schema(),
+        format_mode="schema",
     )
     prompt = (
         "Re-emit the plan below as ONE JSON object with a \"nodes\" "
@@ -11502,6 +11503,7 @@ def _contract_constrained_reask(
         reask_settings = dataclass_replace(
             settings,
             format_schema=plan_envelope_schema(require_contract=True),
+            format_mode="schema",
         )
         reask_text = call_llm(
             system_prompt, reask_prompt, settings=reask_settings
@@ -12508,10 +12510,16 @@ def _call_llm_with_repair(
     planner_schema_owned = False
     if (
         effective_settings.format_schema is None
+        and effective_settings.format_mode is None
         and effective_settings.backend == "ollama"
     ):
+        # Build #14: an explicit format_mode is the caller's stated
+        # expectation and is never overridden here — the same rule
+        # as a caller-supplied schema above.
         effective_settings = dataclass_replace(
-            effective_settings, format_schema=plan_envelope_schema()
+            effective_settings,
+            format_schema=plan_envelope_schema(),
+            format_mode="schema",
         )
         planner_schema_owned = True
     # Campaign build #11: the skeleton-phase flag, captured before
@@ -12927,10 +12935,14 @@ def _content_fill_settings(
     """Effective settings for a fill call (planner window/fuse).
 
     Same derivation as _call_llm_with_repair (a caller-set num_ctx /
-    num_predict is respected), except the format schema: the plan
+    num_predict is respected), except the format directive: the plan
     envelope schema constrains the SKELETON phase only — a fill
     response is one node's payload object, not a plan envelope, so
-    any envelope schema is dropped here.
+    any envelope schema is dropped here and the mode is stated
+    explicitly as "json" (build #14): the payload IS parsed as a
+    JSON object downstream, so the bare JSON directive the
+    transport used to substitute for a dropped schema is now the
+    call's declared expectation, not an accident of None.
     """
     if settings is None:
         effective = LLMSettings.from_env()
@@ -12942,8 +12954,9 @@ def _content_fill_settings(
         effective = dataclass_replace(
             effective, num_predict=_PLANNER_NUM_PREDICT
         )
-    if effective.format_schema is not None:
-        effective = dataclass_replace(effective, format_schema=None)
+    effective = dataclass_replace(
+        effective, format_schema=None, format_mode="json"
+    )
     return effective
 
 
@@ -15010,6 +15023,43 @@ def _local_repair_shape_repair_block(target: _LocalRepairTarget) -> str:
     return "\n".join(lines)
 
 
+def _is_fabricated_error_body(response_text: str) -> bool:
+    """True when a seam response is a fabricated API-error body.
+
+    Campaign build #14: arm #23's scoped-edit seam received, in
+    all six recorded responses, a JSON object shaped like an API
+    error — {"error": {"message": ..., "type":
+    "invalid_request_error", "code": ...}} — naming a model that
+    exists nowhere on the box. Ordered by the prompt to emit edit
+    blocks and by the transport to emit JSON, the model invented
+    the error that explained the missing blocks. The transport
+    contradiction is fixed at the settings layer; this classifier
+    names the shape if it ever recurs, so a decline records
+    error_body_response instead of masquerading as an ordinary
+    no-blocks / no-definition answer.
+    """
+    text = response_text.strip()
+    if not text.startswith("{"):
+        return False
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    return isinstance(error, (dict, str)) and bool(error)
+
+
+def _scoped_edit_decline_reason(problem: str | None) -> str:
+    """The decline reason a scoped-edit problem class records."""
+    if problem == "malformed":
+        return "malformed_edit_blocks"
+    if problem == "error_body":
+        return "error_body_response"
+    return "no_edit_blocks"
+
+
 def try_local_repair(
     plan: ExecutionPlan,
     brief: dict[str, Any],
@@ -15098,11 +15148,15 @@ def _try_local_repair(
     effective = settings or LLMSettings.from_env()
     if effective.num_ctx is None:
         effective = dataclass_replace(effective, num_ctx=_PLANNER_NUM_CTX)
-    if effective.format_schema is not None:
-        # The repair returns one definition, not a plan envelope —
-        # the envelope grammar would corrupt the code payload (the
-        # cycle-2 two-channel finding).
-        effective = dataclass_replace(effective, format_schema=None)
+    # The repair returns one definition, not a plan envelope —
+    # the envelope grammar would corrupt the code payload (the
+    # cycle-2 two-channel finding). Build #14: the mode is stated
+    # explicitly as unconstrained — dropping the schema alone
+    # used to leave the transport substituting a "json" directive
+    # the prompt never ordered.
+    effective = dataclass_replace(
+        effective, format_schema=None, format_mode="unconstrained"
+    )
     # Campaign build #13: the call is recorded (raw response
     # included), and an answer from which no matching definition
     # can be extracted earns ONE format re-ask — the scoped-edit
@@ -15124,7 +15178,15 @@ def _try_local_repair(
         attempt=1,
         outcome="accepted" if extracted is not None else "rejected",
         response_text=response,
-        decline_reason="" if extracted is not None else "no_definition_extracted",
+        decline_reason=(
+            ""
+            if extracted is not None
+            else (
+                "error_body_response"
+                if _is_fabricated_error_body(response)
+                else "no_definition_extracted"
+            )
+        ),
         plan_id=plan.plan_id,
         plan_version=brief.get("plan_version"),
         target=seam_target,
@@ -15146,7 +15208,13 @@ def _try_local_repair(
             outcome="accepted" if extracted is not None else "rejected",
             response_text=response,
             decline_reason=(
-                "" if extracted is not None else "no_definition_extracted"
+                ""
+                if extracted is not None
+                else (
+                    "error_body_response"
+                    if _is_fabricated_error_body(response)
+                    else "no_definition_extracted"
+                )
             ),
             shape_repair=True,
             plan_id=plan.plan_id,
@@ -15154,6 +15222,13 @@ def _try_local_repair(
             target=seam_target,
         )
     if extracted is None:
+        if _is_fabricated_error_body(response):
+            return decline(
+                "error_body_response",
+                "the model's answer was a fabricated API-error "
+                "body (an invented {\"error\": ...} object), not "
+                "a definition",
+            )
         return decline(
             "no_definition_extracted",
             "the model's answer holds no definition matching "
@@ -15849,11 +15924,16 @@ def _try_scoped_edit_repair(
     effective = settings or LLMSettings.from_env()
     if effective.num_ctx is None:
         effective = dataclass_replace(effective, num_ctx=_PLANNER_NUM_CTX)
-    if effective.format_schema is not None:
-        # The repair returns edit blocks, not a plan envelope — the
-        # envelope grammar would corrupt the payload (the cycle-2
-        # two-channel finding).
-        effective = dataclass_replace(effective, format_schema=None)
+    # The repair returns edit blocks, not a plan envelope — the
+    # envelope grammar would corrupt the payload (the cycle-2
+    # two-channel finding). Build #14: the mode is stated
+    # explicitly as unconstrained — dropping the schema alone
+    # used to leave the transport substituting a "json" directive,
+    # and arm #23 proved what that contradiction produces: six
+    # fabricated API-error bodies, zero edit blocks.
+    effective = dataclass_replace(
+        effective, format_schema=None, format_mode="unconstrained"
+    )
     # Campaign build #13: every seam call is recorded (raw
     # response included), and a response carrying no parseable
     # edit blocks earns ONE format re-ask — build #8's
@@ -15875,6 +15955,8 @@ def _try_scoped_edit_repair(
     seam_target = ", ".join(target.relative_path for target in targets)
     response = call_llm(system_prompt, user_prompt, settings=effective)
     sections, problem = _scoped_edit_sections(response, targets)
+    if sections is None and _is_fabricated_error_body(response):
+        problem = "error_body"
     _record_seam_attempt(
         seam="scoped_edit",
         attempt=1,
@@ -15883,17 +15965,13 @@ def _try_scoped_edit_repair(
         decline_reason=(
             ""
             if sections is not None
-            else (
-                "malformed_edit_blocks"
-                if problem == "malformed"
-                else "no_edit_blocks"
-            )
+            else _scoped_edit_decline_reason(problem)
         ),
         plan_id=plan.plan_id,
         plan_version=brief.get("plan_version"),
         target=seam_target,
     )
-    if sections is None and problem in ("empty", "missing_section"):
+    if sections is None and problem in ("empty", "missing_section", "error_body"):
         response = call_llm(
             system_prompt,
             user_prompt
@@ -15902,6 +15980,8 @@ def _try_scoped_edit_repair(
             settings=effective,
         )
         sections, problem = _scoped_edit_sections(response, targets)
+        if sections is None and _is_fabricated_error_body(response):
+            problem = "error_body"
         _record_seam_attempt(
             seam="scoped_edit",
             attempt=2,
@@ -15910,11 +15990,7 @@ def _try_scoped_edit_repair(
             decline_reason=(
                 ""
                 if sections is not None
-                else (
-                    "malformed_edit_blocks"
-                    if problem == "malformed"
-                    else "no_edit_blocks"
-                )
+                else _scoped_edit_decline_reason(problem)
             ),
             shape_repair=True,
             plan_id=plan.plan_id,
@@ -15927,6 +16003,13 @@ def _try_scoped_edit_repair(
                 "malformed_edit_blocks",
                 "the model's response carries a malformed edit "
                 "block or FILE section",
+            )
+        if problem == "error_body":
+            return decline(
+                "error_body_response",
+                "the model's response was a fabricated API-error "
+                "body (an invented {\"error\": ...} object), not "
+                "edit blocks",
             )
         if problem == "missing_section":
             return decline(

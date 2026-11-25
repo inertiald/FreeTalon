@@ -18,10 +18,11 @@ import tempfile
 import time
 import warnings
 from collections.abc import Callable, Coroutine
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
 
-from .intake import call_llm
+from .intake import LLMSettings, call_llm
 
 AsyncHandler = Callable[[dict[str, Any]], Coroutine[Any, Any, dict[str, Any]]]
 
@@ -515,7 +516,15 @@ class ToolRegistry:
             system_prompt = "You are an analytical assistant. Process the provided context data according to the instructions."
             user_prompt = f"INSTRUCTION: {instruction}\n\nCONTEXT DATA:\n{context_data}"
 
-            summary = await asyncio.to_thread(call_llm, system_prompt, user_prompt)
+            # Build #14: the summary is free-form prose used raw —
+            # the call states unconstrained explicitly instead of
+            # inheriting the transport's default JSON directive.
+            synthesis_settings = dataclass_replace(
+                LLMSettings.from_env(), format_mode="unconstrained"
+            )
+            summary = await asyncio.to_thread(
+                call_llm, system_prompt, user_prompt, synthesis_settings
+            )
             print(f"\n--- SYNTHESIS RESULT ---\n{summary}\n------------------------\n")
             # Report a measurable metric: a plan can assert summary_chars >= 1
             # to prove text was produced (content quality stays the LLM's job).
