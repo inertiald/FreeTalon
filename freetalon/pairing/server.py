@@ -5,18 +5,27 @@ Stdlib only, mirroring freetalon/api.py's server shape. The operator
 token comes from the environment and is compared via
 freetalon.security.authorize (hmac.compare_digest); with no token
 configured the operator API fails closed.
+
+Deployment option (CONTRACT.md, "Static fallthrough"): when a static
+root is configured, GET/HEAD requests outside the /pairing namespace
+serve files from that tree, so one process can front both the pairing
+API and the provisioning payloads. Off by default; the pairing routes
+are matched first and are unaffected either way.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
+import shutil
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from ..security import authorize
 from .store import (
@@ -51,6 +60,7 @@ class PairingServerConfig:
     store_path: str = _DEFAULT_STORE_PATH
     ttl_seconds: float = 1800.0
     token: str | None = None
+    static_root: str | None = None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "PairingServerConfig":
@@ -63,6 +73,7 @@ class PairingServerConfig:
             or _DEFAULT_STORE_PATH,
             ttl_seconds=float(env.get("FREETALON_PAIRING_TTL_SECONDS") or 1800),
             token=token,
+            static_root=env.get("FREETALON_PAIRING_STATIC_ROOT") or None,
         )
 
 
@@ -175,8 +186,52 @@ class _PairingHandler(BaseHTTPRequestHandler):
             self._handle_poll(path[len("/pairing/"):])
         elif kind is not None:
             self._send_json(405, {"error": "method not allowed"})
+        elif self.server.pairing_static_root is not None:
+            self._serve_static(head=False)
         else:
             self._send_json(404, {"error": "not found"})
+
+    def _serve_static(self, head: bool) -> None:
+        """Serve one file from the configured static root.
+
+        The request path is percent-decoded and resolved under the
+        root; anything that resolves outside the root, a missing file,
+        or a directory without an index.html is the same JSON 404 the
+        API returns for unknown routes. No directory listings. Only
+        reached when a static root is configured (CONTRACT.md, "Static
+        fallthrough").
+        """
+        root = Path(self.server.pairing_static_root or "").resolve()
+        decoded = unquote(urlparse(self.path).path)
+        parts = [p for p in decoded.split("/") if p not in ("", ".")]
+        try:
+            candidate = root.joinpath(*parts).resolve()
+            if candidate.is_dir():
+                candidate = (candidate / "index.html").resolve()
+        except (OSError, ValueError):
+            candidate = None
+        if (
+            candidate is None
+            or not candidate.is_relative_to(root)
+            or not candidate.is_file()
+        ):
+            self._send_json(404, {"error": "not found"})
+            return
+        size = candidate.stat().st_size
+        content_type = (
+            mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        if head:
+            return
+        try:
+            with candidate.open("rb") as handle:
+                shutil.copyfileobj(handle, self.wfile, 256 * 1024)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client went away mid-download; nothing to answer
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -206,7 +261,13 @@ class _PairingHandler(BaseHTTPRequestHandler):
         self._reject_method()
 
     def do_HEAD(self) -> None:
-        self._reject_method()
+        path = urlparse(self.path).path
+        if _route_kind(path) is not None:
+            self._send_json(405, {"error": "method not allowed"})
+        elif self.server.pairing_static_root is not None:
+            self._serve_static(head=True)
+        else:
+            self._send_json(404, {"error": "not found"})
 
     def do_OPTIONS(self) -> None:
         self._reject_method()
@@ -313,6 +374,7 @@ class _PairingHandler(BaseHTTPRequestHandler):
 class _PairingHTTPServer(_ThreadingHTTPServer):
     pairing_store: PairingStore
     pairing_token: str | None
+    pairing_static_root: str | None = None
 
 
 def make_server(
@@ -320,10 +382,12 @@ def make_server(
     token: str | None,
     host: str = "127.0.0.1",
     port: int = 0,
+    static_root: str | None = None,
 ) -> _PairingHTTPServer:
     httpd = _PairingHTTPServer((host, port), _PairingHandler)
     httpd.pairing_store = store
     httpd.pairing_token = token or None
+    httpd.pairing_static_root = static_root or None
     return httpd
 
 
@@ -331,13 +395,21 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO)
     config = PairingServerConfig.from_env()
     store = PairingStore(config.store_path, ttl_seconds=config.ttl_seconds)
-    httpd = make_server(store, config.token, host=config.host, port=config.port)
+    httpd = make_server(
+        store,
+        config.token,
+        host=config.host,
+        port=config.port,
+        static_root=config.static_root,
+    )
     logger.info(
-        "pairing server listening on %s:%d (store %s, operator API %s)",
+        "pairing server listening on %s:%d (store %s, operator API %s, "
+        "static root %s)",
         config.host,
         config.port,
         config.store_path,
         "enabled" if config.token else "CLOSED (no FREETALON_PAIRING_TOKEN)",
+        config.static_root or "off",
     )
     try:
         httpd.serve_forever()
@@ -346,3 +418,7 @@ def main() -> int:
     finally:
         httpd.server_close()
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

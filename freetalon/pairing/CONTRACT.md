@@ -177,9 +177,24 @@ wrong method → `405`. A confirm refused with `410` returns the
 poll-style body `{"code", "status"}` (`"expired"` or `"claimed"`), so
 a client reads the terminal state the same way it does from a poll.
 
+## Static fallthrough (deployment option)
+
+When a static root is configured (`static_root` on `make_server`, or
+`FREETALON_PAIRING_STATIC_ROOT` for the standalone entry), `GET` and
+`HEAD` requests whose path is **not** a pairing route serve files from
+that directory, so one process can front both this API and the static
+provisioning payloads. Pairing routes are matched first and are
+unaffected. The request path is percent-decoded and resolved under the
+root: a path that resolves outside the root, a missing file, and a
+directory without an `index.html` all return the same
+`404 {"error": "not found"}` as an unknown route, and there are no
+directory listings. Other methods never fall through. With no static
+root configured (the default) the fallthrough is off and every
+non-route path is the plain `404` above.
+
 ## Server construction (`server.py`)
 
-- `make_server(store, token, host="127.0.0.1", port=0)` → a threaded
+- `make_server(store, token, host="127.0.0.1", port=0, static_root=None)` → a threaded
   `http.server` instance, already bound to `(host, port)`. The caller
   runs `serve_forever()` (typically in a thread) and stops it with
   `shutdown()` + `server_close()`; `port=0` binds an ephemeral port,
@@ -196,6 +211,8 @@ a client reads the terminal state the same way it does from a poll.
 
 ## Configuration (env only)
 
+Read by `PairingServerConfig.from_env`.
+
 | var | default | meaning |
 |-----|---------|---------|
 | `FREETALON_PAIRING_TOKEN` | *(unset → operator API closed)* | operator bearer token |
@@ -203,6 +220,7 @@ a client reads the terminal state the same way it does from a poll.
 | `FREETALON_PAIRING_TTL_SECONDS` | `1800` | code lifetime |
 | `FREETALON_PAIRING_HOST` | `0.0.0.0` | bind host |
 | `FREETALON_PAIRING_PORT` | `8080` | bind port |
+| `FREETALON_PAIRING_STATIC_ROOT` | *(unset → static fallthrough off)* | directory served for non-`/pairing` GET/HEAD (see "Static fallthrough") |
 
 Production note: the node console's default base is
 `http://10.40.0.1` (port 80), so in Pat's session the control plane
