@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import ast
 import http.client
+import importlib.util
 import json
 import os
 import re
@@ -283,6 +284,43 @@ def clause_coverage_errors(
     return errors
 
 
+
+def _method_surface_guidance_lines(
+    clauses: list[dict[str, Any]],
+) -> list[str]:
+    """Generation steering for a contract that pins 405 (build #25).
+
+    The probes have judged the method surface since builds
+    #23/#24 — the static handler-surface check and the live
+    method matrix — but build #24's screening showed a run whose
+    re-plan budget was consumed by an unrelated failure shipping
+    a do_GET/do_POST-only server: the fact existed in-run, yet
+    nothing at generation time told the planner the closed
+    method set is required, so the surface had to be REPAIRED
+    (one re-plan in run 2) instead of born conformant. When any
+    frozen clause is method-surface-flagged, the clauses block
+    carries the requirement up front. General: any contract
+    family whose clause text pins 405 gets the steering.
+    """
+    if not any(clause.get("method_surface") for clause in clauses):
+        return []
+    return [
+        "",
+        "METHOD SURFACE (the contract pins 405, and the system's "
+        "probes check this mechanically): a request handler that "
+        "defines only do_GET/do_POST is NON-CONFORMANT — every "
+        "other method falls through to the stdlib default 501, "
+        "which the contract forbids. A generated handler must "
+        "cover the full closed method set (GET, POST, PUT, "
+        "DELETE, PATCH, HEAD, OPTIONS): define explicit do_PUT / "
+        "do_DELETE / do_PATCH / do_HEAD / do_OPTIONS handlers (or "
+        "one dispatch that all of them share), so a method the "
+        "route table does not define for a known route answers "
+        "with the contract's response for that route — never the "
+        "stdlib 501.",
+    ]
+
+
 def format_clauses_block(clauses: list[dict[str, Any]]) -> str:
     """The CONTRACT CLAUSES prompt block: the frozen list + the
     declaration rule, rendered for planner and re-plan prompts."""
@@ -302,6 +340,7 @@ def format_clauses_block(clauses: list[dict[str, Any]]) -> str:
     ]
     for clause in clauses:
         lines.append(f"- {clause['id']}: {clause.get('heading')}")
+    lines.extend(_method_surface_guidance_lines(clauses))
     return "\n".join(lines)
 
 
@@ -495,6 +534,7 @@ def format_replan_clauses_block(
             "the brief — the per-node declaration rule above still "
             "applies to every node."
         )
+    lines.extend(_method_surface_guidance_lines(clauses))
     return "\n".join(lines)
 
 
@@ -1683,10 +1723,296 @@ def _jobqueue_method_matrix_records(
     return records
 
 
+
+
+# ── Store-behavior probes (campaign build #25) ─────────────────────
+#
+# The pairing family's second registered runner. The HTTP runner
+# cannot see the store file, and that blind spot held for 18
+# straight exam arms (store-ceiling diagnosis, 2026-11-25): every
+# in-run check read the API view, never the bytes on disk, so a
+# poll-triggered expiry that wiped memory but never persisted
+# passed every status-level assertion while the credential bundle
+# sat in the file indefinitely; and the corrupt-file timing
+# (raise at construction vs at first use) had no machine arbiter,
+# so arm #31 resolved it toward its own rewritten test. This
+# runner exercises the tree's real store module directly —
+# imported from the tree under test, driven through the
+# contract's own clock seam (now_fn) in a temp dir — and asserts
+# on the FILE. Records ride the clauses the behavior belongs to
+# (expiry, persistence), so those clause states become
+# probe-driven exactly as the method surface made its clause
+# probe-driven in build #23: a verify-node declaration alone no
+# longer verifies them, and a red flow fails them.
+
+_PAIRING_STORE_PATH = "freetalon/pairing/store.py"
+_STORE_PROBE_CODE = "STORE-0001"
+_STORE_PROBE_NONCE = "0123456789abcdef" * 2
+_STORE_PROBE_MACHINE_ID = "store-probe-machine"
+_STORE_PROBE_SENTINEL = "store-probe-sentinel-7f3a9c1e"
+
+
+def _clause_by_slug(clauses: list[dict[str, Any]], slug: str):
+    """The clause whose id ends in -<slug> (C06-expiry, ...)."""
+    suffix = f"-{slug}"
+    for clause in clauses:
+        if str(clause.get("id") or "").endswith(suffix):
+            return clause
+    return None
+
+
+def _load_store_module(root: Path):
+    """Import the tree's pairing store module by file location.
+
+    The probe judges the tree under test, never the loop's own
+    installed package, so the module loads from its path under a
+    private name. Raises whatever the import raises; the runner
+    turns that into failing records.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_freetalon_store_probe", root / _PAIRING_STORE_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_PAIRING_STORE_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    # Dataclasses (the contract's PollOutcome) resolve their
+    # module through sys.modules at decoration time; register
+    # the private name for the duration of the load. The runner
+    # pops it when its flows are done.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
+
+
+def _outcome_field(outcome: Any, field: str) -> Any:
+    if isinstance(outcome, dict):
+        return outcome.get(field)
+    return getattr(outcome, field, None)
+
+
+def _store_flow_expiry_wipe(module: Any, workdir: Path) -> tuple[bool, str]:
+    clock = [1_000_000.0]
+    path = workdir / "store-expiry.json"
+    store = module.PairingStore(
+        path, ttl_seconds=100.0, now_fn=lambda: clock[0]
+    )
+    store.register(
+        _STORE_PROBE_CODE, _STORE_PROBE_NONCE, _STORE_PROBE_MACHINE_ID
+    )
+    store.confirm(
+        _STORE_PROBE_CODE, {"probe_sentinel": _STORE_PROBE_SENTINEL}
+    )
+    if _STORE_PROBE_SENTINEL.encode() not in path.read_bytes():
+        return False, (
+            "the sentinel credential never reached the store file "
+            "after confirm — the wipe assertion has nothing to judge"
+        )
+    clock[0] += 200.0
+    outcome = store.poll(_STORE_PROBE_CODE)
+    problems = []
+    status = _outcome_field(outcome, "status")
+    if status != "expired":
+        problems.append(
+            f"poll after the TTL returned status {status!r}, "
+            "expected 'expired'"
+        )
+    if _outcome_field(outcome, "credentials") is not None:
+        problems.append(
+            "poll after the TTL returned credentials, expected None"
+        )
+    if _STORE_PROBE_SENTINEL.encode() in path.read_bytes():
+        problems.append(
+            "the sentinel credential is still present in the store "
+            "file bytes after the expiry poll — the wipe was not "
+            "persisted in the same write as the operation"
+        )
+    try:
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        record = (on_disk.get("records") or {}).get(_STORE_PROBE_CODE) or {}
+        if record.get("status") != "expired":
+            problems.append(
+                f"the on-disk record status is {record.get('status')!r} "
+                "after the expiry poll, expected 'expired'"
+            )
+    except (OSError, ValueError) as exc:
+        problems.append(f"the store file is unreadable after the poll: {exc}")
+    if problems:
+        return False, "; ".join(problems)
+    return True, (
+        "the expiry poll wiped the bundle from the store file in "
+        "the same write (sentinel absent, on-disk status 'expired')"
+    )
+
+
+def _store_flow_corrupt_raises(module: Any, workdir: Path) -> tuple[bool, str]:
+    path = workdir / "store-corrupt.json"
+    garbage = b"{ this is not a store file "
+    path.write_bytes(garbage)
+    error_type = getattr(module, "StoreCorruptError", None)
+    if error_type is None:
+        return False, (
+            "the store module does not export StoreCorruptError, "
+            "which the contract names"
+        )
+    try:
+        module.PairingStore(
+            path, ttl_seconds=100.0, now_fn=lambda: 1_000_000.0
+        )
+    except error_type:
+        pass
+    except Exception as exc:  # noqa: BLE001 - the probe reports it
+        return False, (
+            f"constructing the store over a corrupt file raised "
+            f"{type(exc).__name__}, expected StoreCorruptError at "
+            "construction"
+        )
+    else:
+        return False, (
+            "constructing the store over a corrupt file did not "
+            "raise — a corrupt file must raise StoreCorruptError "
+            "at construction, never load lazily or reset silently"
+        )
+    if path.read_bytes() != garbage:
+        return False, (
+            "the corrupt store file was modified by the "
+            "construction attempt — a corrupt file is left "
+            "byte-identical, never reset"
+        )
+    return True, (
+        "the corrupt file raised StoreCorruptError at "
+        "construction and was left byte-identical"
+    )
+
+
+def _store_flow_claim_burn(module: Any, workdir: Path) -> tuple[bool, str]:
+    clock = [2_000_000.0]
+    path = workdir / "store-claim.json"
+    now_fn = lambda: clock[0]  # noqa: E731 - the contract's clock seam
+    store = module.PairingStore(path, ttl_seconds=100.0, now_fn=now_fn)
+    store.register(
+        _STORE_PROBE_CODE, _STORE_PROBE_NONCE, _STORE_PROBE_MACHINE_ID
+    )
+    store.confirm(
+        _STORE_PROBE_CODE, {"probe_sentinel": _STORE_PROBE_SENTINEL}
+    )
+    outcome = store.poll(_STORE_PROBE_CODE)
+    problems = []
+    if _outcome_field(outcome, "status") != "confirmed":
+        problems.append(
+            f"the claiming poll returned status "
+            f"{_outcome_field(outcome, 'status')!r}, expected 'confirmed'"
+        )
+    bundle = _outcome_field(outcome, "credentials") or {}
+    if not isinstance(bundle, dict) or (
+        bundle.get("probe_sentinel") != _STORE_PROBE_SENTINEL
+    ):
+        problems.append(
+            "the claiming poll did not return the confirmed bundle"
+        )
+    reloaded = module.PairingStore(path, ttl_seconds=100.0, now_fn=now_fn)
+    second = reloaded.poll(_STORE_PROBE_CODE)
+    if _outcome_field(second, "status") != "claimed":
+        problems.append(
+            f"a reloaded store's poll returned status "
+            f"{_outcome_field(second, 'status')!r}, expected 'claimed' "
+            "— the claim burn did not persist"
+        )
+    if _outcome_field(second, "credentials") is not None:
+        problems.append(
+            "a reloaded store's poll returned credentials for an "
+            "already-claimed code"
+        )
+    if _STORE_PROBE_SENTINEL.encode() in path.read_bytes():
+        problems.append(
+            "the sentinel credential is still present in the store "
+            "file bytes after the claim — the burn was not persisted"
+        )
+    if problems:
+        return False, "; ".join(problems)
+    return True, (
+        "the claim burned in one poll and persisted across a "
+        "store reload (second poll 'claimed', sentinel gone)"
+    )
+
+
+def _pairing_store_behavior_records(
+    clauses: list[dict[str, Any]], root: Path
+) -> list[dict[str, Any]]:
+    """Store-behavior probe for the pairing contract (build #25).
+
+    Scoping is the contract's own: the runner engages when a
+    clause declares the pairing store module, and stays silent
+    when the module itself is missing (the declared_files probe
+    owns that failure). The flows run against the real module in
+    a temp dir — no server, no real clock, no writes to the tree.
+    """
+    store_clauses = [
+        clause
+        for clause in clauses
+        if _PAIRING_STORE_PATH in (clause.get("declared_files") or [])
+    ]
+    if not store_clauses:
+        return []
+    if not (root / _PAIRING_STORE_PATH).is_file():
+        return []
+    flow_targets = [
+        ("store_expiry_wipe", _store_flow_expiry_wipe, "expiry"),
+        ("store_corrupt_raises", _store_flow_corrupt_raises, "persistence"),
+        (
+            "store_claim_burn_persists",
+            _store_flow_claim_burn,
+            "persistence",
+        ),
+    ]
+    try:
+        module = _load_store_module(root)
+        load_error = None
+    except Exception as exc:  # noqa: BLE001 - reported as records
+        module = None
+        load_error = (
+            f"the store module could not be imported: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    records: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(
+        prefix="freetalon-store-probe-"
+    ) as tmp:
+        workdir = Path(tmp)
+        for name, flow, slug in flow_targets:
+            target = _clause_by_slug(clauses, slug)
+            targets = [target] if target is not None else store_clauses
+            if load_error is not None:
+                ok, detail = False, load_error
+            else:
+                try:
+                    ok, detail = flow(module, workdir)
+                except Exception as exc:  # noqa: BLE001 - reported
+                    ok, detail = False, (
+                        f"the flow errored: {type(exc).__name__}: {exc}"
+                    )
+            for clause in targets:
+                records.append(
+                    {
+                        "clause_id": str(clause["id"]),
+                        "probe": "store_behavior",
+                        "ok": ok,
+                        "detail": detail,
+                        "flow": name,
+                        "file": _PAIRING_STORE_PATH,
+                    }
+                )
+    sys.modules.pop("_freetalon_store_probe", None)
+    return records
+
 # The registered live-probe runners, in run order. A new contract
 # family appends its runner here (see the section header).
 _LIVE_PROBE_RUNNERS = (
     _pairing_http_smoke_records,
+    _pairing_store_behavior_records,
     _jobqueue_method_matrix_records,
 )
 
