@@ -177,7 +177,7 @@ wrong method → `405`. A confirm refused with `410` returns the
 poll-style body `{"code", "status"}` (`"expired"` or `"claimed"`), so
 a client reads the terminal state the same way it does from a poll.
 
-## Static fallthrough (deployment option)
+### Static fallthrough (deployment option)
 
 When a static root is configured (`static_root` on `make_server`, or
 `FREETALON_PAIRING_STATIC_ROOT` for the standalone entry), `GET` and
