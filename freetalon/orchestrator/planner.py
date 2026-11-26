@@ -30,6 +30,7 @@ from .contract_clauses import (
     format_replan_clauses_block,
     handler_surface_gaps,
     node_clause_declaration,
+    normalize_clause_id_declarations,
     probe_suspect_map,
 )
 from .executor import _command_runs_full_suite
@@ -320,6 +321,23 @@ def _attach_impact_synthesis(
     is not asked to re-derive it.
     """
     exc.impact_check_synthesis = list(records)  # type: ignore[attr-defined]
+    return exc
+
+
+def _attach_clause_id_normalizations(
+    exc: LLMResponseError, records: Collection[dict[str, Any]]
+) -> LLMResponseError:
+    """Attach this attempt's clause-id normalizations to a rejection.
+
+    Campaign build #28: parse rewrites a declared clause id that
+    unambiguously truncates one frozen id (see
+    normalize_clause_id_declarations in contract_clauses); when
+    the attempt is still rejected for other defects, the repairs
+    ride the exception on the _attach_intent_corrections channel,
+    so the repair round's record shows the ids were already
+    repaired and the model is not asked to re-derive them.
+    """
+    exc.clause_id_normalizations = list(records)  # type: ignore[attr-defined]
     return exc
 
 
@@ -1609,6 +1627,22 @@ def parse_planner_response(
         index=index,
         modules=module_cache,
     )
+    # Campaign build #28: deterministic clause-id normalization —
+    # a declared clause id that is not frozen but unambiguously
+    # truncates exactly one frozen id is rewritten to that id
+    # here, before the clause rules judge the attempt (arm #36:
+    # the re-plan's best attempt lost its repair round to two
+    # truncations judged as inventions). The repairs are
+    # recorded, never silent: they ride the returned metadata on
+    # acceptance and the rejection itself (the
+    # _attach_clause_id_normalizations channel) otherwise. Only
+    # runs when the caller supplied the frozen list; a
+    # clauses-free parse is byte-unchanged.
+    clause_id_normalizations: list[dict[str, Any]] = []
+    if clauses is not None:
+        clause_id_normalizations = normalize_clause_id_declarations(
+            nodes, clauses
+        )
     relabeled_nodes = _relabel_nodes_for_errors(nodes, id_labels)
     records, cheap = _collect_plan_error_records(
         relabeled_nodes,
@@ -1638,6 +1672,10 @@ def parse_planner_response(
             _attach_intent_corrections(rejection, intent_corrections)
         if impact_synthesis:
             _attach_impact_synthesis(rejection, impact_synthesis)
+        if clause_id_normalizations:
+            _attach_clause_id_normalizations(
+                rejection, clause_id_normalizations
+            )
         raise rejection
 
     metadata = payload.get("metadata")
@@ -1665,6 +1703,15 @@ def parse_planner_response(
     metadata.pop(IMPACT_CHECK_SYNTHESIS_METADATA_KEY, None)
     if impact_synthesis:
         metadata[IMPACT_CHECK_SYNTHESIS_METADATA_KEY] = impact_synthesis
+    # The clause-id normalizations key is system-owned the same
+    # way (campaign build #28): stamped from this parse's own
+    # repairs — a model-supplied value under it never survives,
+    # and a parse that repaired nothing carries none.
+    metadata.pop(CLAUSE_ID_NORMALIZATIONS_METADATA_KEY, None)
+    if clause_id_normalizations:
+        metadata[CLAUSE_ID_NORMALIZATIONS_METADATA_KEY] = (
+            clause_id_normalizations
+        )
 
     return nodes, metadata
 
@@ -7231,6 +7278,14 @@ PLAN_EMISSION_METADATA_KEY = "plan_emission"
 #: model payload carried under it.
 INTENT_CORRECTIONS_METADATA_KEY = "intent_corrections"
 IMPACT_CHECK_SYNTHESIS_METADATA_KEY = "impact_check_synthesis"
+
+#: Plan metadata key for the deterministic clause-id
+#: normalizations (campaign build #28): one entry per declared
+#: clause id parse rewrote to the frozen id it unambiguously
+#: truncates — {node, role, from, to}. System-owned like the
+#: keys above: parse stamps it from its own repairs and clears
+#: any value a model payload carried under it.
+CLAUSE_ID_NORMALIZATIONS_METADATA_KEY = "clause_id_normalizations"
 
 #: Validator codes that judge a write node's payload. At the
 #: skeleton phase their records against a content-less write node
@@ -12997,6 +13052,15 @@ def _call_llm_with_repair(
     itself — and every skeleton repair prompt carries the
     SKELETON TARGET FACTS block: the rejected skeleton's write
     targets with their measured existence and legal intents.
+
+    Campaign build #28: parse normalizes a declared clause id
+    that unambiguously truncates one frozen id before judging
+    the attempt (arm #36: two truncations judged as inventions),
+    and every repair prompt in a clauses-carrying call re-states
+    the full clause declaration contract next to the rejection —
+    arm #36's third attempt regressed the declaration shape its
+    second attempt had held, because the re-ask carried only the
+    latest error deltas. Clauses-free calls are unchanged.
     """
     # Retry #22: derive the effective settings once, before the loop,
     # so every call in this planning call (initial + repairs) gets
@@ -13390,11 +13454,36 @@ def _call_llm_with_repair(
                 if pinned_contract
                 else ""
             )
+            # Campaign build #28: the clause declaration contract
+            # is re-stated with the repair, on the pinned-contract
+            # block's precedent — the frozen ids verbatim, the
+            # per-node object-mapping rule, and (build #27) the
+            # probe-gated requirements. Arm #36: attempt 2 held
+            # every property and its rejection named only five
+            # clause-id deltas; attempt 3 answered by losing the
+            # mapping shape entirely, because at the point of
+            # repair only the last errors were restated, never the
+            # contract they are deltas against. Clauses-free calls
+            # render byte-identically to before.
+            clauses_block = ""
+            if clauses:
+                if clause_mode == "delta":
+                    clauses_block = (
+                        format_replan_clauses_block(
+                            clauses,
+                            clause_required,
+                            clause_probe_failures,
+                        )
+                        + "\n"
+                    )
+                else:
+                    clauses_block = format_clauses_block(clauses) + "\n"
             prompt = (
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
                 f"{task_block}"
                 f"{contract_block}"
+                f"{clauses_block}"
                 f"Rejection reason: {exc}\n"
                 f"Previous output: {_describe_failed_output(response_text)}\n"
                 f"{_dropped_fields_note(prev_response_text, response_text)}"

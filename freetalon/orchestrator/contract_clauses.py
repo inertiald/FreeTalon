@@ -70,6 +70,7 @@ _BACKTICK_RE = re.compile(r"`([^`]+)`")
 _PY_FILE_RE = re.compile(r"[A-Za-z0-9_./-]+\.py\b")
 _PYTHON_M_RE = re.compile(r"python\s+-m\s+([A-Za-z_][A-Za-z0-9_.]*)")
 _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
+_CLAUSE_NUMBER_RE = re.compile(r"C(\d+)")
 
 # HTTP methods beyond GET/POST whose handler (or an equivalent
 # dispatch) proves the method surface is deliberate, not the
@@ -221,6 +222,122 @@ def node_clause_declaration(node: "PlanNode") -> tuple[list[str], list[str], str
     return parsed["implements"], parsed["verifies"], None
 
 
+def _clause_number_token(clause_id: str) -> str | None:
+    """The C<NN> token an id carries, or None (build #28).
+
+    Frozen ids are ``C{position:02d}-{slug}`` (extract_clauses),
+    optionally behind a multi-spec prefix; the number is the
+    first C<digits> run in the id.
+    """
+    match = _CLAUSE_NUMBER_RE.search(clause_id)
+    return match.group(0) if match else None
+
+
+def normalize_clause_id_declarations(
+    nodes: list["PlanNode"], clauses: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Repair truncated clause ids in node declarations (build #28).
+
+    Arm #36: the re-plan's best attempt declared the frozen
+    clauses C02/C07 in truncated form (C02-status-vocabulary for
+    C02-status-vocabulary-exact-strings-no-synonyms) and was
+    rejected exactly as if it had invented them — no seam
+    normalized an emitted id against the frozen set. An emitted
+    id that is not frozen but is a STRICT PREFIX of exactly one
+    frozen id names that clause unambiguously, so parse rewrites
+    it in place, before validation judges the attempt (the
+    builds #11/#26 deterministic-correction seam), and returns
+    one record per repair: {node, role, from, to}.
+
+    The invariant is fabrication, not generosity: a prefix of
+    zero or of two or more frozen ids is left exactly as emitted
+    (it stays the unknown-id error below), an exact frozen id is
+    untouched, and a re-slugged id — the clause number kept, the
+    slug invented, as in arm #36's C12-node-self-registration —
+    is not a prefix of anything and is never normalized: a
+    clause counts only when its declaration is real. Malformed
+    declarations (a flat list, a non-string entry) are likewise
+    left for node_clause_declaration to judge.
+    """
+    frozen = [str(clause["id"]) for clause in clauses]
+    known = set(frozen)
+    records: list[dict[str, Any]] = []
+    for node in nodes:
+        inputs = node.inputs or {}
+        if not isinstance(inputs, dict):
+            continue
+        raw = inputs.get("clauses")
+        if not isinstance(raw, dict):
+            continue
+        for role in ("implements", "verifies"):
+            value = raw.get(role)
+            if not isinstance(value, list):
+                continue
+            repaired: list[Any] = []
+            changed = False
+            for item in value:
+                if isinstance(item, str) and item and item not in known:
+                    candidates = [
+                        frozen_id
+                        for frozen_id in frozen
+                        if frozen_id.startswith(item)
+                    ]
+                    if len(candidates) == 1:
+                        records.append(
+                            {
+                                "node": node.id,
+                                "role": role,
+                                "from": item,
+                                "to": candidates[0],
+                            }
+                        )
+                        repaired.append(candidates[0])
+                        changed = True
+                        continue
+                repaired.append(item)
+            if changed:
+                raw[role] = list(dict.fromkeys(repaired))
+    return records
+
+
+def _unknown_clause_id_error(
+    node_id: str, clause_id: str, clauses: list[dict[str, Any]]
+) -> str:
+    """The unknown-clause-id plan error (builds #3/#7; #28 hint).
+
+    When the invented id's clause number matches exactly one
+    frozen id's number — arm #36's re-slugged C10-make-server
+    for the frozen C10-server-construction-server-py — the error
+    names that frozen id verbatim and states the copy-verbatim
+    rule, so one repair round can answer it (the build #27
+    fact-carrying pattern). With no number twin, or an ambiguous
+    one, the text is byte-identical to before this build.
+    """
+    known = sorted(str(clause["id"]) for clause in clauses)
+    message = (
+        f"node '{node_id}' declares contract clause "
+        f"{clause_id!r}, which is not in the frozen clause "
+        f"list ({', '.join(known)}) — clause ids "
+        "are system-extracted from the contract and cannot "
+        "be invented"
+    )
+    token = _clause_number_token(clause_id)
+    if token is not None:
+        twins = [
+            frozen_id
+            for frozen_id in known
+            if _clause_number_token(frozen_id) == token
+        ]
+        if len(twins) == 1:
+            message += (
+                f" — the frozen clause numbered {token} is "
+                f"{twins[0]!r}: copy clause ids verbatim from the "
+                "frozen list; never re-derive an id from its "
+                "number or heading"
+            )
+    return message
+
+
 def coverage_map(nodes: list["PlanNode"]) -> dict[str, dict[str, list[str]]]:
     """clause id -> {"implement": [node ids], "verify": [node ids]}."""
     coverage: dict[str, dict[str, list[str]]] = {}
@@ -257,11 +374,7 @@ def clause_coverage_errors(
         for clause_id in implements + verifies:
             if clause_id not in known:
                 errors.append(
-                    f"node '{node.id}' declares contract clause "
-                    f"{clause_id!r}, which is not in the frozen clause "
-                    f"list ({', '.join(sorted(known))}) — clause ids "
-                    "are system-extracted from the contract and cannot "
-                    "be invented"
+                    _unknown_clause_id_error(node.id, clause_id, clauses)
                 )
     coverage = coverage_map(nodes)
     for clause in clauses:
@@ -510,11 +623,7 @@ def clause_delta_errors(
         for clause_id in implements + verifies:
             if clause_id not in known:
                 errors.append(
-                    f"node '{node.id}' declares contract clause "
-                    f"{clause_id!r}, which is not in the frozen clause "
-                    f"list ({', '.join(sorted(known))}) — clause ids "
-                    "are system-extracted from the contract and cannot "
-                    "be invented"
+                    _unknown_clause_id_error(node.id, clause_id, clauses)
                 )
     coverage = coverage_map(nodes)
     probe_by_clause = _failed_probes_by_clause(probe_failures)
