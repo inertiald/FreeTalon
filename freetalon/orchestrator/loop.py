@@ -300,6 +300,40 @@ class LoopRunner:
         self._run_store.create_run(run_id, contract.model_dump(mode="json"))
         self._log("loop.run.started", run_id=run_id, plan_id=plan.plan_id)
 
+        # Campaign build #26: a plan stamped planning_failure
+        # (plan_task_intent's terminal-failure outcome) has no
+        # nodes to execute and nothing to re-plan from — planning
+        # already recorded the failure (build #17 machinery).
+        # Finish the run as that recorded outcome: FAIL, the
+        # escalation naming the planning failure, zero versions.
+        # Without this, an empty plan would drift through the
+        # loop and be measured as something it is not.
+        planning_failure = (plan.metadata or {}).get("planning_failure")
+        if isinstance(planning_failure, dict) and planning_failure.get(
+            "error"
+        ):
+            escalation = (
+                "planning failed before execution: "
+                f"{planning_failure['error']}"
+            )
+            self._log(
+                "loop.planning_failure",
+                run_id=run_id,
+                plan_id=plan.plan_id,
+                error=str(planning_failure["error"]),
+            )
+            return self._finish_run(
+                run_id,
+                plan,
+                contract,
+                version=1,
+                attempts=[],
+                decision_history=[],
+                escalation=escalation,
+                started=started,
+                started_at=started_at,
+            )
+
         version = 1
         attempts: list[dict[str, Any]] = []
         decision_history: list[dict[str, Any]] = []

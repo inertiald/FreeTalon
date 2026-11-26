@@ -28,10 +28,14 @@ The build is tested at the levels it operates:
   identity scoped edit is rejected with no_op_edit;
 - fill exhaustion with the driver flow's workspace constraint
   writes the run record (contract, drained planner attempts,
-  summary with the FAIL planning-failure verdict) and the
-  original exception propagates annotated with the record's run
-  id (attribute + message suffix), its type unchanged; without
-  the constraint the exception propagates untouched.
+  summary with the FAIL planning-failure verdict); build #26
+  then RETURNS the failure as a FAILED plan carrying the
+  planning_failure stamp {error, error_type, run_id} instead of
+  propagating the exception — arm #34 measured that no caller
+  handles the raise (both drivers call plan_task_intent bare),
+  so the invariant is now: planning failure is a recorded
+  outcome, never an uncaught exception. Without the workspace
+  constraint the same FAILED plan returns with run_id None.
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from freetalon.orchestrator.intake import LLMResponseError, LLMSettings
-from freetalon.orchestrator.models import TaskIntent
+from freetalon.orchestrator.models import PlanStatus, TaskIntent
 from freetalon.orchestrator.planner import (
     _split_identity_edits,
     drain_pending_planner_attempts,
@@ -268,12 +272,16 @@ class TestNoChangeFill(_FillCase):
 
     def test_identity_over_absent_text_still_exhausts(self) -> None:
         dispatcher = self._dispatcher([ABSENT_IDENTITY_FILL])
-        with self.assertRaises(LLMResponseError) as caught:
-            self._plan(dispatcher)
+        plan = self._plan(dispatcher)
         self.assertEqual(dispatcher.state["fills"], 3)
-        self.assertIn("no_op_edit", str(caught.exception))
-        # No workspace constraint: the exception stands untouched.
-        self.assertIsNone(getattr(caught.exception, "run_id", None))
+        # Build #26: exhaustion returns a FAILED plan whose stamp
+        # names the fill's own error; nothing propagates.
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        stamp = plan.metadata.get("planning_failure")
+        self.assertIsInstance(stamp, dict)
+        self.assertIn("no_op_edit", stamp["error"])
+        # No workspace constraint: no record was written.
+        self.assertIsNone(stamp.get("run_id"))
 
 
 class TestAuthoredGuardUnchanged(_FillCase):
@@ -321,16 +329,19 @@ class TestPlanningFailureRecord(_FillCase):
             constraints={"workspace": str(workspace)},
         )
         dispatcher = self._dispatcher([NOT_FOUND_FILL])
-        with self.assertRaises(LLMResponseError) as caught:
-            self._plan(dispatcher, intent=intent)
-        exc = caught.exception
-        # The exception is the fill's own, type unchanged; the
-        # record is announced on it.
-        self.assertIs(type(exc), LLMResponseError)
+        plan = self._plan(dispatcher, intent=intent)
         self.assertEqual(dispatcher.state["fills"], 3)
-        self.assertIsNotNone(exc.run_id)
-        self.assertIn("planning failure recorded as run", str(exc))
-        run_dir = workspace / "runs" / str(exc.run_id)
+        # Build #26: the failure returns as a FAILED plan; the
+        # stamp carries the fill's error and the record's run id.
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        self.assertEqual(plan.nodes, [])
+        stamp = plan.metadata.get("planning_failure")
+        self.assertIsInstance(stamp, dict)
+        self.assertEqual(stamp["error_type"], "LLMResponseError")
+        self.assertIn("Content fill for planner node", stamp["error"])
+        run_id = stamp.get("run_id")
+        self.assertIsNotNone(run_id)
+        run_dir = workspace / "runs" / str(run_id)
         self.assertTrue(run_dir.is_dir())
         contract = json.loads(
             (run_dir / "contract.json").read_text(encoding="utf-8")
@@ -363,13 +374,18 @@ class TestPlanningFailureRecord(_FillCase):
         self.assertIn("planning failure", summary)
         self.assertIn("Extend the pairing server", summary)
 
-    def test_exhaustion_without_workspace_raises_original(self) -> None:
+    def test_exhaustion_without_workspace_returns_failed_plan(self) -> None:
         dispatcher = self._dispatcher([NOT_FOUND_FILL])
-        with self.assertRaises(LLMResponseError) as caught:
-            self._plan(dispatcher)
-        self.assertIsNone(getattr(caught.exception, "run_id", None))
-        self.assertNotIn("planning failure recorded", str(caught.exception))
-        self.assertIn("Content fill for planner node", str(caught.exception))
+        plan = self._plan(dispatcher)
+        # Build #26: no workspace constraint means no record was
+        # written (run_id None) — but the outcome is still the
+        # returned FAILED plan, never an exception.
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        self.assertEqual(plan.nodes, [])
+        stamp = plan.metadata.get("planning_failure")
+        self.assertIsInstance(stamp, dict)
+        self.assertIsNone(stamp.get("run_id"))
+        self.assertIn("Content fill for planner node", stamp["error"])
 
 
 if __name__ == "__main__":

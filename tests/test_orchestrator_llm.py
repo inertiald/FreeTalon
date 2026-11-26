@@ -13,7 +13,7 @@ from freetalon.orchestrator.intake import (
     intake_request,
     parse_task_intent_response,
 )
-from freetalon.orchestrator.models import TaskIntent
+from freetalon.orchestrator.models import PlanStatus, TaskIntent
 from freetalon.orchestrator.planner import (
     build_execution_plan,
     normalize_plan_nodes,
@@ -756,9 +756,14 @@ class TestPlannerHardening(unittest.TestCase):
         with patch(
             "freetalon.orchestrator.planner.call_llm", return_value=bad
         ) as call_mock:
-            with self.assertRaisesRegex(LLMResponseError, "unknown claw"):
-                plan_task_intent(self.intent, settings=self.settings)
-        # Initial attempt + 2 repair retries, then the last error is raised.
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        # Initial attempt + 2 repair retries, then planning gives
+        # up: build #26 returns the failure as a FAILED plan whose
+        # stamp names the last error; nothing raises.
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        self.assertIn(
+            "unknown claw", plan.metadata["planning_failure"]["error"]
+        )
         self.assertEqual(call_mock.call_count, 3)
 
     def test_replan_repairs_echoed_brief_then_succeeds(self) -> None:
@@ -1369,9 +1374,13 @@ class TestPlannerEchoFix(unittest.TestCase):
         with patch(
             "freetalon.orchestrator.planner.call_llm", return_value=echo
         ) as call_mock:
-            with self.assertRaisesRegex(LLMResponseError, "'nodes' array"):
-                plan_task_intent(self.intent, settings=self.settings)
-        # Initial attempt + 2 repair retries, then the last error is raised.
+            plan = plan_task_intent(self.intent, settings=self.settings)
+        # Initial attempt + 2 repair retries, then planning gives
+        # up (build #26: the FAILED plan's stamp, not a raise).
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        self.assertIn(
+            "'nodes' array", plan.metadata["planning_failure"]["error"]
+        )
         self.assertEqual(call_mock.call_count, 3)
 
     def test_describe_failed_output_names_the_problem_without_quoting_it(
@@ -5224,11 +5233,13 @@ class TestPlannerStandinOverwriteFix(unittest.TestCase):
             "freetalon.orchestrator.planner.call_llm",
             side_effect=[empty] * 8,
         ) as call_mock:
-            with self.assertRaises(LLMResponseError):
-                plan_task_intent(self.intent, settings=self.settings)
+            plan = plan_task_intent(self.intent, settings=self.settings)
         # 1 initial + 2 free re-prompts + 4 repairs = 7 calls, then
-        # raise. (The repair count is campaign build #4's raised
-        # plan_task_intent budget; the free-reprompt cap is unchanged.)
+        # the failure returns as the stamped FAILED plan (build
+        # #26; the repair count is campaign build #4's raised
+        # plan_task_intent budget; the free-reprompt cap is
+        # unchanged.)
+        self.assertEqual(plan.status, PlanStatus.FAILED)
         self.assertEqual(call_mock.call_count, 7)
 
     # --- Legitimate writes still pass ---
@@ -9434,10 +9445,12 @@ class TestPlannerForbiddenSteerFix(unittest.TestCase):
             "freetalon.orchestrator.planner.call_llm",
             side_effect=[flask, flask, flask],
         ) as call_mock:
-            with self.assertRaises(LLMResponseError) as caught:
-                plan_task_intent(self.intent, settings=self.settings)
+            plan = plan_task_intent(self.intent, settings=self.settings)
         self.assertEqual(call_mock.call_count, 3)
-        message = str(caught.exception)
+        # Build #26: the escalation returns as the FAILED plan's
+        # stamp; its error text is the rejection's own.
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        message = plan.metadata["planning_failure"]["error"]
         self.assertIn("Flask", message)
         # Both repair prompts named Flask as forbidden, with the
         # replacement and the consequence.
@@ -11871,10 +11884,15 @@ class TestPlannerEmptyEscalationFix(unittest.TestCase):
             "freetalon.orchestrator.planner.call_llm",
             side_effect=[empty, empty, empty, empty, empty, empty, empty],
         ) as call_mock:
-            with self.assertRaises(EmptyPlanError) as caught:
-                plan_task_intent(self.intent, settings=self.settings)
+            plan = plan_task_intent(self.intent, settings=self.settings)
         self.assertEqual(call_mock.call_count, 7)
-        message = str(caught.exception)
+        # Build #26: the EmptyPlanError escalation returns as the
+        # FAILED plan's stamp; its error text is the escalation's
+        # own, unchanged.
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        stamp = plan.metadata["planning_failure"]
+        self.assertEqual(stamp["error_type"], "EmptyPlanError")
+        message = stamp["error"]
         self.assertIn("grounded move", message)
         self.assertIn("freetalon/api.py", message)
         self.assertIn("empty plans", message)
@@ -18532,20 +18550,21 @@ class TestPlannerCycle2(unittest.TestCase):
         with patch(
             "freetalon.orchestrator.planner.call_llm", side_effect=fake_call
         ):
-            with self.assertRaises(planner_module.StuckRepairError) as caught:
-                plan_task_intent(intent, settings=self._settings())
+            plan = plan_task_intent(intent, settings=self._settings())
         # Three identical rejections, then the loop stops and
         # escalates — it does not spend the remaining budget
-        # re-asking. The error is an LLMResponseError (the loop's
-        # re-plan path treats it as a planning failure) and carries
-        # the repeated rejection's structured records.
+        # re-asking. Build #26: the escalation returns as the
+        # FAILED plan's stamp — error_type names the
+        # StuckRepairError (an LLMResponseError, the class the
+        # loop's re-plan path treats as a planning failure) and
+        # error_codes carries the repeated rejection's structured
+        # records.
         self.assertEqual(len(calls), 3)
-        self.assertIsInstance(caught.exception, LLMResponseError)
-        self.assertIn("stuck", str(caught.exception).lower())
-        self.assertIn(
-            "unknown_claw",
-            {record.code for record in caught.exception.plan_errors},
-        )
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        stamp = plan.metadata["planning_failure"]
+        self.assertEqual(stamp["error_type"], "StuckRepairError")
+        self.assertIn("stuck", stamp["error"].lower())
+        self.assertIn("unknown_claw", set(stamp.get("error_codes") or []))
 
     def test_stuck_detection_requires_three_in_a_row(self) -> None:
         # A, B, A, A, good: the identical signature never occurs

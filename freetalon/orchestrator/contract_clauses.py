@@ -595,6 +595,94 @@ def _handler_surface_ok(root: Path, spec_path: str) -> tuple[bool, str]:
     return False, "no request handler class found in the package"
 
 
+def handler_surface_gaps(content: str) -> list[tuple[str, list[str]]]:
+    """Per-class method-surface gaps in one file's source text.
+
+    Returns (class name, missing handlers) for every class in the
+    file that resolves to a request handler — a base name ending
+    in "RequestHandler", with the file's own class definitions
+    resolved through the chain — whose effective method set lacks
+    part of the closed extra-method set (_EXTRA_METHOD_HANDLERS).
+    A class whose chain defines __getattr__ or handle_one_request
+    answers every method deliberately and has no gap; unparseable
+    content has none either (syntax belongs to other validators).
+
+    The gap condition is _handler_surface_ok's own failure
+    condition, per class: a handler defining NONE of the extra
+    handlers leaves every non-GET/POST method to the stdlib 501
+    default — that is the ship build #26 gates (held-out A's
+    failing runs shipped exactly a do_GET/do_POST-only handler).
+    A handler defining SOME extra handler has a deliberate
+    surface by the contract's own static judgment; finer
+    per-method behavior is the live method matrix's domain
+    (execution-time, route-aware), and a planning gate stricter
+    than the contract's probe would decline content the probe
+    accepts. So the missing set reported for a gapped class is
+    the full extra set, and a deliberate class reports no gap.
+    """
+    try:
+        tree = ast.parse(content)
+    except (SyntaxError, ValueError):
+        return []
+    classes = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+    }
+    if not classes:
+        return []
+
+    def _base_names(class_node: ast.ClassDef) -> list[str]:
+        names: list[str] = []
+        for base in class_node.bases:
+            if isinstance(base, ast.Name):
+                names.append(base.id)
+            elif isinstance(base, ast.Attribute):
+                names.append(base.attr)
+        return names
+
+    def _own_methods(class_node: ast.ClassDef) -> set[str]:
+        return {
+            stmt.name
+            for stmt in class_node.body
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+    def _is_handler(class_node: ast.ClassDef, seen: frozenset) -> bool:
+        for name in _base_names(class_node):
+            if name.endswith("RequestHandler"):
+                return True
+            parent = classes.get(name)
+            if parent is not None and name not in seen:
+                if _is_handler(parent, seen | {name}):
+                    return True
+        return False
+
+    def _effective_methods(
+        class_node: ast.ClassDef, seen: frozenset
+    ) -> set[str]:
+        methods = _own_methods(class_node)
+        for name in _base_names(class_node):
+            parent = classes.get(name)
+            if parent is not None and name not in seen:
+                methods |= _effective_methods(parent, seen | {name})
+        return methods
+
+    gaps: list[tuple[str, list[str]]] = []
+    for name, class_node in classes.items():
+        if not _is_handler(class_node, frozenset({name})):
+            continue
+        methods = _effective_methods(class_node, frozenset({name}))
+        if "__getattr__" in methods or "handle_one_request" in methods:
+            continue
+        if methods & set(_EXTRA_METHOD_HANDLERS):
+            continue  # a deliberate surface (see the docstring)
+        missing = [m for m in _EXTRA_METHOD_HANDLERS if m not in methods]
+        if missing:
+            gaps.append((name, missing))
+    return gaps
+
+
 def run_contract_probes(
     clauses: list[dict[str, Any]], repo_root: str | Path
 ) -> list[dict[str, Any]]:

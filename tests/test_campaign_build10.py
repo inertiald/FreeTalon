@@ -54,6 +54,7 @@ from freetalon.orchestrator.loop import LoopRunner
 from freetalon.orchestrator.memory import ExperimentStore
 from freetalon.orchestrator.models import (
     GoalContract,
+    PlanStatus,
     RunBudget,
     TaskIntent,
 )
@@ -316,14 +317,18 @@ class TestStuckPayloadIdentity(unittest.TestCase):
             goal="Run the pairing smoke check", project_type="general"
         )
         with mock.patch.object(planner_module, "call_llm", driver):
-            with self.assertRaises(
-                planner_module.StuckRepairError
-            ) as caught:
-                planner_module.plan_task_intent(
-                    intent, settings=SETTINGS, max_repairs=4
-                )
+            plan = planner_module.plan_task_intent(
+                intent, settings=SETTINGS, max_repairs=4
+            )
         self.assertEqual(len(driver.calls), 3)
-        self.assertIn("command", _codes(caught.exception))
+        # Build #26: the stuck escalation returns as the FAILED
+        # plan's stamp — its error_type names the StuckRepairError
+        # and its error_codes carry the repeated rejection's
+        # structured records.
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        stamp = plan.metadata["planning_failure"]
+        self.assertEqual(stamp["error_type"], "StuckRepairError")
+        self.assertIn("command", set(stamp.get("error_codes") or []))
 
     def test_signature_distinguishes_payload_not_layout(self) -> None:
         record = planner_module.PlanError(

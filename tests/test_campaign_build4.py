@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from freetalon.orchestrator.intake import LLMResponseError, LLMSettings
-from freetalon.orchestrator.models import TaskIntent
+from freetalon.orchestrator.models import PlanStatus, TaskIntent
 from freetalon.orchestrator.planner import (
     PLAN_TASK_INTENT_MAX_REPAIRS,
     PlanError,
@@ -484,10 +484,13 @@ class TestRepairBudget(unittest.TestCase):
         with patch(
             "freetalon.orchestrator.planner.call_llm", side_effect=bads
         ) as call_mock:
-            with self.assertRaises(LLMResponseError):
-                plan_task_intent(
-                    self.intent, settings=self.settings, repo_root=self.root
-                )
+            plan = plan_task_intent(
+                self.intent, settings=self.settings, repo_root=self.root
+            )
+        # Build #26: the exhausted budget returns a FAILED plan
+        # carrying the planning_failure stamp; nothing raises.
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        self.assertIn("planning_failure", plan.metadata)
         self.assertEqual(call_mock.call_count, 5)
 
     def test_explicit_budget_still_governs(self) -> None:
@@ -495,13 +498,13 @@ class TestRepairBudget(unittest.TestCase):
             "freetalon.orchestrator.planner.call_llm",
             side_effect=[BAD_UNKNOWN_CLAW, BAD_SCHEMA, BAD_UNKNOWN_CLAW],
         ) as call_mock:
-            with self.assertRaises(LLMResponseError):
-                plan_task_intent(
-                    self.intent,
-                    settings=self.settings,
-                    repo_root=self.root,
-                    max_repairs=1,
-                )
+            plan = plan_task_intent(
+                self.intent,
+                settings=self.settings,
+                repo_root=self.root,
+                max_repairs=1,
+            )
+        self.assertEqual(plan.status, PlanStatus.FAILED)
         self.assertEqual(call_mock.call_count, 2)
 
 

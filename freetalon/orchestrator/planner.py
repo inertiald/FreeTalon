@@ -28,6 +28,7 @@ from .contract_clauses import (
     delta_clause_coverage,
     format_clauses_block,
     format_replan_clauses_block,
+    handler_surface_gaps,
     node_clause_declaration,
     probe_suspect_map,
 )
@@ -302,6 +303,23 @@ def _attach_intent_corrections(
     the correction vanishing with the discarded candidate.
     """
     exc.intent_corrections = list(corrections)  # type: ignore[attr-defined]
+    return exc
+
+
+def _attach_impact_synthesis(
+    exc: LLMResponseError, records: Collection[dict[str, Any]]
+) -> LLMResponseError:
+    """Attach this attempt's impact-check synthesis to a rejection.
+
+    Campaign build #26: parse synthesizes the impact-check
+    companion a justified whole-file override is missing (see
+    _synthesize_impact_checks); when the attempt is still rejected
+    for other defects, the synthesis rides the exception on the
+    _attach_intent_corrections channel, so the repair round's
+    record shows the companion was already supplied and the model
+    is not asked to re-derive it.
+    """
+    exc.impact_check_synthesis = list(records)  # type: ignore[attr-defined]
     return exc
 
 
@@ -1231,6 +1249,68 @@ def _relabel_nodes_for_errors(
     ]
 
 
+def _clauses_require_method_surface(
+    clauses: Collection[dict[str, Any]] | None,
+) -> bool:
+    """True when any supplied clause is method_surface-flagged.
+
+    The flag is the contract's own (contract_clauses.py: a clause
+    whose text pins the 405 behavior carries it), so the gates
+    this build adds apply exactly where the contract demands the
+    closed method surface — pairing and jobqueue alike, never a
+    family special case.
+    """
+    return any(
+        isinstance(clause, dict) and clause.get("method_surface")
+        for clause in clauses or []
+    )
+
+
+def _method_surface_records(
+    nodes: list[PlanNode],
+    clauses: list[dict[str, Any]] | None,
+) -> list[PlanError]:
+    """Decline pre-filled handler content missing the closed set.
+
+    Campaign build #26: build #25 put the method surface in the
+    prompt as guidance and held-out A still split on it — the
+    passing runs' plans carried the full set, the failing run
+    shipped do_GET/do_POST only and DELETE fell through to the
+    stdlib 501. This is the parse-level half of the deterministic
+    gate (the fill-level half is _fill_method_surface_errors): a
+    content-carrying node whose handler class leaves part of the
+    closed extra-method set undefined is rejected here, where the
+    repair round can fix it, instead of at execution.
+    """
+    if not _clauses_require_method_surface(clauses):
+        return []
+    records: list[PlanError] = []
+    for node in nodes:
+        content = (node.inputs or {}).get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        for class_name, missing in handler_surface_gaps(content):
+            records.append(
+                PlanError(
+                    code="method_surface",
+                    message=(
+                        f"Planner node '{node.id}': handler class "
+                        f"{class_name} leaves the method surface "
+                        f"incomplete — it does not define "
+                        f"{', '.join(missing)}, which the "
+                        "contract's 405 clause requires (an "
+                        "unsupported method must be answered 405, "
+                        "not the standard library's default 501). "
+                        "Define the missing handlers or dispatch "
+                        "every method explicitly "
+                        "(handle_one_request / __getattr__)."
+                    ),
+                    node_id=node.id,
+                )
+            )
+    return records
+
+
 def parse_planner_response(
     raw_text: str,
     *,
@@ -1513,6 +1593,21 @@ def parse_planner_response(
         intent_corrections = _correct_skeleton_intents(
             nodes, repo_root, index=index, modules=module_cache
         )
+    # Campaign build #26: deterministic impact-check synthesis —
+    # a justified whole-file override whose only defect is the
+    # missing companion gains it here, mechanically, before the
+    # remaining validation judges the attempt (arm #34: the model
+    # stated the justification on every attempt and never landed
+    # the companion; the repair loop oscillated to exhaustion).
+    # Runs for skeleton and full parses alike: the modify-path
+    # rule judges pre-filled nodes by the same pair.
+    impact_synthesis = _synthesize_impact_checks(
+        nodes,
+        repo_root,
+        skeleton=skeleton,
+        index=index,
+        modules=module_cache,
+    )
     relabeled_nodes = _relabel_nodes_for_errors(nodes, id_labels)
     records, cheap = _collect_plan_error_records(
         relabeled_nodes,
@@ -1534,10 +1629,13 @@ def parse_planner_response(
         # intent). A write node that already carries content or an
         # edit form is pre-filled and needs no intent.
         records = records + _skeleton_intent_basic_records(relabeled_nodes)
+    records = records + _method_surface_records(relabeled_nodes, clauses)
     if records:
         rejection = _numbered_rejection(records, cheap=cheap)
         if intent_corrections:
             _attach_intent_corrections(rejection, intent_corrections)
+        if impact_synthesis:
+            _attach_impact_synthesis(rejection, impact_synthesis)
         raise rejection
 
     metadata = payload.get("metadata")
@@ -1558,6 +1656,13 @@ def parse_planner_response(
     metadata.pop(INTENT_CORRECTIONS_METADATA_KEY, None)
     if intent_corrections:
         metadata[INTENT_CORRECTIONS_METADATA_KEY] = intent_corrections
+    # The impact-check synthesis key is system-owned the same way
+    # (campaign build #26): stamped from this parse's own
+    # synthesis — a model-supplied value under it never survives,
+    # and a parse that synthesized nothing carries none.
+    metadata.pop(IMPACT_CHECK_SYNTHESIS_METADATA_KEY, None)
+    if impact_synthesis:
+        metadata[IMPACT_CHECK_SYNTHESIS_METADATA_KEY] = impact_synthesis
 
     return nodes, metadata
 
@@ -7123,6 +7228,7 @@ PLAN_EMISSION_METADATA_KEY = "plan_emission"
 #: stamps it from its own corrections and clears any value a
 #: model payload carried under it.
 INTENT_CORRECTIONS_METADATA_KEY = "intent_corrections"
+IMPACT_CHECK_SYNTHESIS_METADATA_KEY = "impact_check_synthesis"
 
 #: Validator codes that judge a write node's payload. At the
 #: skeleton phase their records against a content-less write node
@@ -7383,6 +7489,240 @@ def _correct_skeleton_intents(
             }
         )
     return corrections
+
+
+def _impact_companion_exists(
+    nodes: list[PlanNode], node: PlanNode, resolved: str, root: Path
+) -> bool:
+    """The override rules' companion condition, verbatim.
+
+    Another node that depends on the write node and carries
+    inputs["impact_check_for"] resolving to the same target —
+    the exact test _skeleton_intent_errors and the modify-path
+    rule both apply, shared so synthesis supplies precisely what
+    they demand and never duplicates what the model supplied.
+    """
+    for other in nodes:
+        if other is node:
+            continue
+        if node.id not in (other.depends_on or []):
+            continue
+        named = (other.inputs or {}).get("impact_check_for")
+        if not isinstance(named, str) or not named:
+            continue
+        if str(_resolve_plan_target(named, root).resolve()) == resolved:
+            return True
+    return False
+
+
+def _derived_impact_command(
+    target: str,
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+) -> str | None:
+    """The deterministic impact check for a whole-file rewrite.
+
+    The module's own test module when the plan writes it or the
+    disk holds it (tests/test_<stem>.py, or the repo's flattened
+    tests/test_<package>_<stem>.py; for a package __init__,
+    tests/test_<package>.py) — the shape the model's own
+    companions take (build #9) — else an import of the rewritten
+    module (a package __init__ imports as its package). None for
+    non-Python targets: no check is derivable, so no synthesis —
+    the rejection stands and the model must author the pair.
+    """
+    if not target.endswith(".py"):
+        return None
+    root = resolve_repo_root(repo_root)
+    target_path = Path(target)
+    if target_path.name == "__init__.py":
+        test_candidates = [f"tests/test_{target_path.parent.name}.py"]
+        module = ".".join(target_path.parent.parts)
+    else:
+        test_candidates = [f"tests/test_{target_path.stem}.py"]
+        if target_path.parent.name not in ("", "tests"):
+            # The repo's flattened convention: test_pairing_server.py
+            # for freetalon/pairing/server.py.
+            test_candidates.append(
+                f"tests/test_{target_path.parent.name}_"
+                f"{target_path.stem}.py"
+            )
+        module = ".".join(target_path.with_suffix("").parts)
+    plan_written = {
+        str(_resolve_plan_target(written, root).resolve())
+        for written in (_node_write_target(item) for item in nodes)
+        if written
+    }
+    for test_rel in test_candidates:
+        if (root / test_rel).is_file() or str(
+            (root / test_rel).resolve()
+        ) in plan_written:
+            return f"python3 {test_rel}"
+    if module:
+        return f'python3 -c "import {module}"'
+    return None
+
+
+def _synthesize_impact_checks(
+    nodes: list[PlanNode],
+    repo_root: str | Path | None,
+    *,
+    skeleton: bool,
+    index: Any | None = None,
+    modules: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Append the impact-check companion a justified whole-file
+    override is missing (campaign build #26).
+
+    Arm #34's fatal rejection was never a knowledge gap: the
+    skeleton stated a proper overwrite_justification for the
+    pairing package's __init__.py on attempt after attempt, and
+    the rule is stated at emission time — the model simply never
+    landed the companion node, and the repair loop oscillated
+    between that rejection and a suite_placement rejection until
+    the budget exhausted. The companion is a mechanical form the
+    rule itself fully determines (a bash node depending on the
+    rewrite, naming its target, running the touched module's
+    tests or importing it), so parse supplies it deterministically
+    — the build #11 correction seam's philosophy, one step further:
+    build #11 would not fabricate a JUSTIFICATION (the model's
+    claim to make), and neither does this; it synthesizes only
+    the companion, and only when the justification is present.
+
+    Eligibility mirrors the two rules that demand the pair
+    (_skeleton_intent_errors for content-less skeleton nodes,
+    the modify-path rule for content-carrying ones), including
+    their exemptions: the target must exist (on disk or written
+    by an earlier node of this plan — a missing target is create
+    domain), the justification must be non-empty, no companion
+    may already satisfy the pair, a materialized anchored/scoped
+    edit needs no override, and a content payload byte-identical
+    to the target's current text is a verified no-change, not a
+    rewrite. The synthesized node is appended before error
+    collection, so every ordinary validator judges it like any
+    other node. Returns one record per synthesis:
+    {node, for_node, target, command}.
+    """
+    root = index.root if index is not None else resolve_repo_root(repo_root)
+    records: list[dict[str, Any]] = []
+    existing_ids = {node.id for node in nodes}
+    plan_declares_clauses = any(
+        isinstance((node.inputs or {}).get("clauses"), (dict, list))
+        for node in nodes
+    )
+    written: dict[str, str] = {}
+    additions: list[PlanNode] = []
+    for fact in _skeleton_write_target_facts(
+        nodes, repo_root, index, modules
+    ):
+        node = fact.node
+        inputs = node.inputs or {}
+        if not isinstance(inputs, dict):
+            continue
+        content = inputs.get("content")
+        current_text: str | None = None
+        if isinstance(content, str):
+            current_text = written.get(fact.resolved)
+            if current_text is None:
+                resolved_path = Path(fact.resolved)
+                if modules is not None:
+                    current_text = modules.source(resolved_path)
+                else:
+                    try:
+                        current_text = resolved_path.read_text(
+                            encoding="utf-8"
+                        )
+                    except OSError:
+                        current_text = None
+            written[fact.resolved] = content
+        if not fact.prior:
+            continue
+        justification = inputs.get("overwrite_justification")
+        if not (
+            isinstance(justification, str) and justification.strip()
+        ):
+            continue
+        if isinstance(content, str):
+            if inputs.get("_materialized_from") in (
+                "anchored_edit",
+                "scoped_edits",
+            ):
+                continue
+            if current_text is not None and content == current_text:
+                continue
+        elif skeleton:
+            if inputs.get("content_intent") != "whole_file":
+                continue
+        else:
+            continue
+        if _impact_companion_exists(
+            nodes + additions, node, fact.resolved, root
+        ):
+            continue
+        command = _derived_impact_command(
+            fact.target, nodes + additions, repo_root
+        )
+        if command is None:
+            continue
+        companion_id = f"{node.id}__impact_check"
+        suffix = 2
+        while companion_id in existing_ids:
+            companion_id = f"{node.id}__impact_check_{suffix}"
+            suffix += 1
+        existing_ids.add(companion_id)
+        depends_on = [node.id]
+        if command.startswith("python3 tests/"):
+            # The build #9 model-authored shape: when the derived
+            # command runs a test module another node of this plan
+            # writes, the companion depends on that node too.
+            test_target = command.split(" ", 1)[1]
+            test_resolved = str((root / test_target).resolve())
+            for other in nodes:
+                if other is node:
+                    continue
+                other_target = _node_write_target(other)
+                if not other_target:
+                    continue
+                if (
+                    str(
+                        _resolve_plan_target(other_target, root).resolve()
+                    )
+                    == test_resolved
+                    and other.id not in depends_on
+                ):
+                    depends_on.append(other.id)
+        companion_inputs: dict[str, Any] = {
+            "command": command,
+            "impact_check_for": fact.target,
+        }
+        if plan_declares_clauses:
+            companion_inputs["clauses"] = {
+                "implements": [],
+                "verifies": [],
+            }
+        additions.append(
+            PlanNode(
+                id=companion_id,
+                objective=(
+                    "Impact check for the whole-file rewrite of "
+                    f"{fact.target}"
+                ),
+                depends_on=depends_on,
+                assigned_claw="bash",
+                inputs=companion_inputs,
+                criteria=[{"type": "exit_code", "equals": 0}],
+            )
+        )
+        records.append(
+            {
+                "node": companion_id,
+                "for_node": node.id,
+                "target": fact.target,
+                "command": command,
+            }
+        )
+    nodes.extend(additions)
+    return records
 
 
 def _skeleton_target_facts_block(
@@ -13154,6 +13494,7 @@ def _filled_candidate_errors(
     repo_root: str | Path | None,
     goal_text: str | None,
     plan_written: Collection[str] | None = None,
+    clauses: Collection[dict[str, Any]] | None = None,
 ) -> list[str]:
     """Per-node validators over one filled candidate node.
 
@@ -13248,6 +13589,85 @@ def _filled_candidate_errors(
                     plan_written,
                 )
             )
+            errors.extend(
+                _fill_method_surface_errors(
+                    materialized_content,
+                    target,
+                    prior_dicts,
+                    repo_root,
+                    clauses,
+                )
+            )
+    return errors
+
+
+def _fill_method_surface_errors(
+    content: str,
+    target: str,
+    prior_dicts: list[dict[str, Any]],
+    repo_root: str | Path | None,
+    clauses: Collection[dict[str, Any]] | None,
+) -> list[str]:
+    """Method-surface completeness for one filled candidate (#26).
+
+    The fill-level half of the deterministic method-surface gate,
+    mirroring build #22's import grounding at the same seam: when
+    a supplied clause is method_surface-flagged, a filled handler
+    class that leaves part of the closed extra-method set
+    undefined is declined here — the fill's repair round re-asks
+    with the missing handlers named — instead of shipping a
+    server whose DELETE falls through to the stdlib 501.
+
+    The standing-gap conservatism is grounding's own: a gap that
+    already stands in the target's prior text (on disk, or in an
+    earlier fill of this same plan) at the same size for the same
+    class is not this fill's sin; a created file has no prior
+    text and is always judged; introducing a gap, or widening a
+    standing one, is declined.
+    """
+    if not _clauses_require_method_surface(clauses):
+        return []
+    gaps = handler_surface_gaps(content)
+    if not gaps:
+        return []
+    prior_source: str | None = None
+    for prior in prior_dicts:
+        prior_inputs = prior.get("inputs") or {}
+        try:
+            prior_target = _node_write_target(
+                PlanNode.model_validate(prior)
+            )
+        except Exception:  # noqa: BLE001 — an unjudgeable prior is no prior
+            continue
+        if prior_target == target and isinstance(
+            prior_inputs.get("content"), str
+        ):
+            prior_source = prior_inputs["content"]
+    if prior_source is None:
+        try:
+            prior_source = _resolve_plan_target(
+                target, resolve_repo_root(repo_root)
+            ).read_text(encoding="utf-8")
+        except OSError:
+            prior_source = None
+    prior_gaps = (
+        dict(handler_surface_gaps(prior_source)) if prior_source else {}
+    )
+    errors: list[str] = []
+    for class_name, missing in gaps:
+        standing = prior_gaps.get(class_name)
+        if standing is not None and set(missing) <= set(standing):
+            continue
+        errors.append(
+            "the filled content leaves the method surface "
+            f"incomplete: handler class {class_name} in {target} "
+            f"does not define {', '.join(missing)}, which the "
+            "contract's 405 clause requires — an unsupported "
+            "method must be answered 405, not the standard "
+            "library's default 501. Define the missing handlers "
+            "or dispatch every method explicitly "
+            "(handle_one_request / __getattr__)."
+        )
     return errors
 
 
@@ -13784,6 +14204,7 @@ def _fill_node_payload(
     goal_text: str | None,
     attempt_phase: str = "content_fill",
     plan_written: set[str] | None = None,
+    clauses: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Fill one skeleton write node via its own LLM call(s).
 
@@ -13936,6 +14357,7 @@ def _fill_node_payload(
                 repo_root,
                 goal_text,
                 plan_written=plan_written,
+                clauses=clauses,
             )
         if not last_errors:
             _record_planner_attempt(
@@ -14090,6 +14512,7 @@ def _fill_plan_contents(
             goal_text=goal_text,
             attempt_phase=attempt_phase,
             plan_written=plan_written,
+            clauses=clauses,
         )
         attempts[node.id] = used
         filled_dicts.append(candidate)
@@ -14313,14 +14736,20 @@ def plan_task_intent(
 
     Campaign build #17: a terminal LLMResponseError (skeleton
     repair exhaustion, content-fill exhaustion, spec grounding)
-    is recorded as a run record before it propagates, when the
-    recording applies (see _record_planning_failure). The
-    exception itself is then annotated — a ``run_id`` attribute
-    and the record's name appended to its message — and re-raised
-    unchanged in type, so every caller's failure handling (and
-    the taxonomy the planner's own subclasses carry) is exactly
-    as before; the record is pure addition. When recording does
-    not apply, the exception propagates untouched.
+    is recorded as a run record before anything else happens,
+    when the recording applies (see _record_planning_failure).
+
+    Campaign build #26: the recorded failure is then RETURNED,
+    not raised — a FAILED plan with zero nodes whose metadata
+    carries the ``planning_failure`` stamp {error, error_type,
+    run_id}. Build #17's contract rested on callers handling the
+    annotated raise; arm #34 measured that no caller does (both
+    drivers call this function bare, so the raise killed the
+    process with a traceback and the LoopRunner never ran). The
+    invariant now: planning failure is a recorded outcome, never
+    an uncaught exception — LoopRunner.run_plan finishes a
+    stamped plan as the recorded FAIL, with no execution, no
+    versions, and no re-plans.
     """
     started = time.monotonic()
     started_at = datetime.now(UTC).isoformat()
@@ -14350,13 +14779,27 @@ def plan_task_intent(
             started_at=started_at,
             attempt_sink=attempt_sink,
         )
-        if run_id is not None:
-            exc.run_id = run_id  # type: ignore[attr-defined]
-            exc.args = (
-                f"{exc} [planning failure recorded as run {run_id}]",
-                *exc.args[1:],
+        # Constructed directly, not via build_execution_plan:
+        # that helper normalizes the node list and refuses an
+        # empty one (EmptyPlanError) — an empty plan is exactly
+        # the shape a planning failure needs.
+        failure: dict[str, Any] = {
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "run_id": run_id,
+        }
+        error_records = getattr(exc, "plan_errors", None)
+        if error_records:
+            failure["error_codes"] = sorted(
+                {record.code for record in error_records}
             )
-        raise
+        return ExecutionPlan(
+            plan_id=plan_id or _plan_id_for_intent(intent),
+            intent=intent,
+            nodes=[],
+            status=PlanStatus.FAILED,
+            metadata={"planning_failure": failure},
+        )
 
 
 def _plan_task_intent(

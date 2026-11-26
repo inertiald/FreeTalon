@@ -35,7 +35,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from freetalon.orchestrator.intake import LLMResponseError, LLMSettings
-from freetalon.orchestrator.models import TaskIntent
+from freetalon.orchestrator.models import PlanStatus, TaskIntent
 from freetalon.orchestrator.planner import (
     _fill_payload_shape,
     _fill_shape_repair_block,
@@ -315,10 +315,12 @@ class TestEditShapeRepair(_FillCase):
 
     def test_blind_forever_shape_failures_fail_the_plan(self) -> None:
         dispatcher = self._dispatcher(["{}"])
-        with self.assertRaises(LLMResponseError) as caught:
-            self._plan(dispatcher)
+        plan = self._plan(dispatcher)
         self.assertEqual(dispatcher.state["fills"], 3)
-        message = str(caught.exception)
+        # Build #26: the exhausted fill returns a FAILED plan;
+        # the stamp's error is the fill error's own text.
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        message = plan.metadata["planning_failure"]["error"]
         self.assertIn("Content fill for planner node 'node-1'", message)
         self.assertIn("intent 'edit'", message)
         self.assertIn("empty JSON object", message)

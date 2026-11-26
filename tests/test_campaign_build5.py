@@ -25,7 +25,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from freetalon.orchestrator.intake import LLMResponseError, LLMSettings
-from freetalon.orchestrator.models import TaskIntent
+from freetalon.orchestrator.models import PlanStatus, TaskIntent
 from freetalon.orchestrator.planner import (
     parse_planner_response,
     plan_task_intent,
@@ -345,9 +345,14 @@ class TestSplitEmission(_TreeCase):
     def test_per_node_failure_fails_plan(self) -> None:
         bad = json.dumps({"content": "def broken(:\n"})
         dispatcher = _fill_dispatcher({"pkg/store.py": [bad, bad, bad, bad]})
-        with self.assertRaises(LLMResponseError) as caught:
-            self._plan(dispatcher)
-        self.assertIn("Content fill for planner node", str(caught.exception))
+        plan = self._plan(dispatcher)
+        # Build #26: the per-node failure returns a FAILED plan
+        # whose stamp names the fill error; nothing raises.
+        self.assertEqual(plan.status, PlanStatus.FAILED)
+        self.assertIn(
+            "Content fill for planner node",
+            plan.metadata["planning_failure"]["error"],
+        )
         self.assertEqual(dispatcher.counts["pkg/store.py"], 3)
 
     def test_anchoring_still_functions_at_skeleton_phase(self) -> None:
