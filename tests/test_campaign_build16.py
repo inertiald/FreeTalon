@@ -215,9 +215,21 @@ class TestStatusCodeFidelity(unittest.TestCase):
             # unobserved.
             self.assertTrue(_flow(results, "wrong_method")[0]["ok"])
             self.assertTrue(_flow(results, "unknown_route")[0]["ok"])
+            # The failures are exactly the leak, seen once by
+            # this build's flow and — since build #23 — once per
+            # method by the live method matrix (the fixture's
+            # replace touches every method handler, so every
+            # matrix unknown-path flow answers 405 too).
             self.assertEqual(
                 [r["flow"] for r in probe_failures(results)],
-                ["wrong_method_unknown_route"],
+                [
+                    "wrong_method_unknown_route",
+                    "method_matrix_put_unknown",
+                    "method_matrix_delete_unknown",
+                    "method_matrix_patch_unknown",
+                    "method_matrix_head_unknown",
+                    "method_matrix_options_unknown",
+                ],
             )
 
 

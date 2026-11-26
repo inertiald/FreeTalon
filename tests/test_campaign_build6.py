@@ -177,6 +177,24 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
+    def do_PATCH(self):
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_HEAD(self):
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_OPTIONS(self):
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
+
 
 def make_server(store, token, host="127.0.0.1", port=0):
     return ThreadingHTTPServer((host, port), _Handler)
@@ -189,8 +207,10 @@ FIXTURE_SERVER_400 = FIXTURE_SERVER_GOOD.replace(
     'self._json(400, {"error": "bad request"})',
 )
 
-# No deliberate method surface: PUT falls through to the stdlib
-# 501 default the contract forbids.
+# PUT and DELETE removed: those methods fall through to the
+# stdlib 501 default the contract forbids (PATCH/HEAD/OPTIONS
+# keep their deliberate handlers — build #23's matrix reads the
+# PUT/DELETE 501s per-method).
 FIXTURE_SERVER_501 = FIXTURE_SERVER_GOOD.replace(
     '''    def do_PUT(self):
         if self.path.startswith("/pairing"):

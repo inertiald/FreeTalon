@@ -175,13 +175,31 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
+    def do_PATCH(self):
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_HEAD(self):
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_OPTIONS(self):
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
+
 
 def make_server(store, token, host="127.0.0.1", port=0):
     return ThreadingHTTPServer((host, port), _Handler)
 '''
 
-# No deliberate method surface: PUT/DELETE fall through to the
-# stdlib 501 default the contract forbids.
+# No deliberate method surface: every method beyond GET/POST
+# falls through to the stdlib 501 default the contract forbids.
 FIXTURE_SERVER_NO_SURFACE = FIXTURE_SERVER_GOOD.replace(
     '''    def do_PUT(self):
         if self.path.startswith("/pairing"):
@@ -190,6 +208,24 @@ FIXTURE_SERVER_NO_SURFACE = FIXTURE_SERVER_GOOD.replace(
             self._json(404, {"error": "not found"})
 
     def do_DELETE(self):
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_PATCH(self):
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_HEAD(self):
+        if self.path.startswith("/pairing"):
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_OPTIONS(self):
         if self.path.startswith("/pairing"):
             self._json(405, {"error": "method not allowed"})
         else:
@@ -471,7 +507,7 @@ class TestBestVersionShipping(unittest.TestCase):
                 f"lost checks: {lost_labels}",
             )
             self.assertTrue(
-                any("method_surface" in label for label in lost_labels),
+                any("method_matrix" in label for label in lost_labels),
                 f"lost checks: {lost_labels}",
             )
             # The record: summary section + persisted trees/outcomes.

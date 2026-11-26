@@ -763,6 +763,40 @@ def _smoke_http(
         connection.close()
 
 
+def _smoke_requester(port: int, deadline: float):
+    """The deadline-aware request closure the live flows share.
+
+    Returns request(name, method, path, **kwargs) ->
+    ((status, body), None) on an answered request, or
+    (None, detail) when the request could not be attempted
+    inside the deadline or failed at transport — the caller
+    records those as flow failures, never as probe crashes.
+    """
+
+    def request(name, method, path, **kwargs):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, (
+                f"{name}: not attempted — the probe's overall "
+                f"{_SMOKE_OVERALL_TIMEOUT_S:.0f}s deadline was spent "
+                "by earlier flows"
+            )
+        timeout = min(_SMOKE_REQUEST_TIMEOUT_S, remaining)
+        try:
+            outcome = _smoke_http(port, method, path, timeout=timeout, **kwargs)
+        except TimeoutError:
+            return None, (
+                f"{name}: {method} {path} timed out after "
+                f"{timeout:.1f}s — the server did not answer "
+                "(a hang, not an error response)"
+            )
+        except (OSError, http.client.HTTPException) as exc:
+            return None, f"{name}: {method} {path} failed at transport: {exc}"
+        return outcome, None
+
+    return request
+
+
 def _pairing_smoke_flows(
     port: int, deadline: float
 ) -> list[tuple[str, bool, str]]:
@@ -811,26 +845,7 @@ def _pairing_smoke_flows(
     deadline fails as unattempted.
     """
 
-    def request(name, method, path, **kwargs):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None, (
-                f"{name}: not attempted — the probe's overall "
-                f"{_SMOKE_OVERALL_TIMEOUT_S:.0f}s deadline was spent "
-                "by earlier flows"
-            )
-        timeout = min(_SMOKE_REQUEST_TIMEOUT_S, remaining)
-        try:
-            outcome = _smoke_http(port, method, path, timeout=timeout, **kwargs)
-        except TimeoutError:
-            return None, (
-                f"{name}: {method} {path} timed out after "
-                f"{timeout:.1f}s — the server did not answer "
-                "(a hang, not an error response)"
-            )
-        except (OSError, http.client.HTTPException) as exc:
-            return None, f"{name}: {method} {path} failed at transport: {exc}"
-        return outcome, None
+    request = _smoke_requester(port, deadline)
 
     flows: list[tuple[str, bool, str]] = []
 
@@ -1074,28 +1089,153 @@ def _pairing_smoke_flows(
         )
     return flows
 
+# ── Live method matrix (campaign build #23) ─────────────────────
+#
+# The method-coverage diagnosis (2026-11-25): pairing's
+# wrong-method miss was invisible to every deterministic check —
+# the static method_surface probe passes once ANY handler beyond
+# do_GET/do_POST exists, and the smoke probe sampled exactly one
+# wrong method (PUT), the one the loop happened to route
+# correctly, while PATCH was plan-absent in 6/6 plan versions and
+# DELETE/HEAD answered a blanket 404. The set of methods a
+# BaseHTTPRequestHandler can receive is closed and known in
+# advance; coverage of it should be mechanical, not mnemonic.
+# The matrix below exercises every closed-set method beyond
+# GET/POST (those ride the functional flows) against one known
+# path and one unknown path. The expectations are the contract
+# rule both contract families state in the same shape (pairing
+# CONTRACT.md: "Unknown routes → 404; a known path with the
+# wrong method → 405"; CONTRACT-A states the identical rule):
+# known path + wrong method → 405, unknown path → 404 whatever
+# the method. The matrix engages only for method_surface
+# clauses — clauses whose contract text states a 405 rule — so
+# the contract itself decides where the matrix applies. A
+# failure's detail carries the build-#16 machine-readable fact
+# ("<flow>_status: expected X, got Y") plus the specific shape
+# (501 stdlib default / blanket 404 / 405 leaking onto unknown
+# routes), and the records ride the same probe-failure channel
+# as every other live flow (contract_probe_failures into the
+# re-plan brief, probe_suspect_map to the repair seams).
+
+_METHOD_MATRIX_METHODS = ("PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
+
+
+def _method_matrix_flows(
+    request, *, known_path: str, unknown_path: str
+) -> list[tuple[str, bool, str]]:
+    """Every closed-set method × {known, unknown} path.
+
+    `request` is the _smoke_requester closure. Each entry:
+    (flow, ok, detail) with flow method_matrix_<method>_known /
+    method_matrix_<method>_unknown.
+    """
+    flows: list[tuple[str, bool, str]] = []
+    for method in _METHOD_MATRIX_METHODS:
+        name = f"method_matrix_{method.lower()}_known"
+        outcome, error = request(name, method, known_path)
+        if error is not None:
+            flows.append((name, False, error))
+        else:
+            status, _raw = outcome
+            detail = (
+                f"{name}: {method} {known_path} -> {status} "
+                f"({name}_status: expected 405, got {status} — "
+                "a known path with the wrong method answers the "
+                "contract's 405"
+            )
+            if status == 501:
+                detail += (
+                    "; 501 is the stdlib default — no "
+                    f"do_{method} handler is defined, so the "
+                    "method falls through to BaseHTTPRequestHandler"
+                )
+            elif status == 404:
+                detail += (
+                    "; 404 is the unknown-route answer — the "
+                    "handler does not split known paths from "
+                    "unknown ones for this method (a blanket "
+                    "not-found)"
+                )
+            detail += ")"
+            flows.append((name, status == 405, detail))
+
+        name = f"method_matrix_{method.lower()}_unknown"
+        outcome, error = request(name, method, unknown_path)
+        if error is not None:
+            flows.append((name, False, error))
+        else:
+            status, _raw = outcome
+            detail = (
+                f"{name}: {method} {unknown_path} -> {status} "
+                f"({name}_status: expected 404, got {status} — "
+                "unknown routes answer 404 whatever the method; "
+                "405 belongs only to a known path with the wrong "
+                "method"
+            )
+            if status == 501:
+                detail += (
+                    "; 501 is the stdlib default — no "
+                    f"do_{method} handler is defined, so the "
+                    "method falls through to BaseHTTPRequestHandler"
+                )
+            elif status == 405:
+                detail += (
+                    "; the wrong-method answer is leaking onto "
+                    "unknown routes"
+                )
+            detail += ")"
+            flows.append((name, status == 404, detail))
+    return flows
+
+
 def _boot_pairing_server(
     root: Path, work_dir: Path
 ) -> tuple[subprocess.Popen[bytes] | None, int | None, str]:
     """Boot the shipped pairing server in a subprocess.
 
+    Configuration rides the contract's own env surface, pointed
+    at a throwaway store in the probe's temp dir.
+    """
+    return _boot_smoke_server(
+        root,
+        work_dir,
+        _SMOKE_BOOTSTRAP,
+        {
+            "FREETALON_PAIRING_STORE_PATH": str(
+                work_dir / "smoke-store.json"
+            ),
+            "FREETALON_PAIRING_TOKEN": _SMOKE_TOKEN,
+        },
+    )
+
+
+def _boot_smoke_server(
+    root: Path,
+    work_dir: Path,
+    bootstrap: str,
+    extra_env: dict[str, str],
+) -> tuple[subprocess.Popen[bytes] | None, int | None, str]:
+    """Boot a contract family's server in a subprocess.
+
+    The bootstrap program constructs the family's server via its
+    contract-pinned construction surface, bound to an ephemeral
+    port whose number is the program's first stdout line.
     Returns (process, port, detail): on success the process is
     serving on the port and the caller owns killing it; on
     failure the process may still be returned (hung at boot) and
     the caller kills it the same way. Configuration rides the
-    contract's own env surface, pointed at a throwaway store in
-    the probe's temp dir; the only network the child can see is
-    the loopback it binds.
+    contract's own env surface (extra_env), pointed at throwaway
+    state in the probe's temp dir; the only network the child
+    can see is the loopback it binds.
     """
     stderr_path = work_dir / "smoke-server.stderr"
     env = dict(os.environ)
     env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
-    env["FREETALON_PAIRING_STORE_PATH"] = str(work_dir / "smoke-store.json")
-    env["FREETALON_PAIRING_TOKEN"] = _SMOKE_TOKEN
+    env.update(extra_env)
     with stderr_path.open("wb") as stderr_file:
         proc: subprocess.Popen[bytes] = subprocess.Popen(
-            [sys.executable, "-c", _SMOKE_BOOTSTRAP],
+            [sys.executable, "-c", bootstrap],
             cwd=str(root),
             env=env,
             stdout=subprocess.PIPE,
@@ -1186,7 +1326,10 @@ def _pairing_http_smoke_records(
     module. When the server module itself is missing there are
     no records — the declared_files probe already owns that
     failure. The whole run is bounded by _SMOKE_OVERALL_TIMEOUT_S
-    and the child is killed unconditionally.
+    and the child is killed unconditionally. Since build #23 the
+    run also exercises the live method matrix (below) against
+    the same booted server and appends its records under
+    probe="method_matrix".
     """
     if not any(
         _PAIRING_SERVER_PATH in (clause.get("declared_files") or [])
@@ -1252,6 +1395,123 @@ def _pairing_http_smoke_records(
                             "file": _PAIRING_SERVER_PATH,
                         }
                     )
+            # Campaign build #23: the live method matrix on the
+            # same booted server — every closed-set method
+            # against a known path (a registered route) and an
+            # unknown one. Records carry probe="method_matrix"
+            # and the same flow/file keys, so a matrix failure
+            # enters the probe-failure channel and the suspect
+            # map exactly as a smoke-flow failure does.
+            if port is not None:
+                matrix = _method_matrix_flows(
+                    _smoke_requester(port, deadline),
+                    known_path="/pairing/register",
+                    unknown_path="/smoke-probe/no-such-route",
+                )
+                for clause in flow_clauses:
+                    for name, ok, detail in matrix:
+                        records.append(
+                            {
+                                "clause_id": str(clause["id"]),
+                                "probe": "method_matrix",
+                                "ok": ok,
+                                "detail": detail,
+                                "flow": name,
+                                "file": _PAIRING_SERVER_PATH,
+                            }
+                        )
+        finally:
+            if proc is not None:
+                _kill_process_tree(proc)
+    return records
+
+
+_JOBQUEUE_SERVER_PATH = "freetalon/jobqueue/server.py"
+
+# The jobqueue contract's own construction surface (CONTRACT-A,
+# "Server construction"): JobQueueStore(path) plus
+# make_server(store, host, port), bound to an ephemeral port.
+_JOBQUEUE_BOOTSTRAP = """\
+import os
+
+from freetalon.jobqueue.server import make_server
+from freetalon.jobqueue.store import JobQueueStore
+
+store = JobQueueStore(os.environ["FREETALON_JOBQUEUE_STORE_PATH"])
+server = make_server(store, host="127.0.0.1", port=0)
+print(f"SMOKE_PORT {server.server_address[1]}", flush=True)
+server.serve_forever()
+"""
+
+
+def _jobqueue_method_matrix_records(
+    clauses: list[dict[str, Any]], root: Path
+) -> list[dict[str, Any]]:
+    """Live method matrix for the jobqueue contract (build #23).
+
+    The jobqueue family gets the matrix and only the matrix:
+    its functional behavior rides the static probes and the
+    plan's own test nodes, but method coverage — the defect
+    class the diagnosis measured on this family — is exactly
+    what the matrix enumerates. Scoping mirrors the pairing
+    runner's: the runner engages when a clause declares the
+    jobqueue server module, and the records ride the
+    method-surface clause(s). When the server module itself is
+    missing there are no records — the declared_files probe
+    already owns that failure. Bounded by
+    _SMOKE_OVERALL_TIMEOUT_S; the child is killed
+    unconditionally.
+    """
+    if not any(
+        _JOBQUEUE_SERVER_PATH in (clause.get("declared_files") or [])
+        for clause in clauses
+    ):
+        return []
+    if not (root / _JOBQUEUE_SERVER_PATH).is_file():
+        return []
+    flow_clauses = [c for c in clauses if c.get("method_surface")]
+    if not flow_clauses:
+        return []
+    deadline = time.monotonic() + _SMOKE_OVERALL_TIMEOUT_S
+    records: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="freetalon-matrix-") as tmp:
+        proc, port, boot_detail = _boot_smoke_server(
+            root,
+            Path(tmp),
+            _JOBQUEUE_BOOTSTRAP,
+            {
+                "FREETALON_JOBQUEUE_STORE_PATH": str(
+                    Path(tmp) / "smoke-store.json"
+                )
+            },
+        )
+        try:
+            if port is None:
+                flows = [
+                    (
+                        "flows",
+                        False,
+                        f"no method-matrix flow could run: {boot_detail}",
+                    )
+                ]
+            else:
+                flows = _method_matrix_flows(
+                    _smoke_requester(port, deadline),
+                    known_path="/queue/jobs",
+                    unknown_path="/smoke-probe/no-such-route",
+                )
+            for clause in flow_clauses:
+                for name, ok, detail in flows:
+                    records.append(
+                        {
+                            "clause_id": str(clause["id"]),
+                            "probe": "method_matrix",
+                            "ok": ok,
+                            "detail": detail,
+                            "flow": name,
+                            "file": _JOBQUEUE_SERVER_PATH,
+                        }
+                    )
         finally:
             if proc is not None:
                 _kill_process_tree(proc)
@@ -1260,7 +1520,10 @@ def _pairing_http_smoke_records(
 
 # The registered live-probe runners, in run order. A new contract
 # family appends its runner here (see the section header).
-_LIVE_PROBE_RUNNERS = (_pairing_http_smoke_records,)
+_LIVE_PROBE_RUNNERS = (
+    _pairing_http_smoke_records,
+    _jobqueue_method_matrix_records,
+)
 
 
 # ── Clause states ───────────────────────────────────────────────────
