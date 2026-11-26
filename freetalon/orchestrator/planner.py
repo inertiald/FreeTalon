@@ -1322,6 +1322,7 @@ def parse_planner_response(
     skeleton: bool = False,
     clause_mode: str = "full",
     clause_required: Collection[str] | None = None,
+    clause_probe_failures: Collection[dict[str, Any]] | None = None,
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Validate raw planner output into normalized PlanNodes plus metadata.
 
@@ -1621,6 +1622,7 @@ def parse_planner_response(
         skeleton=skeleton,
         clause_mode=clause_mode,
         clause_required=clause_required,
+        clause_probe_failures=clause_probe_failures,
     )
     records = contract_records + records
     if skeleton:
@@ -7995,6 +7997,7 @@ def _collect_plan_error_records(
     skeleton: bool = False,
     clause_mode: str = "full",
     clause_required: Collection[str] | None = None,
+    clause_probe_failures: Collection[dict[str, Any]] | None = None,
     extra_written: Collection[str] | None = None,
 ) -> tuple[list[PlanError], bool]:
     """Collect EVERY plan validation error as structured records.
@@ -8357,7 +8360,10 @@ def _collect_plan_error_records(
         # unchanged.
         if clause_mode == "delta" and clauses:
             clause_errors = clause_delta_errors(
-                nodes, clauses, clause_required or ()
+                nodes,
+                clauses,
+                clause_required or (),
+                probe_failures=clause_probe_failures,
             )
         else:
             clause_errors = clause_coverage_errors(nodes, clauses)
@@ -11942,6 +11948,7 @@ def _contract_constrained_reask(
     clauses: list[dict[str, Any]] | None = None,
     clause_mode: str = "full",
     clause_required: Collection[str] | None = None,
+    clause_probe_failures: Collection[dict[str, Any]] | None = None,
 ) -> tuple[tuple[list[PlanNode], dict[str, Any]] | None, dict[str, Any]]:
     """One contract-required re-ask (L1, 2026-11-23).
 
@@ -12026,6 +12033,7 @@ def _contract_constrained_reask(
             clauses=clauses,
             clause_mode=clause_mode,
             clause_required=clause_required,
+            clause_probe_failures=clause_probe_failures,
         )
     except Exception as exc:
         return None, {
@@ -12825,6 +12833,7 @@ def _call_llm_with_repair(
     skeleton: bool = False,
     clause_mode: str = "full",
     clause_required: Collection[str] | None = None,
+    clause_probe_failures: Collection[dict[str, Any]] | None = None,
     attempt_phase: str = "plan",
 ) -> tuple[list[PlanNode], dict[str, Any]]:
     """Call the LLM and parse the plan, repairing rejected output.
@@ -13096,6 +13105,7 @@ def _call_llm_with_repair(
                 skeleton=skeleton,
                 clause_mode=clause_mode,
                 clause_required=clause_required,
+                clause_probe_failures=clause_probe_failures,
             )
             if baseline_paths is not None:
                 # Steal #5 scope lock: a repair that parses is still
@@ -13150,6 +13160,7 @@ def _call_llm_with_repair(
                         clauses=clauses,
                         clause_mode=clause_mode,
                         clause_required=clause_required,
+                        clause_probe_failures=clause_probe_failures,
                     )
                     if upgraded is not None:
                         nodes, metadata = upgraded
@@ -15435,6 +15446,14 @@ def _replan_from_brief(
     build #7 went unmeasured). The accepted emission is written
     back into the brief under "plan_emission", on the same
     write-back channel as "replan_clause_coverage".
+
+    Campaign build #27: the brief's verbatim probe failures also
+    ride this call into the prompt's clauses block and the delta
+    rule's coverage errors (clause_probe_failures), so a
+    probe-gated open clause is named with its probe, its failing
+    flows, and the file a repair must target — arm #35's re-plan
+    declared the store clauses verified-only and died on a
+    coverage error that never said what implementing them meant.
     """
 
     index = build_repo_index(repo_root)
@@ -15469,7 +15488,12 @@ def _replan_from_brief(
     clauses_section = ""
     if clauses:
         clauses_section = (
-            f"\n\n{format_replan_clauses_block(clauses, required_clause_ids)}"
+            "\n\n"
+            + format_replan_clauses_block(
+                clauses,
+                required_clause_ids,
+                probe_failures=brief.get("contract_probe_failures"),
+            )
         )
     # Existing-file inventory (campaign build #4), as in
     # plan_task_intent: a re-plan writes into the same tree, and a
@@ -15569,6 +15593,7 @@ def _replan_from_brief(
         skeleton=True,
         clause_mode="delta",
         clause_required=required_clause_ids if clauses else None,
+        clause_probe_failures=brief.get("contract_probe_failures"),
         attempt_phase="replan_skeleton",
     )
     # Campaign build #9, phase 2 + assembly: fill each content-less
@@ -15605,6 +15630,7 @@ def _replan_from_brief(
             clauses=clauses,
             clause_mode="delta",
             clause_required=required_clause_ids if clauses else None,
+            clause_probe_failures=brief.get("contract_probe_failures"),
         )
         _restamp_no_change_nodes(assembled_nodes, filled_dicts)
         nodes = assembled_nodes

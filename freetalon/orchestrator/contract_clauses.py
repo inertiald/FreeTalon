@@ -378,10 +378,95 @@ def _node_declares_clauses(node: "PlanNode") -> bool:
     return (node.inputs or {}).get("clauses") is not None
 
 
+def _failed_probes_by_clause(
+    probe_failures: Any,
+) -> dict[str, list[dict[str, Any]]]:
+    """Failed probe records grouped by clause ID (build #27).
+
+    The brief's contract_probe_failures channel carries the loop's
+    verbatim probe records (clause_id, probe, detail, and — for
+    the live runners — flow and the produced file the probe
+    exercised). Grouped here so the re-plan prompt and the delta
+    rule can name, per clause, the evidence a declaration must
+    answer. A record that is not a failure (ok set true) or names
+    no clause is ignored — the channel is failures by
+    construction, and a stray record must not invent a
+    requirement.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    if not isinstance(probe_failures, (list, tuple)):
+        return grouped
+    for record in probe_failures:
+        if not isinstance(record, dict) or record.get("ok"):
+            continue
+        clause_id = record.get("clause_id")
+        if not isinstance(clause_id, str) or not clause_id:
+            continue
+        grouped.setdefault(clause_id, []).append(record)
+    return grouped
+
+
+def _probe_names(records: list[dict[str, Any]]) -> str:
+    return ", ".join(
+        sorted({str(r.get("probe")) for r in records if r.get("probe")})
+    )
+
+
+def _probe_files(records: list[dict[str, Any]]) -> list[str]:
+    return sorted(
+        {
+            str(r["file"])
+            for r in records
+            if isinstance(r.get("file"), str) and r.get("file")
+        }
+    )
+
+
+def _probe_gate_implements_suffix(records: list[dict[str, Any]]) -> str:
+    """The probe-gated tail of a delta implements error (build #27).
+
+    Names the failing probes and, when the records carry it, the
+    produced file they exercised — for a probe-gated clause the
+    declaration requirement is a repair of that file, stated at
+    the point of rejection so one repair round can answer it.
+    """
+    files = _probe_files(records)
+    target = ", ".join(files) if files else "the code the probe exercises"
+    flows = [
+        str(r["flow"])
+        for r in records
+        if isinstance(r.get("flow"), str) and r.get("flow")
+    ]
+    probe_text = _probe_names(records)
+    if flows:
+        probe_text += f"; flow(s): {', '.join(flows)}"
+    return (
+        f" — this clause is PROBE-GATED: the system's probe(s) "
+        f"({probe_text}) against {target} are failing "
+        "(see the brief's contract probe failures); declare it in "
+        f'the "implements" list of a node that repairs {target} — '
+        'a "verifies" declaration does not implement a probe-gated '
+        "clause, and the clause verifies only when the probe passes "
+        "on the repaired tree"
+    )
+
+
+def _probe_gate_verifies_suffix(records: list[dict[str, Any]]) -> str:
+    """The probe-gated tail of a delta verifies error (build #27)."""
+    return (
+        f" — this clause is PROBE-GATED: the system's probe(s) "
+        f"({_probe_names(records)}) judge it, so a node's tests do "
+        "not verify it; it verifies when the probe passes on the "
+        'repaired tree — declare "verifies" on the node that '
+        "re-checks the repair"
+    )
+
+
 def clause_delta_errors(
     nodes: list["PlanNode"],
     clauses: list[dict[str, Any]],
     required_ids: Any,
+    probe_failures: Any = None,
 ) -> list[str]:
     """Plan errors for the re-plan delta coverage rule (build #7).
 
@@ -391,6 +476,14 @@ def clause_delta_errors(
     cannot be required of the delta. Runs under the same authored
     gating as the full rule, in its place, when the caller marks
     the parse as a re-plan delta.
+
+    ``probe_failures`` (campaign build #27) is the brief's verbatim
+    probe-failure records; when a required clause carries failed
+    records, its coverage errors name the probe and the file a
+    repair must target (see _probe_gate_implements_suffix). The
+    rule itself is unchanged — the records only make the error
+    answerable. Without them the errors are byte-identical to
+    before.
     """
     errors: list[str] = []
     known = {str(clause["id"]) for clause in clauses}
@@ -424,18 +517,23 @@ def clause_delta_errors(
                     "be invented"
                 )
     coverage = coverage_map(nodes)
+    probe_by_clause = _failed_probes_by_clause(probe_failures)
     for clause_id in required:
         entry = coverage.get(clause_id) or {"implement": [], "verify": []}
+        records = probe_by_clause.get(clause_id) or []
         if not entry["implement"]:
-            errors.append(
+            message = (
                 f"open contract clause {clause_id} "
                 f"({headings.get(clause_id)}) is not implemented by "
                 "any node in this re-plan — the brief names it as "
                 "still open; declare it in the \"implements\" list of "
                 "the node that repairs it (inputs.clauses)"
             )
+            if records:
+                message += _probe_gate_implements_suffix(records)
+            errors.append(message)
         if not entry["verify"]:
-            errors.append(
+            message = (
                 f"open contract clause {clause_id} "
                 f"({headings.get(clause_id)}) is not verified by "
                 "any node in this re-plan — declare it in the "
@@ -444,6 +542,9 @@ def clause_delta_errors(
                 "independently check the mechanically checkable "
                 "clauses"
             )
+            if records:
+                message += _probe_gate_verifies_suffix(records)
+            errors.append(message)
     return errors
 
 
@@ -478,8 +579,81 @@ def delta_clause_coverage(
     }
 
 
+def _probe_gated_guidance_lines(
+    clauses: list[dict[str, Any]],
+    required_ids: Any,
+    probe_failures: Any,
+) -> list[str]:
+    """Generation steering for probe-gated open clauses (build #27).
+
+    Arm #35: the brief carried the store probes' failures verbatim
+    and the delta rule demanded the clauses, yet three re-plan
+    attempts never declared them implemented — the prompt nowhere
+    said what a probe-gated clause requires. A clause the system's
+    probes judge is not verified by any node's tests, and it is
+    not implemented by a declaration on a reading or test node:
+    the delta must carry a node that repairs the file the probe
+    exercised (the probe records name it) and declares the clause
+    in that node's "implements" list. Rendered only for open
+    clauses with failed probe records in the brief; a brief
+    without them renders byte-identically to before.
+    """
+    grouped = _failed_probes_by_clause(probe_failures)
+    if not grouped:
+        return []
+    required = {
+        str(clause["id"])
+        for clause in clauses
+        if str(clause["id"]) in set(required_ids or ())
+    }
+    lines: list[str] = []
+    for clause in clauses:
+        clause_id = str(clause["id"])
+        records = grouped.get(clause_id) or []
+        if not records or clause_id not in required:
+            continue
+        if not lines:
+            lines.append("")
+            lines.append(
+                "PROBE-GATED open clauses (the system's deterministic "
+                "probes judge these clauses — no node's tests verify "
+                "them, and they verify only when the probe passes on "
+                "the repaired tree):"
+            )
+        detail = f"probe(s): {_probe_names(records)}"
+        flows = [
+            str(r["flow"])
+            for r in records
+            if isinstance(r.get("flow"), str) and r.get("flow")
+        ]
+        if flows:
+            detail += f"; failing flow(s): {', '.join(flows)}"
+        files = _probe_files(records)
+        if files:
+            target = ", ".join(files)
+            detail += f"; exercised file: {target}"
+            lines.append(
+                f"- {clause_id} ({clause.get('heading')}): {detail}. "
+                f"Your delta must include a node that repairs {target} "
+                "and declares this clause in that node's "
+                '\"implements\" list; declare \"verifies\" on the '
+                "node that re-checks the repair."
+            )
+        else:
+            lines.append(
+                f"- {clause_id} ({clause.get('heading')}): {detail}. "
+                "Your delta must include a node that repairs the code "
+                "the probe exercises and declares this clause in the "
+                '\"implements\" list of that node; declare '
+                '\"verifies\" on the node that re-checks the repair.'
+            )
+    return lines
+
+
 def format_replan_clauses_block(
-    clauses: list[dict[str, Any]], required_ids: Any
+    clauses: list[dict[str, Any]],
+    required_ids: Any,
+    probe_failures: Any = None,
 ) -> str:
     """The CONTRACT CLAUSES block for a re-plan prompt (build #7).
 
@@ -534,6 +708,9 @@ def format_replan_clauses_block(
             "the brief — the per-node declaration rule above still "
             "applies to every node."
         )
+    lines.extend(
+        _probe_gated_guidance_lines(clauses, required_ids, probe_failures)
+    )
     lines.extend(_method_surface_guidance_lines(clauses))
     return "\n".join(lines)
 
@@ -2108,6 +2285,26 @@ _LIVE_PROBE_RUNNERS = (
 # ── Clause states ───────────────────────────────────────────────────
 
 
+def _node_runs_full_suite(node: "PlanNode | None") -> bool:
+    """True when the node is a bash/shell node running the full suite.
+
+    Campaign build #27: the suite-scope judgment is the executor's
+    (_command_runs_full_suite — the same judgment that raises a
+    suite node's timeout floor), imported at call time because the
+    executor imports this module for the clause list.
+    """
+    if node is None or (node.assigned_claw or "") not in (
+        "bash",
+        "shell_exec",
+    ):
+        return False
+    from .executor import _command_runs_full_suite
+
+    inputs = node.inputs or {}
+    command = inputs.get("command") or inputs.get("cmd")
+    return isinstance(command, str) and _command_runs_full_suite(command)
+
+
 def clause_states(
     clauses: list[dict[str, Any]],
     nodes: list["PlanNode"],
@@ -2122,8 +2319,10 @@ def clause_states(
       its probes plus, when it also has verification nodes, at
       least one of them passing — a probe pass does not excuse a
       failed verification node.
-    failed — a probe failed, or verification nodes exist and every
-      one of them failed.
+    failed — a probe failed, or in-scope verification nodes exist
+      and every one of them failed. A full-suite node's failure is
+      out-of-scope evidence for any single clause (build #27): it
+      leaves the clause unverified, never failed.
     waived — the waivers map carries a non-empty reason (an
       operator/system record; the loop never writes one).
     unverified — everything else: no coverage, or coverage whose
@@ -2168,8 +2367,21 @@ def clause_states(
             reasons.append(f"probe {probe.get('probe')} failing: {probe.get('detail')}")
         verify_ids = entry["verify"]
         any_verify_passed = any(node_passed(nid) for nid in verify_ids)
-        all_verify_failed = bool(verify_ids) and all(
-            node_failed(nid) for nid in verify_ids
+        # Campaign build #27 (class-7): a full-suite verify node's
+        # failure is out-of-scope evidence for this clause — the
+        # suite evaluates the whole repo, not the clause — so the
+        # failed computation runs over the in-scope verification
+        # nodes only. A clause whose in-scope verifiers all failed
+        # still fails exactly as before; a clause whose only
+        # verifier is a failed suite node is unverified (its
+        # verification has not passed), not failed.
+        in_scope_verify_ids = [
+            nid
+            for nid in verify_ids
+            if not _node_runs_full_suite(by_id.get(nid))
+        ]
+        all_verify_failed = bool(in_scope_verify_ids) and all(
+            node_failed(nid) for nid in in_scope_verify_ids
         )
         if failed_probes or all_verify_failed:
             if all_verify_failed:

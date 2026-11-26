@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING, TypedDict
 
+from .contract_clauses import clauses_from_metadata
 from .measure import (
     VERDICT_PASS,
     build_envelope,
@@ -127,6 +128,21 @@ def _command_runs_full_suite(command: str) -> bool:
     return False
 
 
+def _is_full_suite_node(node: PlanNode) -> bool:
+    """True when the node runs the full test suite in one command.
+
+    The claw/command test _effective_node_timeout applies for the
+    suite timeout floor, factored out for build #27's status
+    derivation: the same judgment decides both how long a suite
+    node may run and whether its failure is in scope for a
+    contract-scoped plan's verdict.
+    """
+    if (node.assigned_claw or "") not in ("bash", "shell_exec"):
+        return False
+    command = node.inputs.get("command") or node.inputs.get("cmd")
+    return isinstance(command, str) and _command_runs_full_suite(command)
+
+
 def _effective_node_timeout(node: PlanNode) -> float:
     """The timeout a node actually runs under.
 
@@ -142,10 +158,8 @@ def _effective_node_timeout(node: PlanNode) -> float:
     and hand-built plans alike. A node that declares a larger
     timeout keeps it; every other node keeps exactly its own.
     """
-    if (node.assigned_claw or "") in ("bash", "shell_exec"):
-        command = node.inputs.get("command") or node.inputs.get("cmd")
-        if isinstance(command, str) and _command_runs_full_suite(command):
-            return max(node.timeout_s, _SUITE_NODE_TIMEOUT_S)
+    if _is_full_suite_node(node):
+        return max(node.timeout_s, _SUITE_NODE_TIMEOUT_S)
     return node.timeout_s
 
 
@@ -927,9 +941,35 @@ def _find_node(plan: ExecutionPlan, node_id: str) -> PlanNode | None:
     return plan.node_map().get(node_id)
 
 
+def _failures_are_out_of_scope_suite_only(plan: ExecutionPlan) -> bool:
+    """True when a contract-scoped plan's failures are all suite runs.
+
+    Campaign build #27 (class-7): a full-suite node evaluates the
+    whole repo corpus — in a held-out worktree the discover runs
+    far beyond the node's 900s floor and carries the repo's
+    standing failures with it — while the plan's contract scope
+    is the goal-named clause list. When the plan carries that
+    list and every FAILED node is a suite run, the failures are
+    out-of-scope evidence: they stand on the nodes and in their
+    measurements exactly as before, but they are not a verdict on
+    the contract work, whose own judge is the clause gate
+    (probes + clause states). Any in-scope failure — a scoped
+    test node, a write node — keeps the plan FAILED, and a plan
+    without a clause list is judged exactly as before.
+    """
+    if not clauses_from_metadata(plan.metadata):
+        return False
+    failed = [n for n in plan.nodes if n.status == PlanStatus.FAILED]
+    return bool(failed) and all(_is_full_suite_node(n) for n in failed)
+
+
 def _derive_plan_status(plan: ExecutionPlan) -> PlanStatus:
     statuses = {node.status for node in plan.nodes}
-    if PlanStatus.FAILED in statuses or PlanStatus.NEEDS_TOOL in statuses:
+    if PlanStatus.NEEDS_TOOL in statuses:
+        return PlanStatus.FAILED
+    if PlanStatus.FAILED in statuses and not (
+        _failures_are_out_of_scope_suite_only(plan)
+    ):
         return PlanStatus.FAILED
     if PlanStatus.CANCELLED in statuses:
         return PlanStatus.CANCELLED
