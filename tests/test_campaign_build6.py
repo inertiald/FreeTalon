@@ -139,9 +139,24 @@ class _Handler(BaseHTTPRequestHandler):
             record["status"] = "confirmed"
             self._json(200, {"code": code, "status": "confirmed"})
             return
+        # Build #24: the route-table sweep samples wrong methods
+        # on every route shape; a known shape with the wrong
+        # method owes 405 (the production server's _route_kind
+        # dispatch), not the blanket 404 below.
+        if self.path == "/pairing" or self.path.startswith("/pairing/"):
+            self._json(405, {"error": "method not allowed"})
+            return
         self._json(404, {"error": "not found"})
 
     def do_GET(self):
+        # Build #24: register and confirm are POST-only shapes —
+        # a GET on either owes 405 before any poll logic runs.
+        if self.path == "/pairing/register" or (
+            self.path.startswith("/pairing/")
+            and self.path.endswith("/confirm")
+        ):
+            self._json(405, {"error": "method not allowed"})
+            return
         if self.path.startswith("/pairing/") and self.path != "/pairing":
             code = self.path.split("/")[2]
             record = self.records.get(code)

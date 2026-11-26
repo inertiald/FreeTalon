@@ -23,6 +23,17 @@ logic, which is what the held-out A driver executes.
 
 No GPU is touched: the probe tests boot fixture servers on
 loopback, exactly as builds #6/#12/#16 did.
+
+Build #24 note (2026-11-25): the matrix was widened from the
+known/unknown pair to each family's full route table (see
+tests/test_campaign_build24.py). This file's expectations were
+updated where the grid widened: the scripted unit tests pin a
+primary route defining GET+POST, so build #23's ten flows are
+exactly their expectation; the live flow lists grew (pairing
+10 -> 29, jobqueue 10 -> 34); the NO_PATCH fixture now fails
+the whole PATCH column, not two cells; and the jobqueue GOOD
+fixture gained a real submit plus shape-true do_GET/do_POST,
+because the sweep mints the job id it sweeps against.
 """
 
 from __future__ import annotations
@@ -83,6 +94,35 @@ EXPECTED_MATRIX_FLOWS = [
     for side in ("known", "unknown")
 ]
 
+# Build #24: the full route-table flow lists, in emission order
+# (build #23's ten first, then the sweep in route-table order,
+# methods in closed-set order within each route).
+_SWEEP_METHODS = ("get", "post", "put", "delete", "patch", "head", "options")
+
+
+def _sweep_flows(tag, defined):
+    return [
+        f"method_matrix_{method}_on_{tag}"
+        for method in _SWEEP_METHODS
+        if method not in defined
+    ]
+
+
+EXPECTED_PAIRING_MATRIX_FLOWS = (
+    EXPECTED_MATRIX_FLOWS
+    + ["method_matrix_get_known"]
+    + _sweep_flows("list", {"get"})
+    + _sweep_flows("poll", {"get"})
+    + _sweep_flows("confirm", {"post"})
+)
+EXPECTED_JOBQUEUE_MATRIX_FLOWS = (
+    EXPECTED_MATRIX_FLOWS
+    + _sweep_flows("claim", {"post"})
+    + _sweep_flows("item", {"get"})
+    + _sweep_flows("complete", {"post"})
+    + _sweep_flows("fail", {"post"})
+)
+
 
 def _matrix_records(results, clause_id="C09-http-api-server-py"):
     return [
@@ -114,7 +154,7 @@ class TestMethodMatrixUnit(unittest.TestCase):
             statuses[(method, "/unknown")] = 404
         flows = _method_matrix_flows(
             self._requester(statuses),
-            known_path="/known",
+            routes=[("/known", frozenset({"GET", "POST"}), "known")],
             unknown_path="/unknown",
         )
         self.assertEqual([name for name, _ok, _d in flows], EXPECTED_MATRIX_FLOWS)
@@ -130,7 +170,7 @@ class TestMethodMatrixUnit(unittest.TestCase):
         flows = dict()
         for name, ok, detail in _method_matrix_flows(
             self._requester(statuses),
-            known_path="/known",
+            routes=[("/known", frozenset({"GET", "POST"}), "known")],
             unknown_path="/unknown",
         ):
             flows[name] = (ok, detail)
@@ -167,7 +207,7 @@ class TestMethodMatrixUnit(unittest.TestCase):
             name: (ok, detail)
             for name, ok, detail in _method_matrix_flows(
                 self._requester(statuses),
-                known_path="/known",
+                routes=[("/known", frozenset({"GET", "POST"}), "known")],
                 unknown_path="/unknown",
             )
         }
@@ -189,7 +229,7 @@ class TestPairingMethodMatrix(unittest.TestCase):
             results = run_contract_probes(SMOKE_CLAUSES, root)
             matrix = _matrix_records(results)
             self.assertEqual(
-                [r["flow"] for r in matrix], EXPECTED_MATRIX_FLOWS
+                [r["flow"] for r in matrix], EXPECTED_PAIRING_MATRIX_FLOWS
             )
             self.assertTrue(all(r["ok"] for r in matrix))
             for record in matrix:
@@ -213,13 +253,19 @@ class TestPairingMethodMatrix(unittest.TestCase):
             self.assertFalse(unknown[0]["ok"])
             # The matrix failure is the ONLY failure: the static
             # surface probe and the ten functional flows all pass
-            # against this fixture — before this build, no check
-            # the loop runs could see the defect at all.
+            # against this fixture — before build #23, no check
+            # the loop runs could see the defect at all. Since
+            # build #24 the failure is the whole PATCH column:
+            # the sweep samples PATCH on every route, and this
+            # fixture has no do_PATCH anywhere.
             self.assertEqual(
                 {r["flow"] for r in probe_failures(results)},
                 {
                     "method_matrix_patch_known",
                     "method_matrix_patch_unknown",
+                    "method_matrix_patch_on_list",
+                    "method_matrix_patch_on_poll",
+                    "method_matrix_patch_on_confirm",
                 },
             )
 
@@ -251,6 +297,9 @@ class TestPairingMethodMatrix(unittest.TestCase):
                 {
                     "method_matrix_patch_known",
                     "method_matrix_patch_unknown",
+                    "method_matrix_patch_on_list",
+                    "method_matrix_patch_on_poll",
+                    "method_matrix_patch_on_confirm",
                 },
             )
 
@@ -276,7 +325,9 @@ class TestPairingMethodMatrix(unittest.TestCase):
         repo_root = Path(__file__).resolve().parents[1]
         results = run_contract_probes(SMOKE_CLAUSES, repo_root)
         matrix = _matrix_records(results)
-        self.assertEqual([r["flow"] for r in matrix], EXPECTED_MATRIX_FLOWS)
+        self.assertEqual(
+            [r["flow"] for r in matrix], EXPECTED_PAIRING_MATRIX_FLOWS
+        )
         self.assertTrue(all(r["ok"] for r in matrix))
         self.assertEqual(probe_failures(results), [])
 
@@ -291,13 +342,23 @@ class JobQueueStore:
         self.path = path
 '''
 
-FIXTURE_JOBQUEUE_SERVER_GOOD = '''"""Fixture jobqueue server: the matrix surface, minimally."""
+FIXTURE_JOBQUEUE_SERVER_GOOD = '''"""Fixture jobqueue server: the contract surface, minimally.
+
+Build #24: the route-table sweep mints the job id it sweeps
+against with a real submit, and samples wrong methods on every
+route shape — so the fixture keeps a minimal in-memory store
+and routes every method by path shape, the way CONTRACT-A's
+rule reads.
+"""
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class _Handler(BaseHTTPRequestHandler):
+    jobs = {}
+    next_id = 1
+
     def log_message(self, *args):
         pass
 
@@ -309,21 +370,83 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _known(self):
-        path = self.path.split("?")[0]
-        return path == "/queue/claim" or path.startswith("/queue/jobs")
+    def _body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            return json.loads(raw.decode() or "{}")
+        except ValueError:
+            return {}
+
+    def _shape(self):
+        parts = [p for p in self.path.split("?")[0].split("/") if p]
+        if parts == ["queue", "jobs"]:
+            return "jobs"
+        if parts == ["queue", "claim"]:
+            return "claim"
+        if len(parts) == 3 and parts[:2] == ["queue", "jobs"]:
+            return "item"
+        if (
+            len(parts) == 4
+            and parts[:2] == ["queue", "jobs"]
+            and parts[3] in ("complete", "fail")
+        ):
+            return parts[3]
+        return None
+
+    def _job_id(self):
+        return self.path.split("?")[0].split("/")[3]
 
     def _reject(self):
-        if self._known():
+        if self._shape() is not None:
             self._json(405, {"error": "method not allowed"})
         else:
             self._json(404, {"error": "not found"})
 
     def do_GET(self):
-        self._json(404, {"error": "not found"})
+        shape = self._shape()
+        if shape == "jobs":
+            self._json(200, {"jobs": list(type(self).jobs.values())})
+        elif shape == "item":
+            job = type(self).jobs.get(self._job_id())
+            if job is None:
+                self._json(404, {"error": "not found"})
+            else:
+                self._json(200, job)
+        elif shape is not None:
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        self._json(404, {"error": "not found"})
+        shape = self._shape()
+        if shape == "jobs":
+            body = self._body()
+            if "payload" not in body:
+                self._json(400, {"error": "invalid job"})
+                return
+            job_id = "job-%06d" % type(self).next_id
+            type(self).next_id += 1
+            job = {
+                "id": job_id,
+                "payload": body["payload"],
+                "status": "queued",
+            }
+            type(self).jobs[job_id] = job
+            self._json(201, job)
+        elif shape == "claim":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif shape in ("complete", "fail"):
+            if self._job_id() not in type(self).jobs:
+                self._json(404, {"error": "not found"})
+            else:
+                self._json(409, {"error": "not claimed"})
+        elif shape is not None:
+            self._json(405, {"error": "method not allowed"})
+        else:
+            self._json(404, {"error": "not found"})
 
     def do_PUT(self):
         self._reject()
@@ -385,7 +508,7 @@ class TestJobqueueMethodMatrix(unittest.TestCase):
             results = run_contract_probes(JOBQUEUE_CLAUSES, root)
             matrix = _matrix_records(results)
             self.assertEqual(
-                [r["flow"] for r in matrix], EXPECTED_MATRIX_FLOWS
+                [r["flow"] for r in matrix], EXPECTED_JOBQUEUE_MATRIX_FLOWS
             )
             self.assertTrue(all(r["ok"] for r in matrix))
             for record in matrix:

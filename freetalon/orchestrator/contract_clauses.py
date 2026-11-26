@@ -1089,7 +1089,7 @@ def _pairing_smoke_flows(
         )
     return flows
 
-# ── Live method matrix (campaign build #23) ─────────────────────
+# ── Live method matrix (campaign builds #23 + #24) ──────────────
 #
 # The method-coverage diagnosis (2026-11-25): pairing's
 # wrong-method miss was invisible to every deterministic check —
@@ -1100,91 +1100,162 @@ def _pairing_smoke_flows(
 # DELETE/HEAD answered a blanket 404. The set of methods a
 # BaseHTTPRequestHandler can receive is closed and known in
 # advance; coverage of it should be mechanical, not mnemonic.
-# The matrix below exercises every closed-set method beyond
+# Build #23's matrix exercised every closed-set method beyond
 # GET/POST (those ride the functional flows) against one known
-# path and one unknown path. The expectations are the contract
-# rule both contract families state in the same shape (pairing
-# CONTRACT.md: "Unknown routes → 404; a known path with the
-# wrong method → 405"; CONTRACT-A states the identical rule):
-# known path + wrong method → 405, unknown path → 404 whatever
-# the method. The matrix engages only for method_surface
-# clauses — clauses whose contract text states a 405 rule — so
-# the contract itself decides where the matrix applies. A
-# failure's detail carries the build-#16 machine-readable fact
-# ("<flow>_status: expected X, got Y") plus the specific shape
-# (501 stdlib default / blanket 404 / 405 leaking onto unknown
-# routes), and the records ride the same probe-failure channel
-# as every other live flow (contract_probe_failures into the
-# re-plan brief, probe_suspect_map to the repair seams).
+# path and one unknown path. Build #24 (the sub-path grid
+# diagnosis, 2026-11-25): arm #32 then failed on a cell the pair
+# never sampled — GET on /pairing/<code>/confirm answered 404 —
+# because the grid was one path deep. The matrix now takes the
+# family's whole ROUTE TABLE: every contract route x every
+# closed-set method that route does not define -> 405, with the
+# unknown-path column (404 whatever the method) unchanged. The
+# expectations are the contract rule both contract families state
+# in the same shape (pairing CONTRACT.md: "Unknown routes → 404;
+# a known path with the wrong method → 405"; CONTRACT-A states
+# the identical rule, and pins the item route explicitly: a bare
+# POST to /queue/jobs/<id> is 405). The 405 decision is by path
+# SHAPE, before any store lookup — the pairing acceptance test
+# asserts 405 on routes for a code that was never registered — so
+# parameterized routes are swept with the probe's own ids (the
+# smoke code, registered by the functional flows in the same
+# boot; a job id minted by one setup submit). TRACE stays out:
+# no contract text pins it. The matrix engages only for
+# method_surface clauses — clauses whose contract text states a
+# 405 rule — so the contract itself decides where the matrix
+# applies. A failure's detail carries the build-#16
+# machine-readable fact ("<flow>_status: expected X, got Y") plus
+# the specific shape (501 stdlib default / blanket 404 / 405
+# leaking onto unknown routes), and the records ride the same
+# probe-failure channel as every other live flow
+# (contract_probe_failures into the re-plan brief,
+# probe_suspect_map to the repair seams). Flow names: build
+# #23's ten keep their names (method_matrix_<method>_known /
+# _unknown on the primary route); the primary route's one added
+# cell is method_matrix_get_known; every other route's cells are
+# method_matrix_<method>_on_<route tag>.
 
 _METHOD_MATRIX_METHODS = ("PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
 
+# The full closed set both contracts live under, in contract
+# order. A route's wrong methods are this set minus the methods
+# the route defines.
+_CLOSED_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
+
+
+def _matrix_known_cell(request, name, method, path):
+    """One wrong-method request against a known path (405 owed)."""
+    outcome, error = request(name, method, path)
+    if error is not None:
+        return (name, False, error)
+    status, _raw = outcome
+    detail = (
+        f"{name}: {method} {path} -> {status} "
+        f"({name}_status: expected 405, got {status} — "
+        "a known path with the wrong method answers the "
+        "contract's 405"
+    )
+    if status == 501:
+        detail += (
+            "; 501 is the stdlib default — no "
+            f"do_{method} handler is defined, so the "
+            "method falls through to BaseHTTPRequestHandler"
+        )
+    elif status == 404:
+        detail += (
+            "; 404 is the unknown-route answer — the "
+            "handler does not split known paths from "
+            "unknown ones for this method (a blanket "
+            "not-found)"
+        )
+    detail += ")"
+    return (name, status == 405, detail)
+
+
+def _matrix_unknown_cell(request, name, method, path):
+    """One matrix-method request against an unknown path (404 owed)."""
+    outcome, error = request(name, method, path)
+    if error is not None:
+        return (name, False, error)
+    status, _raw = outcome
+    detail = (
+        f"{name}: {method} {path} -> {status} "
+        f"({name}_status: expected 404, got {status} — "
+        "unknown routes answer 404 whatever the method; "
+        "405 belongs only to a known path with the wrong "
+        "method"
+    )
+    if status == 501:
+        detail += (
+            "; 501 is the stdlib default — no "
+            f"do_{method} handler is defined, so the "
+            "method falls through to BaseHTTPRequestHandler"
+        )
+    elif status == 405:
+        detail += (
+            "; the wrong-method answer is leaking onto "
+            "unknown routes"
+        )
+    detail += ")"
+    return (name, status == 404, detail)
+
 
 def _method_matrix_flows(
-    request, *, known_path: str, unknown_path: str
+    request,
+    *,
+    routes: list[tuple[str | None, frozenset, str]],
+    unknown_path: str,
+    blocked_detail: str | None = None,
 ) -> list[tuple[str, bool, str]]:
-    """Every closed-set method × {known, unknown} path.
+    """The route-table method sweep (build #24; pair form in #23).
 
-    `request` is the _smoke_requester closure. Each entry:
-    (flow, ok, detail) with flow method_matrix_<method>_known /
-    method_matrix_<method>_unknown.
+    `request` is the _smoke_requester closure. `routes` is the
+    family's route table: (path, defined_methods, tag) per route,
+    the PRIMARY route first — its cells keep build #23's
+    method_matrix_<method>_known names, and its one added cell
+    (a wrong GET or POST) is method_matrix_<method>_known too;
+    every other route's cells are method_matrix_<method>_on_<tag>.
+    The unknown-path column is emitted alongside the primary
+    route's matrix methods, exactly as in build #23. A route whose
+    path is None (its instantiation id could not be minted) emits
+    its cells as failures carrying `blocked_detail` instead of
+    issuing requests. Each entry: (flow, ok, detail).
     """
     flows: list[tuple[str, bool, str]] = []
+    primary_path = routes[0][0]
+    emitted: set[tuple[str, str]] = set()
+    # Build #23's columns, in their original order: the primary
+    # route's matrix methods interleaved with the unknown path's.
     for method in _METHOD_MATRIX_METHODS:
         name = f"method_matrix_{method.lower()}_known"
-        outcome, error = request(name, method, known_path)
-        if error is not None:
-            flows.append((name, False, error))
+        if primary_path is None:
+            flows.append((name, False, blocked_detail or ""))
         else:
-            status, _raw = outcome
-            detail = (
-                f"{name}: {method} {known_path} -> {status} "
-                f"({name}_status: expected 405, got {status} — "
-                "a known path with the wrong method answers the "
-                "contract's 405"
+            flows.append(
+                _matrix_known_cell(request, name, method, primary_path)
             )
-            if status == 501:
-                detail += (
-                    "; 501 is the stdlib default — no "
-                    f"do_{method} handler is defined, so the "
-                    "method falls through to BaseHTTPRequestHandler"
-                )
-            elif status == 404:
-                detail += (
-                    "; 404 is the unknown-route answer — the "
-                    "handler does not split known paths from "
-                    "unknown ones for this method (a blanket "
-                    "not-found)"
-                )
-            detail += ")"
-            flows.append((name, status == 405, detail))
-
+            emitted.add((primary_path, method))
         name = f"method_matrix_{method.lower()}_unknown"
-        outcome, error = request(name, method, unknown_path)
-        if error is not None:
-            flows.append((name, False, error))
-        else:
-            status, _raw = outcome
-            detail = (
-                f"{name}: {method} {unknown_path} -> {status} "
-                f"({name}_status: expected 404, got {status} — "
-                "unknown routes answer 404 whatever the method; "
-                "405 belongs only to a known path with the wrong "
-                "method"
-            )
-            if status == 501:
-                detail += (
-                    "; 501 is the stdlib default — no "
-                    f"do_{method} handler is defined, so the "
-                    "method falls through to BaseHTTPRequestHandler"
-                )
-            elif status == 405:
-                detail += (
-                    "; the wrong-method answer is leaking onto "
-                    "unknown routes"
-                )
-            detail += ")"
-            flows.append((name, status == 404, detail))
+        flows.append(
+            _matrix_unknown_cell(request, name, method, unknown_path)
+        )
+        emitted.add((unknown_path, method))
+    # The route-table sweep: every route x every closed-set
+    # method the route does not define, minus the cells above.
+    for path, defined, tag in routes:
+        for method in _CLOSED_METHODS:
+            if method in defined:
+                continue
+            if path is not None and (path, method) in emitted:
+                continue
+            if tag == "known":
+                name = f"method_matrix_{method.lower()}_known"
+            else:
+                name = f"method_matrix_{method.lower()}_on_{tag}"
+            if path is None:
+                flows.append((name, False, blocked_detail or ""))
+            else:
+                flows.append(_matrix_known_cell(request, name, method, path))
+                emitted.add((path, method))
     return flows
 
 
@@ -1395,17 +1466,39 @@ def _pairing_http_smoke_records(
                             "file": _PAIRING_SERVER_PATH,
                         }
                     )
-            # Campaign build #23: the live method matrix on the
-            # same booted server — every closed-set method
-            # against a known path (a registered route) and an
-            # unknown one. Records carry probe="method_matrix"
-            # and the same flow/file keys, so a matrix failure
-            # enters the probe-failure channel and the suspect
-            # map exactly as a smoke-flow failure does.
+            # Campaign builds #23 + #24: the live method matrix
+            # on the same booted server — build #23's known /
+            # unknown path pair, widened by build #24 to the
+            # contract's whole route table. The sweep runs after
+            # the functional flows in the same boot, so the
+            # probe's own code exists in the store for the
+            # parameterized routes (the contract's 405 decision
+            # is by path shape regardless of state). Records
+            # carry probe="method_matrix" and the same flow/file
+            # keys, so a matrix failure enters the probe-failure
+            # channel and the suspect map exactly as a smoke-flow
+            # failure does.
             if port is not None:
                 matrix = _method_matrix_flows(
                     _smoke_requester(port, deadline),
-                    known_path="/pairing/register",
+                    routes=[
+                        (
+                            "/pairing/register",
+                            frozenset({"POST"}),
+                            "known",
+                        ),
+                        ("/pairing", frozenset({"GET"}), "list"),
+                        (
+                            f"/pairing/{_SMOKE_CODE}",
+                            frozenset({"GET"}),
+                            "poll",
+                        ),
+                        (
+                            f"/pairing/{_SMOKE_CODE}/confirm",
+                            frozenset({"POST"}),
+                            "confirm",
+                        ),
+                    ],
                     unknown_path="/smoke-probe/no-such-route",
                 )
                 for clause in flow_clauses:
@@ -1444,16 +1537,60 @@ server.serve_forever()
 """
 
 
+def _jobqueue_mint_job_id(request) -> tuple[str | None, str]:
+    """One setup submit to mint a real job id for the sweep.
+
+    CONTRACT-A's submit: POST /queue/jobs with a payload object
+    answers 201 with the job's public view, whose "id" names the
+    job. Returns (job_id, "") on success; (None, detail) when the
+    submit could not be attempted, was refused, or named no id —
+    the caller then fails the item-route cells with that detail
+    rather than sweeping an id the server never minted.
+    """
+    name = "method_matrix_setup"
+    outcome, error = request(
+        name,
+        "POST",
+        "/queue/jobs",
+        body={"payload": {"smoke_probe": "method-matrix"}},
+    )
+    if error is not None:
+        return None, error
+    status, raw = outcome
+    if status not in (200, 201):
+        return None, (
+            f"{name}: POST /queue/jobs -> {status} "
+            f"({name}_status: expected 201, got {status} — the "
+            "setup submit that mints a job id for the sub-path "
+            "sweep was refused)"
+        )
+    try:
+        view = json.loads(raw.decode("utf-8"))
+        job_id = view["id"]
+    except (ValueError, UnicodeDecodeError, KeyError, TypeError):
+        return None, (
+            f"{name}: POST /queue/jobs -> {status} but the "
+            "response named no job id — the sub-path sweep has "
+            "no minted id to sweep against"
+        )
+    return str(job_id), ""
+
+
 def _jobqueue_method_matrix_records(
     clauses: list[dict[str, Any]], root: Path
 ) -> list[dict[str, Any]]:
-    """Live method matrix for the jobqueue contract (build #23).
+    """Live method matrix for the jobqueue contract (builds #23 + #24).
 
     The jobqueue family gets the matrix and only the matrix:
     its functional behavior rides the static probes and the
     plan's own test nodes, but method coverage — the defect
     class the diagnosis measured on this family — is exactly
-    what the matrix enumerates. Scoping mirrors the pairing
+    what the matrix enumerates. Build #24 widens the matrix to
+    CONTRACT-A's whole route table; the parameterized routes
+    are swept against a real job id minted by one setup submit
+    (the contract's 405 decision is by path shape, but the sweep
+    never has to argue from a nonexistent resource). Scoping
+    mirrors the pairing
     runner's: the runner engages when a clause declares the
     jobqueue server module, and the records ride the
     method-surface clause(s). When the server module itself is
@@ -1495,10 +1632,38 @@ def _jobqueue_method_matrix_records(
                     )
                 ]
             else:
+                requester = _smoke_requester(port, deadline)
+                job_id, setup_detail = _jobqueue_mint_job_id(requester)
+                item = (
+                    f"/queue/jobs/{job_id}"
+                    if job_id is not None
+                    else None
+                )
                 flows = _method_matrix_flows(
-                    _smoke_requester(port, deadline),
-                    known_path="/queue/jobs",
+                    requester,
+                    routes=[
+                        (
+                            "/queue/jobs",
+                            frozenset({"GET", "POST"}),
+                            "known",
+                        ),
+                        ("/queue/claim", frozenset({"POST"}), "claim"),
+                        (item, frozenset({"GET"}), "item"),
+                        (
+                            f"{item}/complete"
+                            if item is not None
+                            else None,
+                            frozenset({"POST"}),
+                            "complete",
+                        ),
+                        (
+                            f"{item}/fail" if item is not None else None,
+                            frozenset({"POST"}),
+                            "fail",
+                        ),
+                    ],
                     unknown_path="/smoke-probe/no-such-route",
+                    blocked_detail=setup_detail,
                 )
             for clause in flow_clauses:
                 for name, ok, detail in flows:
