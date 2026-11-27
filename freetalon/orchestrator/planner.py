@@ -14290,6 +14290,161 @@ def _code_under_test_block(
     )
 
 
+# ── Campaign build #30: repair fills run in patch form ─────────
+#
+# Arm #38's lineage trace (build #29) exonerated diagnosis,
+# planning, scheduling, and selection for the pairing exam's five
+# standing defects and convicted the fill FORM: repair of a
+# diagnosed defect ran as a whole-file regeneration, and the fills
+# repeatedly returned the standing file byte-for-byte (v2's tree
+# was v1's tree) or rewrote without moving the failing probe —
+# while the diagnostic battery had shown the same model fixing
+# all five defects when handed a defect directly as a targeted
+# patch. A repair fill therefore no longer regenerates the file:
+# it answers in scoped edits (scoped_edits.py — the form the
+# materializer already applies deterministically), and a repair
+# attempt that changes nothing is a FAILED attempt, never a
+# completed node. Build #17's identity-edit no-change spelling
+# does not apply here: that spelling serves a fill asked to edit
+# against a standing file it judges already correct; a repair
+# node exists because the standing file was MEASURED failing, so
+# "no change" is not a judgment available to it.
+
+
+def _is_repair_patch_fill(
+    node: PlanNode,
+    intent: str,
+    existing_source: str | None,
+    attempt_phase: str,
+) -> bool:
+    """Is this fill the repair of a diagnosed defect?
+
+    All four witnesses must agree: the fill belongs to a re-plan
+    (a delta answering a prior version's failed measurements, so
+    a prior version exists whose probes failed); the node
+    declares whole_file; the target stands (an earlier fill's
+    content or the file on disk) — there is a file to patch; and
+    the node carries the non-empty overwrite_justification the
+    skeleton validators require of exactly such a node, the
+    plan's own statement of the defect the rewrite exists to
+    fix. Initial fills (the content_fill phase) are construction
+    even when they overwrite, and create/edit fills already have
+    their forms; neither is converted.
+    """
+    if attempt_phase != "replan_content_fill":
+        return False
+    if intent != "whole_file":
+        return False
+    if existing_source is None:
+        return False
+    justification = (node.inputs or {}).get("overwrite_justification")
+    return isinstance(justification, str) and bool(justification.strip())
+
+
+def _repair_patch_shape_repair_block(defects: list[str]) -> str:
+    """The schema-explicit repair block after a repair fill's
+    shape failure (campaign build #30).
+
+    The build #8 block's edit branch is NOT reused here: it
+    teaches identity edits as the legal no-change spelling,
+    which is exactly backwards for a repair node (see the build
+    #30 note above). This block spells the one accepted envelope
+    and the repair rule.
+    """
+    lines = [
+        "Your previous payload for this node was REJECTED — it "
+        "did not match the required payload shape:",
+        *(f"  - {defect}" for defect in defects),
+        "",
+        "This node is a REPAIR node: it exists to fix a diagnosed "
+        "defect in the file as it stands. The required payload "
+        "shape is EXACTLY this JSON object — nothing else is a "
+        "valid payload:",
+        '  {"edits": [{"search": "<text copied exactly from the '
+        'current file>", "replace": "<the new text>"}]}',
+        '  Worked example: {"edits": [{"search": "import os\\n", '
+        '"replace": "import os\\nimport sys\\n"}]}',
+        "",
+        'A whole-file {"content": ...} payload is NOT accepted '
+        "for this node, however complete. Every \"search\" text "
+        "must be copied character-for-character from the current "
+        "file and occur exactly once in it; widen a search text "
+        "with more surrounding lines until it is unique. An edit "
+        'whose "replace" is identical to its "search" is a '
+        "no-change declaration, and on a repair node it FAILS "
+        "the attempt: the file as it stands is the file that "
+        "fails.",
+        "Return a corrected payload only.",
+    ]
+    return "\n".join(lines)
+
+
+def _materialized_fill_content(
+    candidate: dict[str, Any],
+    prior_dicts: list[dict[str, Any]],
+    repo_root: str | Path | None,
+) -> str | None:
+    """The content one filled candidate produces, or None.
+
+    Mirrors _filled_candidate_errors' own materialization: the
+    candidate rides with every earlier filled node through the
+    ordinary materialization seam and the resulting content
+    input is read back. None when materialization cannot
+    produce a content string — validation has already judged
+    the candidate by the time this reader runs; it serves the
+    build #30 no-change comparison, which simply does not
+    apply without a produced content.
+    """
+    import copy as _copy
+
+    dicts = [_copy.deepcopy(item) for item in prior_dicts]
+    candidate_copy = _copy.deepcopy(candidate)
+    dicts.append(candidate_copy)
+    try:
+        _materialize_plan_edits(dicts, repo_root)
+    except LLMResponseError:
+        return None
+    content = (dicts[-1].get("inputs") or {}).get("content")
+    return content if isinstance(content, str) else None
+
+
+def _repair_no_change_error(
+    node: PlanNode, obligations: str
+) -> str:
+    """The failed-attempt sentence for a no-change repair patch.
+
+    Restates the obligation the retry must answer: the node's
+    objective, the plan's own overwrite_justification (the
+    diagnosed defect as the skeleton stated it), and the node's
+    clause obligations — the diagnosis artifacts the fill itself
+    carries (campaign build #30).
+    """
+    justification = str(
+        (node.inputs or {}).get("overwrite_justification") or ""
+    ).strip()
+    lines = [
+        "your repair patch changed NOTHING: applied to the file "
+        "as it stands, it produces that same file byte-for-byte, "
+        "and the file as it stands is the file that fails. A "
+        "repair attempt that changes nothing is a FAILED attempt "
+        "on this node, not a completed repair.",
+        f"This node's objective: {node.objective}",
+    ]
+    if justification:
+        lines.append(
+            "The plan's stated reason this node exists "
+            f"(overwrite_justification): {justification}"
+        )
+    if obligations:
+        lines.append(obligations)
+    lines.append(
+        "Return scoped edits that make a concrete change to the "
+        "file — at least one edit whose replacement differs from "
+        "its search text and that addresses the defect above."
+    )
+    return "\n".join(lines)
+
+
 def _fill_node_payload(
     node: PlanNode,
     intent: str,
@@ -14348,9 +14503,44 @@ def _fill_node_payload(
     an imagined API detonating at execution; the fill now sees
     the real definitions and is declined when it imports names
     they do not define.
+
+    Campaign build #30: a REPAIR fill (see _is_repair_patch_fill)
+    is executed in patch form — the model answers in scoped
+    edits, build #17's identity-edit partition does not apply,
+    and an attempt whose materialized result is byte-identical
+    to the file as it stood fails with the obligation restated
+    (see _repair_no_change_error). Arm #38's lineage trace is
+    the evidence: whole-file repair fills returned the standing
+    files unchanged while the same model, handed the defects
+    directly, patched all five.
     """
     target = _node_write_target(node) or ""
-    if intent in ("create", "whole_file"):
+    repair_patch = _is_repair_patch_fill(
+        node, intent, existing_source, attempt_phase
+    )
+    if repair_patch:
+        form = (
+            "REPAIR FILL — this node repairs a diagnosed defect "
+            "in the file as it stands (its current content is "
+            "given above). Although the skeleton declared "
+            'content_intent "whole_file", repair fills are '
+            "executed in patch form (campaign build #30): return "
+            '{"edits": [{"search": "<text copied exactly from '
+            'the current file>", "replace": "<the new text>"}]} '
+            "— targeted scoped edits that fix the defect named "
+            "in this node's objective and overwrite "
+            "justification. Every search text must be copied "
+            "character-for-character from the current file and "
+            "occur exactly once in it; widen a search text with "
+            "more surrounding lines until it is unique. Do NOT "
+            "return the whole file. An edit whose \"replace\" "
+            'is identical to its "search" declares that text '
+            "needs no change; on a repair node such a "
+            "declaration is NOT accepted — the file as it "
+            "stands is the file that fails, and a payload that "
+            "changes nothing FAILS this node."
+        )
+    elif intent in ("create", "whole_file"):
         form = (
             'Return {"content": "<the complete file content>"} — '
             "the whole file, every definition, no elisions, no "
@@ -14435,8 +14625,14 @@ def _fill_node_payload(
         fields: dict[str, Any] = {}
         fill_notes: list[str] = []
         if payload is not None:
-            fields, last_defects = _fill_payload_shape(payload, intent)
-        if not last_defects and isinstance(fields.get("edits"), list):
+            fields, last_defects = _fill_payload_shape(
+                payload, "scoped_edits" if repair_patch else intent
+            )
+        if (
+            not repair_patch
+            and not last_defects
+            and isinstance(fields.get("edits"), list)
+        ):
             # Campaign build #17: partition the payload's identity
             # edits out as no-change declarations before validation
             # judges the rest (see _split_identity_edits). A mixed
@@ -14475,7 +14671,36 @@ def _fill_node_payload(
                 plan_written=plan_written,
                 clauses=clauses,
             )
+        if repair_patch and not last_errors:
+            # Campaign build #30: the net-effect net. Validation
+            # passed, but a repair whose materialized result is
+            # the file as it stood has repaired nothing — the
+            # attempt fails and the retry carries the restated
+            # obligation (see _repair_no_change_error). Scoped
+            # edits already refuse no-change inside
+            # apply_scoped_edits; this comparison is the same
+            # rule for every patch shape that reaches acceptance
+            # (an anchored insert of nothing, a whole-file
+            # payload the shape gate somehow passed).
+            materialized = _materialized_fill_content(
+                candidate, prior_dicts, repo_root
+            )
+            if (
+                materialized is not None
+                and existing_source is not None
+                and materialized == existing_source
+            ):
+                last_errors = [
+                    _repair_no_change_error(node, obligations)
+                ]
         if not last_errors:
+            if repair_patch:
+                fill_notes = [
+                    *fill_notes,
+                    "campaign build #30: repair fill executed in "
+                    "patch form (scoped edits / anchored edit), "
+                    "not whole-file regeneration",
+                ]
             _record_planner_attempt(
                 phase=attempt_phase,
                 attempt=attempt,
@@ -14512,9 +14737,29 @@ def _fill_node_payload(
             intent=intent,
             fill_notes=fill_notes,
         )
+        if repair_patch:
+            # Campaign build #30: a rejected repair attempt is a
+            # lineage fact in its own right — the patch text rides
+            # the planner attempt record above; this outcome
+            # record carries its disposition (and, for a payload
+            # that wrongly returned whole content, whether that
+            # content was byte-identical to the file as it stood).
+            record_fill_outcome(
+                phase=attempt_phase,
+                attempt=attempt,
+                node_id=node.id,
+                target=target,
+                intent=intent,
+                outcome="rejected",
+                candidate_inputs=candidate_inputs,
+                existing_source=existing_source,
+                errors=last_errors,
+            )
         if last_defects:
-            errors_block = "\n\n" + _fill_shape_repair_block(
-                intent, last_defects
+            errors_block = "\n\n" + (
+                _repair_patch_shape_repair_block(last_defects)
+                if repair_patch
+                else _fill_shape_repair_block(intent, last_defects)
             )
         else:
             errors_block = (

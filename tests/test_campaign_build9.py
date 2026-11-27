@@ -415,6 +415,13 @@ class TestTwoPhaseReplan(ReplanTwoPhaseCase):
         # delta rewrites it whole. No single response may carry
         # the whole plan plus contents — the skeleton is structure
         # only, the large content rides its own fill call.
+        # Campaign build #30: this whole_file node is a repair
+        # node (standing file, overwrite_justification, the open
+        # clause), so its fill rides PATCH form — SERVER_EDIT,
+        # whose application produces exactly big_fill. The build
+        # #9 claim is unchanged and the payload is now smaller
+        # than the file it repairs, not merely separate from the
+        # skeleton.
         big_existing = SERVER_TEXT + "\n" + "\n".join(
             f"# standing line {index}" for index in range(300)
         )
@@ -431,9 +438,7 @@ class TestTwoPhaseReplan(ReplanTwoPhaseCase):
         )
         llm = _ScriptedLLM(
             [self._skeleton(server_intent="whole_file")],
-            self._good_fills(
-                **{"server.py": [json.dumps({"content": big_fill})]}
-            ),
+            self._good_fills(**{"server.py": [SERVER_EDIT]}),
         )
         nodes, brief = self._run_replan(llm)
         server = next(
