@@ -66,6 +66,7 @@ from .repo_index import (
     package_lineage_overlap,
     qualified_def_names,
 )
+from .lineage import record_fill_outcome, record_fill_prompt
 from .run_store import RunStore, new_run_id
 from .measure import (
     CRITERION_COMMAND_TIMEOUT_S,
@@ -14402,6 +14403,21 @@ def _fill_node_payload(
             f"{form}\n"
             "JSON Output:"
         )
+        # Campaign build #29: the exact assembled prompt rides the
+        # lineage sink to the run record before the call is made —
+        # what the fill was actually told, per attempt, is a fact
+        # the battery showed the loop could not reconstruct after
+        # the fact. Observability only (see lineage.py).
+        record_fill_prompt(
+            phase=attempt_phase,
+            attempt=attempt,
+            node_id=node.id,
+            target=target,
+            intent=intent,
+            prompt=prompt,
+            system_prompt=_CONTENT_FILL_SYSTEM_PROMPT,
+            existing_source=existing_source,
+        )
         response_text = call_llm(
             _CONTENT_FILL_SYSTEM_PROMPT, prompt, settings=settings
         )
@@ -14470,6 +14486,20 @@ def _fill_node_payload(
                 intent=intent,
                 fill_notes=fill_notes,
             )
+            # Campaign build #29: the accepted candidate's shape
+            # for the lineage record — whole-content hash and its
+            # byte-identity against the file as it stood, or the
+            # scoped-edit / anchor form it arrived in.
+            record_fill_outcome(
+                phase=attempt_phase,
+                attempt=attempt,
+                node_id=node.id,
+                target=target,
+                intent=intent,
+                outcome="accepted",
+                candidate_inputs=candidate_inputs,
+                existing_source=existing_source,
+            )
             return candidate, attempt
         _record_planner_attempt(
             phase=attempt_phase,
@@ -14492,6 +14522,18 @@ def _fill_node_payload(
                 + "\n".join(f"  - {error}" for error in last_errors)
                 + "\nReturn a corrected payload only."
             )
+    # Campaign build #29: the fill's terminal failure is a lineage
+    # fact too — the node was planned and scheduled, and its fill
+    # produced nothing acceptable in the attempts it was given.
+    record_fill_outcome(
+        phase=attempt_phase,
+        attempt=_CONTENT_FILL_MAX_ATTEMPTS,
+        node_id=node.id,
+        target=target,
+        intent=intent,
+        outcome="failed",
+        errors=last_errors,
+    )
     raise LLMResponseError(
         f"Content fill for planner node '{node.id}' (target "
         f"{target!r}, intent {intent!r}) failed after "

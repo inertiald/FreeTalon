@@ -22,6 +22,7 @@ from .contract_clauses import (
     WAIVERS_METADATA_KEY,
     clause_states,
     clauses_from_metadata,
+    node_clause_declaration,
     probe_failures,
     probe_suspect_map,
     run_contract_probes,
@@ -38,6 +39,7 @@ from .judge import (
     regressed_checks,
     timeout_diagnostics,
 )
+from .lineage import LineageRecorder, drain_pending_lineage, lineage_sink
 from .measure import (
     VERDICT_FAIL,
     VERDICT_INCONCLUSIVE,
@@ -247,6 +249,15 @@ class LoopRunner:
         seam_attempts.jsonl — every model call a seam makes in
         this run, raw response included (arm #22's declines were
         unresolvable without them).
+
+        Campaign build #29: the defect-lineage recorder (see
+        lineage.py) is installed alongside — per-defect provenance
+        from probe record to shipped tree, streamed to
+        lineage.jsonl with the exact fill prompts preserved under
+        lineage_prompts/, assembled at run end into lineage.json
+        and lineage.md. Observability only, like the sinks above:
+        the recorder guards every entry point, so it can never
+        fail a run.
         """
         run_id = run_id or new_run_id()
 
@@ -260,11 +271,33 @@ class LoopRunner:
             else:
                 self._run_store.append_planner_attempt(run_id, record)
 
-        with planner_attempt_sink(_attempt_sink):
+        # Campaign build #29: the defect-lineage recorder rides the
+        # same installation pattern — its sink receives the planner's
+        # fill-prompt records for this run (drained first, like the
+        # attempts: the initial planning ran before this entry point
+        # existed), the loop's stage hooks feed it directly, and
+        # finalize() in the finally is the backstop that assembles
+        # the record even when the run raises.
+        recorder = LineageRecorder(self._run_store, run_id)
+
+        def _lineage_sink(record: dict[str, Any]) -> None:
+            recorder.handle_sink_record(record)
+
+        with planner_attempt_sink(_attempt_sink), lineage_sink(
+            _lineage_sink
+        ):
             drain_pending_planner_attempts(_attempt_sink)
-            return self._run_plan(
-                plan, contract, run_id=run_id, replan_fn=replan_fn
-            )
+            drain_pending_lineage(_lineage_sink)
+            try:
+                return self._run_plan(
+                    plan,
+                    contract,
+                    run_id=run_id,
+                    replan_fn=replan_fn,
+                    lineage_recorder=recorder,
+                )
+            finally:
+                recorder.finalize()
 
     def _run_plan(
         self,
@@ -273,6 +306,7 @@ class LoopRunner:
         *,
         run_id: str | None = None,
         replan_fn: ReplanFn | None = None,
+        lineage_recorder: LineageRecorder | None = None,
     ) -> RunResult:
         """run_plan's body (campaign build #9 split it out so the
         public entry can scope the planner attempt sink)."""
@@ -280,6 +314,10 @@ class LoopRunner:
         started = time.monotonic()
         started_at = datetime.now(UTC).isoformat()
         judge = Judge(contract.budget)
+        # Campaign build #29: the defect-lineage recorder run_plan
+        # installed (None for direct callers — every lineage hook
+        # below is then skipped, and the run is exactly as before).
+        lineage = lineage_recorder
         # Track B: the substance critic for this run — injected
         # settings win; otherwise the env decides (the production
         # driver constructs the runner with no critic argument).
@@ -332,6 +370,7 @@ class LoopRunner:
                 escalation=escalation,
                 started=started,
                 started_at=started_at,
+                lineage_recorder=lineage_recorder,
             )
 
         version = 1
@@ -402,6 +441,20 @@ class LoopRunner:
                 plan_id=plan.plan_id,
                 version=version,
             )
+            if lineage is not None:
+                # Campaign build #29: record this plan version's
+                # node -> clause bindings — and, before version 1
+                # executes, the baseline tree the run started from
+                # (version 1's parent). Read-only observation: the
+                # baseline snapshot uses a throwaway target set, so
+                # the loop's own accumulator is untouched.
+                if version == 1:
+                    lineage.note_baseline(
+                        self._snapshot_version_tree(plan, set())
+                    )
+                lineage.plan_written(
+                    version, self._lineage_node_records(plan.nodes)
+                )
             before = {n.id: n.status for n in plan.nodes}
             # Track B (GAN critic): an accepted version's write
             # nodes are measured for substance before they
@@ -453,6 +506,36 @@ class LoopRunner:
                     },
                 }
             )
+            if lineage is not None:
+                # Campaign build #29: this version's execution pass,
+                # per node — the status across the pass, the failure
+                # text, the measurement verdict, and the write
+                # handlers' merged outputs (path, bytes_written).
+                lineage.version_executed(
+                    version,
+                    [
+                        {
+                            "id": n.id,
+                            "status_before": (
+                                before[n.id].value
+                                if n.id in before
+                                else None
+                            ),
+                            "status_after": n.status.value,
+                            "error": n.error,
+                            "verdict": (n.measurement or {}).get(
+                                "verdict"
+                            ),
+                            "exit_code": n.exit_code,
+                            "duration_s": n.duration_s,
+                            "path": (n.inputs or {}).get("path"),
+                            "bytes_written": (n.inputs or {}).get(
+                                "bytes_written"
+                            ),
+                        }
+                        for n in plan.nodes
+                    ],
+                )
 
             # Campaign build #3: the deterministic contract probes
             # run against the tree this version produced — outside
@@ -462,6 +545,22 @@ class LoopRunner:
             # plan with failing probes has NOT met the contract,
             # whatever its own nodes report.
             probe_failures_now = self._run_contract_probes(run_id, plan, version)
+            if lineage is not None:
+                # Campaign build #29: this version's probe results
+                # are the run's diagnoses — the failing records are
+                # the defects every later stage is accountable to.
+                _probe_results = (plan.metadata or {}).get(
+                    PROBE_RESULTS_METADATA_KEY
+                )
+                lineage.diagnosis(
+                    version,
+                    (
+                        _probe_results
+                        if isinstance(_probe_results, list)
+                        else []
+                    ),
+                    probe_failures_now,
+                )
 
             # Campaign build #18: record this version's outcome
             # facts and snapshot its produced files, so the run can
@@ -500,6 +599,13 @@ class LoopRunner:
             snapshot = self._snapshot_version_tree(plan, declared_targets_all)
             if snapshot is not None:
                 version_snapshots[version] = snapshot
+            if lineage is not None:
+                # Campaign build #29: the version as a candidate —
+                # its outcome facts (the rank inputs), its tree, and
+                # its parentage, from the records above.
+                lineage.version_verified(
+                    version, version_outcomes[version], snapshot
+                )
 
             # M4: a node paused at a gate ends this pass — the run waits
             # for a human decision, it does not push through.
@@ -736,6 +842,12 @@ class LoopRunner:
                         conversion_timeout_diagnostics
                     )
                 replan = replan_fn or (lambda b: replan_from_brief(b))
+                # Campaign build #29: which path produced the delta
+                # (the repair seams, the whole-task re-planner, or an
+                # injected replan_fn), recorded for the lineage
+                # record at acceptance/rejection below. Recorder
+                # input only — no loop decision reads it.
+                replan_source: str | None = None
                 new_nodes: list[PlanNode] | None = None
                 # Campaign build #2: the repair seams record WHY
                 # they declined into this list (one structured
@@ -784,6 +896,7 @@ class LoopRunner:
                         plan, brief, declines=repair_declines
                     )
                     if new_nodes is not None:
+                        replan_source = "local_repair"
                         self._log(
                             "loop.replan.local_repair",
                             run_id=run_id,
@@ -812,6 +925,7 @@ class LoopRunner:
                             plan, brief, declines=repair_declines
                         )
                         if new_nodes is not None:
+                            replan_source = "scoped_edit_repair"
                             self._log(
                                 "loop.replan.scoped_edit_repair",
                                 run_id=run_id,
@@ -827,6 +941,11 @@ class LoopRunner:
                                 declines_logged,
                             )
                 if new_nodes is None:
+                    replan_source = (
+                        "injected_replan_fn"
+                        if replan_fn is not None
+                        else "replan_from_brief"
+                    )
                     try:
                         new_nodes = replan(brief)
                     except Exception as exc:  # noqa: BLE001 - re-planner failure escalates
@@ -842,6 +961,16 @@ class LoopRunner:
                     ),
                 )
                 if rejection is not None:
+                    if lineage is not None:
+                        # Campaign build #29: a rejected delta is a
+                        # lineage fact too — the diagnosis was
+                        # answered with a plan the judge refused.
+                        lineage.plan_rejected(
+                            version,
+                            source=replan_source,
+                            rejection=rejection,
+                            repair_declines=repair_declines,
+                        )
                     escalation = f"delta plan rejected: {rejection}"
                     break
                 version += 1
@@ -928,6 +1057,24 @@ class LoopRunner:
                             warning=warning,
                         )
                     judge.repeat_warnings.clear()
+                if lineage is not None:
+                    # Campaign build #29: the accepted delta — its
+                    # path, its nodes' bindings, and the brief's
+                    # write-backs (the planner's coverage claim and
+                    # emission record, next to which the new plan's
+                    # own binding, recorded at the next pass's top,
+                    # is the fact).
+                    lineage.plan_accepted(
+                        version,
+                        source=replan_source,
+                        nodes=self._lineage_node_records(new_nodes),
+                        coverage_writeback=brief.get(
+                            "replan_clause_coverage"
+                        ),
+                        plan_emission=brief.get("plan_emission"),
+                        repair_declines=repair_declines,
+                        seams_bypassed=seams_bypassed,
+                    )
                 plan = build_execution_plan(
                     plan.intent, new_nodes, plan_id=plan.plan_id, metadata=metadata
                 )
@@ -956,6 +1103,7 @@ class LoopRunner:
                 version_probe_results=version_probe_results,
                 version_snapshots=version_snapshots,
                 final_version=version,
+                lineage_recorder=lineage,
             )
         return self._finish_run(
             run_id,
@@ -968,6 +1116,7 @@ class LoopRunner:
             started=started,
             started_at=started_at,
             shipping=shipping,
+            lineage_recorder=lineage_recorder,
         )
 
     def _critic_review(
@@ -1097,6 +1246,7 @@ class LoopRunner:
         started: float,
         started_at: str,
         shipping: dict[str, Any] | None = None,
+        lineage_recorder: LineageRecorder | None = None,
     ) -> RunResult:
         """Evaluate the goal, write the summary, and build the result."""
         measurements = self._run_store.read_measurements(run_id)
@@ -1131,6 +1281,20 @@ class LoopRunner:
             goal_verdict=goal_verdict,
             elapsed_s=round(elapsed_s, 3),
         )
+        if lineage_recorder is not None:
+            # Campaign build #29: assemble the run's lineage record
+            # (lineage.json + lineage.md) from everything the stage
+            # hooks streamed in. Every run that reaches a finish —
+            # terminal, escalated, or planning-failed — lands here.
+            lineage_recorder.finish(
+                shipping=shipping,
+                escalation=escalation,
+                decision_history=decision_history,
+                attempts=attempts,
+                goal_verdict=goal_verdict,
+                goal_detail=goal_detail,
+                plan_versions=version,
+            )
         return RunResult(
             run_id=run_id,
             plan=plan,
@@ -1477,6 +1641,47 @@ class LoopRunner:
 
     # ── Goal evaluation ──────────────────────────────────────────────────
 
+    @staticmethod
+    def _lineage_node_records(
+        nodes: list[PlanNode],
+    ) -> list[dict[str, Any]]:
+        """Per-node lineage facts for one plan version (build #29).
+
+        The node's identity, objective, claw, its clause declaration
+        (implements / verifies — read with the clause layer's own
+        parser), its repair lineage fields (responds_to /
+        differs_by), and whether it carries filled content, with
+        that content's hash — never the content itself. Read-only:
+        this shapes facts the plan already carries, for the
+        recorder.
+        """
+        import hashlib
+
+        records: list[dict[str, Any]] = []
+        for node in nodes:
+            implements, verifies, _error = node_clause_declaration(node)
+            content = (node.inputs or {}).get("content")
+            records.append(
+                {
+                    "id": node.id,
+                    "objective": node.objective,
+                    "assigned_claw": node.assigned_claw,
+                    "implements": implements,
+                    "verifies": verifies,
+                    "responds_to": node.responds_to or None,
+                    "differs_by": node.differs_by or None,
+                    "has_content": isinstance(content, str),
+                    "content_sha256": (
+                        hashlib.sha256(
+                            content.encode("utf-8")
+                        ).hexdigest()
+                        if isinstance(content, str)
+                        else None
+                    ),
+                }
+            )
+        return records
+
     def _snapshot_version_tree(
         self, plan: ExecutionPlan, declared_targets_all: set[str]
     ) -> dict[str, bytes | None] | None:
@@ -1525,6 +1730,7 @@ class LoopRunner:
         version_probe_results: dict[int, list[dict[str, Any]]],
         version_snapshots: dict[int, dict[str, bytes | None]],
         final_version: int,
+        lineage_recorder: LineageRecorder | None = None,
     ) -> dict[str, Any]:
         """Rank the versions, ship the best one's tree, record it.
 
@@ -1613,6 +1819,12 @@ class LoopRunner:
             restored=restored,
             lost_checks=[fact["check"] for fact in lost],
         )
+        if lineage_recorder is not None:
+            # Campaign build #29: the settlement for the lineage
+            # record — the shipped version, the restore, the lost
+            # checks, and every candidate's rank facts, so the
+            # record shows why the winner won.
+            lineage_recorder.shipping_settled(shipping, outcomes)
         return shipping
 
     def _run_contract_probes(

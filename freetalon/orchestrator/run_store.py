@@ -11,6 +11,10 @@ Every run gets a directory Pat can inspect directly::
         memory.jsonl         # experiment records (M2)
         planner_attempts.jsonl  # planner attempts (campaign build #9)
         seam_attempts.jsonl  # repair-seam attempts (campaign build #13)
+        lineage.jsonl        # defect-lineage events (campaign build #29)
+        lineage_prompts/     # exact fill prompts (campaign build #29)
+        lineage.json         # assembled defect lineage (build #29)
+        lineage.md           # rendered lineage table (campaign build #29)
         gates/               # approval requests and decisions (M4)
         summary.md           # human-readable run report
         logs/                # service-level logs, as today
@@ -164,6 +168,58 @@ class RunStore:
         """
         self.run_dir(run_id).mkdir(parents=True, exist_ok=True)
         self._append_jsonl(run_id, "seam_attempts.jsonl", record)
+
+    def append_lineage(self, run_id: str, record: dict[str, Any]) -> None:
+        """Append one defect-lineage event to lineage.jsonl.
+
+        Campaign build #29: the LineageRecorder's stage events
+        (baseline, plan bindings, diagnoses, executions, candidates,
+        shipping, fill records) land here, one JSON object per line,
+        streamed as the run produces them so a crashed run still
+        leaves its partial lineage on disk. The run directory is
+        created if missing, as in append_planner_attempt: the
+        recorder is constructed before create_run runs.
+        """
+        self.run_dir(run_id).mkdir(parents=True, exist_ok=True)
+        self._append_jsonl(run_id, "lineage.jsonl", record)
+
+    def read_lineage(self, run_id: str) -> list[dict[str, Any]]:
+        """Read back all lineage events for a run (empty if none)."""
+        return self._read_jsonl(run_id, "lineage.jsonl")
+
+    def write_lineage_prompt(
+        self, run_id: str, filename: str, prompt_text: str
+    ) -> str:
+        """Save one fill prompt verbatim under lineage_prompts/.
+
+        Campaign build #29: the exact assembled prompt a content
+        fill sent (or was about to send), preserved as its own file
+        so the lineage events can reference it by name and hash
+        instead of embedding plan-sized texts in the JSONL. Returns
+        the path relative to the run directory.
+        """
+        prompts_dir = self.run_dir(run_id) / "lineage_prompts"
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        path = prompts_dir / filename
+        path.write_text(prompt_text, encoding="utf-8")
+        return f"lineage_prompts/{filename}"
+
+    def write_lineage(self, run_id: str, record: dict[str, Any]) -> Path:
+        """Write the assembled per-run lineage record (lineage.json)."""
+        self.run_dir(run_id).mkdir(parents=True, exist_ok=True)
+        path = self.run_dir(run_id) / "lineage.json"
+        path.write_text(
+            json.dumps(record, indent=2, sort_keys=True, default=json_default),
+            encoding="utf-8",
+        )
+        return path
+
+    def write_lineage_table(self, run_id: str, table_md: str) -> Path:
+        """Write the rendered lineage table (lineage.md)."""
+        self.run_dir(run_id).mkdir(parents=True, exist_ok=True)
+        path = self.run_dir(run_id) / "lineage.md"
+        path.write_text(table_md, encoding="utf-8")
+        return path
 
     def read_measurements(self, run_id: str) -> list[dict[str, Any]]:
         """Read back all measurement records for a run (empty list if none)."""
