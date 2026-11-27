@@ -69,18 +69,32 @@ JOBQUEUE_ROUTES = [
 ]
 
 
-def _correct_requester(calls, overrides=None):
+def _defined_pairs(routes):
+    return {
+        (method, path)
+        for path, methods, _tag in routes
+        for method in methods
+        if path is not None
+    }
+
+
+def _correct_requester(calls, overrides=None, defined=None):
     """A scripted requester for a contract-perfect server.
 
-    405 on every known path, 404 on the unknown path, unless a
-    (method, path) override says otherwise. Records every call.
+    405 on every known path's wrong methods, 404 on the unknown
+    path, and the route's own answer (200) on its defined
+    (method, path) pairs — build #34's positive controls sample
+    those. Overrides win. Records every call.
     """
     overrides = overrides or {}
+    defined = defined or set()
 
     def request(name, method, path):
         calls.append((method, path))
         if (method, path) in overrides:
             return (overrides[(method, path)], b""), None
+        if (method, path) in defined:
+            return (200, b""), None
         return ((404 if path == UNKNOWN else 405), b""), None
 
     return request
@@ -89,10 +103,12 @@ def _correct_requester(calls, overrides=None):
 class TestRouteTableUnits(unittest.TestCase):
     """The sweep logic itself, against a scripted requester."""
 
-    def test_pairing_table_correct_server_passes_all_29(self):
+    def test_pairing_table_correct_server_passes_all_33(self):
         calls = []
         flows = _method_matrix_flows(
-            _correct_requester(calls),
+            _correct_requester(
+                calls, defined=_defined_pairs(PAIRING_ROUTES)
+            ),
             routes=PAIRING_ROUTES,
             unknown_path=UNKNOWN,
         )
@@ -100,20 +116,23 @@ class TestRouteTableUnits(unittest.TestCase):
             [name for name, _ok, _d in flows], EXPECTED_PAIRING_MATRIX_FLOWS
         )
         self.assertTrue(all(ok for _name, ok, _d in flows))
-        # Exactly the wrong-method cells were sampled: no
-        # defined (route, method) pair was ever requested.
-        defined = {
-            (method, path)
-            for path, methods, _tag in PAIRING_ROUTES
-            for method in methods
-        }
-        self.assertTrue(defined.isdisjoint(set(calls)))
-        self.assertEqual(len(calls), 29)
+        # The negative sweep samples only wrong-method cells —
+        # never a defined pair. Build #34's positive controls
+        # then sample each defined pair exactly once.
+        defined = _defined_pairs(PAIRING_ROUTES)
+        negative_calls = calls[: len(calls) - len(defined)]
+        self.assertTrue(defined.isdisjoint(set(negative_calls)))
+        self.assertEqual(
+            sorted(calls[len(calls) - len(defined) :]), sorted(defined)
+        )
+        self.assertEqual(len(calls), 33)
 
-    def test_jobqueue_table_correct_server_passes_all_34(self):
+    def test_jobqueue_table_correct_server_passes_all_40(self):
         calls = []
         flows = _method_matrix_flows(
-            _correct_requester(calls),
+            _correct_requester(
+                calls, defined=_defined_pairs(JOBQUEUE_ROUTES)
+            ),
             routes=JOBQUEUE_ROUTES,
             unknown_path=UNKNOWN,
         )
@@ -121,7 +140,13 @@ class TestRouteTableUnits(unittest.TestCase):
             [name for name, _ok, _d in flows], EXPECTED_JOBQUEUE_MATRIX_FLOWS
         )
         self.assertTrue(all(ok for _name, ok, _d in flows))
-        self.assertEqual(len(calls), 34)
+        defined = _defined_pairs(JOBQUEUE_ROUTES)
+        negative_calls = calls[: len(calls) - len(defined)]
+        self.assertTrue(defined.isdisjoint(set(negative_calls)))
+        self.assertEqual(
+            sorted(calls[len(calls) - len(defined) :]), sorted(defined)
+        )
+        self.assertEqual(len(calls), 40)
 
     def test_arm32_cell_get_on_confirm_404_is_caught(self):
         # Arm #32's exact miss, in isolation: the shipped server
@@ -133,6 +158,7 @@ class TestRouteTableUnits(unittest.TestCase):
             _correct_requester(
                 calls,
                 overrides={("GET", "/pairing/SMOKE-0001/confirm"): 404},
+                defined=_defined_pairs(PAIRING_ROUTES),
             ),
             routes=PAIRING_ROUTES,
             unknown_path=UNKNOWN,
@@ -155,7 +181,7 @@ class TestRouteTableUnits(unittest.TestCase):
         ]
         calls = []
         flows = _method_matrix_flows(
-            _correct_requester(calls),
+            _correct_requester(calls, defined=_defined_pairs(routes)),
             routes=routes,
             unknown_path=UNKNOWN,
             blocked_detail="setup: no id minted",
@@ -171,8 +197,10 @@ class TestRouteTableUnits(unittest.TestCase):
             if name in blocked:
                 self.assertEqual(detail, "setup: no id minted")
         # No request was issued for a blocked cell: the calls
-        # are the collection + claim cells only.
-        self.assertEqual(len(calls), 34 - 18)
+        # are the collection + claim cells only, negative and
+        # positive alike (40 cells - 21 blocked: the 18 negative
+        # item-route cells plus their 3 positive controls).
+        self.assertEqual(len(calls), 40 - 21)
         self.assertTrue(all(path is not None for _m, path in calls))
 
 

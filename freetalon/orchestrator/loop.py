@@ -24,6 +24,7 @@ from .contract_clauses import (
     clauses_from_metadata,
     node_clause_declaration,
     probe_failures,
+    probe_flips,
     probe_suspect_map,
     repair_family_key,
     repair_family_scope,
@@ -1786,6 +1787,44 @@ class LoopRunner:
                 continue
         return entries or None
 
+    @staticmethod
+    def _direct_repair_reprobe(
+        clauses: list[dict[str, Any]],
+        root: Path,
+        target: str,
+        baseline: list[dict[str, Any]],
+    ) -> Any:
+        """The post-patch re-probe hook for one target (build #34).
+
+        The closure the executor calls after a patch is written:
+        re-run the contract probes against the patched tree and
+        return the flips — measurements of the target file that
+        were passing in `baseline` and fail (or vanish) now
+        (contract_clauses.probe_flips). The executor's contract
+        is that a non-empty return restores the standing bytes,
+        so the baseline advances only on a clean re-probe: the
+        target's slice is replaced by the fresh measurements,
+        and the next obligation is judged against the tree the
+        retained patches actually left.
+        """
+
+        def _reprobe() -> list[dict[str, Any]]:
+            fresh = run_contract_probes(clauses, str(root))
+            flips = probe_flips(baseline, fresh, target=target)
+            if not flips:
+                baseline[:] = [
+                    record
+                    for record in baseline
+                    if record.get("file") != target
+                ] + [
+                    dict(record)
+                    for record in fresh
+                    if record.get("file") == target
+                ]
+            return flips
+
+        return _reprobe
+
     def _direct_repair_pass(
         self,
         run_id: str,
@@ -1841,6 +1880,15 @@ class LoopRunner:
         names no file keeps build #32's decline, and one with a
         file but no family key executes alone, as in build #32.
 
+        Campaign build #34: an executed obligation whose file
+        the parent version's probe run measured also carries a
+        post-patch re-probe hook (see _direct_repair_reprobe).
+        A patch that flips a passing measurement fails inside
+        the executor and retries there; the candidate registered
+        below is still judged by the same full probe run as
+        before — the re-probe guards the attempt, the verifier
+        still judges the tree.
+
         Returns {"version", "failures"} for a registered
         candidate (failures = the candidate's own probe
         failures), else None.
@@ -1865,6 +1913,16 @@ class LoopRunner:
         all_records = version_probe_results.get(parent_version) or []
         if not all_records:
             all_records = list(failures)
+        # Build #34: the re-probe baseline — the parent version's
+        # full probe results, advanced by the hook factory to
+        # each retained patch's fresh measurements. Clauses ride
+        # the plan metadata (the same frozen list
+        # _run_contract_probes reads); without them there are no
+        # probes to re-run and no hook.
+        clauses = clauses_from_metadata(plan.metadata)
+        reprobe_baseline: list[dict[str, Any]] = [
+            dict(record) for record in all_records
+        ]
         families: dict[tuple[str, str, str], list[str]] = {}
         units: list[list[str]] = []
         for defect_id in sorted(by_defect):
@@ -1920,6 +1978,17 @@ class LoopRunner:
                 if key is not None
                 else None
             )
+            reprobe = (
+                self._direct_repair_reprobe(
+                    clauses, root, target, reprobe_baseline
+                )
+                if clauses
+                and any(
+                    record.get("file") == target
+                    for record in reprobe_baseline
+                )
+                else None
+            )
             outcome = execute_direct_repair_obligation(
                 defect_id=defect_id,
                 record=dict(record),
@@ -1927,6 +1996,7 @@ class LoopRunner:
                 repo_root=root,
                 goal_text=goal_text,
                 scope=scope,
+                reprobe=reprobe,
             )
             if len(member_ids) > 1:
                 family_count += 1

@@ -124,6 +124,35 @@ EXPECTED_JOBQUEUE_MATRIX_FLOWS = (
 )
 
 
+def _control_flows(tag, defined):
+    suffix = "known" if tag == "known" else f"on_{tag}"
+    return [
+        f"positive_control_{method}_{suffix}"
+        for method in _SWEEP_METHODS
+        if method in defined
+    ]
+
+
+# Build #34: the positive controls ride the same expected lists,
+# appended after the sweep in route-table order (one per defined
+# method per route).
+EXPECTED_PAIRING_MATRIX_FLOWS = (
+    EXPECTED_PAIRING_MATRIX_FLOWS
+    + _control_flows("known", {"post"})
+    + _control_flows("list", {"get"})
+    + _control_flows("poll", {"get"})
+    + _control_flows("confirm", {"post"})
+)
+EXPECTED_JOBQUEUE_MATRIX_FLOWS = (
+    EXPECTED_JOBQUEUE_MATRIX_FLOWS
+    + _control_flows("known", {"get", "post"})
+    + _control_flows("claim", {"post"})
+    + _control_flows("item", {"get"})
+    + _control_flows("complete", {"post"})
+    + _control_flows("fail", {"post"})
+)
+
+
 def _matrix_records(results, clause_id="C09-http-api-server-py"):
     return [
         r
@@ -152,12 +181,21 @@ class TestMethodMatrixUnit(unittest.TestCase):
         for method in ("PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"):
             statuses[(method, "/known")] = 405
             statuses[(method, "/unknown")] = 404
+        # Build #34: the positive controls sample the defined
+        # pairs; a correct server answers them with its own
+        # statuses.
+        statuses[("GET", "/known")] = 200
+        statuses[("POST", "/known")] = 201
         flows = _method_matrix_flows(
             self._requester(statuses),
             routes=[("/known", frozenset({"GET", "POST"}), "known")],
             unknown_path="/unknown",
         )
-        self.assertEqual([name for name, _ok, _d in flows], EXPECTED_MATRIX_FLOWS)
+        self.assertEqual(
+            [name for name, _ok, _d in flows],
+            EXPECTED_MATRIX_FLOWS
+            + ["positive_control_get_known", "positive_control_post_known"],
+        )
         self.assertTrue(all(ok for _name, ok, _d in flows))
 
     def test_missing_patch_fails_with_the_501_fact(self):
@@ -165,6 +203,11 @@ class TestMethodMatrixUnit(unittest.TestCase):
         for method in ("PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"):
             statuses[(method, "/known")] = 405
             statuses[(method, "/unknown")] = 404
+        # Build #34: the positive controls sample the defined
+        # pairs; a correct server answers them with its own
+        # statuses.
+        statuses[("GET", "/known")] = 200
+        statuses[("POST", "/known")] = 201
         statuses[("PATCH", "/known")] = 501
         statuses[("PATCH", "/unknown")] = 501
         flows = dict()
@@ -202,6 +245,11 @@ class TestMethodMatrixUnit(unittest.TestCase):
         for method in ("PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"):
             statuses[(method, "/known")] = 405
             statuses[(method, "/unknown")] = 404
+        # Build #34: the positive controls sample the defined
+        # pairs; a correct server answers them with its own
+        # statuses.
+        statuses[("GET", "/known")] = 200
+        statuses[("POST", "/known")] = 201
         statuses[("DELETE", "/known")] = 404
         flows = {
             name: (ok, detail)

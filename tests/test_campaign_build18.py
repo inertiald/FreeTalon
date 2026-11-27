@@ -176,6 +176,19 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json(410, {"code": code, "status": record["status"]})
             return
+        if self.path == "/pairing":
+            # The contract's list route (build #34's positive
+            # control measures it): 200 with the public views.
+            self._json(
+                200,
+                {
+                    "pairings": [
+                        {"code": code, "status": record["status"]}
+                        for code, record in self.records.items()
+                    ]
+                },
+            )
+            return
         self._json(404, {"error": "not found"})
 
     def do_PUT(self):

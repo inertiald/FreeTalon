@@ -145,7 +145,11 @@ class TestUnknownRouteFlow(unittest.TestCase):
             started = time.monotonic()
             results = run_contract_probes(SMOKE_CLAUSES, root)
             elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 20.0)
+            # Deadline (20s) + boot/teardown slack: since build
+            # #34's positive controls joined the probe set, the
+            # hang case saturates the probe's overall deadline
+            # instead of ending early — bounded is the invariant.
+            self.assertLess(elapsed, 22.0)
             flows = _smoke_records(results)
             self.assertEqual(len(flows), 10)
             register = _flow(results, "register")

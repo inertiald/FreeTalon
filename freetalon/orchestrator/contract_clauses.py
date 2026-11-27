@@ -1153,6 +1153,80 @@ def repair_family_scope(
     return scope
 
 
+def probe_flips(
+    baseline_records: list[dict[str, Any]],
+    fresh_records: list[dict[str, Any]],
+    *,
+    target: str,
+) -> list[dict[str, Any]]:
+    """Passing measurements a patch turned failing (build #34).
+
+    The post-patch re-probe comparison for direct repair: for
+    the affected file, every measurement identity — (clause_id,
+    probe, flow), the defect-id formula — that was PASSING in
+    the baseline and is failing, or absent, in the fresh run is
+    a flip: the patch regressed behavior nobody had diagnosed
+    as broken. A measurement failing in the baseline is never a
+    flip (moving it is the repair's whole purpose), and records
+    naming another file are not this patch's blast radius.
+    Projected like repair_family_scope's entries, in baseline
+    (probe-run) order.
+    """
+    fresh_by_key: dict[tuple[str, str, Any], dict[str, Any]] = {}
+    for record in fresh_records:
+        if not isinstance(record, dict) or record.get("file") != target:
+            continue
+        key = (
+            str(record.get("clause_id") or ""),
+            str(record.get("probe") or ""),
+            record.get("flow"),
+        )
+        if key not in fresh_by_key:
+            fresh_by_key[key] = record
+    flips: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, Any]] = set()
+    for record in baseline_records:
+        if not isinstance(record, dict) or record.get("file") != target:
+            continue
+        if not record.get("ok"):
+            continue
+        clause_id = str(record.get("clause_id") or "")
+        probe = str(record.get("probe") or "")
+        flow = record.get("flow")
+        key = (clause_id, probe, flow)
+        if key in seen:
+            continue
+        seen.add(key)
+        fresh = fresh_by_key.get(key)
+        if fresh is not None and fresh.get("ok"):
+            continue
+        defect_id = (
+            f"{clause_id}::{probe}::{flow}"
+            if flow
+            else f"{clause_id}::{probe}"
+        )
+        if fresh is None:
+            detail = (
+                "the measurement no longer exists on the "
+                "patched tree — the probe produced no record "
+                "for it"
+            )
+        else:
+            detail = str(fresh.get("detail") or "")
+        flips.append(
+            {
+                "defect_id": defect_id,
+                "clause_id": clause_id,
+                "probe": probe,
+                "flow": flow if isinstance(flow, str) else None,
+                "ok": False,
+                "detail": detail,
+                "file": target,
+            }
+        )
+    return flips
+
+
 # ── Live probes (campaign build #6) ────────────────────────────────
 #
 # The static probes read the tree; they cannot see behavior that
@@ -1685,6 +1759,47 @@ def _matrix_unknown_cell(request, name, method, path):
     return (name, status == 404, detail)
 
 
+def _matrix_positive_cell(request, name, method, path):
+    """One legitimate-method request against a known path.
+
+    Campaign build #34: the matrix's positive control. The
+    expectation is the route's OWN answer — the status the
+    contract assigns this route x method pair. A bare request
+    earns a correct server's success status on a read route
+    (200) and its contract request/state answer on an action
+    route (400/401/403/409); the cell fails only on the two
+    answers the contract reserves for pairs OUTSIDE the route
+    table — 405 (the wrong-method answer) and 404 (the
+    unknown-route answer). Either one, on a legitimate method,
+    is an over-block: the failure mode the negative-only sweep
+    shipped blind in held-out A run7 (build #33).
+    """
+    outcome, error = request(name, method, path)
+    if error is not None:
+        return (name, False, error)
+    status, _raw = outcome
+    detail = (
+        f"{name}: {method} {path} -> {status} "
+        f"({name}_status: expected the route's own answer, "
+        f"got {status} — a legitimate method on a known route "
+        "is answered by the route; 405 belongs to a wrong "
+        "method and 404 to an unknown route"
+    )
+    if status == 405:
+        detail += (
+            "; the legitimate method was refused with the "
+            "wrong-method answer — an over-block, the failure "
+            "this control exists to catch"
+        )
+    elif status == 404:
+        detail += (
+            "; the known route was answered as unknown — a "
+            "blanket not-found over the route table"
+        )
+    detail += ")"
+    return (name, status not in (404, 405), detail)
+
+
 def _method_matrix_flows(
     request,
     *,
@@ -1705,6 +1820,14 @@ def _method_matrix_flows(
     path is None (its instantiation id could not be minted) emits
     its cells as failures carrying `blocked_detail` instead of
     issuing requests. Each entry: (flow, ok, detail).
+
+    Campaign build #34 appends the positive controls after the
+    sweep: for each route, one cell per method the route
+    DEFINES (positive_control_<method>_known on the primary
+    route, positive_control_<method>_on_<tag> elsewhere),
+    derived from the same route table — a route whose path is
+    None fails its controls with `blocked_detail`, exactly as
+    its sweep cells do.
     """
     flows: list[tuple[str, bool, str]] = []
     primary_path = routes[0][0]
@@ -1742,6 +1865,25 @@ def _method_matrix_flows(
             else:
                 flows.append(_matrix_known_cell(request, name, method, path))
                 emitted.add((path, method))
+    # Campaign build #34: the positive controls (see the
+    # docstring). The sweep above is negative-only — it proves
+    # wrong methods are refused and cannot see a server that
+    # refuses everything; these cells prove the defined methods
+    # are answered.
+    for path, defined, tag in routes:
+        for method in _CLOSED_METHODS:
+            if method not in defined:
+                continue
+            if tag == "known":
+                name = f"positive_control_{method.lower()}_known"
+            else:
+                name = f"positive_control_{method.lower()}_on_{tag}"
+            if path is None:
+                flows.append((name, False, blocked_detail or ""))
+            else:
+                flows.append(
+                    _matrix_positive_cell(request, name, method, path)
+                )
     return flows
 
 

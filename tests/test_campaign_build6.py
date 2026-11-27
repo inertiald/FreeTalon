@@ -178,6 +178,19 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json(410, {"code": code, "status": record["status"]})
             return
+        if self.path == "/pairing":
+            # Build #34: the operator list route the contract's
+            # route table declares. The matrix's positive
+            # controls sample it; a correct server answers it
+            # (production answers 200 with the operator token,
+            # 401 without — the fixture, auth-free throughout,
+            # answers 200 with the public views).
+            views = [
+                {"code": code, "status": record["status"]}
+                for code, record in self.records.items()
+            ]
+            self._json(200, {"records": views})
+            return
         self._json(404, {"error": "not found"})
 
     def do_PUT(self):
@@ -394,8 +407,14 @@ class TestPairingSmokeProbe(unittest.TestCase):
             results = run_contract_probes(SMOKE_CLAUSES, root)
             elapsed = time.monotonic() - started
             # The probe's hard bound: it reported failures, it did
-            # not stall the caller.
-            self.assertLess(elapsed, 20.0)
+            # not stall the caller. The bound is the probe's own
+            # overall deadline (20s) plus boot/teardown slack:
+            # since build #34 the probe set includes the positive
+            # controls, so against a server that hangs on every
+            # request the run now saturates the deadline instead
+            # of ending early — the invariant is that it stays
+            # bounded by the deadline, not that it beats it.
+            self.assertLess(elapsed, 22.0)
             flows = _smoke_records(results)
             register = [r for r in flows if r["detail"].startswith("register:")]
             confirm = [r for r in flows if r["detail"].startswith("confirm:")]

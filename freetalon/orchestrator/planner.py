@@ -15506,6 +15506,35 @@ def _direct_repair_apply_retry_block(
     return "\n".join(lines)
 
 
+def _direct_repair_flip_errors(
+    flips: list[dict[str, Any]], target: str
+) -> list[str]:
+    """The failed-attempt sentences for a re-probe flip (build #34).
+
+    The patch applied, but the post-patch re-probe found it
+    regressed measurement(s) that were passing on the standing
+    tree — the attempt is refused, and the flips are named, one
+    sentence each, so the retry aims at the regression as well
+    as the defect. A repair that breaks passing behavior is a
+    failed attempt exactly as a patch that changes nothing is.
+    """
+    errors = [
+        "the repair patch applied, but the post-patch re-probe "
+        "refused it: it regressed measurement(s) that were "
+        f"passing on {target} before the patch:"
+    ]
+    for entry in flips:
+        errors.append(
+            f"  - regressed: defect {entry.get('defect_id')} — "
+            f"{entry.get('detail') or 'the measurement now fails'}"
+        )
+    errors.append(
+        "Return edits that fix the defect AND keep every "
+        "regressed measurement passing."
+    )
+    return errors
+
+
 def execute_direct_repair_obligation(
     *,
     defect_id: str,
@@ -15515,6 +15544,7 @@ def execute_direct_repair_obligation(
     goal_text: str | None,
     settings: LLMSettings | None = None,
     scope: list[dict[str, Any]] | None = None,
+    reprobe: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Execute one direct repair obligation (campaign build #32).
 
@@ -15537,6 +15567,17 @@ def execute_direct_repair_obligation(
     included. A multi-measurement scope renders the family form
     of the prompt and is reported on the outcome ("family",
     "scope"); a singleton or absent scope is build #32 exactly.
+
+    Build #34: ``reprobe``, when the loop supplies it, is called
+    after an applied patch is written and before the attempt is
+    accepted. It re-runs the standing measurement set against
+    the patched tree and returns the flips — measurements that
+    were passing and now fail (contract_clauses.probe_flips).
+    A flip makes the attempt a FAILED one: the standing bytes
+    are restored, the flips are named in the retry block and on
+    the outcome ("reprobe_flips"), and the obligation retries
+    inside the same budget. No hook, no re-probe — build #33
+    exactly.
     """
     outcome: dict[str, Any] = {
         "defect_id": defect_id,
@@ -15563,6 +15604,7 @@ def execute_direct_repair_obligation(
             settings=settings,
             outcome=outcome,
             scope=scope,
+            reprobe=reprobe,
         )
     except Exception as exc:  # noqa: BLE001 — a seam never fails a run
         if outcome["status"] == "declined" and outcome["reason"] is None:
@@ -15583,6 +15625,7 @@ def _execute_direct_repair_obligation(
     settings: LLMSettings | None,
     outcome: dict[str, Any],
     scope: list[dict[str, Any]] | None = None,
+    reprobe: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> None:
     root = Path(repo_root)
     node_id = _direct_repair_node_id(defect_id)
@@ -15811,6 +15854,82 @@ def _execute_direct_repair_obligation(
                 "cannot succeed"
             )
             return
+        # Campaign build #34: the post-patch re-probe. The patch
+        # is on disk; before the attempt may be accepted, the
+        # loop's hook re-measures the tree. A flip — a passing
+        # measurement the patch turned failing — refuses the
+        # attempt: restore the standing bytes, record the
+        # rejection with the flips named, and spend the next
+        # attempt on a patch that fixes the defect without
+        # breaking what was green.
+        if reprobe is not None:
+            try:
+                flips = [
+                    dict(entry) for entry in (reprobe() or [])
+                ]
+            except Exception as exc:  # noqa: BLE001 — a seam
+                # never fails a run; an un-runnable re-probe is
+                # judged as a flip, not waved through.
+                flips = [
+                    {
+                        "defect_id": "reprobe",
+                        "detail": (
+                            "the post-patch re-probe could not "
+                            f"run: {type(exc).__name__}: {exc}"
+                        ),
+                    }
+                ]
+            if flips:
+                try:
+                    resolved.write_bytes(standing.encode("utf-8"))
+                except OSError as exc:
+                    attempt_record["errors"] = [
+                        "the flipped patch could not be rolled "
+                        f"back on {target}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ]
+                    outcome["status"] = "exhausted"
+                    outcome["detail"] = (
+                        "a patch that regressed a passing "
+                        "measurement could not be rolled back; "
+                        "the tree may hold the flipped patch"
+                    )
+                    return
+                flip_errors = _direct_repair_flip_errors(flips, target)
+                attempt_record["outcome"] = "rejected"
+                attempt_record["errors"] = flip_errors
+                attempt_record["flips"] = [
+                    str(entry.get("defect_id")) for entry in flips
+                ]
+                outcome.setdefault("reprobe_flips", []).extend(flips)
+                _record_planner_attempt(
+                    phase="direct_repair",
+                    attempt=attempt,
+                    outcome="rejected",
+                    response_text=response_text,
+                    errors=flip_errors,
+                    node_id=node_id,
+                    target=target,
+                    intent="scoped_edits",
+                )
+                record_fill_outcome(
+                    phase="direct_repair",
+                    attempt=attempt,
+                    node_id=node_id,
+                    target=target,
+                    intent="scoped_edits",
+                    outcome="rejected",
+                    candidate_inputs={"edits": fields.get("edits")},
+                    existing_source=standing,
+                    errors=flip_errors,
+                )
+                errors_block = _direct_repair_apply_retry_block(
+                    flip_errors,
+                    defect_id=defect_id,
+                    record=record,
+                    target=target,
+                )
+                continue
         after_sha = hashlib.sha256(
             new_content.encode("utf-8")
         ).hexdigest()
@@ -18052,7 +18171,19 @@ def _scoped_edit_targets(
         return decline(
             "no_failing_tests", "the brief names no failing tests"
         )
-    if len(failing) > _SUSPECT_TEST_CAP:
+    if len(failing) > _SUSPECT_TEST_CAP and any(
+        test not in suspect_map for test in failing
+    ):
+        # The cap guards against a suspect map computed over a
+        # capped prefix of the failing tests (partial evidence).
+        # It bites only when the map actually is partial: a map
+        # that covers every failing entry is complete evidence
+        # at any count. Build #34: probe-derived entries (one per
+        # failed flow, all naming the same produced file via
+        # probe_suspect_map) arrive with a complete map by
+        # construction, and the enlarged probe set (positive
+        # controls) pushed a single-file failure past the raw
+        # count — the seam declined on complete evidence.
         return decline(
             "suspect_cap_exceeded",
             f"{len(failing)} failing tests exceed the suspect cap "

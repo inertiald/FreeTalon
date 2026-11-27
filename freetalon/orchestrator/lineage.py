@@ -698,6 +698,18 @@ class LineageRecorder:
                     "family": obligation.get("family"),
                     "family_primary": obligation.get("family_primary"),
                     "scope_measured": len(obligation.get("scope") or []),
+                    # Build #34: the post-patch re-probe flips
+                    # this obligation's attempts produced — the
+                    # defect ids of the passing measurements its
+                    # patches regressed before one was accepted
+                    # (or the budget ran out).
+                    "reprobe_flips": [
+                        str(entry.get("defect_id"))
+                        for entry in (
+                            obligation.get("reprobe_flips") or []
+                        )
+                        if isinstance(entry, dict)
+                    ],
                 }
             self._append(event)
 
@@ -1171,6 +1183,17 @@ def render_lineage_table(record: dict[str, Any]) -> str:
                         f"{len(obligation.get('scope') or [])} "
                         f"measured — primary "
                         f"{obligation.get('family_primary')}]"
+                    )
+                flips = obligation.get("reprobe_flips") or []
+                if flips:
+                    line += (
+                        " [re-probe flips: "
+                        + ", ".join(
+                            str(entry.get("defect_id"))
+                            for entry in flips
+                            if isinstance(entry, dict)
+                        )
+                        + "]"
                     )
                 lines.append(line)
     lines.append("")
