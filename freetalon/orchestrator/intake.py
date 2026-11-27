@@ -265,6 +265,60 @@ def parse_json_object(raw_text: str) -> dict[str, Any]:
     )
 
 
+def json_truncation_diagnosis(raw_text: str) -> str | None:
+    """Why ``raw_text`` reads as a TRUNCATED JSON document, or None.
+
+    Campaign build #31: the planner's parse failure used to be a
+    single undifferentiated "not valid JSON", but arm #39's three
+    rejected re-plan skeletons were a different failure wearing
+    that label — each was cut off mid-document at the context
+    wall (the Ollama log shows the slot stopping at the window
+    edge, truncated=1, on all three). A truncated reply is an
+    unfinished PREFIX of a JSON document: scanned with string and
+    bracket state, it ends inside a string or with brackets still
+    open. Malformed-but-complete text (balanced, with its defect
+    mid-document) is not truncation and returns None, as does
+    anything that parses, anything fenced the usual way that
+    parses after extraction, and anything not starting with "{"
+    (prose is a shape failure, never a length failure). The scan
+    is deliberately conservative: it can only ever relabel a
+    rejection the parse already made, never accept anything.
+    """
+    candidate = _extract_json_candidate(raw_text)
+    if not candidate.startswith("{"):
+        return None
+    try:
+        json.loads(candidate)
+        return None
+    except json.JSONDecodeError:
+        pass
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in candidate:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+            if depth < 0:
+                return None
+    if in_string:
+        return "the text ends inside a string"
+    if depth > 0:
+        return f"the text ends with {depth} bracket(s) still open"
+    return None
+
+
 def sanitize_llm_output(raw_text: str) -> str:
     """Clean raw SentencePiece UNK_BYTE token artifacts output by Gemma models."""
     # Same two-pass decode as the planner's copy (see planner.py):

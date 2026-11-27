@@ -51,6 +51,7 @@ from .intake import (
     LLMResponseError,
     LLMSettings,
     call_llm,
+    json_truncation_diagnosis,
     parse_json_object,
 )
 from .repo_index import (
@@ -1412,7 +1413,29 @@ def parse_planner_response(
         raise _numbered_rejection(
             all_records, suffix=f"\n{_NODE_SHAPE_EXAMPLE}"
         )
-    payload = parse_json_object(raw_text)
+    try:
+        payload = parse_json_object(raw_text)
+    except LLMResponseError:
+        # Campaign build #31: a reply cut off at the generation /
+        # context limit is a LENGTH failure, not a shape failure,
+        # and the repair loop steers off the distinction — so when
+        # the truncation diagnosis holds, the bare parse error is
+        # replaced by a structured rejection naming the cause.
+        # Any other parse failure keeps the bare error exactly as
+        # before (its consumers, the contract re-ask among them,
+        # record it as parse's own behavior).
+        truncation = json_truncation_diagnosis(raw_text)
+        if truncation is None:
+            raise
+        raise _single_error_rejection(
+            "response_truncated",
+            "Planner response was not valid JSON — the output was "
+            f"truncated: {truncation}, at {len(raw_text)} characters. "
+            "The generation stopped before the JSON object completed "
+            "(the reply hit the output/context limit), so this is a "
+            "length failure, not a shape failure.",
+            STAGE_SCHEMA,
+        )
     if not isinstance(payload, dict):
         raise _single_error_rejection(
             "not_json_object",
@@ -11929,12 +11952,26 @@ def _rejection_signature(
             text = node_payload(view)
             if text is not None:
                 payloads[view.id] = normalize_payload(text)
+    def _payload_component(record: PlanError) -> str | None:
+        if record.node_id:
+            return payloads.get(record.node_id)
+        if record.code == "response_truncated":
+            # Campaign build #31: a truncated output never parses,
+            # so no node payload can be read from it; key the record
+            # on the text itself. Two DIFFERENT truncated replies
+            # are then different signatures (this function's own
+            # principle), so the stuck detector does not call
+            # context exhaustion a repeated defect — the repair
+            # budget, not the detector, ends such a call, and the
+            # truncation error itself escalates. The identical
+            # reply twice still keys identically, as it should.
+            return hashlib.sha256(
+                response_text.encode("utf-8")
+            ).hexdigest()
+        return None
+
     return frozenset(
-        (
-            record.code,
-            record.node_id,
-            payloads.get(record.node_id) if record.node_id else None,
-        )
+        (record.code, record.node_id, _payload_component(record))
         for record in records
     )
 
@@ -12872,6 +12909,61 @@ def _record_seam_attempt(
             )
 
 
+def _truncation_steering_block(
+    response_text: str, truncation_count: int
+) -> str:
+    """The repair block after a truncated planner reply (build #31).
+
+    Arm #39's re-plan died on three truncated skeletons: the
+    re-plan prompt measured ~23K tokens against a 24,576-token
+    window, and the ordinary repair prompt — the full original
+    prompt PLUS the rejection apparatus — handed each retry
+    strictly less generation room than the attempt before (the
+    Ollama slot record: 1,570, then 212, then 73 tokens). A
+    repair that grows the prompt cannot fix a failure the
+    prompt's size caused. This block is the whole of the repair
+    apparatus for such a retry (the caller empties the other
+    blocks): it tells the model the truth about what happened —
+    a cut-off is not a content rejection — and names the only
+    currency the retry has, compactness, with a character budget
+    that tightens on a second truncation. The compactness must
+    come from prose and node count, never from the declarations
+    the validators judge (arm #36's lesson: a repair that drops
+    the clause mapping to save space trades one rejection for
+    another).
+    """
+    lines = [
+        "TRUNCATION — READ THIS FIRST: your previous reply was not "
+        "rejected for its content. It was CUT OFF mid-JSON at "
+        f"{len(response_text)} characters: the planning prompt "
+        "nearly fills the context window, so a reply has far less "
+        "room than the prompt's size suggests, and the reply hit "
+        "that limit before the JSON object closed.",
+        "Emit the SAME plan in a much more compact form:",
+        "- Merge read/inspect steps into the node that uses them, "
+        "or into a single inspection node — do not give every file "
+        "its own node.",
+        "- One short sentence per objective; the shortest command "
+        "that does the job; no repeated explanation anywhere.",
+        "- Keep EVERY required node field and every clause "
+        "declaration (inputs.clauses) — compactness must come from "
+        "prose and node count, never from dropping declarations.",
+        "- The skeleton rules are unchanged: no file contents in "
+        "the skeleton; payloads are filled separately, one node at "
+        "a time.",
+    ]
+    if truncation_count >= 2:
+        lines.append(
+            "This is the SECOND cut-off reply in this planning "
+            "call. Halve it again: keep the WHOLE reply under "
+            "3,000 characters — fewer nodes, terse fields, "
+            "nothing else."
+        )
+    else:
+        lines.append("Keep the WHOLE reply under 4,000 characters.")
+    return "\n".join(lines) + "\n"
+
+
 def _call_llm_with_repair(
     system_prompt: str,
     user_prompt: str,
@@ -13062,6 +13154,19 @@ def _call_llm_with_repair(
     arm #36's third attempt regressed the declaration shape its
     second attempt had held, because the re-ask carried only the
     latest error deltas. Clauses-free calls are unchanged.
+
+    Campaign build #31: a rejection carrying the structured
+    response_truncated code (parse's diagnosis of a reply cut off
+    mid-JSON — arm #39's re-plan died on three, each retry handed
+    strictly less generation room than the last) is repaired with
+    a COMPACT prompt: the original prompt plus the truncation
+    block, with the growth blocks (contract/clauses re-renders,
+    steering, anchoring) emptied, because they spend the context
+    room whose exhaustion caused the failure; the block escalates
+    its compactness demand on a second truncation in the same
+    call. Every other rejection builds its prompt exactly as
+    before, and the budget accounting is unchanged — a truncation
+    spends a repair like any other real rejection.
     """
     # Retry #22: derive the effective settings once, before the loop,
     # so every call in this planning call (initial + repairs) gets
@@ -13137,6 +13242,10 @@ def _call_llm_with_repair(
             rejected_approaches.append(seeded)
     spent_repair = False
     contract_reask_done = False
+    # Campaign build #31: attempts in this call whose reply was
+    # cut off mid-JSON; the truncation block escalates on the
+    # second (see _truncation_steering_block).
+    truncation_count = 0
     # Campaign build #4: per-attempt plan-shape facts for the
     # anchoring block (see the section above this function). One
     # entry per rejected attempt, in order; the block is rebuilt
@@ -13479,6 +13588,42 @@ def _call_llm_with_repair(
                     )
                 else:
                     clauses_block = format_clauses_block(clauses) + "\n"
+            # Campaign build #31: after a TRUNCATION rejection
+            # the retry prompt is rebuilt compact — the growth
+            # blocks are emptied (they spend the context room
+            # whose exhaustion caused the failure) and the
+            # previous-output lines tell the truth about a cut-off
+            # reply instead of describing it as invalid JSON or as
+            # dropped fields. Any other rejection leaves every
+            # block exactly as computed above.
+            if "response_truncated" in error_codes:
+                truncation_count += 1
+                truncation_block = _truncation_steering_block(
+                    response_text, truncation_count
+                )
+                forbidden_block = ""
+                steering_block = ""
+                extension_block = ""
+                materialization_block = ""
+                existence_block = ""
+                anchoring_block = ""
+                skeleton_block = ""
+                contract_block = ""
+                clauses_block = ""
+                previous_output_line = (
+                    "Previous output: a JSON document cut off "
+                    "before completion — see the rejection above.\n"
+                )
+                dropped_fields_line = ""
+            else:
+                truncation_block = ""
+                previous_output_line = (
+                    "Previous output: "
+                    f"{_describe_failed_output(response_text)}\n"
+                )
+                dropped_fields_line = _dropped_fields_note(
+                    prev_response_text, response_text
+                )
             prompt = (
                 f"{user_prompt}\n\n"
                 "Your previous output was REJECTED. Do not repeat it.\n"
@@ -13486,8 +13631,9 @@ def _call_llm_with_repair(
                 f"{contract_block}"
                 f"{clauses_block}"
                 f"Rejection reason: {exc}\n"
-                f"Previous output: {_describe_failed_output(response_text)}\n"
-                f"{_dropped_fields_note(prev_response_text, response_text)}"
+                f"{previous_output_line}"
+                f"{dropped_fields_line}"
+                f"{truncation_block}"
                 f"{forbidden_block}"
                 f"{steering_block}"
                 f"{extension_block}"
@@ -14787,6 +14933,79 @@ def _fill_node_payload(
     )
 
 
+def _standing_source_for(
+    target: str,
+    prior_dicts: list[dict[str, Any]],
+    root: Path,
+) -> str | None:
+    """The content ``target`` stands at, given a plan's earlier writes.
+
+    The last earlier node dict that wrote ``target`` with string
+    content wins; otherwise the file on disk; otherwise None.
+    This is the lookup _fill_plan_contents has always done inline
+    for a node being filled (campaign build #31 factors it out so
+    the pre-filled branch can ask the same question of a node that
+    arrived carrying its content).
+    """
+    source: str | None = None
+    for prior in prior_dicts:
+        prior_inputs = prior.get("inputs") or {}
+        prior_target = prior_inputs.get("file_path") or prior_inputs.get(
+            "path"
+        )
+        if prior_target == target and isinstance(
+            prior_inputs.get("content"), str
+        ):
+            source = prior_inputs["content"]
+    if source is None:
+        try:
+            source = _resolve_plan_target(target, root).read_text(
+                encoding="utf-8"
+            )
+        except OSError:
+            source = None
+    return source
+
+
+def _prefilled_reroute_standing(
+    node: PlanNode,
+    prior_dicts: list[dict[str, Any]],
+    root: Path,
+    attempt_phase: str,
+) -> str | None:
+    """The standing source when ``node`` is a rerouted pre-fill, else None.
+
+    Campaign build #31: a node that arrived carrying its content
+    (the legacy single-shot shape) is rerouted through the fill
+    path when build #30's repair predicate holds for it and the
+    carried content is byte-identical to the file as it stands —
+    such a node has not repaired anything, and the patch-form /
+    no-change discipline of a repair fill is exactly what it must
+    meet. The declared intent defaults to "whole_file" when the
+    node declares none: a carried content string IS a whole-file
+    payload, whatever the (absent) declaration says. Changed
+    pre-filled content is not rerouted — it was judged whole at
+    the skeleton phase and stands as before.
+    """
+    inputs = node.inputs or {}
+    content = inputs.get("content")
+    if not isinstance(content, str):
+        return None
+    declared = inputs.get("content_intent")
+    intent = (
+        str(declared)
+        if isinstance(declared, str) and declared.strip()
+        else "whole_file"
+    )
+    target = _node_write_target(node) or ""
+    standing = _standing_source_for(target, prior_dicts, root)
+    if standing is None or content != standing:
+        return None
+    if not _is_repair_patch_fill(node, intent, standing, attempt_phase):
+        return None
+    return standing
+
+
 def _fill_plan_contents(
     nodes: list[PlanNode],
     *,
@@ -14797,16 +15016,28 @@ def _fill_plan_contents(
     spec_section: str,
     inventory_section: str,
     attempt_phase: str = "content_fill",
-) -> tuple[list[dict[str, Any]], dict[str, int], list[str]] | None:
+) -> tuple[list[dict[str, Any]], dict[str, int], list[str], list[str]] | None:
     """Phase 2: fill every content-less write node of a skeleton.
 
-    Returns None when no node needs filling (the plan was emitted
-    pre-filled, the legacy single-shot shape — assembly is then
-    unnecessary and the skeleton nodes stand as accepted). Otherwise
-    returns (filled raw node dicts for assembly, per-node content
-    attempt counts, pre-filled node ids). Nodes fill in skeleton
-    (topological) order, so an edit node sees the filled content of
-    every earlier write to its target.
+    Returns None when no node needs filling and no pre-filled
+    node needs rerouting (the plan was emitted pre-filled, the
+    legacy single-shot shape — assembly is then unnecessary and
+    the skeleton nodes stand as accepted). Otherwise returns
+    (filled raw node dicts for assembly, per-node content
+    attempt counts, pre-filled node ids, rerouted node ids).
+    Nodes fill in skeleton (topological) order, so an edit node
+    sees the filled content of every earlier write to its target.
+
+    Campaign build #31: a pre-filled node that build #30's
+    repair predicate convicts — a re-plan repair node whose
+    carried content is byte-identical to the file as it stands
+    (see _prefilled_reroute_standing) — does NOT stand as
+    pre-filled: it is rerouted through the fill below, where the
+    patch form and the no-change failed-attempt rule apply, and
+    its id is returned among the rerouted ids so the caller's
+    emission record says so. Changed pre-filled content, and
+    every pre-filled node of an initial plan, stand exactly as
+    before.
 
     Campaign build #9: this helper is the ONE fill implementation
     for both planning calls — plan_task_intent (initial plans) and
@@ -14815,14 +15046,6 @@ def _fill_plan_contents(
     are recorded under. There is no second fill path for the
     re-plan to drift from.
     """
-    pending = [
-        node
-        for node in nodes
-        if (node.assigned_claw or "") in ("scaffold", "file_writer")
-        and not isinstance((node.inputs or {}).get("content"), str)
-    ]
-    if not pending:
-        return None
     effective = _content_fill_settings(settings)
     skeleton_json = json.dumps(
         [
@@ -14843,6 +15066,7 @@ def _fill_plan_contents(
     filled_dicts: list[dict[str, Any]] = []
     attempts: dict[str, int] = {}
     prefilled: list[str] = []
+    rerouted: list[str] = []
     root = resolve_repo_root(repo_root)
     # Campaign build #20: the whole skeleton's written paths travel
     # with each fill, so the per-node validation judges the plan
@@ -14859,32 +15083,50 @@ def _fill_plan_contents(
             continue
         inputs = node.inputs or {}
         if isinstance(inputs.get("content"), str):
-            raw_inputs = dict(raw.get("inputs") or {})
-            raw_inputs.pop("content_intent", None)
-            raw["inputs"] = raw_inputs
-            prefilled.append(node.id)
-            filled_dicts.append(raw)
-            continue
-        intent = str(inputs.get("content_intent"))
-        target = _node_write_target(node) or ""
+            # Campaign build #31: a pre-filled REPAIR node whose
+            # content is byte-identical to the file as it stands
+            # has not repaired anything — it is rerouted through
+            # the fill below (patch form; a no-change attempt
+            # fails) instead of standing as pre-filled. Changed
+            # pre-filled content stands exactly as before: it was
+            # judged whole at the skeleton phase.
+            if (
+                _prefilled_reroute_standing(
+                    node, filled_dicts, root, attempt_phase
+                )
+                is None
+            ):
+                raw_inputs = dict(raw.get("inputs") or {})
+                raw_inputs.pop("content_intent", None)
+                raw["inputs"] = raw_inputs
+                prefilled.append(node.id)
+                filled_dicts.append(raw)
+                continue
+            rerouted.append(node.id)
+            # The fill builds its candidate from the node's own
+            # dict and updates the inputs with the fill's fields,
+            # so the carried payload must go: the rerouted node is
+            # presented to the fill exactly as a content-less
+            # skeleton node would be.
+            fill_inputs = dict(inputs)
+            fill_inputs.pop("content", None)
+            fill_inputs.pop("edits", None)
+            node = node.model_copy(update={"inputs": fill_inputs})
+            declared = inputs.get("content_intent")
+            intent = (
+                str(declared)
+                if isinstance(declared, str) and declared.strip()
+                else "whole_file"
+            )
+            target = _node_write_target(node) or ""
+        else:
+            intent = str(inputs.get("content_intent"))
+            target = _node_write_target(node) or ""
         existing_source: str | None = None
         if intent in ("edit", "whole_file"):
-            for prior in filled_dicts:
-                prior_inputs = prior.get("inputs") or {}
-                prior_target = prior_inputs.get(
-                    "file_path"
-                ) or prior_inputs.get("path")
-                if prior_target == target and isinstance(
-                    prior_inputs.get("content"), str
-                ):
-                    existing_source = prior_inputs["content"]
-            if existing_source is None:
-                try:
-                    existing_source = _resolve_plan_target(
-                        target, root
-                    ).read_text(encoding="utf-8")
-                except OSError:
-                    existing_source = None
+            existing_source = _standing_source_for(
+                target, filled_dicts, root
+            )
         candidate, used = _fill_node_payload(
             node,
             intent,
@@ -14903,7 +15145,13 @@ def _fill_plan_contents(
         )
         attempts[node.id] = used
         filled_dicts.append(candidate)
-    return filled_dicts, attempts, prefilled
+    if not attempts:
+        # Nothing was filled and nothing was rerouted: the plan
+        # was emitted fully pre-filled (or carries no write nodes
+        # at all) — the caller's signal to skip assembly, exactly
+        # what the pre-build-#31 early return said.
+        return None
+    return filled_dicts, attempts, prefilled, rerouted
 
 
 def _no_change_node_ids(filled_dicts: list[dict[str, Any]]) -> list[str]:
@@ -15294,7 +15542,12 @@ def _plan_task_intent(
         attempt_phase="content_fill",
     )
     if filled is not None:
-        filled_dicts, fill_attempts, prefilled_ids = filled
+        (
+            filled_dicts,
+            fill_attempts,
+            prefilled_ids,
+            prefilled_rerouted_ids,
+        ) = filled
         assembled_nodes, assembled_metadata = parse_planner_response(
             json.dumps({"nodes": filled_dicts, "metadata": {}}),
             goal_text=intent.goal,
@@ -15314,6 +15567,11 @@ def _plan_task_intent(
             "content_attempts": fill_attempts,
             "prefilled": prefilled_ids,
         }
+        if prefilled_rerouted_ids:
+            # Campaign build #31: never non-empty on this path
+            # (the reroute requires the re-plan phase); stamped
+            # uniformly so both callers' records share one shape.
+            emission["prefilled_rerouted"] = prefilled_rerouted_ids
         no_change_ids = _no_change_node_ids(filled_dicts)
         if no_change_ids:
             emission["no_change_nodes"] = no_change_ids
@@ -15984,7 +16242,12 @@ def _replan_from_brief(
     # they do for the initial planner (build #5): a skeleton has
     # no contents for them to judge. A delta the model emitted
     # pre-filled needs neither step — its nodes were judged whole
-    # at the skeleton phase.
+    # at the skeleton phase. (Build #31 exception: a pre-filled
+    # REPAIR node whose carried content is byte-identical to the
+    # standing file is rerouted through the fill inside
+    # _fill_plan_contents and DOES take both steps — standing
+    # unchanged is the one pre-filled shape that was never a
+    # repair at all.)
     filled = _fill_plan_contents(
         nodes,
         settings=settings,
@@ -15996,7 +16259,12 @@ def _replan_from_brief(
         attempt_phase="replan_content_fill",
     )
     if filled is not None:
-        filled_dicts, fill_attempts, prefilled_ids = filled
+        (
+            filled_dicts,
+            fill_attempts,
+            prefilled_ids,
+            prefilled_rerouted_ids,
+        ) = filled
         assembled_nodes, _assembled_metadata = parse_planner_response(
             json.dumps({"nodes": filled_dicts, "metadata": {}}),
             goal_text=_goal_text_from_brief(brief),
@@ -16015,6 +16283,13 @@ def _replan_from_brief(
             "content_attempts": fill_attempts,
             "prefilled": prefilled_ids,
         }
+        if prefilled_rerouted_ids:
+            # Campaign build #31: pre-filled repair nodes this
+            # delta rerouted through the fill (byte-identical
+            # carried content — see _prefilled_reroute_standing).
+            replan_emission["prefilled_rerouted"] = (
+                prefilled_rerouted_ids
+            )
         replan_no_change_ids = _no_change_node_ids(filled_dicts)
         if replan_no_change_ids:
             replan_emission["no_change_nodes"] = replan_no_change_ids
