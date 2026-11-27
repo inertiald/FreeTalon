@@ -327,6 +327,11 @@ class LineageRecorder:
         self._executions: dict[int, list[dict[str, Any]]] = {}
         # version -> candidate record (see version_verified()).
         self._candidates: dict[int, dict[str, Any]] = {}
+        # Campaign build #32: direct-repair obligation passes
+        # (see repair_obligations()) — the raw pass events and
+        # a per-defect summary for the assembled record.
+        self._obligations: list[dict[str, Any]] = []
+        self._obligation_by_defect: dict[str, dict[str, Any]] = {}
         # Fill records with their attributed plan version (or None).
         self._fills: list[dict[str, Any]] = []
         # Fill records not yet attributed to a plan version.
@@ -637,6 +642,58 @@ class LineageRecorder:
             self._append({"kind": "candidate", **candidate})
 
         self._guarded("candidate", _record)
+
+    def repair_obligations(
+        self,
+        version: int | None,
+        *,
+        parent_version: int,
+        obligations: list[dict[str, Any]],
+    ) -> None:
+        """Record one direct-repair pass (campaign build #32).
+
+        One event per pass: the obligations the loop opened from
+        a version's diagnosed defects, each with its attempts and
+        outcome, and the candidate version they produced (None
+        when no obligation changed a file — the attempts are
+        lineage facts either way). The pass's fill records are
+        attributed to the candidate first, so a defect's
+        Generated stage can see the repair fills that produced
+        its tree. Resolution is NOT recorded here: whether a
+        defect is fixed is read from the candidate's probe status
+        at assembly, exactly as for planner versions — only
+        verification resolves a defect.
+        """
+
+        def _record() -> None:
+            self._attribute_pending_fills(version)
+            event = {
+                "kind": "repair_obligations",
+                "version": version,
+                "parent_version": parent_version,
+                "source": "direct",
+                "obligations": [dict(item) for item in obligations],
+            }
+            self._obligations.append(event)
+            for obligation in obligations:
+                attempts = obligation.get("attempts") or []
+                self._obligation_by_defect[
+                    str(obligation.get("defect_id"))
+                ] = {
+                    "source": "direct",
+                    "parent_version": parent_version,
+                    "candidate_version": version,
+                    "target": obligation.get("target"),
+                    "status": obligation.get("status"),
+                    "attempts": len(attempts),
+                    "attempt_outcomes": [
+                        item.get("outcome") for item in attempts
+                    ],
+                    "changed": bool(obligation.get("changed")),
+                }
+            self._append(event)
+
+        self._guarded("repair_obligations", _record)
 
     def plan_accepted(
         self,
@@ -966,6 +1023,9 @@ class LineageRecorder:
                 "diagnosis_detail": defect["diagnosis_detail"],
                 "last_failing_version": defect.get("last_failing_version"),
                 "last_failing_detail": defect.get("last_failing_detail"),
+                "direct_repair": self._obligation_by_defect.get(
+                    defect_id
+                ),
             }
             defects[defect_id] = row
             table.append(row)
@@ -991,6 +1051,7 @@ class LineageRecorder:
             "table": table,
             "fills": self._fills,
             "acceptances": self._acceptances,
+            "obligations": self._obligations,
         }
 
     def _assemble_and_write(self) -> None:
@@ -1076,5 +1137,24 @@ def render_lineage_table(record: dict[str, Any]) -> str:
     for row in table:
         transition = row["first_no_transition"] or "none — shipped fixed"
         lines.append(f"- {row['defect_id']}: {transition}")
+    obligations = record.get("obligations") or []
+    if obligations:
+        lines.append("")
+        lines.append("Direct repair obligations (build #32):")
+        for event in obligations:
+            candidate = event.get("version")
+            candidate_text = (
+                f"v{candidate}" if candidate is not None else "none"
+            )
+            for obligation in event.get("obligations") or []:
+                attempts = obligation.get("attempts") or []
+                lines.append(
+                    f"- {obligation.get('defect_id')}: "
+                    f"{obligation.get('status')} — "
+                    f"{len(attempts)} attempt(s) on "
+                    f"{obligation.get('target')} (parent "
+                    f"v{event.get('parent_version')}, candidate "
+                    f"{candidate_text})"
+                )
     lines.append("")
     return "\n".join(lines)

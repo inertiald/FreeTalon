@@ -15154,6 +15154,516 @@ def _fill_plan_contents(
     return filled_dicts, attempts, prefilled, rerouted
 
 
+# ── Campaign build #32: direct repair obligations ─────────────
+#
+# Three consecutive arms broke three DIFFERENT links of the
+# planner-mediated repair chain: arm #38 lost at fill FORM
+# (whole-file fills byte-identical — build #30's patch form is
+# the fix), arm #39 lost before fills (proven Ollama truncation
+# of the re-plan, and a pre-filled delta bypassing the fill —
+# build #31's fixes), and arm #40 lost before either: the INITIAL
+# plan was construction-shaped, bound no diagnosed defect at all,
+# and the run escalated at an approval gate on a plan node before
+# any re-plan could occur. A six-service frontier consultation
+# (2026-11-26 follow-up round) unanimously recommended the
+# structural answer this section implements: a DIRECT repair path
+# for verified defects — the planner is bypassed, nothing
+# downstream is. The loop (loop._direct_repair_pass) opens one
+# obligation per diagnosed defect straight from the probe record
+# and executes it through execute_direct_repair_obligation below;
+# the repaired tree becomes a candidate version judged by the
+# same probes and the same selection as any planner version, and
+# only verification marks a defect resolved. The 2026-11-26
+# diagnostic battery is the endpoint proof: handed a defect
+# directly, the exam model patch-repairs all five standing
+# defects on existing code — this path replicates that condition
+# inside the loop.
+#
+# The obligation's form is build #30's: scoped edits through
+# apply_scoped_edits, the model receiving the standing file plus
+# the defect's probe record, a no-change or non-applying patch a
+# FAILED attempt, retries bounded by _CONTENT_FILL_MAX_ATTEMPTS
+# (the fill budget; also RunBudget's per-hypothesis default).
+# Grounding checks are deliberately NOT applied to obligation
+# payloads: the fill's grounding judges a payload against its
+# plan skeleton, and an obligation has none — the probes are the
+# judge here, and an over-eager filter risks declining exactly
+# the repairs the battery proved the model can make.
+#
+# The function never raises (the repair seams' precedent): any
+# internal failure returns a declined outcome the loop records.
+
+
+def _direct_repair_node_id(defect_id: str) -> str:
+    """The attempt-record node id for one direct-repair obligation."""
+    return f"direct-repair:{defect_id}"
+
+
+def _direct_repair_no_change_error(
+    defect_id: str, record: dict[str, Any], target: str
+) -> str:
+    """The failed-attempt sentence for a no-change obligation patch.
+
+    Build #30's _repair_no_change_error restates the node's
+    obligation; an obligation's restatement is the probe record
+    itself — the measured failure the patch exists to move.
+    """
+    return (
+        "the repair patch left "
+        f"{target} byte-for-byte unchanged, but this repair "
+        "obligation exists because the file as it stands was "
+        f"MEASURED failing: defect {defect_id} — "
+        f"{record.get('detail') or 'the probe failed with no detail'} "
+        "A patch that changes nothing cannot fix a measured "
+        "failure; the attempt FAILS. Return edits that change "
+        "the code the failure names."
+    )
+
+
+def _direct_repair_edits(
+    fields: dict[str, Any],
+) -> tuple[list[ScopedEdit] | None, list[str]]:
+    """Validate a direct-repair payload's edits list.
+
+    The payload shape (_fill_payload_shape, scoped_edits intent)
+    already guarantees an "edits" key when it passes; the entries
+    themselves are judged here, in the build #8/#30 sentence
+    style, so a malformed entry is a shape failure the retry
+    block can teach against.
+    """
+    raw = fields.get("edits")
+    if not isinstance(raw, list) or not raw:
+        return None, [
+            'the payload\'s "edits" must be a non-empty list of '
+            '{"search", "replace"} objects'
+        ]
+    edits: list[ScopedEdit] = []
+    defects: list[str] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            defects.append(
+                f"edits[{index}] is not an object with \"search\" "
+                "and \"replace\" string fields"
+            )
+            continue
+        search = entry.get("search")
+        replace = entry.get("replace")
+        if not isinstance(search, str) or not isinstance(replace, str):
+            defects.append(
+                f"edits[{index}] must carry \"search\" and "
+                "\"replace\" as strings"
+            )
+            continue
+        edits.append(ScopedEdit(search=search, replace=replace))
+    if defects:
+        return None, defects
+    return edits, []
+
+
+def _direct_repair_prompt(
+    *,
+    defect_id: str,
+    record: dict[str, Any],
+    target: str,
+    standing: str,
+    goal_text: str | None,
+    errors_block: str,
+) -> str:
+    """One obligation attempt's prompt: defect + standing file.
+
+    The battery's direct-repair condition, verbatim in structure:
+    the goal for context, the diagnosed defect with its measured
+    evidence, the file as it stands, and build #30's patch-form
+    instruction. No plan, no skeleton, no other defects.
+    """
+    lines = [
+        f"DIRECT REPAIR — one diagnosed defect in {target}.",
+        "",
+    ]
+    if goal_text:
+        lines += [f"Goal: {goal_text}", ""]
+    lines += [
+        "The contract probes measured this defect in the file as "
+        "it stands:",
+        f"  defect: {defect_id}",
+        f"  clause: {record.get('clause_id') or ''}",
+        f"  probe: {record.get('probe') or ''} / flow: "
+        f"{record.get('flow') or ''}",
+        f"  measured failure: {record.get('detail') or ''}",
+        "",
+        f"Current content of {target} (the file as it stands):",
+        standing,
+        "",
+    ]
+    if errors_block:
+        lines += [errors_block, ""]
+    lines += [
+        "REPAIR — this call exists to fix the diagnosed defect "
+        "above in the file as it stands (its current content is "
+        "given above). Return "
+        '{"edits": [{"search": "<text copied exactly from the '
+        'current file>", "replace": "<the new text>"}]} — '
+        "targeted scoped edits that fix the defect. Every search "
+        "text must be copied character-for-character from the "
+        "current file and occur exactly once in it; widen a "
+        "search text with more surrounding lines until it is "
+        "unique. Do NOT return the whole file. An edit whose "
+        '"replace" is identical to its "search" declares that '
+        "text needs no change; on a repair call such a "
+        "declaration is NOT accepted — the file as it stands is "
+        "the file that fails, and a payload that changes nothing "
+        "FAILS this repair.",
+        "JSON Output:",
+    ]
+    return "\n".join(lines)
+
+
+def _direct_repair_apply_retry_block(
+    defects: list[str],
+    *,
+    defect_id: str,
+    record: dict[str, Any],
+    target: str,
+) -> str:
+    """The retry block after an obligation patch failed to apply.
+
+    Shape failures reuse build #30's schema block; an apply
+    failure (search text absent or ambiguous, an unparseable
+    result, a no-change patch) is answered with the failure
+    itself plus, for the no-change case, the obligation
+    restated — the escalated-retry discipline of the fill path.
+    """
+    lines = [
+        "Your previous repair attempt was REJECTED — it did not "
+        "repair the file:",
+        *(f"  - {defect}" for defect in defects),
+        "",
+        "Return a corrected payload only: "
+        '{"edits": [{"search": "<text copied exactly from the '
+        'current file>", "replace": "<the new text>"}]}. Every '
+        "search text must be copied character-for-character from "
+        "the current file above and occur exactly once in it; "
+        "widen a search text with more surrounding lines until "
+        "it is unique.",
+    ]
+    return "\n".join(lines)
+
+
+def execute_direct_repair_obligation(
+    *,
+    defect_id: str,
+    record: dict[str, Any],
+    target: str,
+    repo_root: str | Path,
+    goal_text: str | None,
+    settings: LLMSettings | None = None,
+) -> dict[str, Any]:
+    """Execute one direct repair obligation (campaign build #32).
+
+    One diagnosed defect, one file, patch form only: the model
+    receives the standing file content and the defect's probe
+    record and answers with scoped edits, applied through
+    apply_scoped_edits — build #30's machinery, driven without
+    the planner. A patch that does not apply, does not parse, or
+    changes nothing is a failed attempt; retries carry the
+    failure and are bounded by _CONTENT_FILL_MAX_ATTEMPTS. On
+    success the patched content is WRITTEN to the live file (the
+    loop snapshots and re-verifies it as a candidate version);
+    the outcome dict reports every attempt. Never raises: an
+    internal failure is a declined outcome, recorded like any
+    other (the repair seams' contract with the loop).
+    """
+    outcome: dict[str, Any] = {
+        "defect_id": defect_id,
+        "clause_id": record.get("clause_id"),
+        "probe": record.get("probe"),
+        "flow": record.get("flow"),
+        "target": target,
+        "source": "direct",
+        "status": "declined",
+        "reason": None,
+        "detail": "",
+        "attempts": [],
+        "changed": False,
+        "before_sha256": None,
+        "after_sha256": None,
+    }
+    try:
+        _execute_direct_repair_obligation(
+            defect_id=defect_id,
+            record=record,
+            target=target,
+            repo_root=repo_root,
+            goal_text=goal_text,
+            settings=settings,
+            outcome=outcome,
+        )
+    except Exception as exc:  # noqa: BLE001 — a seam never fails a run
+        if outcome["status"] == "declined" and outcome["reason"] is None:
+            outcome["reason"] = "internal_error"
+            outcome["detail"] = (
+                f"{type(exc).__name__}: {exc}"[:300]
+            )
+    return outcome
+
+
+def _execute_direct_repair_obligation(
+    *,
+    defect_id: str,
+    record: dict[str, Any],
+    target: str,
+    repo_root: str | Path,
+    goal_text: str | None,
+    settings: LLMSettings | None,
+    outcome: dict[str, Any],
+) -> None:
+    root = Path(repo_root)
+    node_id = _direct_repair_node_id(defect_id)
+    try:
+        resolved_root = root.resolve()
+        resolved = (root / target).resolve()
+    except OSError as exc:
+        outcome["reason"] = "target_unresolvable"
+        outcome["detail"] = f"{type(exc).__name__}: {exc}"[:300]
+        return
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        outcome["reason"] = "target_outside_root"
+        outcome["detail"] = (
+            f"the implicated file {target} resolves outside the "
+            "repository root; a direct repair never writes there"
+        )
+        return
+    try:
+        standing = resolved.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        outcome["reason"] = "target_unreadable"
+        outcome["detail"] = f"{type(exc).__name__}: {exc}"[:300]
+        return
+    outcome["before_sha256"] = hashlib.sha256(
+        standing.encode("utf-8")
+    ).hexdigest()
+    effective = _content_fill_settings(settings or LLMSettings.from_env())
+    errors_block = ""
+    for attempt in range(1, _CONTENT_FILL_MAX_ATTEMPTS + 1):
+        prompt = _direct_repair_prompt(
+            defect_id=defect_id,
+            record=record,
+            target=target,
+            standing=standing,
+            goal_text=goal_text,
+            errors_block=errors_block,
+        )
+        record_fill_prompt(
+            phase="direct_repair",
+            attempt=attempt,
+            node_id=node_id,
+            target=target,
+            intent="scoped_edits",
+            prompt=prompt,
+            system_prompt=_CONTENT_FILL_SYSTEM_PROMPT,
+            existing_source=standing,
+        )
+        response_text = sanitize_llm_output(
+            call_llm(_CONTENT_FILL_SYSTEM_PROMPT, prompt, settings=effective)
+        )
+        defects: list[str] = []
+        shape_failure = False
+        fields: dict[str, Any] = {}
+        payload: dict[str, Any] | None = None
+        try:
+            payload = parse_json_object(response_text)
+        except Exception as exc:  # noqa: BLE001 — a rejection, not a crash
+            defects = [f"your previous payload was not a JSON object: {exc}"]
+            shape_failure = True
+        edits: list[ScopedEdit] | None = None
+        if payload is not None:
+            fields, shape_defects = _fill_payload_shape(
+                payload, "scoped_edits"
+            )
+            if shape_defects:
+                defects = list(shape_defects)
+                shape_failure = True
+            elif "edits" not in fields or "anchor" in fields:
+                # The shape passed an anchored payload (anchor +
+                # content, the whole-replacement form); this
+                # path's applier is apply_scoped_edits, so that
+                # form is a shape failure here, never applied.
+                # (An anchor riding alongside an edits list is
+                # consumed by the shape as a form marker and
+                # returns edits only — those edits are then
+                # judged on whole-file uniqueness, strictly
+                # stricter than the anchor's scoping.)
+                defects = [
+                    "your previous payload carried an anchored "
+                    "edit — a direct repair accepts ONLY an "
+                    '"edits" list of {"search", "replace"} pairs'
+                ]
+                shape_failure = True
+            else:
+                edits, entry_defects = _direct_repair_edits(fields)
+                if entry_defects:
+                    defects = entry_defects
+                    shape_failure = True
+        new_content: str | None = None
+        if edits is not None:
+            try:
+                new_content = apply_scoped_edits(standing, edits)
+            except ScopedEditError as exc:
+                defects = [
+                    f"your repair patch could not be applied "
+                    f"({exc.kind}): {exc}"
+                ]
+                if exc.kind in ("no_op_edit", "no_change"):
+                    defects.append(
+                        _direct_repair_no_change_error(
+                            defect_id, record, target
+                        )
+                    )
+            if new_content is not None and target.endswith(".py"):
+                syntax = python_syntax_error(new_content)
+                if syntax is not None:
+                    defects = [
+                        f"your repair patch leaves {target} "
+                        f"unparseable Python: {syntax}"
+                    ]
+                    new_content = None
+            if new_content is not None and new_content == standing:
+                # apply_scoped_edits already refuses a no-change
+                # result; this net is build #30's, kept so the
+                # obligation's rule does not depend on the
+                # applier's internals.
+                defects = [
+                    _direct_repair_no_change_error(
+                        defect_id, record, target
+                    )
+                ]
+                new_content = None
+        attempt_record: dict[str, Any] = {
+            "attempt": attempt,
+            "outcome": "rejected",
+            "errors": list(defects),
+            "edits_count": len(edits) if edits is not None else None,
+            "result_sha256": None,
+        }
+        outcome["attempts"].append(attempt_record)
+        if new_content is None:
+            _record_planner_attempt(
+                phase="direct_repair",
+                attempt=attempt,
+                outcome="rejected",
+                response_text=response_text,
+                errors=defects,
+                node_id=node_id,
+                target=target,
+                intent="scoped_edits",
+            )
+            record_fill_outcome(
+                phase="direct_repair",
+                attempt=attempt,
+                node_id=node_id,
+                target=target,
+                intent="scoped_edits",
+                outcome="rejected",
+                candidate_inputs=(
+                    {"edits": fields.get("edits")} if fields else None
+                ),
+                existing_source=standing,
+                errors=defects,
+            )
+            if shape_failure:
+                errors_block = _repair_patch_shape_repair_block(defects)
+            else:
+                errors_block = _direct_repair_apply_retry_block(
+                    defects,
+                    defect_id=defect_id,
+                    record=record,
+                    target=target,
+                )
+            continue
+        # The patch applied and parses: write it to the live
+        # file. The loop snapshots the tree and re-runs the
+        # probes — only that verification can call the defect
+        # fixed; this function's success is a candidate, nothing
+        # more.
+        try:
+            resolved.write_bytes(new_content.encode("utf-8"))
+        except OSError as exc:
+            attempt_record["errors"] = [
+                f"the applied patch could not be written to "
+                f"{target}: {type(exc).__name__}: {exc}"
+            ]
+            _record_planner_attempt(
+                phase="direct_repair",
+                attempt=attempt,
+                outcome="rejected",
+                response_text=response_text,
+                errors=attempt_record["errors"],
+                node_id=node_id,
+                target=target,
+                intent="scoped_edits",
+            )
+            record_fill_outcome(
+                phase="direct_repair",
+                attempt=attempt,
+                node_id=node_id,
+                target=target,
+                intent="scoped_edits",
+                outcome="rejected",
+                candidate_inputs={"edits": fields.get("edits")},
+                existing_source=standing,
+                errors=attempt_record["errors"],
+            )
+            outcome["status"] = "exhausted"
+            outcome["detail"] = (
+                "the patch applied but could not be written; "
+                "retrying a failing write inside the budget "
+                "cannot succeed"
+            )
+            return
+        after_sha = hashlib.sha256(
+            new_content.encode("utf-8")
+        ).hexdigest()
+        attempt_record["outcome"] = "accepted"
+        attempt_record["errors"] = []
+        attempt_record["result_sha256"] = after_sha
+        _record_planner_attempt(
+            phase="direct_repair",
+            attempt=attempt,
+            outcome="accepted",
+            response_text=response_text,
+            node_id=node_id,
+            target=target,
+            intent="scoped_edits",
+        )
+        record_fill_outcome(
+            phase="direct_repair",
+            attempt=attempt,
+            node_id=node_id,
+            target=target,
+            intent="scoped_edits",
+            outcome="accepted",
+            candidate_inputs={
+                "content": new_content,
+                "_materialized_from": "scoped_edits",
+                "edits": fields.get("edits"),
+            },
+            existing_source=standing,
+        )
+        outcome["status"] = "patched"
+        outcome["changed"] = True
+        outcome["after_sha256"] = after_sha
+        outcome["detail"] = (
+            f"patch applied on attempt {attempt}; the candidate "
+            "is the probes' to judge"
+        )
+        return
+    outcome["status"] = "exhausted"
+    outcome["detail"] = (
+        f"no acceptable patch in {_CONTENT_FILL_MAX_ATTEMPTS} "
+        "attempts; the standing file is untouched"
+    )
+
+
 def _no_change_node_ids(filled_dicts: list[dict[str, Any]]) -> list[str]:
     """Ids of filled nodes the fill completed as no-change.
 

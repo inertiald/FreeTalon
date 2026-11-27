@@ -39,7 +39,12 @@ from .judge import (
     regressed_checks,
     timeout_diagnostics,
 )
-from .lineage import LineageRecorder, drain_pending_lineage, lineage_sink
+from .lineage import (
+    LineageRecorder,
+    defect_id_for_record,
+    drain_pending_lineage,
+    lineage_sink,
+)
 from .measure import (
     VERDICT_FAIL,
     VERDICT_INCONCLUSIVE,
@@ -59,6 +64,7 @@ from .models import (
 from .planner import (
     build_execution_plan,
     drain_pending_planner_attempts,
+    execute_direct_repair_obligation,
     planner_attempt_sink,
     replan_from_brief,
     try_local_repair,
@@ -389,6 +395,12 @@ class LoopRunner:
         version_snapshots: dict[int, dict[str, bytes | None]] = {}
         declared_targets_all: set[str] = set()
         paused_at_gate = False
+        # Campaign build #32: version numbers a direct-repair
+        # pass has registered as candidates. The re-plan path
+        # skips them (a plan version never collides with a
+        # repair candidate), and a RETRY of the parent plan
+        # version leaves the candidate's records untouched.
+        repair_candidate_versions: set[int] = set()
 
         # M2: before executing, the planner's retrieval — a second run of
         # the same goal must not repeat a measured-failed approach. A node
@@ -606,6 +618,49 @@ class LoopRunner:
                 lineage.version_verified(
                     version, version_outcomes[version], snapshot
                 )
+
+            # Campaign build #32: direct repair obligations run
+            # HERE — after this version's outcome and candidate
+            # are recorded, before the gate check below. Arm #40
+            # is why the placement matters: its run escalated at
+            # an approval gate on a plan node with every diagnosed
+            # defect outstanding, and no repair of any kind was
+            # ever attempted. The gate still guards its node —
+            # nothing at or below the check changes; the
+            # obligations are a separate, already-authorized
+            # loop-internal activity (patch-form edits inside
+            # the workspace, the same class the repair seams
+            # perform), not a way around the gate. A candidate
+            # the pass registers is judged by the same probes
+            # and the same selection as this version was.
+            repair = self._direct_repair_pass(
+                run_id,
+                plan,
+                parent_version=version,
+                failures=probe_failures_now,
+                goal_text=contract.objective,
+                declared_targets_all=declared_targets_all,
+                version_outcomes=version_outcomes,
+                version_measurements_map=version_measurements_map,
+                version_probe_results=version_probe_results,
+                version_snapshots=version_snapshots,
+                repair_candidate_versions=repair_candidate_versions,
+                lineage_recorder=lineage,
+            )
+            if repair is not None:
+                attempts.append(
+                    {
+                        "version": repair["version"],
+                        "status": "direct_repair",
+                        "failed": [],
+                        "verdicts": {},
+                    }
+                )
+                # The tree on disk is now the candidate's: the
+                # completed check and any re-plan brief below
+                # judge the candidate's probe failures, not the
+                # parent version's stale ones.
+                probe_failures_now = repair["failures"]
 
             # M4: a node paused at a gate ends this pass — the run waits
             # for a human decision, it does not push through.
@@ -974,6 +1029,10 @@ class LoopRunner:
                     escalation = f"delta plan rejected: {rejection}"
                     break
                 version += 1
+                # Campaign build #32: a plan version never takes
+                # a number a direct-repair candidate registered.
+                while version in repair_candidate_versions:
+                    version += 1
                 metadata = dict(plan.metadata or {})
                 if repair_declines:
                     # Campaign build #2: why each repair seam
@@ -1102,7 +1161,12 @@ class LoopRunner:
                 version_measurements_map=version_measurements_map,
                 version_probe_results=version_probe_results,
                 version_snapshots=version_snapshots,
-                final_version=version,
+                # Campaign build #32: the final candidate is the
+                # last REGISTERED one — a repair candidate
+                # registered after the last plan version is the
+                # tree the run ends on (identical to `version`
+                # whenever no repair candidate exists).
+                final_version=max(version_outcomes),
                 lineage_recorder=lineage,
             )
         return self._finish_run(
@@ -1719,6 +1783,185 @@ class LoopRunner:
             except OSError:
                 continue
         return entries or None
+
+    def _direct_repair_pass(
+        self,
+        run_id: str,
+        plan: ExecutionPlan,
+        *,
+        parent_version: int,
+        failures: list[dict[str, Any]],
+        goal_text: str | None,
+        declared_targets_all: set[str],
+        version_outcomes: dict[int, dict[str, Any]],
+        version_measurements_map: dict[int, list[dict[str, Any]]],
+        version_probe_results: dict[int, list[dict[str, Any]]],
+        version_snapshots: dict[int, dict[str, bytes | None]],
+        repair_candidate_versions: set[int],
+        lineage_recorder: LineageRecorder | None = None,
+    ) -> dict[str, Any] | None:
+        """Execute one version's direct repair obligations (build #32).
+
+        Campaign build #32: one repair obligation per diagnosed
+        defect, opened straight from the probe failure records —
+        the planner is not consulted for creation or execution
+        (planner.execute_direct_repair_obligation). Obligations
+        run sequentially in defect-id order against the evolving
+        live tree: the diagnostic battery's patches were applied
+        in sequence to one tree, and a later obligation's model
+        sees the file as the earlier obligations left it.
+
+        When at least one obligation changed a file, the repaired
+        tree is registered as a CANDIDATE version under the next
+        free version number: its targets join the declared set,
+        its tree is snapshotted, the contract probes re-run
+        against it, and its outcome is recorded with the parent
+        version's failed-node / failed-criterion counts INHERITED
+        — the repair version executed no plan nodes, so it can
+        win selection on probe greens or recency, never on erased
+        node failures. The re-plan path skips repair-candidate
+        numbers, and a later RETRY re-executes the parent plan
+        version without touching the candidate's records. When
+        nothing changed there is no candidate, but the
+        obligations are still recorded in the lineage.
+
+        Returns {"version", "failures"} for a registered
+        candidate (failures = the candidate's own probe
+        failures), else None.
+        """
+        root_value = (plan.metadata or {}).get("repo_root")
+        if not failures or not root_value:
+            return None
+        root = Path(str(root_value))
+        by_defect: dict[str, dict[str, Any]] = {}
+        for record in failures:
+            if not isinstance(record, dict):
+                continue
+            defect_id = defect_id_for_record(record)
+            if defect_id not in by_defect:
+                by_defect[defect_id] = record
+        obligations: list[dict[str, Any]] = []
+        changed_targets: list[str] = []
+        for defect_id in sorted(by_defect):
+            record = by_defect[defect_id]
+            target = record.get("file")
+            if not isinstance(target, str) or not target:
+                obligations.append(
+                    {
+                        "defect_id": defect_id,
+                        "clause_id": record.get("clause_id"),
+                        "probe": record.get("probe"),
+                        "flow": record.get("flow"),
+                        "target": None,
+                        "source": "direct",
+                        "status": "declined",
+                        "reason": "no_file_named",
+                        "detail": (
+                            "the probe record names no file; a "
+                            "direct repair patches the file the "
+                            "probe implicates, and this record "
+                            "implicates none"
+                        ),
+                        "attempts": [],
+                        "changed": False,
+                        "before_sha256": None,
+                        "after_sha256": None,
+                    }
+                )
+                continue
+            outcome = execute_direct_repair_obligation(
+                defect_id=defect_id,
+                record=dict(record),
+                target=target,
+                repo_root=root,
+                goal_text=goal_text,
+            )
+            obligations.append(outcome)
+            if outcome.get("changed"):
+                changed_targets.append(target)
+        self._log(
+            "loop.direct_repair.obligations",
+            run_id=run_id,
+            version=parent_version,
+            obligations=len(obligations),
+            patched=sum(
+                1 for item in obligations if item.get("status") == "patched"
+            ),
+            exhausted=sum(
+                1 for item in obligations if item.get("status") == "exhausted"
+            ),
+            declined=sum(
+                1 for item in obligations if item.get("status") == "declined"
+            ),
+        )
+        if not changed_targets:
+            if lineage_recorder is not None:
+                lineage_recorder.repair_obligations(
+                    None,
+                    parent_version=parent_version,
+                    obligations=obligations,
+                )
+            return None
+        candidate_version = parent_version + 1
+        while (
+            candidate_version in version_outcomes
+            or candidate_version in repair_candidate_versions
+        ):
+            candidate_version += 1
+        repair_candidate_versions.add(candidate_version)
+        for target in changed_targets:
+            declared_targets_all.add(target)
+        candidate_failures = self._run_contract_probes(
+            run_id, plan, candidate_version
+        )
+        probe_results_now = (plan.metadata or {}).get(
+            PROBE_RESULTS_METADATA_KEY
+        )
+        probe_results_list = (
+            probe_results_now if isinstance(probe_results_now, list) else []
+        )
+        if lineage_recorder is not None:
+            lineage_recorder.diagnosis(
+                candidate_version, probe_results_list, candidate_failures
+            )
+        parent_outcome = version_outcomes[parent_version]
+        outcome = {
+            "version": candidate_version,
+            "probe_green": sum(
+                1 for record in probe_results_list if record.get("ok")
+            ),
+            "probe_total": len(probe_results_list),
+            "failed_nodes": parent_outcome["failed_nodes"],
+            "failed_criteria": parent_outcome["failed_criteria"],
+            "source": "direct_repair",
+            "parent_version": parent_version,
+        }
+        version_probe_results[candidate_version] = [
+            dict(record) for record in probe_results_list
+        ]
+        version_measurements_map[candidate_version] = []
+        version_outcomes[candidate_version] = outcome
+        snapshot = self._snapshot_version_tree(plan, declared_targets_all)
+        if snapshot is not None:
+            version_snapshots[candidate_version] = snapshot
+        if lineage_recorder is not None:
+            lineage_recorder.repair_obligations(
+                candidate_version,
+                parent_version=parent_version,
+                obligations=obligations,
+            )
+            lineage_recorder.version_verified(
+                candidate_version, outcome, snapshot
+            )
+        self._log(
+            "loop.direct_repair.candidate",
+            run_id=run_id,
+            parent_version=parent_version,
+            version=candidate_version,
+            probe_green=outcome["probe_green"],
+            probe_total=outcome["probe_total"],
+        )
+        return {"version": candidate_version, "failures": candidate_failures}
 
     def _settle_shipping(
         self,
