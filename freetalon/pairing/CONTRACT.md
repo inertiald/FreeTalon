@@ -177,6 +177,38 @@ wrong method → `405`. A confirm refused with `410` returns the
 poll-style body `{"code", "status"}` (`"expired"` or `"claimed"`), so
 a client reads the terminal state the same way it does from a poll.
 
+### Fleet update channel (deployment option)
+
+When a fleet directory is configured (`fleet_dir` on `make_server`, or
+`FREETALON_FLEET_DIR` for the standalone entry), the server also fronts
+the console-carried update channel specified in DESIGN.md §13. The
+implementation lives in `updates.py`: `FleetStore` reads published
+bundles and records node reports, `build_bundle` assembles a bundle,
+`canonical_manifest_bytes` produces the exact bytes that are signed,
+and `sign_manifest` signs them with OpenSSH's SSHSIG
+(`ssh-keygen -Y sign`, namespace `freetalon-update`, principal
+`freetalon-fleet`) using the fleet Ed25519 key — the same keypair the
+pairing bundle installs on a node as its SSH credential, so nodes
+verify with the public half and no new secret class exists. Publishing
+is the module's CLI (run the `freetalon.pairing.updates`
+module with python's `-m` flag: `publish` / `show`), which writes
+bundle files directly; there is no HTTP publish route.
+
+| route                          | role     | success | errors |
+|--------------------------------|----------|---------|--------|
+| `GET /fleet/updates/<machine-id>` | node  | `200` → the published bundle record (`manifest`, `manifest_canonical`, `signature`, `files`) | `404` no bundle published for that node |
+| `POST /fleet/report`           | node     | `200` `{"ok": true, "node": <public view>}` | `400` invalid machine-id |
+| `GET /fleet`                   | operator | `200` `{"nodes": [public views], "published": {machine-id: version}}` | `401` unauthorized |
+
+A machine-id is 32 lowercase hex characters (the node's
+`/etc/machine-id`); anything else names no bundle. Reports are the
+node's own account of its console/bundle versions and last apply
+outcome — informational, on a sealed segment, following the same
+unauthenticated node posture as `register`. With no fleet directory
+configured (the default) the channel is off and every `/fleet` path is
+the plain `404` above; a known `/fleet` path with the wrong method is
+a `405`, exactly like the pairing routes.
+
 ### Static fallthrough (deployment option)
 
 When a static root is configured (`static_root` on `make_server`, or
@@ -221,6 +253,7 @@ Read by `PairingServerConfig.from_env`.
 | `FREETALON_PAIRING_HOST` | `0.0.0.0` | bind host |
 | `FREETALON_PAIRING_PORT` | `8080` | bind port |
 | `FREETALON_PAIRING_STATIC_ROOT` | *(unset → static fallthrough off)* | directory served for non-`/pairing` GET/HEAD (see "Static fallthrough") |
+| `FREETALON_FLEET_DIR` | *(unset → fleet channel off)* | directory holding update bundles + fleet state (see "Fleet update channel") |
 
 Production note: the node console's default base is
 `http://10.40.0.1` (port 80), so in Pat's session the control plane

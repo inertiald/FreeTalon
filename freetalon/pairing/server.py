@@ -11,6 +11,12 @@ root is configured, GET/HEAD requests outside the /pairing namespace
 serve files from that tree, so one process can front both the pairing
 API and the provisioning payloads. Off by default; the pairing routes
 are matched first and are unaffected either way.
+
+Fleet update channel (CONTRACT.md, "Fleet update channel"): when a
+fleet directory is configured, the /fleet routes serve signed update
+bundles to joined nodes and collect their reports. Off by default,
+exactly like the static fallthrough; the pairing routes are unaffected
+either way.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from ..security import authorize
+from .updates import FleetStore, InvalidBundle as FleetInvalidBundle
 from .store import (
     CodeAlreadyClaimed,
     CodeAlreadyConfirmed,
@@ -61,6 +68,7 @@ class PairingServerConfig:
     ttl_seconds: float = 1800.0
     token: str | None = None
     static_root: str | None = None
+    fleet_dir: str | None = None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "PairingServerConfig":
@@ -74,6 +82,7 @@ class PairingServerConfig:
             ttl_seconds=float(env.get("FREETALON_PAIRING_TTL_SECONDS") or 1800),
             token=token,
             static_root=env.get("FREETALON_PAIRING_STATIC_ROOT") or None,
+            fleet_dir=env.get("FREETALON_FLEET_DIR") or None,
         )
 
 
@@ -105,6 +114,23 @@ def _route_kind(path: str) -> str | None:
             code = rest[: -len("/confirm")]
             return "confirm" if code and "/" not in code else None
         return "poll" if rest and "/" not in rest else None
+    return None
+
+
+def _fleet_route_kind(path: str) -> str | None:
+    """Which fleet-channel route a path names, regardless of method.
+
+    One of "view", "updates", "report" -- or None. Same dispatch
+    discipline as _route_kind: known path with the wrong method is a
+    405, anything else falls through (to the static root or a 404).
+    """
+    if path == "/fleet":
+        return "view"
+    if path == "/fleet/report":
+        return "report"
+    if path.startswith("/fleet/updates/"):
+        machine_id = path[len("/fleet/updates/"):]
+        return "updates" if machine_id and "/" not in machine_id else None
     return None
 
 
@@ -180,11 +206,18 @@ class _PairingHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         kind = _route_kind(path)
+        fkind = _fleet_route_kind(path)
         if kind == "list":
             self._handle_list()
         elif kind == "poll":
             self._handle_poll(path[len("/pairing/"):])
         elif kind is not None:
+            self._send_json(405, {"error": "method not allowed"})
+        elif fkind == "updates":
+            self._handle_fleet_updates(path[len("/fleet/updates/"):])
+        elif fkind == "view":
+            self._handle_fleet_view()
+        elif fkind is not None:
             self._send_json(405, {"error": "method not allowed"})
         elif self.server.pairing_static_root is not None:
             self._serve_static(head=False)
@@ -236,17 +269,23 @@ class _PairingHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         kind = _route_kind(path)
+        fkind = _fleet_route_kind(path)
         if kind == "register":
             self._handle_register()
         elif kind == "confirm":
             self._handle_confirm(path[len("/pairing/"):-len("/confirm")])
         elif kind is not None:
             self._send_json(405, {"error": "method not allowed"})
+        elif fkind == "report":
+            self._handle_fleet_report()
+        elif fkind is not None:
+            self._send_json(405, {"error": "method not allowed"})
         else:
             self._send_json(404, {"error": "not found"})
 
     def _reject_method(self) -> None:
-        if _route_kind(urlparse(self.path).path) is not None:
+        path = urlparse(self.path).path
+        if _route_kind(path) is not None or _fleet_route_kind(path) is not None:
             self._send_json(405, {"error": "method not allowed"})
         else:
             self._send_json(404, {"error": "not found"})
@@ -262,7 +301,7 @@ class _PairingHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         path = urlparse(self.path).path
-        if _route_kind(path) is not None:
+        if _route_kind(path) is not None or _fleet_route_kind(path) is not None:
             self._send_json(405, {"error": "method not allowed"})
         elif self.server.pairing_static_root is not None:
             self._serve_static(head=True)
@@ -370,11 +409,48 @@ class _PairingHandler(BaseHTTPRequestHandler):
         records = self.server.pairing_store.list_records()
         self._send_json(200, {"records": records})
 
+    # -- fleet update channel (CONTRACT.md, "Fleet update channel") ------
+
+    def _handle_fleet_updates(self, machine_id: str) -> None:
+        store = self.server.fleet_store
+        if store is None:
+            self._send_json(404, {"error": "not found"})
+            return
+        bundle = store.current_bundle(machine_id)
+        if bundle is None:
+            self._send_json(404, {"error": "no bundle published"})
+            return
+        self._send_json(200, bundle)
+
+    def _handle_fleet_report(self) -> None:
+        store = self.server.fleet_store
+        if store is None:
+            self._send_json(404, {"error": "not found"})
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
+        try:
+            view = store.record_report(body.get("machine_id"), body)
+        except FleetInvalidBundle as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        self._send_json(200, {"ok": True, "node": view})
+
+    def _handle_fleet_view(self) -> None:
+        if self.server.fleet_store is None:
+            self._send_json(404, {"error": "not found"})
+            return
+        if not self._require_operator():
+            return
+        self._send_json(200, self.server.fleet_store.fleet_view())
+
 
 class _PairingHTTPServer(_ThreadingHTTPServer):
     pairing_store: PairingStore
     pairing_token: str | None
     pairing_static_root: str | None = None
+    fleet_store: FleetStore | None = None
 
 
 def make_server(
@@ -383,11 +459,13 @@ def make_server(
     host: str = "127.0.0.1",
     port: int = 0,
     static_root: str | None = None,
+    fleet_dir: str | None = None,
 ) -> _PairingHTTPServer:
     httpd = _PairingHTTPServer((host, port), _PairingHandler)
     httpd.pairing_store = store
     httpd.pairing_token = token or None
     httpd.pairing_static_root = static_root or None
+    httpd.fleet_store = FleetStore(fleet_dir) if fleet_dir else None
     return httpd
 
 
@@ -401,15 +479,17 @@ def main() -> int:
         host=config.host,
         port=config.port,
         static_root=config.static_root,
+        fleet_dir=config.fleet_dir,
     )
     logger.info(
         "pairing server listening on %s:%d (store %s, operator API %s, "
-        "static root %s)",
+        "static root %s, fleet dir %s)",
         config.host,
         config.port,
         config.store_path,
         "enabled" if config.token else "CLOSED (no FREETALON_PAIRING_TOKEN)",
         config.static_root or "off",
+        config.fleet_dir or "off",
     )
     try:
         httpd.serve_forever()
