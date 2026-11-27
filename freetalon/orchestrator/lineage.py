@@ -690,6 +690,14 @@ class LineageRecorder:
                         item.get("outcome") for item in attempts
                     ],
                     "changed": bool(obligation.get("changed")),
+                    # Build #33: the repair family this obligation
+                    # belonged to (None for a build #32 singleton):
+                    # the failing member ids, the member whose
+                    # record headlined the family's one execution,
+                    # and how many measurements its scope carried.
+                    "family": obligation.get("family"),
+                    "family_primary": obligation.get("family_primary"),
+                    "scope_measured": len(obligation.get("scope") or []),
                 }
             self._append(event)
 
@@ -1148,7 +1156,7 @@ def render_lineage_table(record: dict[str, Any]) -> str:
             )
             for obligation in event.get("obligations") or []:
                 attempts = obligation.get("attempts") or []
-                lines.append(
+                line = (
                     f"- {obligation.get('defect_id')}: "
                     f"{obligation.get('status')} — "
                     f"{len(attempts)} attempt(s) on "
@@ -1156,5 +1164,14 @@ def render_lineage_table(record: dict[str, Any]) -> str:
                     f"v{event.get('parent_version')}, candidate "
                     f"{candidate_text})"
                 )
+                family = obligation.get("family") or []
+                if len(family) > 1:
+                    line += (
+                        f" [family of {len(family)} failing, "
+                        f"{len(obligation.get('scope') or [])} "
+                        f"measured — primary "
+                        f"{obligation.get('family_primary')}]"
+                    )
+                lines.append(line)
     lines.append("")
     return "\n".join(lines)

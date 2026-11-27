@@ -25,6 +25,8 @@ from .contract_clauses import (
     node_clause_declaration,
     probe_failures,
     probe_suspect_map,
+    repair_family_key,
+    repair_family_scope,
     run_contract_probes,
 )
 from .critic import CriticSettings, critic_settings_from_env, review_write_nodes
@@ -1825,6 +1827,20 @@ class LoopRunner:
         nothing changed there is no candidate, but the
         obligations are still recorded in the lineage.
 
+        Campaign build #33: obligations are grouped into repair
+        families — (clause, probe, file), the contract's identity
+        for one measured behavior — and executed ONE per family,
+        carrying the family's full scope: every record of this
+        version's probe run in the family, passing measurements
+        included (contract_clauses.repair_family_scope). Arm
+        #41's per-record obligations patched one flow at a time
+        and oscillated; the family's records are simultaneous
+        constraints on shared handling, so the repair is aimed at
+        the family, and the executor's outcome is recorded once
+        per member defect in the lineage. A defect whose record
+        names no file keeps build #32's decline, and one with a
+        file but no family key executes alone, as in build #32.
+
         Returns {"version", "failures"} for a registered
         candidate (failures = the candidate's own probe
         failures), else None.
@@ -1840,9 +1856,38 @@ class LoopRunner:
             defect_id = defect_id_for_record(record)
             if defect_id not in by_defect:
                 by_defect[defect_id] = record
+        # Build #33: group the diagnosed defects into repair
+        # families and execute one obligation per family (the
+        # docstring above). The scope source is this version's
+        # FULL probe results — the passing measurements are half
+        # the scope — falling back to the failures themselves
+        # when the full set was not recorded.
+        all_records = version_probe_results.get(parent_version) or []
+        if not all_records:
+            all_records = list(failures)
+        families: dict[tuple[str, str, str], list[str]] = {}
+        units: list[list[str]] = []
+        for defect_id in sorted(by_defect):
+            record = by_defect[defect_id]
+            target = record.get("file")
+            key = (
+                repair_family_key(record)
+                if isinstance(target, str) and target
+                else None
+            )
+            if key is None:
+                units.append([defect_id])
+            elif key in families:
+                families[key].append(defect_id)
+            else:
+                families[key] = [defect_id]
+                units.append(families[key])
+        units.sort(key=lambda member_ids: member_ids[0])
         obligations: list[dict[str, Any]] = []
         changed_targets: list[str] = []
-        for defect_id in sorted(by_defect):
+        family_count = 0
+        for member_ids in units:
+            defect_id = member_ids[0]
             record = by_defect[defect_id]
             target = record.get("file")
             if not isinstance(target, str) or not target:
@@ -1869,21 +1914,41 @@ class LoopRunner:
                     }
                 )
                 continue
+            key = repair_family_key(record)
+            scope = (
+                repair_family_scope(all_records, key)
+                if key is not None
+                else None
+            )
             outcome = execute_direct_repair_obligation(
                 defect_id=defect_id,
                 record=dict(record),
                 target=target,
                 repo_root=root,
                 goal_text=goal_text,
+                scope=scope,
             )
+            if len(member_ids) > 1:
+                family_count += 1
+                outcome["family_primary"] = defect_id
             obligations.append(outcome)
-            if outcome.get("changed"):
+            for member_id in member_ids[1:]:
+                member_record = by_defect[member_id]
+                member = dict(outcome)
+                member["defect_id"] = member_id
+                member["clause_id"] = member_record.get("clause_id")
+                member["probe"] = member_record.get("probe")
+                member["flow"] = member_record.get("flow")
+                member["family_primary"] = defect_id
+                obligations.append(member)
+            if outcome.get("changed") and target not in changed_targets:
                 changed_targets.append(target)
         self._log(
             "loop.direct_repair.obligations",
             run_id=run_id,
             version=parent_version,
             obligations=len(obligations),
+            families=family_count,
             patched=sum(
                 1 for item in obligations if item.get("status") == "patched"
             ),

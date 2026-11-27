@@ -15192,6 +15192,24 @@ def _fill_plan_contents(
 #
 # The function never raises (the repair seams' precedent): any
 # internal failure returns a declined outcome the loop records.
+#
+# Campaign build #33 — scope enumeration: arm #41's four repair
+# passes patched the pairing confirm flow one probe record at a
+# time and never produced the one-line envelope unwrap the
+# records jointly force, because each obligation saw only its
+# own record (the battery repaired the same defects only when
+# its spec named the full scope — the two-location scope rider,
+# in vivo again). An obligation now carries its defect's repair
+# FAMILY: every record of the parent version's probe run sharing
+# the defect's (clause, probe, file) key, mechanically enumerated
+# (contract_clauses.repair_family_scope). Failing members are
+# co-defects of one shared behavior; passing members are standing
+# constraints the patch must keep green. The loop executes ONE
+# obligation per family; the prompt below renders the whole
+# measurement set as simultaneous constraints on the shared
+# handling. A singleton family renders build #32's prompt
+# byte-identically — the scope form is earned by a second
+# measurement, never asserted.
 
 
 def _direct_repair_node_id(defect_id: str) -> str:
@@ -15200,14 +15218,35 @@ def _direct_repair_node_id(defect_id: str) -> str:
 
 
 def _direct_repair_no_change_error(
-    defect_id: str, record: dict[str, Any], target: str
+    defect_id: str,
+    record: dict[str, Any],
+    target: str,
+    family_failures: list[dict[str, Any]] | None = None,
 ) -> str:
     """The failed-attempt sentence for a no-change obligation patch.
 
     Build #30's _repair_no_change_error restates the node's
     obligation; an obligation's restatement is the probe record
     itself — the measured failure the patch exists to move.
+    Build #33: a family obligation's restatement is the family's
+    failing records, all of them — the whole measured set the
+    patch exists to move.
     """
+    if family_failures and len(family_failures) > 1:
+        measured = "; ".join(
+            f"defect {entry.get('defect_id')} — "
+            f"{entry.get('detail') or 'the probe failed with no detail'}"
+            for entry in family_failures
+        )
+        return (
+            "the repair patch left "
+            f"{target} byte-for-byte unchanged, but this repair "
+            "obligation exists because the file as it stands was "
+            f"MEASURED failing: {measured} "
+            "A patch that changes nothing cannot fix a measured "
+            "failure; the attempt FAILS. Return edits that change "
+            "the code the failures name."
+        )
     return (
         "the repair patch left "
         f"{target} byte-for-byte unchanged, but this repair "
@@ -15218,6 +15257,52 @@ def _direct_repair_no_change_error(
         "failure; the attempt FAILS. Return edits that change "
         "the code the failure names."
     )
+
+
+def _direct_repair_family_scope(
+    scope: list[dict[str, Any]] | None,
+    *,
+    defect_id: str,
+    record: dict[str, Any],
+    target: str,
+) -> list[dict[str, Any]] | None:
+    """The effective family scope an obligation renders (build #33).
+
+    The loop's enumeration, normalized at the seam: entries are
+    confined to the obligation's own target file, and the headline
+    defect is guaranteed present among the failing entries (the
+    loop builds the scope from the same run's records, so it
+    always is; the guarantee keeps the prompt honest if a caller
+    hands a partial scope). Returns None when the effective scope
+    holds at most one measurement — a singleton renders build
+    #32's single-defect prompt, byte-identically.
+    """
+    if not scope:
+        return None
+    entries = [
+        dict(entry)
+        for entry in scope
+        if isinstance(entry, dict) and entry.get("file") == target
+    ]
+    if not any(
+        entry.get("defect_id") == defect_id and not entry.get("ok")
+        for entry in entries
+    ):
+        entries.insert(
+            0,
+            {
+                "defect_id": defect_id,
+                "clause_id": record.get("clause_id"),
+                "probe": record.get("probe"),
+                "flow": record.get("flow"),
+                "ok": False,
+                "detail": record.get("detail") or "",
+                "file": target,
+            },
+        )
+    if len(entries) <= 1:
+        return None
+    return entries
 
 
 def _direct_repair_edits(
@@ -15268,6 +15353,7 @@ def _direct_repair_prompt(
     standing: str,
     goal_text: str | None,
     errors_block: str,
+    scope: list[dict[str, Any]] | None = None,
 ) -> str:
     """One obligation attempt's prompt: defect + standing file.
 
@@ -15275,31 +15361,102 @@ def _direct_repair_prompt(
     the goal for context, the diagnosed defect with its measured
     evidence, the file as it stands, and build #30's patch-form
     instruction. No plan, no skeleton, no other defects.
+
+    Build #33: when the obligation carries a family scope (the
+    defect's whole repair family, enumerated by the loop), the
+    prompt names every failing member as a co-defect and renders
+    the SCOPE block — every measurement of the family, passing
+    ones included — as simultaneous constraints on the shared
+    handling. With no scope (or a singleton), the prompt is
+    build #32's, byte for byte.
     """
-    lines = [
-        f"DIRECT REPAIR — one diagnosed defect in {target}.",
-        "",
-    ]
+    family = scope if scope and len(scope) > 1 else None
+    failing = (
+        [entry for entry in family if not entry.get("ok")]
+        if family
+        else []
+    )
+    if family:
+        lines = [
+            f"DIRECT REPAIR — diagnosed defects in {target} "
+            "sharing one measured behavior.",
+            "",
+        ]
+    else:
+        lines = [
+            f"DIRECT REPAIR — one diagnosed defect in {target}.",
+            "",
+        ]
     if goal_text:
         lines += [f"Goal: {goal_text}", ""]
-    lines += [
-        "The contract probes measured this defect in the file as "
-        "it stands:",
-        f"  defect: {defect_id}",
-        f"  clause: {record.get('clause_id') or ''}",
-        f"  probe: {record.get('probe') or ''} / flow: "
-        f"{record.get('flow') or ''}",
-        f"  measured failure: {record.get('detail') or ''}",
-        "",
-        f"Current content of {target} (the file as it stands):",
-        standing,
-        "",
-    ]
+    if family:
+        lines += [
+            "The contract probes measured these defects in the "
+            "file as it stands — one family of measurements of a "
+            "single shared behavior:",
+        ]
+        for entry in failing:
+            lines += [
+                f"  defect: {entry.get('defect_id')}",
+                f"  clause: {entry.get('clause_id') or ''}",
+                f"  probe: {entry.get('probe') or ''} / flow: "
+                f"{entry.get('flow') or ''}",
+                f"  measured failure: {entry.get('detail') or ''}",
+            ]
+        lines += [
+            "",
+            "SCOPE — the complete measurement set for this "
+            "behavior. The probe took every measurement below in "
+            "one run, in this order, against the same code (and, "
+            "for a live probe, against server state the earlier "
+            "flows built for the later ones). They are "
+            "simultaneous constraints on the code the family "
+            "shares:",
+        ]
+        for entry in family:
+            label = entry.get("flow") or "(the probe record)"
+            if entry.get("ok"):
+                lines.append(
+                    f"  PASSING  flow {label} — "
+                    f"{entry.get('detail') or ''}"
+                )
+            else:
+                lines.append(
+                    f"  FAILING  flow {label} — "
+                    "one of the defects above"
+                )
+        lines += [
+            "Repair the shared handling so every FAILING "
+            "measurement passes and every PASSING one stays "
+            "passing. A patch that turns one failing measurement "
+            "green by turning a passing one red has not repaired "
+            "this behavior — the repaired tree is judged on the "
+            "whole set at once.",
+            "",
+            f"Current content of {target} (the file as it stands):",
+            standing,
+            "",
+        ]
+    else:
+        lines += [
+            "The contract probes measured this defect in the file as "
+            "it stands:",
+            f"  defect: {defect_id}",
+            f"  clause: {record.get('clause_id') or ''}",
+            f"  probe: {record.get('probe') or ''} / flow: "
+            f"{record.get('flow') or ''}",
+            f"  measured failure: {record.get('detail') or ''}",
+            "",
+            f"Current content of {target} (the file as it stands):",
+            standing,
+            "",
+        ]
     if errors_block:
         lines += [errors_block, ""]
     lines += [
-        "REPAIR — this call exists to fix the diagnosed defect "
-        "above in the file as it stands (its current content is "
+        "REPAIR — this call exists to fix the diagnosed "
+        + ("defects " if family else "defect ")
+        + "above in the file as it stands (its current content is "
         "given above). Return "
         '{"edits": [{"search": "<text copied exactly from the '
         'current file>", "replace": "<the new text>"}]} — '
@@ -15357,6 +15514,7 @@ def execute_direct_repair_obligation(
     repo_root: str | Path,
     goal_text: str | None,
     settings: LLMSettings | None = None,
+    scope: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute one direct repair obligation (campaign build #32).
 
@@ -15372,6 +15530,13 @@ def execute_direct_repair_obligation(
     the outcome dict reports every attempt. Never raises: an
     internal failure is a declined outcome, recorded like any
     other (the repair seams' contract with the loop).
+
+    Build #33: ``scope`` is the defect's repair family as the
+    loop enumerated it (contract_clauses.repair_family_scope) —
+    every measurement of the shared behavior, passing ones
+    included. A multi-measurement scope renders the family form
+    of the prompt and is reported on the outcome ("family",
+    "scope"); a singleton or absent scope is build #32 exactly.
     """
     outcome: dict[str, Any] = {
         "defect_id": defect_id,
@@ -15397,6 +15562,7 @@ def execute_direct_repair_obligation(
             goal_text=goal_text,
             settings=settings,
             outcome=outcome,
+            scope=scope,
         )
     except Exception as exc:  # noqa: BLE001 — a seam never fails a run
         if outcome["status"] == "declined" and outcome["reason"] is None:
@@ -15416,9 +15582,27 @@ def _execute_direct_repair_obligation(
     goal_text: str | None,
     settings: LLMSettings | None,
     outcome: dict[str, Any],
+    scope: list[dict[str, Any]] | None = None,
 ) -> None:
     root = Path(repo_root)
     node_id = _direct_repair_node_id(defect_id)
+    # Build #33: the effective family scope (None = build #32's
+    # single-defect form). The outcome reports what the model
+    # was actually shown, so the lineage can judge the repair
+    # against the scope it was given.
+    effective_scope = _direct_repair_family_scope(
+        scope, defect_id=defect_id, record=record, target=target
+    )
+    family_failures = (
+        [entry for entry in effective_scope if not entry.get("ok")]
+        if effective_scope
+        else None
+    )
+    if effective_scope is not None:
+        outcome["family"] = sorted(
+            entry.get("defect_id") for entry in family_failures or []
+        )
+        outcome["scope"] = effective_scope
     try:
         resolved_root = root.resolve()
         resolved = (root / target).resolve()
@@ -15452,6 +15636,7 @@ def _execute_direct_repair_obligation(
             standing=standing,
             goal_text=goal_text,
             errors_block=errors_block,
+            scope=effective_scope,
         )
         record_fill_prompt(
             phase="direct_repair",
@@ -15516,7 +15701,10 @@ def _execute_direct_repair_obligation(
                 if exc.kind in ("no_op_edit", "no_change"):
                     defects.append(
                         _direct_repair_no_change_error(
-                            defect_id, record, target
+                            defect_id,
+                            record,
+                            target,
+                            family_failures=family_failures,
                         )
                     )
             if new_content is not None and target.endswith(".py"):
@@ -15534,7 +15722,10 @@ def _execute_direct_repair_obligation(
                 # applier's internals.
                 defects = [
                     _direct_repair_no_change_error(
-                        defect_id, record, target
+                        defect_id,
+                        record,
+                        target,
+                        family_failures=family_failures,
                     )
                 ]
                 new_content = None

@@ -1081,6 +1081,78 @@ def probe_suspect_map(
     return {"file": path, "flows": flows}
 
 
+def repair_family_key(
+    record: dict[str, Any],
+) -> tuple[str, str, str] | None:
+    """The repair-family key of one probe record (campaign build #33).
+
+    (clause_id, probe, file) — the contract's own identity for one
+    measured behavior: one clause's section, measured by one probe,
+    against one produced file. Records that do not name all three
+    (a static probe with no file, a flow-less summary) have no
+    family: None. Derived from the record's fields only, never
+    from model output — probe_suspect_map's standard, one level up.
+    """
+    if not isinstance(record, dict):
+        return None
+    clause_id = record.get("clause_id")
+    probe = record.get("probe")
+    path = record.get("file")
+    if not isinstance(clause_id, str) or not clause_id:
+        return None
+    if not isinstance(probe, str) or not probe:
+        return None
+    if not isinstance(path, str) or not path:
+        return None
+    return (clause_id, probe, path)
+
+
+def repair_family_scope(
+    records: list[dict[str, Any]],
+    key: tuple[str, str, str],
+) -> list[dict[str, Any]]:
+    """Every record of one repair family, in probe-run order (#33).
+
+    The scope enumeration for direct repair: a defect's family is
+    the full set of measurements its probe took against the shared
+    behavior — the failing records are co-defects of one root, the
+    passing records are standing constraints a repair must keep
+    green. Arm #41 is why this exists: four repair passes patched
+    the pairing confirm flow one record at a time and never
+    produced the one-line unwrap the records jointly force,
+    because no obligation ever saw its siblings (the diagnostic
+    battery repaired the same defects only when its spec named
+    the full scope). Projected to the fields an obligation
+    renders; defect ids use lineage.defect_id_for_record's
+    formula, restated here to keep this module import-free of
+    the lineage recorder.
+    """
+    scope: list[dict[str, Any]] = []
+    for record in records:
+        if repair_family_key(record) != key:
+            continue
+        clause_id = str(record.get("clause_id") or "")
+        probe = str(record.get("probe") or "")
+        flow = record.get("flow")
+        defect_id = (
+            f"{clause_id}::{probe}::{flow}"
+            if flow
+            else f"{clause_id}::{probe}"
+        )
+        scope.append(
+            {
+                "defect_id": defect_id,
+                "clause_id": clause_id,
+                "probe": probe,
+                "flow": flow if isinstance(flow, str) else None,
+                "ok": bool(record.get("ok")),
+                "detail": str(record.get("detail") or ""),
+                "file": str(record.get("file") or ""),
+            }
+        )
+    return scope
+
+
 # ── Live probes (campaign build #6) ────────────────────────────────
 #
 # The static probes read the tree; they cannot see behavior that
